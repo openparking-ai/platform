@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  PGPASSWORD: postgres
+  ADMIN_URL: postgres://postgres:postgres@localhost:5432
+  DATABASE_URL: postgres://postgres:postgres@localhost:5432/openparking_test
+  APP_DATABASE_URL: postgres://openparking_app:ci_password@localhost:5432/openparking_test
+  APP_DB_PASSWORD: ci_password
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+
+      - name: Create the test database
+        run: psql "$ADMIN_URL/postgres" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE openparking_test'
+
+      - name: Migrate
+        run: npm run migrate
+
+      - name: Create the application role
+        # NOSUPERUSER, NOBYPASSRLS. The service container hands out a superuser
+        # by default, and a superuser bypasses row-level security
+        # unconditionally -- running the isolation suite as one would make every
+        # assertion in it meaningless.
+        run: npm run ensure-app-role
+
+      - name: Tests
+        run: npm test
+
+      - name: RLS fail-control
+        # Proves the isolation suite actually measures isolation, by requiring
+        # it to FAIL against a scratch database with RLS stripped out.
+        run: npm run rls-fail-control
