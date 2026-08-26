@@ -14,4 +14,4 @@
 
 ---
 
-Built by 72 Knots. Method by [72Knots.ai](https://72knots.ai)
+Built by 72 Knots Method by 72Knots.ai
