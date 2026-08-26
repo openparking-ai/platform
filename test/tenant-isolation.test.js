@@ -51,7 +51,12 @@ if (only && tables.length === 0) {
 }
 
 for (const spec of tables) {
-  const { table, insert, appendOnly } = spec;
+  const { table, insert, appendOnly, singleton } = spec;
+
+  // A singleton table holds one row per tenant by construction (tenant_settings
+  // is keyed on tenant_id), so its "second row" is another tenant's, and the
+  // row's identity IS the tenant id.
+  const key = singleton ? 'tenant_id' : 'id';
 
   test(`${table}: a tenant reads only its own rows`, async () => {
     const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
@@ -60,7 +65,7 @@ for (const spec of tables) {
       await insert(c, A, worldA);
       // Deliberately unqualified — no WHERE tenant_id. This asks the database
       // alone to do the scoping, which is the thing under test.
-      const { rows } = await c.query(`SELECT id, tenant_id FROM ${table}`);
+      const { rows } = await c.query(`SELECT ${key} AS id, tenant_id FROM ${table}`);
       return rows;
     });
 
@@ -75,7 +80,7 @@ for (const spec of tables) {
   test(`${table}: naming another tenant's row id does not reveal it`, async () => {
     const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
     const rows = await withTenant(A, async (c) => {
-      const { rows } = await c.query(`SELECT id FROM ${table} WHERE id = $1`, [idB]);
+      const { rows } = await c.query(`SELECT ${key} AS id FROM ${table} WHERE ${key} = $1`, [idB]);
       return rows;
     });
     assert.equal(rows.length, 0, `${table} revealed a row when its id was known`);
@@ -96,7 +101,7 @@ for (const spec of tables) {
     test(`${table}: a tenant cannot update another tenant's row`, async () => {
       const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
       const count = await withTenant(A, async (c) => {
-        const res = await c.query(`UPDATE ${table} SET tenant_id = tenant_id WHERE id = $1`, [idB]);
+        const res = await c.query(`UPDATE ${table} SET tenant_id = tenant_id WHERE ${key} = $1`, [idB]);
         return res.rowCount;
       });
       assert.equal(count, 0, `${table} let tenant A update tenant B's row`);
@@ -105,7 +110,7 @@ for (const spec of tables) {
     test(`${table}: a tenant cannot delete another tenant's row`, async () => {
       const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
       const count = await withTenant(A, async (c) => {
-        const res = await c.query(`DELETE FROM ${table} WHERE id = $1`, [idB]);
+        const res = await c.query(`DELETE FROM ${table} WHERE ${key} = $1`, [idB]);
         return res.rowCount;
       });
       assert.equal(count, 0, `${table} let tenant A delete tenant B's row`);
@@ -117,7 +122,7 @@ for (const spec of tables) {
     // rather than true. Fail closed.
     const client = await pool.connect();
     try {
-      const { rows } = await client.query(`SELECT id FROM ${table}`);
+      const { rows } = await client.query(`SELECT ${key} FROM ${table}`);
       assert.equal(rows.length, 0, `${table} is readable with no tenant context`);
     } finally {
       client.release();

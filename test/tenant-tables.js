@@ -73,6 +73,26 @@ export const TENANT_TABLES = [
     appendOnly: true,
   },
   {
+    table: 'tenant_settings',
+    insert: (c, t) =>
+      c.query(
+        `INSERT INTO tenant_settings (tenant_id, vehicle_retention_days) VALUES ($1, 30)
+         ON CONFLICT (tenant_id) DO UPDATE SET updated_at = now() RETURNING tenant_id AS id`,
+        [t],
+      ),
+    // One row per tenant by construction, so there is no second row to plant.
+    singleton: true,
+  },
+  {
+    table: 'operator_tokens',
+    insert: (c, t) =>
+      c.query(
+        `INSERT INTO operator_tokens (tenant_id, name, token_hash)
+         VALUES ($1,'Row', md5(gen_random_uuid()::text) || md5(gen_random_uuid()::text)) RETURNING id`,
+        [t],
+      ),
+  },
+  {
     table: 'lane_devices',
     insert: (c, t, w) =>
       c.query(
@@ -100,7 +120,13 @@ export const TABLES_WITHOUT_TENANT_ID = {
 
 /**
  * Tables that are ENABLE ROW LEVEL SECURITY but deliberately NOT FORCE.
+ *
+ * BOTH are credential-resolution tables, and they are on this list for the one
+ * reason the RLS template cannot express: a credential is presented and the
+ * tenant that owns it is precisely what the lookup exists to discover, so no
+ * tenant policy can gate it. Nothing else may join this list without the same
+ * argument.
  * See migration 0002 for why lane_devices is the exception, and
  * rls-coverage.test.js for the assertion that it is the ONLY one.
  */
-export const NOT_FORCED_BY_DESIGN = ['lane_devices'];
+export const NOT_FORCED_BY_DESIGN = ['lane_devices', 'operator_tokens'];

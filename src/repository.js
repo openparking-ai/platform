@@ -7,15 +7,26 @@
  */
 import { toMinor } from './money.js';
 
-export async function upsertVehicle(client, tenantId, { plate, plateRegion = null, seenAt }) {
+export async function upsertVehicle(
+  client,
+  tenantId,
+  { plate, plateRegion = null, seenAt, make = null, model = null, color = null, attributes = null },
+) {
   const { rows } = await client.query(
-    `INSERT INTO vehicles (tenant_id, plate, plate_region, first_seen_at, last_seen_at)
-     VALUES ($1, $2, $3, $4, $4)
+    `INSERT INTO vehicles (tenant_id, plate, plate_region, make, model, color, attributes,
+                           first_seen_at, last_seen_at)
+     VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::jsonb, '{}'::jsonb), $8, $8)
      ON CONFLICT (tenant_id, plate) DO UPDATE
-       SET last_seen_at = GREATEST(vehicles.last_seen_at, EXCLUDED.last_seen_at),
-           plate_region = COALESCE(EXCLUDED.plate_region, vehicles.plate_region)
-     RETURNING id, plate, plate_region`,
-    [tenantId, plate, plateRegion, seenAt],
+       SET last_seen_at  = GREATEST(vehicles.last_seen_at, EXCLUDED.last_seen_at),
+           plate_region  = COALESCE(EXCLUDED.plate_region, vehicles.plate_region),
+           -- A later, better read fills in what an earlier one could not. It
+           -- never blanks what is already known.
+           make          = COALESCE(EXCLUDED.make,  vehicles.make),
+           model         = COALESCE(EXCLUDED.model, vehicles.model),
+           color         = COALESCE(EXCLUDED.color, vehicles.color),
+           attributes    = vehicles.attributes || EXCLUDED.attributes
+     RETURNING id, plate, plate_region, make, model, color`,
+    [tenantId, plate, plateRegion, make, model, color, attributes ? JSON.stringify(attributes) : null, seenAt],
   );
   return rows[0];
 }
@@ -54,7 +65,19 @@ export async function openSession(
   // Keyed on the event, so a replay is recognised whether the session it
   // created is still open, already closed, or closed and long forgotten.
   const alreadyOpened = await findSessionByOpenEvent(client, tenantId, openEventId);
-  if (alreadyOpened) return { session: alreadyOpened, created: false };
+  if (alreadyOpened) {
+    if (alreadyOpened.vehicle_id !== vehicleId) {
+      // The same id presented for a DIFFERENT vehicle. Silently handing back
+      // the first vehicle's session would leave this car with no session at
+      // all: it would exit to a 404, the close would be dead-lettered, and it
+      // would park free with nothing in the record to say so. A lane fault
+      // that is loud is worth far more than a silent free park.
+      const conflict = new Error('event_id already used for a different vehicle');
+      conflict.code = 'EVENT_ID_VEHICLE_CONFLICT';
+      throw conflict;
+    }
+    return { session: alreadyOpened, created: false };
+  }
 
   const existing = await findOpenSession(client, tenantId, garageId, vehicleId);
   if (existing) return { session: existing, created: false };
@@ -155,6 +178,36 @@ export async function appendEvents(client, tenantId, events) {
     params,
   );
   return { accepted: rowCount, duplicates: events.length - rowCount };
+}
+
+export async function findOpenSessionById(client, tenantId, garageId, sessionId) {
+  const { rows } = await client.query(
+    `SELECT * FROM sessions
+      WHERE tenant_id = $1 AND garage_id = $2 AND id = $3 AND exit_at IS NULL`,
+    [tenantId, garageId, sessionId],
+  );
+  return rows[0] ?? null;
+}
+
+export async function findOpenSessionByPlate(client, tenantId, garageId, plate) {
+  const { rows } = await client.query(
+    `SELECT s.* FROM sessions s
+       JOIN vehicles v ON v.id = s.vehicle_id
+      WHERE s.tenant_id = $1 AND s.garage_id = $2 AND v.plate = $3 AND s.exit_at IS NULL`,
+    [tenantId, garageId, plate],
+  );
+  return rows[0] ?? null;
+}
+
+export async function retentionDays(client, tenantId) {
+  const { rows } = await client.query(
+    'SELECT vehicle_retention_days FROM tenant_settings WHERE tenant_id = $1',
+    [tenantId],
+  );
+  // No row means the tenant has never changed it. 30 is the default, and it is
+  // the default in one place only -- the column -- so this mirrors it rather
+  // than inventing a second source of truth.
+  return rows[0] ? Number(rows[0].vehicle_retention_days) : 30;
 }
 
 export async function openSessionsForGarage(client, tenantId, garageId) {
