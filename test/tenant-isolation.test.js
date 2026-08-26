@@ -1,16 +1,24 @@
+/**
+ * Tenant isolation, run generically against EVERY tenant-owned table.
+ *
+ * Set ISOLATION_TABLE to run one table only -- scripts/rls-fail-control.js uses
+ * that to strip RLS from one table at a time and require this suite to fail.
+ */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { pool, withTenant, createTenant, createSite } from './helpers.js';
+import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
+import { TENANT_TABLES } from './tenant-tables.js';
 
-let tenantA;
-let tenantB;
-let siteB;
+let A;
+let B;
+let worldA;
+let worldB;
 
 before(async () => {
-  tenantA = await createTenant('tenant-a');
-  tenantB = await createTenant('tenant-b');
-  siteB = await createSite(tenantB, 'B main lot');
-  await createSite(tenantA, 'A main lot');
+  A = await createTenant('iso-a');
+  B = await createTenant('iso-b');
+  worldA = await buildWorld(A);
+  worldB = await buildWorld(B);
 });
 
 after(async () => {
@@ -18,108 +26,101 @@ after(async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Guards. These run first because every assertion below is meaningless if the
-// connection under test can bypass row-level security. A superuser sees every
-// tenant's rows whether the policies exist or not.
+// Guards. Every assertion below is meaningless if the connection under test can
+// bypass row-level security, so these come first.
 // ---------------------------------------------------------------------------
 
 test('the connection under test cannot bypass RLS', async () => {
   const { rows } = await pool.query(
     'SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user',
   );
-  assert.equal(rows.length, 1, 'current_user should resolve to a role');
+  assert.equal(rows.length, 1);
   assert.equal(rows[0].rolsuper, false, 'tests must not connect as a SUPERUSER — it bypasses RLS');
   assert.equal(rows[0].rolbypassrls, false, 'tests must not connect as a BYPASSRLS role');
 });
 
-test('parking_sites has RLS enabled AND forced', async () => {
-  const { rows } = await pool.query(
-    'SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1',
-    ['parking_sites'],
-  );
-  assert.equal(rows[0].relrowsecurity, true, 'ENABLE ROW LEVEL SECURITY is missing');
-  assert.equal(rows[0].relforcerowsecurity, true, 'FORCE ROW LEVEL SECURITY is missing');
-});
-
 // ---------------------------------------------------------------------------
-// Isolation.
+// The same five assertions, for every table in the registry.
 // ---------------------------------------------------------------------------
 
-test('a tenant reads only its own rows', async () => {
-  const rows = await withTenant(tenantA, async (client) => {
-    // Deliberately unqualified: no WHERE tenant_id. This asks the database
-    // alone to do the scoping, which is exactly what is under test.
-    const { rows } = await client.query('SELECT id, tenant_id, name FROM parking_sites');
-    return rows;
+const only = process.env.ISOLATION_TABLE;
+const tables = only ? TENANT_TABLES.filter((t) => t.table === only) : TENANT_TABLES;
+
+if (only && tables.length === 0) {
+  throw new Error(`ISOLATION_TABLE=${only} matches no table in the registry`);
+}
+
+for (const spec of tables) {
+  const { table, insert, appendOnly } = spec;
+
+  test(`${table}: a tenant reads only its own rows`, async () => {
+    const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
+
+    const rows = await withTenant(A, async (c) => {
+      await insert(c, A, worldA);
+      // Deliberately unqualified — no WHERE tenant_id. This asks the database
+      // alone to do the scoping, which is the thing under test.
+      const { rows } = await c.query(`SELECT id, tenant_id FROM ${table}`);
+      return rows;
+    });
+
+    assert.ok(rows.length > 0, 'tenant A should see its own rows');
+    assert.ok(
+      rows.every((r) => r.tenant_id === A),
+      `${table} leaked a row belonging to another tenant`,
+    );
+    assert.ok(!rows.some((r) => r.id === idB), `${table} leaked tenant B's specific row to A`);
   });
 
-  assert.equal(rows.length, 1, 'tenant A should see exactly its own one site');
-  assert.equal(rows[0].tenant_id, tenantA);
-  assert.ok(
-    !rows.some((r) => r.tenant_id === tenantB),
-    "tenant A must not see tenant B's rows",
-  );
-});
-
-test("a tenant cannot read another tenant's row even by id", async () => {
-  const rows = await withTenant(tenantA, async (client) => {
-    const { rows } = await client.query('SELECT id FROM parking_sites WHERE id = $1', [siteB]);
-    return rows;
+  test(`${table}: naming another tenant's row id does not reveal it`, async () => {
+    const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
+    const rows = await withTenant(A, async (c) => {
+      const { rows } = await c.query(`SELECT id FROM ${table} WHERE id = $1`, [idB]);
+      return rows;
+    });
+    assert.equal(rows.length, 0, `${table} revealed a row when its id was known`);
   });
-  assert.equal(rows.length, 0, "naming B's row id must not reveal it to A");
-});
 
-test("a tenant cannot update another tenant's row", async () => {
-  const count = await withTenant(tenantA, async (client) => {
-    const res = await client.query('UPDATE parking_sites SET name = $1 WHERE id = $2', [
-      'hijacked',
-      siteB,
-    ]);
-    return res.rowCount;
+  test(`${table}: a tenant cannot write a row attributed to another tenant`, async () => {
+    // The WITH CHECK half. Without it, reads look isolated while writes are
+    // wide open — the worst version of the bug, because the reading half of a
+    // test suite stays green.
+    await assert.rejects(
+      () => withTenant(A, (c) => insert(c, B, worldB)),
+      /row-level security/i,
+      `${table} allowed tenant A to insert a row owned by tenant B`,
+    );
   });
-  assert.equal(count, 0, "A's update must not reach B's row");
 
-  const stillNamed = await withTenant(tenantB, async (client) => {
-    const { rows } = await client.query('SELECT name FROM parking_sites WHERE id = $1', [siteB]);
-    return rows[0].name;
-  });
-  assert.equal(stillNamed, 'B main lot', "B's row must be untouched");
-});
+  if (!appendOnly) {
+    test(`${table}: a tenant cannot update another tenant's row`, async () => {
+      const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
+      const count = await withTenant(A, async (c) => {
+        const res = await c.query(`UPDATE ${table} SET tenant_id = tenant_id WHERE id = $1`, [idB]);
+        return res.rowCount;
+      });
+      assert.equal(count, 0, `${table} let tenant A update tenant B's row`);
+    });
 
-test("a tenant cannot delete another tenant's row", async () => {
-  const count = await withTenant(tenantA, async (client) => {
-    const res = await client.query('DELETE FROM parking_sites WHERE id = $1', [siteB]);
-    return res.rowCount;
-  });
-  assert.equal(count, 0, "A's delete must not reach B's row");
-});
-
-test('a tenant cannot write a row attributed to another tenant', async () => {
-  // This is the WITH CHECK half. Without it, reads look correctly isolated
-  // while writes are wide open -- the worst version of the bug, because the
-  // reading side of the test suite stays green.
-  await assert.rejects(
-    () =>
-      withTenant(tenantA, (client) =>
-        client.query('INSERT INTO parking_sites (tenant_id, name) VALUES ($1, $2)', [
-          tenantB,
-          'planted by A',
-        ]),
-      ),
-    /row-level security/i,
-    'inserting under B while acting as A must be refused',
-  );
-});
-
-test('no tenant context reads nothing', async () => {
-  // current_tenant_id() is NULL when unset, and `tenant_id = NULL` is NULL,
-  // not true. A connection that forgets the context sees nothing rather than
-  // everything. Fail closed.
-  const client = await pool.connect();
-  try {
-    const { rows } = await client.query('SELECT id FROM parking_sites');
-    assert.equal(rows.length, 0, 'a context-less connection must see no rows');
-  } finally {
-    client.release();
+    test(`${table}: a tenant cannot delete another tenant's row`, async () => {
+      const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
+      const count = await withTenant(A, async (c) => {
+        const res = await c.query(`DELETE FROM ${table} WHERE id = $1`, [idB]);
+        return res.rowCount;
+      });
+      assert.equal(count, 0, `${table} let tenant A delete tenant B's row`);
+    });
   }
-});
+
+  test(`${table}: a connection with no tenant context reads nothing`, async () => {
+    // current_tenant_id() is NULL when unset, and `tenant_id = NULL` is NULL
+    // rather than true. Fail closed.
+    const client = await pool.connect();
+    try {
+      const { rows } = await client.query(`SELECT id FROM ${table}`);
+      assert.equal(rows.length, 0, `${table} is readable with no tenant context`);
+    } finally {
+      client.release();
+    }
+  });
+}
