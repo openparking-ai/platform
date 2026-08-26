@@ -49,7 +49,13 @@ function run(args, extraEnv = {}) {
 }
 
 function summarise(result) {
-  const line = (label) => (result.stdout.match(new RegExp(`^ℹ ${label} (\\d+)$`, 'm')) || [])[1] ?? '?';
+  // node --test reports counts as "ℹ pass 3" on some versions and "# pass 3"
+  // on others. Matching only one leaves the CI log saying "? passed", which is
+  // a control whose output nobody can read.
+  const line = (label) => {
+    const match = result.stdout.match(new RegExp(`^[ℹ#] ${label} (\\d+)\\s*$`, 'm'));
+    return match ? match[1] : '?';
+  };
   return `${line('pass')} passed, ${line('fail')} failed`;
 }
 
