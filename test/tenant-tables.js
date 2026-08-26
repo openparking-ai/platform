@@ -53,8 +53,8 @@ export const TENANT_TABLES = [
         `WITH v AS (
            INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'S-' || gen_random_uuid()) RETURNING id
          )
-         INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency)
-         SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD' FROM v
+         INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency, open_event_id)
+         SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD', gen_random_uuid()::text FROM v
          RETURNING id`,
         [t, w.garage, w.entryLane],
       ),
@@ -82,6 +82,21 @@ export const TENANT_TABLES = [
       ),
   },
 ];
+
+/**
+ * Tables that legitimately have no tenant_id, and why.
+ *
+ * The guard requires every table in the schema to be either tenant-owned and
+ * protected, or named here. A table that is neither fails CI. Without this list
+ * the guard only inspects tables that already have a tenant_id -- so a new
+ * table that forgets the column entirely is invisible to it, which is the one
+ * case most worth catching. Measured before this existed: a `permits` table
+ * holding a plate, readable by every tenant, and the suite stayed green 7/7.
+ */
+export const TABLES_WITHOUT_TENANT_ID = {
+  schema_migrations: 'migration bookkeeping; global to the database by definition',
+  tenants: 'the tenant registry itself — scoped by its own id, not by a tenant_id column',
+};
 
 /**
  * Tables that are ENABLE ROW LEVEL SECURITY but deliberately NOT FORCE.

@@ -64,12 +64,17 @@ opens; it leaves and the session closes with the fee computed.
 |---|---|
 | `GET /api/v1/lane/rules` | what the lane caches so it can decide offline |
 | `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` |
-| `POST /api/v1/lane/sessions/open` | entry; idempotent |
-| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent |
+| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id` |
+| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id` |
 
-Every one of those is idempotent on purpose. A lane that has been offline
-re-sends whatever it could not confirm, so duplicate delivery is the normal
-case, not an error case.
+Every one of those is idempotent on purpose, and idempotent **on the lane's
+event id — never on state**. A lane that has been offline re-sends whatever it
+could not confirm, so duplicate delivery is the normal case, not an error case.
+
+State is not a key. An entry replayed after the car has already left finds no
+open session, and a state-based check opens a second one: a phantom that never
+exits and corrupts the garage's inside-count permanently. `event_id` is
+required on every session call for that reason.
 
 Times come from the **lane**, never the server clock — the car may have arrived
 while the lane had no network. The fee, and the rate that produced it, are frozen

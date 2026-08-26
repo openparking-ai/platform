@@ -28,7 +28,9 @@ async function issueToken(tenantId, laneId, name) {
 const asDevice = (token, body) => ({
   method: 'POST',
   headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
-  body: JSON.stringify(body),
+  // Every session call carries an event id, exactly as a lane sends it. Tests
+  // that want to exercise a REPLAY pass the same one twice, deliberately.
+  body: JSON.stringify({ event_id: randomUUID(), ...body }),
 });
 
 before(async () => {
@@ -107,20 +109,110 @@ test('an event without an event_id is refused, because it could not be deduplica
 
 // --- sessions -------------------------------------------------------------
 
-test('a car drives in, and driving in twice does not open two sessions', async () => {
+test('a car drives in, and the same entry replayed does not open two sessions', async () => {
   const plate = `IN-${randomUUID().slice(0, 8)}`;
   const entryAt = new Date('2026-08-26T09:00:00Z').toISOString();
+  const eventId = randomUUID();
 
-  const first = await fetch(`${base}/api/v1/lane/sessions/open`, asDevice(entryToken, { plate, entry_at: entryAt }));
+  const first = await fetch(
+    `${base}/api/v1/lane/sessions/open`,
+    asDevice(entryToken, { plate, entry_at: entryAt, event_id: eventId }),
+  );
   assert.equal(first.status, 201);
   const opened = (await first.json()).session;
   assert.equal(opened.exit_at, null);
 
-  const replay = await fetch(`${base}/api/v1/lane/sessions/open`, asDevice(entryToken, { plate, entry_at: entryAt }));
+  const replay = await fetch(
+    `${base}/api/v1/lane/sessions/open`,
+    asDevice(entryToken, { plate, entry_at: entryAt, event_id: eventId }),
+  );
   assert.equal(replay.status, 200, 'a replayed entry is not a new session');
   const body = await replay.json();
   assert.equal(body.created, false);
   assert.equal(body.session.id, opened.id);
+});
+
+test('an entry replayed AFTER the car has already left does not open a phantom', async () => {
+  // The one that state-based idempotency gets wrong, and the reason sessions
+  // are keyed on the lane's event id. The entry lane's acknowledgement was
+  // lost, the exit lane -- a different controller with its own queue -- closed
+  // the session, and only then does the entry lane reconnect and re-send.
+  const plate = `PHANTOM-${randomUUID().slice(0, 8)}`;
+  const entryEvent = randomUUID();
+
+  const opened = (
+    await (
+      await fetch(
+        `${base}/api/v1/lane/sessions/open`,
+        asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z', event_id: entryEvent }),
+      )
+    ).json()
+  ).session;
+
+  await fetch(
+    `${base}/api/v1/lane/sessions/close`,
+    asDevice(exitToken, { plate, exit_at: '2026-08-26T11:00:00Z' }),
+  );
+
+  const replay = await fetch(
+    `${base}/api/v1/lane/sessions/open`,
+    asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z', event_id: entryEvent }),
+  );
+  assert.equal(replay.status, 200, 'a replayed entry must never be treated as a new arrival');
+  const body = await replay.json();
+  assert.equal(body.created, false);
+  assert.equal(body.session.id, opened.id, 'the replay must resolve to the session it originally opened');
+  assert.ok(body.session.exit_at, 'and that session is the closed one, not a fresh open');
+
+  const open = await withTenant(tenant, async (c) =>
+    (
+      await c.query(
+        'SELECT count(*)::int AS n FROM sessions WHERE garage_id = $1 AND vehicle_id = (SELECT id FROM vehicles WHERE plate = $2) AND exit_at IS NULL',
+        [world.garage, plate],
+      )
+    ).rows[0].n,
+  );
+  assert.equal(open, 0, 'no phantom open session may be left behind');
+});
+
+test('a stale exit from an earlier visit is refused terminally, not with a 500', async () => {
+  // A 500 is classified retryable by the lane, so it would be re-sent forever
+  // and jam every item behind it in the outbox. This has to be a 4xx the lane
+  // can dead-letter.
+  const plate = `STALE-${randomUUID().slice(0, 8)}`;
+
+  await fetch(
+    `${base}/api/v1/lane/sessions/open`,
+    asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z' }),
+  );
+  await fetch(
+    `${base}/api/v1/lane/sessions/close`,
+    asDevice(exitToken, { plate, exit_at: '2026-08-26T11:00:00Z' }),
+  );
+  // second visit, the next day
+  await fetch(
+    `${base}/api/v1/lane/sessions/open`,
+    asDevice(entryToken, { plate, entry_at: '2026-08-27T09:00:00Z' }),
+  );
+
+  // the exit lane's queue finally drains and delivers visit one's close
+  const stale = await fetch(
+    `${base}/api/v1/lane/sessions/close`,
+    asDevice(exitToken, { plate, exit_at: '2026-08-26T11:00:00Z' }),
+  );
+
+  assert.equal(stale.status, 409, 'must be terminal, so the lane stops retrying it');
+  assert.ok(stale.status < 500, 'a 5xx here would be retried forever');
+  assert.match((await stale.json()).error, /stale exit/i);
+});
+
+test('a session call without an event_id is refused', async () => {
+  const res = await fetch(`${base}/api/v1/lane/sessions/open`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${entryToken}` },
+    body: JSON.stringify({ plate: 'NOKEY-1', entry_at: new Date().toISOString() }),
+  });
+  assert.equal(res.status, 400, 'with no key there is nothing to be idempotent on');
 });
 
 test('a car drives out and the fee is computed, frozen, and idempotent on replay', async () => {
@@ -130,9 +222,10 @@ test('a car drives out and the fee is computed, frozen, and idempotent on replay
     asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z' }),
   );
 
+  const closeEvent = randomUUID();
   const res = await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(exitToken, { plate, exit_at: '2026-08-26T12:30:00Z' }),
+    asDevice(exitToken, { plate, exit_at: '2026-08-26T12:30:00Z', event_id: closeEvent }),
   );
   assert.equal(res.status, 200);
   const { session, closed } = await res.json();
@@ -145,7 +238,7 @@ test('a car drives out and the fee is computed, frozen, and idempotent on replay
 
   const replay = await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(exitToken, { plate, exit_at: '2026-08-26T12:30:00Z' }),
+    asDevice(exitToken, { plate, exit_at: '2026-08-26T12:30:00Z', event_id: closeEvent }),
   );
   const replayBody = await replay.json();
   assert.equal(replayBody.replay, true);

@@ -101,6 +101,16 @@ CREATE TABLE sessions (
   exit_lane_id         uuid        REFERENCES lanes(id),
   entry_at             timestamptz NOT NULL,
   exit_at              timestamptz,
+  -- The lane-generated ids of the entry and exit that produced this row.
+  --
+  -- Idempotency keys off THESE, never off whether a session happens to be open.
+  -- State is not a key: an entry replayed after the car has already left finds
+  -- no open session, and a state-based check would happily open a second one --
+  -- a phantom that never exits and corrupts the garage's inside-count forever.
+  -- Measured before this column existed: entry 201, exit 200, replayed entry
+  -- 201, two rows, one permanently open.
+  open_event_id        text        NOT NULL,
+  close_event_id       text,
   currency             text        NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
   rate_id              uuid        REFERENCES rates(id),
   hourly_minor_applied bigint      CHECK (hourly_minor_applied >= 0),
@@ -109,19 +119,27 @@ CREATE TABLE sessions (
 
   -- A closed session has all of its closing facts, or none of them.
   CONSTRAINT sessions_closed_is_complete CHECK (
-    (exit_at IS NULL AND exit_lane_id IS NULL AND fee_minor IS NULL)
+    (exit_at IS NULL AND exit_lane_id IS NULL AND fee_minor IS NULL AND close_event_id IS NULL)
     OR
-    (exit_at IS NOT NULL AND exit_lane_id IS NOT NULL AND fee_minor IS NOT NULL)
+    (exit_at IS NOT NULL AND exit_lane_id IS NOT NULL AND fee_minor IS NOT NULL AND close_event_id IS NOT NULL)
   ),
   CONSTRAINT sessions_exit_after_entry CHECK (exit_at IS NULL OR exit_at >= entry_at)
 );
 CREATE INDEX sessions_tenant_id_idx ON sessions (tenant_id);
 CREATE INDEX sessions_garage_open_idx ON sessions (garage_id) WHERE exit_at IS NULL;
 
--- One open session per vehicle per garage. This is what makes "open a session"
--- safe to retry: a replayed entry cannot create a second one.
+-- One open session per vehicle per garage. This stops two lanes racing; it is
+-- NOT what makes a replay safe, because a replay arriving after the car has
+-- left violates nothing here.
 CREATE UNIQUE INDEX sessions_one_open_per_vehicle
   ON sessions (tenant_id, garage_id, vehicle_id) WHERE exit_at IS NULL;
+
+-- THESE are what make entry and exit idempotent: the same lane event can only
+-- ever produce one session, and can only ever close one, no matter how many
+-- times a reconnecting lane re-sends it.
+CREATE UNIQUE INDEX sessions_open_event_id  ON sessions (tenant_id, open_event_id);
+CREATE UNIQUE INDEX sessions_close_event_id ON sessions (tenant_id, close_event_id)
+  WHERE close_event_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- events — append-only log of lane activity.

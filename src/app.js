@@ -232,8 +232,12 @@ export function createApp() {
     try {
       const { tenantId, garageId, laneId, direction } = req.device;
       if (direction !== 'entry') throw new HttpError(409, 'this device is not on an entry lane');
-      const { plate, plate_region: plateRegion = null } = req.body ?? {};
+      const { plate, plate_region: plateRegion = null, event_id: openEventId } = req.body ?? {};
       if (!plate) throw bad('plate is required');
+      // Required, not optional. Without it there is no key to be idempotent on
+      // and the only thing left to check is state -- which is exactly how a
+      // replay arriving after the car has left opens a second, phantom session.
+      if (!openEventId) throw bad('event_id is required');
       const entryAt = parseTime(req.body?.entry_at, 'entry_at');
 
       const result = await withTenant(tenantId, async (client) => {
@@ -246,6 +250,7 @@ export function createApp() {
           laneId,
           entryAt,
           currency: garage.currency,
+          openEventId: String(openEventId),
         });
       });
 
@@ -266,26 +271,34 @@ export function createApp() {
     try {
       const { tenantId, garageId, laneId, direction } = req.device;
       if (direction !== 'exit') throw new HttpError(409, 'this device is not on an exit lane');
-      const { plate } = req.body ?? {};
+      const { plate, event_id: closeEventId } = req.body ?? {};
       if (!plate) throw bad('plate is required');
+      if (!closeEventId) throw bad('event_id is required');
       const exitAt = parseTime(req.body?.exit_at, 'exit_at');
 
       const out = await withTenant(tenantId, async (client) => {
+        // Keyed on the event first, so a replay returns the very session this
+        // exact exit closed -- not "the most recent closed one", which is a
+        // guess that goes wrong the moment a vehicle visits twice.
+        const already = await repo.findSessionByCloseEvent(client, tenantId, String(closeEventId));
+        if (already) return { session: already, closed: false, replay: true };
+
         const vehicle = await repo.upsertVehicle(client, tenantId, { plate, seenAt: exitAt });
         const open = await repo.findOpenSession(client, tenantId, garageId, vehicle.id);
 
-        if (!open) {
-          // Either it never entered, or this exit was already processed. Look
-          // for the most recent closed session so a replay is idempotent
-          // rather than a 404 the lane will retry forever.
-          const { rows } = await client.query(
-            `SELECT * FROM sessions
-              WHERE tenant_id = $1 AND garage_id = $2 AND vehicle_id = $3 AND exit_at IS NOT NULL
-              ORDER BY exit_at DESC LIMIT 1`,
-            [tenantId, garageId, vehicle.id],
+        if (!open) throw new HttpError(404, 'no open session for this vehicle');
+
+        if (exitAt < open.entry_at) {
+          // A stale exit from an earlier visit, arriving after the vehicle has
+          // come back. Closing this session with that timestamp would violate
+          // sessions_exit_after_entry and surface as a 500 -- which the lane
+          // classifies as RETRYABLE and would then re-send forever, jamming
+          // everything behind it in its outbox. 409 is terminal: the lane
+          // dead-letters it, counts it, and moves on.
+          throw new HttpError(
+            409,
+            'exit precedes the entry of the open session — stale exit from an earlier visit',
           );
-          if (rows[0]) return { session: rows[0], closed: false, replay: true };
-          throw new HttpError(404, 'no open session for this vehicle');
         }
 
         const rate = await repo.currentRate(client, tenantId, garageId);
@@ -303,6 +316,7 @@ export function createApp() {
           rateId: rate.id,
           hourlyMinor: rate.hourlyMinor,
           feeMinor,
+          closeEventId: String(closeEventId),
         });
         return { session: closed, closed: true, replay: false };
       });

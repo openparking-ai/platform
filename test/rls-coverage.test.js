@@ -12,11 +12,26 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { pool } from '../src/db.js';
-import { NOT_FORCED_BY_DESIGN } from './tenant-tables.js';
+import { NOT_FORCED_BY_DESIGN, TABLES_WITHOUT_TENANT_ID } from './tenant-tables.js';
 
 after(async () => {
   await pool.end();
 });
+
+/** Every ordinary table in public, whether or not it carries a tenant_id. */
+async function allTables() {
+  const { rows } = await pool.query(`
+    SELECT c.relname AS table,
+           EXISTS (
+             SELECT 1 FROM pg_attribute a
+              WHERE a.attrelid = c.oid AND a.attname = 'tenant_id' AND NOT a.attisdropped
+           ) AS has_tenant_id
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relkind = 'r'
+     ORDER BY c.relname`);
+  return rows;
+}
 
 /** Every ordinary table in public that carries a tenant_id column. */
 async function tenantOwnedTables() {
@@ -37,6 +52,30 @@ async function tenantOwnedTables() {
 test('the guard actually finds tables (a control on the query itself)', async () => {
   const tables = await tenantOwnedTables();
   assert.ok(tables.length >= 6, `expected the core tenant tables, found ${tables.length}`);
+});
+
+test('EVERY table is either tenant-owned or on the explicit allow list', async () => {
+  // The guard that catches the table nobody thought about. A table with no
+  // tenant_id is not automatically fine -- it is either deliberately global,
+  // and named in TABLES_WITHOUT_TENANT_ID with a reason, or it is a tenant
+  // table that forgot its column and is readable by everyone.
+  const unaccounted = (await allTables())
+    .filter((t) => !t.has_tenant_id && !(t.table in TABLES_WITHOUT_TENANT_ID))
+    .map((t) => t.table);
+
+  assert.deepEqual(
+    unaccounted,
+    [],
+    `these tables have no tenant_id and no entry in TABLES_WITHOUT_TENANT_ID: ${unaccounted.join(', ')}. ` +
+      'Either add the tenant column and its policy, or record why the table is global.',
+  );
+});
+
+test('the allow list has no stale entries', async () => {
+  // A list that keeps naming tables which no longer exist stops being read.
+  const present = new Set((await allTables()).map((t) => t.table));
+  const stale = Object.keys(TABLES_WITHOUT_TENANT_ID).filter((t) => !present.has(t));
+  assert.deepEqual(stale, [], `allow list names tables that do not exist: ${stale.join(', ')}`);
 });
 
 test('every tenant-owned table has row-level security ENABLED', async () => {
@@ -70,16 +109,34 @@ test('tenants itself is protected', async () => {
   assert.equal(rows[0].forced, true);
 });
 
-test('events is append-only in the grants, not merely in its name', async () => {
+test('events is append-only: an UPDATE as the app role actually fails', async () => {
+  // Performed, not inferred from a privilege table. A catalogue lookup tells
+  // you what the catalogue says; running the statement tells you what the
+  // database does.
+  await assert.rejects(
+    () => pool.query("UPDATE events SET kind = 'tampered'"),
+    /permission denied/i,
+    'the app role must not be able to rewrite the event log',
+  );
+});
+
+test('events is append-only: a DELETE as the app role actually fails', async () => {
+  await assert.rejects(
+    () => pool.query('DELETE FROM events'),
+    /permission denied/i,
+    'the app role must not be able to erase the event log',
+  );
+});
+
+test('events remains readable and appendable as the app role', async () => {
+  // The control on the two above: if the app role could do nothing at all with
+  // events, those rejections would pass for the wrong reason.
+  await pool.query('SELECT id FROM events LIMIT 1');
   const { rows } = await pool.query(`
     SELECT has_table_privilege('openparking_app', 'events', 'SELECT') AS can_select,
-           has_table_privilege('openparking_app', 'events', 'INSERT') AS can_insert,
-           has_table_privilege('openparking_app', 'events', 'UPDATE') AS can_update,
-           has_table_privilege('openparking_app', 'events', 'DELETE') AS can_delete`);
-  assert.equal(rows[0].can_select, true, 'the app must be able to read events');
-  assert.equal(rows[0].can_insert, true, 'the app must be able to append events');
-  assert.equal(rows[0].can_update, false, 'append-only means no UPDATE grant');
-  assert.equal(rows[0].can_delete, false, 'append-only means no DELETE grant');
+           has_table_privilege('openparking_app', 'events', 'INSERT') AS can_insert`);
+  assert.equal(rows[0].can_select, true);
+  assert.equal(rows[0].can_insert, true);
 });
 
 test('the application role has no structural privileges', async () => {

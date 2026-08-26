@@ -20,6 +20,23 @@ export async function upsertVehicle(client, tenantId, { plate, plateRegion = nul
   return rows[0];
 }
 
+/** Idempotency lookups. The key is the lane's event id, never the session's state. */
+export async function findSessionByOpenEvent(client, tenantId, openEventId) {
+  const { rows } = await client.query(
+    'SELECT * FROM sessions WHERE tenant_id = $1 AND open_event_id = $2',
+    [tenantId, openEventId],
+  );
+  return rows[0] ?? null;
+}
+
+export async function findSessionByCloseEvent(client, tenantId, closeEventId) {
+  const { rows } = await client.query(
+    'SELECT * FROM sessions WHERE tenant_id = $1 AND close_event_id = $2',
+    [tenantId, closeEventId],
+  );
+  return rows[0] ?? null;
+}
+
 export async function findOpenSession(client, tenantId, garageId, vehicleId) {
   const { rows } = await client.query(
     `SELECT * FROM sessions
@@ -29,7 +46,16 @@ export async function findOpenSession(client, tenantId, garageId, vehicleId) {
   return rows[0] ?? null;
 }
 
-export async function openSession(client, tenantId, { garageId, vehicleId, laneId, entryAt, currency }) {
+export async function openSession(
+  client,
+  tenantId,
+  { garageId, vehicleId, laneId, entryAt, currency, openEventId },
+) {
+  // Keyed on the event, so a replay is recognised whether the session it
+  // created is still open, already closed, or closed and long forgotten.
+  const alreadyOpened = await findSessionByOpenEvent(client, tenantId, openEventId);
+  if (alreadyOpened) return { session: alreadyOpened, created: false };
+
   const existing = await findOpenSession(client, tenantId, garageId, vehicleId);
   if (existing) return { session: existing, created: false };
 
@@ -41,32 +67,40 @@ export async function openSession(client, tenantId, { garageId, vehicleId, laneI
   await client.query('SAVEPOINT open_session');
   try {
     const { rows } = await client.query(
-      `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency, open_event_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
-      [tenantId, garageId, vehicleId, laneId, entryAt, currency],
+      [tenantId, garageId, vehicleId, laneId, entryAt, currency, openEventId],
     );
     await client.query('RELEASE SAVEPOINT open_session');
     return { session: rows[0], created: true };
   } catch (err) {
     await client.query('ROLLBACK TO SAVEPOINT open_session');
-    // 23505 on sessions_one_open_per_vehicle: somebody else opened it between
-    // our check and our insert. That is the index doing its job, not an error.
+    // 23505: somebody else got there between our check and our insert -- either
+    // the same event arriving twice concurrently, or the other lane opening for
+    // this vehicle. Both are the indexes doing their job, not errors.
     if (err.code !== '23505') throw err;
-    const raced = await findOpenSession(client, tenantId, garageId, vehicleId);
+    const raced =
+      (await findSessionByOpenEvent(client, tenantId, openEventId)) ??
+      (await findOpenSession(client, tenantId, garageId, vehicleId));
     if (!raced) throw err;
     return { session: raced, created: false };
   }
 }
 
-export async function closeSession(client, tenantId, sessionId, { exitAt, laneId, rateId, hourlyMinor, feeMinor }) {
+export async function closeSession(
+  client,
+  tenantId,
+  sessionId,
+  { exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId },
+) {
   const { rows } = await client.query(
     `UPDATE sessions
         SET exit_at = $3, exit_lane_id = $4, rate_id = $5,
-            hourly_minor_applied = $6, fee_minor = $7
+            hourly_minor_applied = $6, fee_minor = $7, close_event_id = $8
       WHERE tenant_id = $1 AND id = $2 AND exit_at IS NULL
       RETURNING *`,
-    [tenantId, sessionId, exitAt, laneId, rateId, hourlyMinor, feeMinor],
+    [tenantId, sessionId, exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId],
   );
   return rows[0] ?? null;
 }
