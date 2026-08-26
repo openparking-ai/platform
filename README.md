@@ -38,8 +38,8 @@ policies are present or absent, so it proves nothing in either direction. Connec
 unprivileged role is what makes the test mean something.
 
 See [docs/RLS_TEMPLATE.md](docs/RLS_TEMPLATE.md) for the pattern every new tenant-owned
-table follows, and [docs/DATA_RETENTION.md](docs/DATA_RETENTION.md) for what is stored
-about vehicles and what has not been decided about keeping it.
+table follows, and [docs/DATA_RETENTION.md](docs/DATA_RETENTION.md) for what is stored about
+vehicles and how long it is kept.
 
 ## Watch a car drive through
 
@@ -79,6 +79,28 @@ required on every session call for that reason.
 Times come from the **lane**, never the server clock — the car may have arrived
 while the lane had no network. The fee, and the rate that produced it, are frozen
 onto the session at exit, so editing a rate later cannot silently reprice history.
+
+## Operator surface
+
+Authenticated by an operator token; the tenant comes **from the token**. There is
+no HTTP route that mints one — `npm run issue-operator-token <tenant-id> "<name>"`
+needs database access, deliberately, because a token is what unlocks the surface.
+
+```sh
+curl -H "authorization: Bearer $OPERATOR_TOKEN" \
+  http://127.0.0.1:3000/api/v1/garages/<id>/sessions/open
+```
+
+## Vehicle identity and retention
+
+The database stores real vehicle identity — plate, make, model, colour — because
+that is the product. Transient identity is redacted **30 days after the stay
+closes** by default, configurable per tenant; enrolled vehicles persist while
+enrolled. `npm run purge` enforces it, and it redacts rather than deletes so the
+financial record survives. See [docs/DATA_RETENTION.md](docs/DATA_RETENTION.md).
+
+The **repository** contains no real data at all: fixtures and tests use invented
+values, enforced by `npm run check-no-real-data`.
 
 ## Licence and contributing
 

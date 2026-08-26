@@ -11,6 +11,7 @@ let tenant;
 let world;
 let entryToken;
 let exitToken;
+let operatorToken;
 
 async function issueToken(tenantId, laneId, name) {
   const token = generateDeviceToken();
@@ -33,11 +34,25 @@ const asDevice = (token, body) => ({
   body: JSON.stringify({ event_id: randomUUID(), ...body }),
 });
 
+async function issueOperatorToken(tenantId) {
+  const token = generateDeviceToken();
+  await withTenant(tenantId, (c) =>
+    c.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'ops',$2)`, [
+      tenantId,
+      hashToken(token),
+    ]),
+  );
+  return token;
+}
+
+const asOperator = (token) => ({ headers: { authorization: `Bearer ${token}` } });
+
 before(async () => {
   tenant = await createTenant('api');
   world = await buildWorld(tenant, { hourlyMinor: 250 });
   entryToken = await issueToken(tenant, world.entryLane, 'entry device');
   exitToken = await issueToken(tenant, world.exitLane, 'exit device');
+  operatorToken = await issueOperatorToken(tenant);
   server = createApp().listen(0);
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}`;
@@ -298,28 +313,52 @@ test('open sessions and the inside-count are readable per garage', async () => {
   const plate = `INSIDE-${randomUUID().slice(0, 8)}`;
   await fetch(`${base}/api/v1/lane/sessions/open`, asDevice(entryToken, { plate, entry_at: new Date().toISOString() }));
 
-  const res = await fetch(`${base}/api/v1/garages/${world.garage}/sessions/open`, {
-    headers: { 'x-tenant-id': tenant },
-  });
+  const res = await fetch(`${base}/api/v1/garages/${world.garage}/sessions/open`, asOperator(operatorToken));
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.inside_count, body.sessions.length);
   assert.ok(body.sessions.some((s) => s.plate === plate));
 });
 
-test("another tenant sees nothing of this garage's sessions", async () => {
+test("another tenant's operator sees nothing of this garage's sessions", async () => {
   const other = await createTenant('nosy');
-  const res = await fetch(`${base}/api/v1/garages/${world.garage}/sessions/open`, {
-    headers: { 'x-tenant-id': other },
-  });
+  const otherToken = await issueOperatorToken(other);
+  const res = await fetch(`${base}/api/v1/garages/${world.garage}/sessions/open`, asOperator(otherToken));
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), { inside_count: 0, sessions: [] });
+});
+
+test('the operator surface refuses an unauthenticated call', async () => {
+  const res = await fetch(`${base}/api/v1/garages/${world.garage}/sessions/open`);
+  assert.equal(res.status, 401);
+  assert.deepEqual(await res.json(), { error: 'operator token required' });
+});
+
+test('an x-tenant-id header no longer grants anything', async () => {
+  // This is the closed hole. Knowing a tenant id used to be enough to act as
+  // that tenant, including minting lane credentials for it.
+  const res = await fetch(`${base}/api/v1/garages/${world.garage}/sessions/open`, {
+    headers: { 'x-tenant-id': tenant },
+  });
+  assert.equal(res.status, 401, 'the header must not authenticate anything');
+});
+
+test('a revoked operator token stops working', async () => {
+  const doomed = await issueOperatorToken(tenant);
+  assert.equal((await fetch(`${base}/api/v1/garages/${world.garage}/sessions/open`, asOperator(doomed))).status, 200);
+  await withTenant(tenant, (c) =>
+    c.query('UPDATE operator_tokens SET revoked_at = now() WHERE token_hash = $1', [hashToken(doomed)]),
+  );
+  assert.equal((await fetch(`${base}/api/v1/garages/${world.garage}/sessions/open`, asOperator(doomed))).status, 401);
 });
 
 test('a device token is returned exactly once, and only its hash is stored', async () => {
   const res = await fetch(`${base}/api/v1/lanes/${world.entryLane}/devices`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-tenant-id': tenant },
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${operatorToken}`,
+    },
     body: JSON.stringify({ name: 'issued in a test' }),
   });
   assert.equal(res.status, 201);
@@ -332,4 +371,129 @@ test('a device token is returned exactly once, and only its hash is stored', asy
   );
   assert.equal(stored.token_hash, hashToken(token));
   assert.notEqual(stored.token_hash, token);
+});
+
+// --- C5: the two residuals from the independent review ---------------------
+
+test('the exit lane can look up the open session for a plate', async () => {
+  const plate = `LOOKUP-${randomUUID().slice(0, 8)}`;
+  const opened = (
+    await (
+      await fetch(
+        `${base}/api/v1/lane/sessions/open`,
+        asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z' }),
+      )
+    ).json()
+  ).session;
+
+  const res = await fetch(`${base}/api/v1/lane/sessions/open?plate=${plate}`, {
+    headers: { authorization: `Bearer ${exitToken}` },
+  });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).session.id, opened.id);
+});
+
+test('C5(a): a stale exit cannot land on a later visit when it names the session', async () => {
+  // The residual the previous round could not close: an exit whose timestamp
+  // falls AFTER a later entry. Naming the session removes the guesswork.
+  const plate = `NAMED-${randomUUID().slice(0, 8)}`;
+  const first = (
+    await (
+      await fetch(
+        `${base}/api/v1/lane/sessions/open`,
+        asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z' }),
+      )
+    ).json()
+  ).session;
+  await fetch(
+    `${base}/api/v1/lane/sessions/close`,
+    asDevice(exitToken, { plate, exit_at: '2026-08-26T10:00:00Z', session_id: first.id }),
+  );
+
+  // second visit, and its exit is LATER than the stale one we are about to replay
+  await fetch(
+    `${base}/api/v1/lane/sessions/open`,
+    asDevice(entryToken, { plate, entry_at: '2026-08-27T09:00:00Z' }),
+  );
+
+  const stale = await fetch(
+    `${base}/api/v1/lane/sessions/close`,
+    asDevice(exitToken, { plate, exit_at: '2026-08-27T11:00:00Z', session_id: first.id }),
+  );
+  assert.equal(stale.status, 404, 'the named session is closed; it must not fall through to the open one');
+
+  const stillOpen = await withTenant(tenant, async (c) =>
+    (
+      await c.query(
+        `SELECT count(*)::int AS n FROM sessions s JOIN vehicles v ON v.id = s.vehicle_id
+          WHERE v.plate = $1 AND s.exit_at IS NULL`,
+        [plate],
+      )
+    ).rows[0].n,
+  );
+  assert.equal(stillOpen, 1, "the second visit's session is untouched");
+});
+
+test('C5(a): naming a session belonging to another vehicle is refused', async () => {
+  const a = `OWNER-${randomUUID().slice(0, 8)}`;
+  const b = `OTHER-${randomUUID().slice(0, 8)}`;
+  const sessionA = (
+    await (
+      await fetch(
+        `${base}/api/v1/lane/sessions/open`,
+        asDevice(entryToken, { plate: a, entry_at: '2026-08-26T09:00:00Z' }),
+      )
+    ).json()
+  ).session;
+  await fetch(
+    `${base}/api/v1/lane/sessions/open`,
+    asDevice(entryToken, { plate: b, entry_at: '2026-08-26T09:05:00Z' }),
+  );
+
+  const res = await fetch(
+    `${base}/api/v1/lane/sessions/close`,
+    asDevice(exitToken, { plate: b, exit_at: '2026-08-26T12:00:00Z', session_id: sessionA.id }),
+  );
+  assert.equal(res.status, 409);
+  assert.match((await res.json()).error, /different vehicle/i);
+});
+
+test('C5(b): an event id re-presented for a different vehicle is a loud conflict', async () => {
+  // Previously this silently returned the FIRST vehicle's session, so the
+  // second car got no session at all, exited to a 404, and parked free with
+  // nothing in the record to say so. A loud lane fault is worth more.
+  const shared = randomUUID();
+  const first = await fetch(
+    `${base}/api/v1/lane/sessions/open`,
+    asDevice(entryToken, { plate: `DUP-A-${randomUUID().slice(0, 6)}`, entry_at: '2026-08-26T09:00:00Z', event_id: shared }),
+  );
+  assert.equal(first.status, 201);
+
+  const second = await fetch(
+    `${base}/api/v1/lane/sessions/open`,
+    asDevice(entryToken, { plate: `DUP-B-${randomUUID().slice(0, 6)}`, entry_at: '2026-08-26T09:10:00Z', event_id: shared }),
+  );
+  assert.equal(second.status, 409, 'must be a conflict, not a silent resolution to the first vehicle');
+  assert.match((await second.json()).error, /different vehicle/i);
+});
+
+test('vehicle identity from the lane is stored', async () => {
+  const plate = `ID-${randomUUID().slice(0, 8)}`;
+  await fetch(
+    `${base}/api/v1/lane/sessions/open`,
+    asDevice(entryToken, {
+      plate,
+      entry_at: new Date().toISOString(),
+      make: 'Toyota',
+      model: 'Corolla',
+      color: 'silver',
+      attributes: { marks: ['roof rack'] },
+    }),
+  );
+  const v = await withTenant(tenant, async (c) =>
+    (await c.query('SELECT make, model, color, attributes FROM vehicles WHERE plate = $1', [plate])).rows[0],
+  );
+  assert.equal(v.make, 'Toyota');
+  assert.equal(v.color, 'silver');
+  assert.deepEqual(v.attributes, { marks: ['roof rack'] });
 });

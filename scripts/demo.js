@@ -52,6 +52,7 @@ await withTenant(tenantId, (c) =>
 
 const entryToken = generateDeviceToken();
 const exitToken = generateDeviceToken();
+const operatorTokenValue = generateDeviceToken();
 
 const demo = await withTenant(tenantId, async (c) => {
   const garage = (
@@ -88,6 +89,9 @@ const demo = await withTenant(tenantId, async (c) => {
     );
   }
 
+  await c.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'Demo operator',$2)`,
+    [tenantId, hashToken(operatorTokenValue)]);
+
   return { garage, entryLane, exitLane };
 });
 
@@ -100,6 +104,7 @@ const credentials = {
   hourly_minor: 250,
   entry_token: entryToken,
   exit_token: exitToken,
+  operator_token: operatorTokenValue,
 };
 writeFileSync('.demo-credentials.json', `${JSON.stringify(credentials, null, 2)}\n`);
 
@@ -118,7 +123,7 @@ createApp().listen(port, () => {
    python -m lane_controller.demo --credentials ../platform/.demo-credentials.json
 
  Inside count:
-   curl -H "x-tenant-id: ${tenantId}" \\
+   curl -H "authorization: Bearer ${operatorTokenValue}" \\
      http://127.0.0.1:${port}/api/v1/garages/${demo.garage}/sessions/open
 ──────────────────────────────────────────────────────────────`);
 });
