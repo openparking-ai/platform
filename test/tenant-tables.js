@@ -1,0 +1,91 @@
+/**
+ * The registry of tenant-owned tables and how to put one row in each.
+ *
+ * This exists so the isolation suite is written ONCE and runs against every
+ * table, rather than being copy-pasted per table. The foundation's suite named
+ * `parking_sites` nine times; that pattern does not survive six more tables
+ * without one of them quietly ending up untested.
+ *
+ * Adding a table here is how it gets isolation coverage. Forgetting to is
+ * caught separately by test/rls-coverage.test.js, which walks the schema
+ * itself rather than this list.
+ */
+
+export const TENANT_TABLES = [
+  {
+    table: 'garages',
+    insert: (c, t) =>
+      c.query(
+        `INSERT INTO garages (tenant_id, name, timezone, currency)
+         VALUES ($1, 'Row', 'UTC', 'USD') RETURNING id`,
+        [t],
+      ),
+  },
+  {
+    table: 'lanes',
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1,$2,'Row','entry') RETURNING id`,
+        [t, w.garage],
+      ),
+  },
+  {
+    table: 'vehicles',
+    insert: (c, t) =>
+      c.query(`INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'ROW-' || gen_random_uuid()) RETURNING id`, [t]),
+  },
+  {
+    table: 'rates',
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO rates (tenant_id, garage_id, name, hourly_minor) VALUES ($1,$2,'Row',100) RETURNING id`,
+        [t, w.garage],
+      ),
+  },
+  {
+    table: 'sessions',
+    // Each row gets its own vehicle: sessions_one_open_per_vehicle allows only
+    // one open session per vehicle per garage, so reusing one would collide
+    // with the index rather than with a policy — and the test would then be
+    // measuring the index, not isolation.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH v AS (
+           INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'S-' || gen_random_uuid()) RETURNING id
+         )
+         INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency)
+         SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD' FROM v
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+  },
+  {
+    table: 'events',
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO events (tenant_id, garage_id, lane_id, event_id, kind, occurred_at)
+         VALUES ($1,$2,$3, gen_random_uuid()::text, 'probe', now()) RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+    // Append-only: the app role has no UPDATE or DELETE grant, so those two
+    // assertions do not apply. That the grants are actually absent is asserted
+    // in rls-coverage.test.js rather than assumed here.
+    appendOnly: true,
+  },
+  {
+    table: 'lane_devices',
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO lane_devices (tenant_id, lane_id, name, token_hash)
+         VALUES ($1,$2,'Row', md5(gen_random_uuid()::text) || md5(gen_random_uuid()::text)) RETURNING id`,
+        [t, w.entryLane],
+      ),
+  },
+];
+
+/**
+ * Tables that are ENABLE ROW LEVEL SECURITY but deliberately NOT FORCE.
+ * See migration 0002 for why lane_devices is the exception, and
+ * rls-coverage.test.js for the assertion that it is the ONLY one.
+ */
+export const NOT_FORCED_BY_DESIGN = ['lane_devices'];

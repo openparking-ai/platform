@@ -1,17 +1,20 @@
 {
   "name": "@openparking-ai/platform",
   "version": "0.1.0",
-  "description": "Open Parking AI platform — multi-tenant parking server with Postgres row-level security",
+  "description": "Open Parking AI platform \u2014 multi-tenant parking server with Postgres row-level security",
   "license": "AGPL-3.0-or-later",
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node src/server.js",
     "migrate": "node scripts/migrate.js",
     "ensure-app-role": "node scripts/ensure-app-role.js",
     "test": "node --test test/*.test.js",
     "lint": "eslint .",
-    "rls-fail-control": "bash scripts/rls-fail-control.sh"
+    "rls-fail-control": "node scripts/rls-fail-control.js",
+    "demo": "node scripts/demo.js"
   },
   "dependencies": {
     "express": "^4.21.2",
