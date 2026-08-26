@@ -29,6 +29,16 @@ jobs:
       - run: npm ci
       - run: npm run lint
 
+      - name: No real personal data in the repository
+        run: node .github/scripts/check-no-real-data.js --self-test
+
+      - run: npm run check-no-real-data
+
+      - name: Migration 0002's SQL is frozen
+        # Its comments may change; its statements may not. It is applied
+        # everywhere it will ever be applied.
+        run: bash scripts/assert-0002-sql-unchanged.sh
+
   test:
     name: test
     runs-on: ubuntu-latest
@@ -67,6 +77,9 @@ jobs:
 
       - name: Tests
         run: npm test
+
+      - name: Retention purge runs clean on a fresh database
+        run: npm run purge
 
       - name: RLS fail-control
         # Proves the isolation suite actually measures isolation, by requiring

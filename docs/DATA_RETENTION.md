@@ -1,39 +1,88 @@
-# Data retention — an open decision, recorded as open
+# Data retention
 
-A number plate identifies a vehicle and, in practice, a person. In most
-jurisdictions that makes it personal data, with obligations attached about how
-long it is kept and why.
+**The decision:** the running system stores real vehicle identity, and keeps it
+for a limited, configurable time.
 
-**No retention policy has been decided for Open Parking AI, and this file exists
-so that absence is visible rather than accidental.** There is no purge job, no
-expiry column and no anonymisation step in the schema today. That is a gap, not
-a design.
+Vehicle ID is the product. A parking platform that cannot recognise a vehicle
+cannot open a gate for it, price its stay, or tell one car from another — so the
+database holds the plate, the make, the model, the colour and whatever else the
+lane read, tenant-scoped under row-level security like everything else.
 
-## What is stored today
+What is kept for a limited time is *transient* identity: the vehicles that
+simply parked and left. What persists is *enrolled* identity: a vehicle holding
+a monthly, a pass or another standing credential, for as long as it holds it.
 
-| Table | Personal data | Kept until |
-|---|---|---|
-| `vehicles` | `plate`, `plate_region`, first and last seen | deleted by hand |
-| `sessions` | links a vehicle to times and a fee | deleted by hand |
-| `events` | lane activity; `detail` may carry a plate and a confidence score | never — the table is append-only |
+## The window
 
-`events` deserves particular attention. It is deliberately append-only, enforced
-by the grants rather than by convention, which is the right property for an
-audit log and the wrong one for personal data with a retention limit. Those two
-requirements will have to be reconciled — most likely by keeping the event rows
-and redacting the personal fields out of `detail` on a schedule.
+| | |
+|---|---|
+| Default | **30 days** after the stay closes |
+| Configurable | per tenant, `tenant_settings.vehicle_retention_days` |
+| Bounds | 1 to 3650 days |
+| Enforced by | `scripts/purge-vehicles.js`, run on a schedule |
 
-## What has to be decided
+The default lives in the column default and nowhere else, so there is exactly
+one place it can be wrong.
 
-1. How long a `vehicle` row outlives its last session.
-2. Whether a closed session keeps the plate, or points at an anonymised vehicle
-   after some period.
-3. How `events.detail` gets redacted given that the table takes no `UPDATE`
-   grant — a redaction path will need its own privileged, audited route.
-4. Which jurisdictions the answer has to satisfy.
+## Redaction, not deletion
 
-Until those are answered, an operator running this software is responsible for
-its retention behaviour, and should read the table above as the whole of it.
+The purge **redacts**; it does not delete. That is not squeamishness, it is a
+foreign key: `sessions.vehicle_id` references `vehicles` with `ON DELETE
+CASCADE`, so deleting a vehicle would take with it every parking session it ever
+had — and therefore the financial record of every stay it paid for.
+
+Removing personal data must not destroy the books. So the row survives and
+everything identifying is replaced:
+
+```
+plate         -> 'redacted:<row id>'   (keeps the unique index satisfied, carries nothing)
+plate_region  -> NULL
+make          -> NULL
+model         -> NULL
+color         -> NULL
+attributes    -> {}
+redacted_at   -> when it happened
+```
+
+The session keeps its times and its fee. `test/retention.test.js` asserts
+exactly that, because it is the property most likely to be broken by someone
+later deciding deletion is tidier.
+
+## What is never redacted
+
+- **Enrolled vehicles**, while enrolled.
+- **A vehicle still inside a garage** — a car that has not left cannot have its
+  identity removed out from under the session it is in.
+- **Anything inside the retention window**, which the tests control for
+  explicitly rather than assuming.
+
+## Known gap: the event log
+
+`events` is append-only, enforced by the grants — the application role has no
+`UPDATE` and no `DELETE`. That is the right property for an audit log and the
+wrong one for personal data with a retention limit, and the two have not been
+reconciled yet.
+
+`events.detail` can carry a plate. It is not redacted today, and the purge does
+not touch it. Closing this needs a privileged, audited redaction path that does
+not hand the application a general power to rewrite history. **Recorded as open,
+not as done.**
+
+## No real data in this repository
+
+Separate rule, same spirit. The repository — code, docs, tests, fixtures —
+contains only invented values. No real plate, no real address, nothing about a
+real person or a real vehicle.
+
+Enforced, not remembered:
+
+| Guard | What it does |
+|---|---|
+| `.github/scripts/check-no-real-data.js` | fails CI on real-looking data in any tracked file |
+| `.github/scripts/check-commit-emails.js` | fails CI on a real address in commit metadata or a co-author trailer |
+
+Both self-test before they report: each plants something it ought to catch and
+requires the catch. A guard nobody has watched fail is not known to work.
 
 ---
 

@@ -35,11 +35,31 @@ export function createApp() {
   // whatever replaces it must set req.tenantId and nothing downstream changes.
   // -------------------------------------------------------------------------
   const operator = express.Router();
-  operator.use((req, _res, next) => {
-    const tenantId = req.get('x-tenant-id');
-    if (!tenantId) return next(new HttpError(401, 'tenant context required'));
-    req.tenantId = tenantId;
-    next();
+
+  /**
+   * Authenticated by an operator token, and the tenant comes FROM the token.
+   *
+   * This used to trust an `x-tenant-id` header. Anyone who could reach the API
+   * could then act as any tenant whose id they knew -- including minting lane
+   * credentials for it, which is a route into that tenant's whole estate. The
+   * header is no longer read anywhere.
+   *
+   * Same bootstrap problem as lane devices, same answer: resolve_operator_token
+   * is SECURITY DEFINER because the tenant is what the lookup is for.
+   */
+  operator.use(async (req, _res, next) => {
+    try {
+      const token = bearerFrom(req.get('authorization'));
+      if (!token) throw new HttpError(401, 'operator token required');
+      const { rows } = await pool.query('SELECT * FROM resolve_operator_token($1)', [hashToken(token)]);
+      if (rows.length === 0) throw new HttpError(401, 'unknown or revoked operator token');
+      req.tenantId = rows[0].tenant_id;
+      req.operatorTokenId = rows[0].token_id;
+      pool.query('SELECT touch_operator_token($1)', [req.operatorTokenId]).catch(() => {});
+      next();
+    } catch (err) {
+      next(err);
+    }
   });
 
   operator.post('/garages', async (req, res, next) => {
@@ -223,6 +243,26 @@ export function createApp() {
   });
 
   /**
+   * What is currently open for this plate, so the exit lane can name the
+   * session it is closing rather than leaving the platform to guess from a
+   * plate. Best effort: an offline lane simply closes without it.
+   */
+  lane.get('/sessions/open', async (req, res, next) => {
+    try {
+      const { tenantId, garageId } = req.device;
+      const plate = req.query?.plate;
+      if (!plate) throw bad('plate is required');
+      const session = await withTenant(tenantId, (client) =>
+        repo.findOpenSessionByPlate(client, tenantId, garageId, String(plate)),
+      );
+      if (!session) throw new HttpError(404, 'no open session for this vehicle');
+      res.json({ session: presentSession(session) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
    * Entry. Idempotent: replaying it returns the session already open.
    *
    * entry_at comes from the LANE, not from the server clock, because the lane
@@ -232,7 +272,15 @@ export function createApp() {
     try {
       const { tenantId, garageId, laneId, direction } = req.device;
       if (direction !== 'entry') throw new HttpError(409, 'this device is not on an entry lane');
-      const { plate, plate_region: plateRegion = null, event_id: openEventId } = req.body ?? {};
+      const {
+        plate,
+        plate_region: plateRegion = null,
+        event_id: openEventId,
+        make = null,
+        model = null,
+        color = null,
+        attributes = null,
+      } = req.body ?? {};
       if (!plate) throw bad('plate is required');
       // Required, not optional. Without it there is no key to be idempotent on
       // and the only thing left to check is state -- which is exactly how a
@@ -243,7 +291,9 @@ export function createApp() {
       const result = await withTenant(tenantId, async (client) => {
         const garage = await repo.getGarage(client, tenantId, garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
-        const vehicle = await repo.upsertVehicle(client, tenantId, { plate, plateRegion, seenAt: entryAt });
+        const vehicle = await repo.upsertVehicle(client, tenantId, {
+          plate, plateRegion, seenAt: entryAt, make, model, color, attributes,
+        });
         return repo.openSession(client, tenantId, {
           garageId,
           vehicleId: vehicle.id,
@@ -259,6 +309,9 @@ export function createApp() {
         created: result.created,
       });
     } catch (err) {
+      if (err.code === 'EVENT_ID_VEHICLE_CONFLICT') {
+        return next(new HttpError(409, 'event_id already used for a different vehicle'));
+      }
       next(err);
     }
   });
@@ -271,7 +324,7 @@ export function createApp() {
     try {
       const { tenantId, garageId, laneId, direction } = req.device;
       if (direction !== 'exit') throw new HttpError(409, 'this device is not on an exit lane');
-      const { plate, event_id: closeEventId } = req.body ?? {};
+      const { plate, event_id: closeEventId, session_id: sessionId = null } = req.body ?? {};
       if (!plate) throw bad('plate is required');
       if (!closeEventId) throw bad('event_id is required');
       const exitAt = parseTime(req.body?.exit_at, 'exit_at');
@@ -284,9 +337,26 @@ export function createApp() {
         if (already) return { session: already, closed: false, replay: true };
 
         const vehicle = await repo.upsertVehicle(client, tenantId, { plate, seenAt: exitAt });
-        const open = await repo.findOpenSession(client, tenantId, garageId, vehicle.id);
 
-        if (!open) throw new HttpError(404, 'no open session for this vehicle');
+        // When the lane names the session, that is the session -- no guessing
+        // from a plate, so a stale exit from an earlier visit can never land on
+        // a later one. When it does not (it was offline at the exit), fall back
+        // to the plate with the ordering guard below.
+        const open = sessionId
+          ? await repo.findOpenSessionById(client, tenantId, garageId, sessionId)
+          : await repo.findOpenSession(client, tenantId, garageId, vehicle.id);
+
+        if (!open) {
+          throw new HttpError(
+            404,
+            sessionId
+              ? 'the named session is not open in this garage'
+              : 'no open session for this vehicle',
+          );
+        }
+        if (sessionId && open.vehicle_id !== vehicle.id) {
+          throw new HttpError(409, 'the named session belongs to a different vehicle');
+        }
 
         if (exitAt < open.entry_at) {
           // A stale exit from an earlier visit, arriving after the vehicle has

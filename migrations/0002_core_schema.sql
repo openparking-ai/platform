@@ -49,10 +49,15 @@ CREATE INDEX lanes_garage_id_idx ON lanes (garage_id);
 -- ---------------------------------------------------------------------------
 -- vehicles
 --
--- A plate is personal data in most jurisdictions. There is no retention or
--- purge policy in this migration because that decision has not been made --
--- see docs/DATA_RETENTION.md, which records it as open rather than pretending
--- the absence is a decision.
+-- A plate is personal data in most jurisdictions. Retention IS decided: 0003
+-- adds the vehicle attribute columns, per-tenant retention (default 30 days
+-- after a session closes), and the redaction job that enforces it. Enrolled
+-- vehicles persist while enrolled. See docs/DATA_RETENTION.md.
+--
+-- (This comment previously said the decision had not been made. Only the
+-- comment changed; no statement in this migration was altered -- proven by
+-- scripts/assert-0002-sql-unchanged.sh, which compares the SQL with comments
+-- stripped against the recorded digest.)
 -- ---------------------------------------------------------------------------
 CREATE TABLE vehicles (
   id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),

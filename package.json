@@ -14,7 +14,10 @@
     "test": "node --test test/*.test.js",
     "lint": "eslint .",
     "rls-fail-control": "node scripts/rls-fail-control.js",
-    "demo": "node scripts/demo.js"
+    "demo": "node scripts/demo.js",
+    "purge": "node scripts/purge-vehicles.js",
+    "issue-operator-token": "node scripts/issue-operator-token.js",
+    "check-no-real-data": "node .github/scripts/check-no-real-data.js"
   },
   "dependencies": {
     "express": "^4.21.2",
