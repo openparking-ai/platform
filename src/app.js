@@ -4,6 +4,7 @@ import { bearerFrom, generateDeviceToken, hashToken } from './auth.js';
 import { computeFee } from './fees.js';
 import { toMinor } from './money.js';
 import * as repo from './repository.js';
+import { reconcile } from './reconcile.js';
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -144,6 +145,27 @@ export function createApp() {
       );
       // The inside-count the occupancy module will want later, for free.
       res.json({ inside_count: sessions.length, sessions });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * Reconciliation. Counts that should agree, reported when they do not.
+   *
+   * Read-only and correcting nothing, deliberately: an auto-correcting
+   * reconciler on a money record destroys the evidence of the thing it was
+   * meant to detect.
+   */
+  operator.get('/garages/:garageId/reconciliation', async (req, res, next) => {
+    try {
+      const hours = clampWindow(req.query.hours, 24);
+      const maxHours = clampWindow(req.query.max_stay_hours, 48);
+      const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+      const report = await withTenant(req.tenantId, (client) =>
+        reconcile(client, req.tenantId, req.params.garageId, { since, maxHours }),
+      );
+      res.json(report);
     } catch (err) {
       next(err);
     }
@@ -425,3 +447,17 @@ function presentSession(s) {
 }
 
 export { pool };
+
+/**
+ * A window the caller asked for, bounded.
+ *
+ * Unbounded, `?hours=1000000` is a full table scan somebody can ask for from
+ * outside. Rejecting it outright would be unhelpful for a caller who simply
+ * wants "everything"; clamping gives them the most this will do and says so by
+ * echoing the value back in the report.
+ */
+function clampWindow(raw, fallback) {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.min(Math.floor(value), 24 * 90);
+}
