@@ -48,9 +48,33 @@ export const MIGRATIONS_DIR = path.join(
   'migrations',
 );
 
-/** @returns {Promise<string[]>} every migration filename this build carries. */
+/**
+ * Every migration filename this build carries.
+ *
+ * ZERO of them is a refusal, in the same place and for the same reason a
+ * MISSING directory already is one -- `readdir` raises ENOENT here and the
+ * process never opens the port. An empty directory would otherwise be the one
+ * input this gate cannot say no to: `pendingMigrations` subtracts the applied
+ * set from an empty set, gets `[]` for every database in the universe, and the
+ * service serves having established nothing at all. A build that ships no
+ * migrations cannot assert its schema, and an assertion it cannot make is a
+ * refusal, exactly like being behind.
+ *
+ * `scripts/schema-gate-control.js` already carries this guard -- it refuses to
+ * run vacuously when it has no file to withhold. The gate it controls holds
+ * itself to the same rule.
+ *
+ * @returns {Promise<string[]>}
+ */
 export async function migrationsOnDisk() {
-  return (await readdir(MIGRATIONS_DIR)).filter((file) => file.endsWith('.sql')).sort();
+  const files = (await readdir(MIGRATIONS_DIR)).filter((file) => file.endsWith('.sql')).sort();
+  if (files.length === 0) {
+    throw new Error(
+      `no migrations on disk -- there is nothing to be behind. ${MIGRATIONS_DIR} carries no ` +
+        '.sql file, so nothing here establishes that this database has had anything applied.',
+    );
+  }
+  return files;
 }
 
 /**
