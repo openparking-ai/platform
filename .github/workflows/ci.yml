@@ -85,3 +85,22 @@ jobs:
         # Proves the isolation suite actually measures isolation, by requiring
         # it to FAIL against a scratch database with RLS stripped out.
         run: npm run rls-fail-control
+
+      - name: Schema-gate fail-control
+        # The deploy-ordering constraint, encoded rather than remembered.
+        #
+        # `/lane/rules` serves columns, and `getGarage` is `SELECT *`: a column
+        # this code expects and the database has not got is not an error and
+        # not a null. The key is dropped, the route answers 200 with a shorter
+        # payload, and the lane reads the absence as unmeasured -- so an
+        # unknown plate that would have been admitted is refused instead, with
+        # no error and no symptom anywhere. Measured on `default_action` when
+        # 0004 was written.
+        #
+        # `src/schema.js` refuses to start the process while any migration this
+        # build ships with has no row in `schema_migrations`. This requires
+        # that refusal to actually happen: a scratch database is migrated with
+        # the newest file withheld, and the service must fail to start, naming
+        # the file. Then the migration is applied and the same command must
+        # serve -- a gate that refuses everything is not a gate either.
+        run: npm run schema-gate-control
