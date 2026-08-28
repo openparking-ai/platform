@@ -53,8 +53,10 @@ export const TENANT_TABLES = [
         `WITH v AS (
            INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'S-' || gen_random_uuid()) RETURNING id
          )
-         INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency, open_event_id)
-         SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD', gen_random_uuid()::text FROM v
+         INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                               open_event_id, entry_confirmation)
+         SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD', gen_random_uuid()::text,
+                'confirmed' FROM v
          RETURNING id`,
         [t, w.garage, w.entryLane],
       ),

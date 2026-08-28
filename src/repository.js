@@ -60,7 +60,7 @@ export async function findOpenSession(client, tenantId, garageId, vehicleId) {
 export async function openSession(
   client,
   tenantId,
-  { garageId, vehicleId, laneId, entryAt, currency, openEventId },
+  { garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation },
 ) {
   // Keyed on the event, so a replay is recognised whether the session it
   // created is still open, already closed, or closed and long forgotten.
@@ -90,10 +90,11 @@ export async function openSession(
   await client.query('SAVEPOINT open_session');
   try {
     const { rows } = await client.query(
-      `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency, open_event_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                             open_event_id, entry_confirmation)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
-      [tenantId, garageId, vehicleId, laneId, entryAt, currency, openEventId],
+      [tenantId, garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation],
     );
     await client.query('RELEASE SAVEPOINT open_session');
     return { session: rows[0], created: true };
@@ -115,15 +116,17 @@ export async function closeSession(
   client,
   tenantId,
   sessionId,
-  { exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId },
+  { exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId, exitConfirmation },
 ) {
   const { rows } = await client.query(
     `UPDATE sessions
         SET exit_at = $3, exit_lane_id = $4, rate_id = $5,
-            hourly_minor_applied = $6, fee_minor = $7, close_event_id = $8
+            hourly_minor_applied = $6, fee_minor = $7, close_event_id = $8,
+            exit_confirmation = $9
       WHERE tenant_id = $1 AND id = $2 AND exit_at IS NULL
       RETURNING *`,
-    [tenantId, sessionId, exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId],
+    [tenantId, sessionId, exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId,
+     exitConfirmation],
   );
   return rows[0] ?? null;
 }
@@ -212,7 +215,8 @@ export async function retentionDays(client, tenantId) {
 
 export async function openSessionsForGarage(client, tenantId, garageId) {
   const { rows } = await client.query(
-    `SELECT s.id, s.entry_at, s.currency, v.plate, v.plate_region, l.name AS entry_lane
+    `SELECT s.id, s.entry_at, s.currency, s.entry_confirmation,
+            v.plate, v.plate_region, l.name AS entry_lane
        FROM sessions s
        JOIN vehicles v ON v.id = s.vehicle_id
        JOIN lanes    l ON l.id = s.entry_lane_id
