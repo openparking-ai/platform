@@ -15,6 +15,29 @@ class HttpError extends Error {
 
 const bad = (message) => new HttpError(400, message);
 
+/**
+ * What a lane does with a confidently-read plate that matches no rule.
+ *
+ * Only the two values the lane recognises by name. An unrecognised value is not
+ * rejected by the lane -- it falls back, which is safe -- but it gets there
+ * through an else-branch rather than through anything either side agreed, and
+ * this platform does not serve values whose meaning rests on that. Refused
+ * here rather than at the database so the operator is told which values exist;
+ * the column's CHECK is what makes it true regardless of route.
+ */
+const DEFAULT_ACTIONS = ['allow', 'deny'];
+
+function defaultAction(value, { required }) {
+  if (value === undefined || value === null) {
+    if (required) throw bad(`default_action is required and must be one of ${DEFAULT_ACTIONS.join(', ')}`);
+    return undefined;
+  }
+  if (!DEFAULT_ACTIONS.includes(value)) {
+    throw bad(`default_action must be one of ${DEFAULT_ACTIONS.join(', ')}`);
+  }
+  return value;
+}
+
 function parseTime(value, label) {
   if (!value) throw bad(`${label} is required`);
   const at = new Date(value);
@@ -67,14 +90,55 @@ export function createApp() {
     try {
       const { name, timezone, currency } = req.body ?? {};
       if (!name || !timezone || !currency) throw bad('name, timezone and currency are required');
+      // Optional. A garage that says nothing gets the column default, which is
+      // the value this platform has always served.
+      const action = defaultAction(req.body?.default_action, { required: false });
       const garage = await withTenant(req.tenantId, async (client) => {
-        const { rows } = await client.query(
-          `INSERT INTO garages (tenant_id, name, timezone, currency) VALUES ($1,$2,$3,$4) RETURNING *`,
-          [req.tenantId, name, timezone, currency],
-        );
+        // The column is left out entirely when nothing was asked for, so the
+        // value an unconfigured garage gets is written down in exactly one
+        // place -- the column default in 0004. Naming it here too would be a
+        // second copy of the same claim, and the two would drift.
+        const { rows } =
+          action === undefined
+            ? await client.query(
+                `INSERT INTO garages (tenant_id, name, timezone, currency)
+                 VALUES ($1,$2,$3,$4) RETURNING *`,
+                [req.tenantId, name, timezone, currency],
+              )
+            : await client.query(
+                `INSERT INTO garages (tenant_id, name, timezone, currency, default_action)
+                 VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+                [req.tenantId, name, timezone, currency, action],
+              );
         return rows[0];
       });
       res.status(201).json({ garage });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * Change what an existing garage does with an unknown plate.
+   *
+   * Creation-time only would have left every garage that already exists unable
+   * to be strict, which is the whole of what was wrong. It takes this one
+   * field and nothing else: a garage's timezone and currency are frozen onto
+   * sessions and money and are not a thing to edit in passing.
+   */
+  operator.patch('/garages/:garageId', async (req, res, next) => {
+    try {
+      const action = defaultAction(req.body?.default_action, { required: true });
+      const garage = await withTenant(req.tenantId, async (client) => {
+        const { rows } = await client.query(
+          `UPDATE garages SET default_action = $3
+            WHERE tenant_id = $1 AND id = $2 RETURNING *`,
+          [req.tenantId, req.params.garageId, action],
+        );
+        return rows[0];
+      });
+      if (!garage) throw new HttpError(404, 'garage not found');
+      res.json({ garage });
     } catch (err) {
       next(err);
     }
@@ -225,7 +289,12 @@ export function createApp() {
         // No per-plate rules exist yet, so the lane's default action governs.
         // The lane already supports per-plate rules; the platform has nothing
         // to put in them until an access-list module exists.
-        default_action: 'allow',
+        //
+        // The garage's own value, not a literal. It was a literal until 0004,
+        // which meant a garage that wanted the strict behaviour could not have
+        // it -- the lane supports 'deny' and always has, and nothing could
+        // reach it. A garage that has set nothing still gets 'allow'.
+        default_action: payload.garage.default_action,
         plate_rules: [],
         synced_at: new Date().toISOString(),
       });
