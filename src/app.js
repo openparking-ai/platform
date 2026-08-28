@@ -44,8 +44,23 @@ const DEFAULT_ACTIONS = ['allow', 'deny'];
 const CONFIRMATIONS = ['confirmed', 'unconfirmable'];
 
 /**
- * A session is not opened on a vend. It is opened on a confirmation, and the
- * confirmation is required — never defaulted.
+ * And what a lane may say about an EXIT, which is the same list plus one.
+ *
+ * `held` is an exit the loops did not confirm. It closes and bills anyway,
+ * because the exit vend is the payment moment and the barrier opened — the car
+ * is gone whatever the loops saw, and holding the session open would leave the
+ * stay unbilled and the vehicle inside for ever. It is a flag for a human, not
+ * a hole in the ledger, and the `exit_held` lane event sits beside it.
+ *
+ * There is deliberately NO entry equivalent. An entry nothing confirmed is not
+ * a session at all — no row, no occupancy, no money — so `held` on an open is
+ * refused, and a test asserts each side of that separately.
+ */
+const EXIT_CONFIRMATIONS = [...CONFIRMATIONS, 'held'];
+
+/**
+ * What a session open or close SAYS saw the car, and it is required — never
+ * defaulted.
  *
  * A default here would be a second copy of a claim about whether anything saw
  * the car, sitting where nobody looks, and the copy is always the one that
@@ -53,9 +68,9 @@ const CONFIRMATIONS = ['confirmed', 'unconfirmable'];
  * values exist, which is a deployment being told to catch up rather than a
  * money record quietly filling with a value nobody asserted.
  */
-function confirmation(value, label) {
-  if (!CONFIRMATIONS.includes(value)) {
-    throw bad(`${label} is required and must be one of ${CONFIRMATIONS.join(', ')}`);
+function confirmation(value, label, allowed = CONFIRMATIONS) {
+  if (!allowed.includes(value)) {
+    throw bad(`${label} is required and must be one of ${allowed.join(', ')}`);
   }
   return value;
 }
@@ -449,6 +464,13 @@ export function createApp() {
         });
       });
 
+      // The row that was written, echoed whole -- `entry_confirmation` with it.
+      // A LANE DEPENDS ON THAT FIELD BEING HERE: a platform that predates the
+      // column answers this call exactly as successfully and hands back a
+      // session without it, so the lane treats an open that does not come back
+      // carrying the value it sent as not delivered, and says so. Dropping the
+      // field from this response would be indistinguishable, to a lane, from
+      // deploying against a platform that cannot record it.
       res.status(result.created ? 201 : 200).json({
         session: presentSession(result.session),
         created: result.created,
@@ -472,7 +494,11 @@ export function createApp() {
       const { plate, event_id: closeEventId, session_id: sessionId = null } = req.body ?? {};
       if (!plate) throw bad('plate is required');
       if (!closeEventId) throw bad('event_id is required');
-      const exitConfirmation = confirmation(req.body?.exit_confirmation, 'exit_confirmation');
+      const exitConfirmation = confirmation(
+        req.body?.exit_confirmation,
+        'exit_confirmation',
+        EXIT_CONFIRMATIONS,
+      );
       const exitAt = parseTime(req.body?.exit_at, 'exit_at');
 
       const out = await withTenant(tenantId, async (client) => {

@@ -120,6 +120,114 @@ test('an exit that does not say what confirmed it is refused', async () => {
   assert.match((await res.json()).error, /exit_confirmation is required/);
 });
 
+test('held is an EXIT value and an entry may not claim it', async () => {
+  // The one value the two ends do not share. An entry nothing confirmed is not
+  // a session at all -- no row, no occupancy, no money -- so there is nothing
+  // for `held` to mean on an open.
+  const res = await openEntry({
+    plate: plate('HELDOPEN'),
+    entry_at: new Date().toISOString(),
+    entry_confirmation: 'held',
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /must be one of confirmed, unconfirmable$/);
+});
+
+// --- what it echoes --------------------------------------------------------
+
+test('the open echoes back what confirmed it, and a lane depends on that', async () => {
+  // A platform that predates the column answers this call exactly as
+  // successfully and hands back a session without the field. The lane treats an
+  // open that does not come back carrying the value it sent as NOT DELIVERED,
+  // so this echo is a contract term and not a convenience of the response.
+  for (const value of ['confirmed', 'unconfirmable']) {
+    const res = await openEntry({
+      plate: plate(`ECHO-${value}`),
+      entry_at: new Date().toISOString(),
+      entry_confirmation: value,
+    });
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.equal(
+      body.session.entry_confirmation,
+      value,
+      'the open did not echo what the lane said confirmed it',
+    );
+  }
+});
+
+test('a replayed open echoes it too, from the row it originally wrote', async () => {
+  // The replay answers 200 from the stored session rather than from the
+  // request, so the echo has to survive that path as well -- an outbox re-sends
+  // and it is the second answer the lane checks.
+  const p = plate('ECHOREPLAY');
+  const eventId = randomUUID();
+  const body = {
+    event_id: eventId,
+    plate: p,
+    entry_at: new Date().toISOString(),
+    entry_confirmation: 'confirmed',
+  };
+  const first = await fetch(`${base}/api/v1/lane/sessions/open`, post(entryToken, body));
+  const again = await fetch(`${base}/api/v1/lane/sessions/open`, post(entryToken, body));
+
+  assert.equal(first.status, 201);
+  assert.equal(again.status, 200);
+  assert.equal((await again.json()).session.entry_confirmation, 'confirmed');
+});
+
+// --- an exit the loops did not confirm -------------------------------------
+
+test('an unconfirmed exit closes, bills, and is marked held', async () => {
+  // The decision, and the reason it is not symmetrical with an entry: the exit
+  // vend is the payment moment and the barrier opened. Holding the session open
+  // left the stay unbilled and the vehicle inside for ever, so installing the
+  // loops made a garage worse off than not installing them.
+  const p = plate('HELDEXIT');
+  await openEntry({ plate: p, entry_at: '2026-08-26T09:00:00Z', entry_confirmation: 'confirmed' });
+
+  const res = await fetch(
+    `${base}/api/v1/lane/sessions/close`,
+    post(exitToken, {
+      plate: p,
+      exit_at: '2026-08-26T11:00:00Z',
+      exit_confirmation: 'held',
+    }),
+  );
+
+  assert.equal(res.status, 200);
+  const { session } = await res.json();
+  assert.equal(session.exit_confirmation, 'held');
+  assert.ok(session.exit_at, 'a held exit must still close the session');
+  assert.equal(session.fee_minor, 500, 'two hours at 250/hour, billed like any other exit');
+});
+
+test('the database refuses an exit confirmation the routes do not publish', async () => {
+  // The constraint, not the route. `closed_on_vend` is 0005's backfill and is
+  // permitted by the column for the old rows; anything else is not there at all.
+  const p = plate('BADEXITVAL');
+  const opened = await openEntry({
+    plate: p,
+    entry_at: '2026-08-26T09:00:00Z',
+    entry_confirmation: 'confirmed',
+  });
+  const sessionId = (await opened.json()).session.id;
+
+  await assert.rejects(
+    () =>
+      withTenant(tenant, (c) =>
+        c.query(
+          `UPDATE sessions SET exit_at = now(), exit_lane_id = $2, close_event_id = $3,
+                               fee_minor = 0, hourly_minor_applied = 0,
+                               exit_confirmation = 'probably'
+             WHERE id = $1`,
+          [sessionId, world.exitLane, randomUUID()],
+        ),
+      ),
+    /sessions_exit_confirmation_check/,
+  );
+});
+
 // --- what it stores --------------------------------------------------------
 
 test('what confirmed the entry is stored on the session, both values', async () => {

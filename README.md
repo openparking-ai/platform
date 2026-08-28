@@ -69,13 +69,13 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 | `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation` |
 | `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation` |
 
-### A session opens on a confirmation, not on a vend
+### Every session records what saw the car
 
 A ticket is not an entry. A driver can pull up, take one and drive away, and a
 vend with nothing behind it is not an arrival at all — so every abandoned
 approach used to become a phantom occupant, counted as inside and never seen
-again. The lane now creates a pending entry at the vend and promotes it only
-when two loops after the barrier see a vehicle cross them forward.
+again. The lane now creates a pending entry at the vend and promotes it when two
+loops after the barrier see a vehicle cross them forward.
 
 `entry_confirmation` is **required and never defaulted**, and it says which:
 
@@ -84,9 +84,19 @@ when two loops after the barrier see a vehicle cross them forward.
 | `confirmed` | two loops after the barrier saw a vehicle cross them forward |
 | `unconfirmable` | that lane has no closing loops, so nothing could confirm or refute it |
 
-`exit_confirmation` is the same question about the other end of the stay. Entries
-that were backed out of or never confirmed are **not sessions** — no session, no
-occupancy, no money. They are lane events and they land in `events`.
+The response **echoes the value back**, and that is a contract term rather than a
+convenience: a platform older than the column accepts the same call and drops the
+field, so the lane treats an open that does not echo what it sent as undelivered.
+
+`exit_confirmation` is the same question about the other end of the stay, with
+one more value:
+
+| | |
+|---|---|
+| `held` | the exit vended and nothing confirmed a crossing. It closes and bills anyway — the barrier opened and the car is gone — carrying the flag, with an `exit_held` lane event beside it |
+
+Entries that were backed out of or never confirmed are **not sessions** — no
+session, no occupancy, no money. They are lane events and they land in `events`.
 
 `inside_count` on the operator surface counts CONFIRMED sessions. The rest are
 not hidden: `unconfirmable_count` and `open_count` are returned beside it.
