@@ -497,3 +497,105 @@ test('vehicle identity from the lane is stored', async () => {
   assert.equal(v.color, 'silver');
   assert.deepEqual(v.attributes, { marks: ['roof rack'] });
 });
+
+// --- what a garage does with a plate that matches no rule -------------------
+//
+// This was a string literal in the response body until 0004, so every lane in
+// every deployment synced 'allow' and the lane's own 'deny' path -- which it
+// has always had -- was unreachable. The tests below are in pairs: the garage
+// that configured nothing, which must not have moved, and the garage that
+// asked to be strict, which could not exist before.
+
+/** A garage of its own, with an entry lane and a device, so a strict garage
+ *  cannot disturb the shared world every other test reads. */
+async function garageWithALane(action) {
+  const body = { name: 'Rules Garage', timezone: 'America/New_York', currency: 'USD' };
+  if (action !== undefined) body.default_action = action;
+  const created = await fetch(`${base}/api/v1/garages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
+    body: JSON.stringify(body),
+  });
+  assert.equal(created.status, 201);
+  const { garage } = await created.json();
+
+  const lane = await fetch(`${base}/api/v1/garages/${garage.id}/lanes`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
+    body: JSON.stringify({ name: 'Entry 1', direction: 'entry' }),
+  });
+  assert.equal(lane.status, 201);
+  const token = await issueToken(tenant, (await lane.json()).lane.id, 'rules device');
+  return { garage, token };
+}
+
+const rulesFor = async (token) =>
+  (await fetch(`${base}/api/v1/lane/rules`, { headers: { authorization: `Bearer ${token}` } })).json();
+
+test('a garage that has configured nothing still serves allow', async () => {
+  // The protection for every lane that already exists. Two committed tests in
+  // lane-controller assert this vend by name; if this one moves, they break.
+  const { token } = await garageWithALane(undefined);
+  assert.equal((await rulesFor(token)).default_action, 'allow');
+});
+
+test('a garage that asked to be strict serves deny to its lane', async () => {
+  const { token } = await garageWithALane('deny');
+  assert.equal((await rulesFor(token)).default_action, 'deny');
+});
+
+test('an existing garage can be made strict, and made open again', async () => {
+  // Creation-time only would leave every garage that already exists unable to
+  // be strict, which is the whole of what was wrong.
+  const { garage, token } = await garageWithALane(undefined);
+  const patch = (action) =>
+    fetch(`${base}/api/v1/garages/${garage.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
+      body: JSON.stringify({ default_action: action }),
+    });
+
+  assert.equal((await patch('deny')).status, 200);
+  assert.equal((await rulesFor(token)).default_action, 'deny');
+
+  assert.equal((await patch('allow')).status, 200);
+  assert.equal((await rulesFor(token)).default_action, 'allow');
+});
+
+test('a default_action the lane does not recognise is refused, not ignored', async () => {
+  // It was accepted and silently dropped: 201 with the field absent from the
+  // row. An operator asking for a strict garage got one that admits everybody
+  // and no indication of it.
+  for (const value of ['fallback', 'ALLOW', 'Allow', '', 'refuse', 0, null]) {
+    const res = await fetch(`${base}/api/v1/garages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
+      body: JSON.stringify({
+        name: 'Nonsense',
+        timezone: 'America/New_York',
+        currency: 'USD',
+        default_action: value,
+      }),
+    });
+    if (value === null) {
+      // Absent is not the same as wrong: it means "say nothing", and the
+      // garage gets the column default.
+      assert.equal(res.status, 201, 'an absent default_action must still create the garage');
+      assert.equal((await res.json()).garage.default_action, 'allow');
+      continue;
+    }
+    assert.equal(res.status, 400, `${JSON.stringify(value)} was accepted`);
+    assert.match((await res.json()).error, /default_action/);
+  }
+});
+
+test('the database refuses a value no route would have let through', async () => {
+  // The route is where an operator is told what the values are; the column is
+  // what makes it true whatever reaches the table next.
+  await assert.rejects(
+    withTenant(tenant, (c) =>
+      c.query(`UPDATE garages SET default_action = 'whatever' WHERE tenant_id = $1`, [tenant]),
+    ),
+    /check constraint/i,
+  );
+});
