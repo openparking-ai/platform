@@ -136,23 +136,6 @@ function eventKind(value) {
   return value;
 }
 
-/**
- * How long a stay this garage will accept, in hours, or no bound at all.
- *
- * Absent means the operator said nothing and the column is left as it is.
- * `null` means they said "no bound", which is a thing to be able to SAY: at
- * creation the two are the same, because the column has no default, and on a
- * PATCH they are not, because there is a value there to clear.
- */
-function maxStayHours(value) {
-  if (value === undefined) return undefined;
-  if (value === null) return null;
-  if (!Number.isInteger(value) || value <= 0) {
-    throw bad('max_stay_hours must be a whole number of hours above zero, or null for no bound');
-  }
-  return value;
-}
-
 function defaultAction(value, { required }) {
   if (value === undefined || value === null) {
     if (required) throw bad(`default_action is required and must be one of ${DEFAULT_ACTIONS.join(', ')}`);
@@ -269,32 +252,26 @@ export function createApp() {
     try {
       const { name, timezone, currency } = req.body ?? {};
       if (!name || !timezone || !currency) throw bad('name, timezone and currency are required');
-      // Both optional. A garage that says nothing about either gets the
-      // column default for both.
+      // Optional. A garage that says nothing gets the column default, which is
+      // the value this platform has always served.
       const action = defaultAction(req.body?.default_action, { required: false });
-      const maxStay = maxStayHours(req.body?.max_stay_hours);
       const garage = await withTenant(req.tenantId, async (client) => {
-        // A column nobody asked about is left OUT of the statement, so what an
-        // unconfigured garage gets is written down in exactly one place -- the
-        // column default in the migration that added it. Naming those values
-        // here too would be a second copy of the same claim, and the two drift.
-        const columns = ['tenant_id', 'name', 'timezone', 'currency'];
-        const values = [req.tenantId, name, timezone, currency];
-        if (action !== undefined) {
-          columns.push('default_action');
-          values.push(action);
-        }
-        // `null` is "no bound", which is what the column already holds, so it
-        // is the same statement as saying nothing.
-        if (maxStay !== undefined && maxStay !== null) {
-          columns.push('max_stay_hours');
-          values.push(maxStay);
-        }
-        const { rows } = await client.query(
-          `INSERT INTO garages (${columns.join(', ')})
-           VALUES (${values.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`,
-          values,
-        );
+        // The column is left out entirely when nothing was asked for, so the
+        // value an unconfigured garage gets is written down in exactly one
+        // place -- the column default in 0004. Naming it here too would be a
+        // second copy of the same claim, and the two would drift.
+        const { rows } =
+          action === undefined
+            ? await client.query(
+                `INSERT INTO garages (tenant_id, name, timezone, currency)
+                 VALUES ($1,$2,$3,$4) RETURNING *`,
+                [req.tenantId, name, timezone, currency],
+              )
+            : await client.query(
+                `INSERT INTO garages (tenant_id, name, timezone, currency, default_action)
+                 VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+                [req.tenantId, name, timezone, currency, action],
+              );
         return rows[0];
       });
       res.status(201).json({ garage });
@@ -304,43 +281,21 @@ export function createApp() {
   });
 
   /**
-   * Change what an existing garage does with an unknown plate, or how long a
-   * stay it will accept.
+   * Change what an existing garage does with an unknown plate.
    *
    * Creation-time only would have left every garage that already exists unable
-   * to be strict, which is the whole of what was wrong the first time. It takes
-   * these two fields and nothing else: a garage's timezone and currency are
-   * frozen onto sessions and money and are not a thing to edit in passing.
-   *
-   * EITHER field alone is a valid change. Requiring `default_action` on a call
-   * that only wanted to set a maximum stay would make an operator restate the
-   * garage's admission policy to touch its clock, and the day they restate it
-   * wrongly the garage silently starts admitting everybody.
+   * to be strict, which is the whole of what was wrong. It takes this one
+   * field and nothing else: a garage's timezone and currency are frozen onto
+   * sessions and money and are not a thing to edit in passing.
    */
   operator.patch('/garages/:garageId', async (req, res, next) => {
     try {
-      const action = defaultAction(req.body?.default_action, { required: false });
-      const maxStay = maxStayHours(req.body?.max_stay_hours);
-      if (action === undefined && maxStay === undefined) {
-        throw bad('default_action or max_stay_hours is required');
-      }
+      const action = defaultAction(req.body?.default_action, { required: true });
       const garage = await withTenant(req.tenantId, async (client) => {
-        const sets = [];
-        const values = [req.tenantId, req.params.garageId];
-        if (action !== undefined) {
-          values.push(action);
-          sets.push(`default_action = $${values.length}`);
-        }
-        // Explicit `null` reaches here and clears the bound, which is the other
-        // half of being able to set one.
-        if (maxStay !== undefined) {
-          values.push(maxStay);
-          sets.push(`max_stay_hours = $${values.length}`);
-        }
         const { rows } = await client.query(
-          `UPDATE garages SET ${sets.join(', ')}
+          `UPDATE garages SET default_action = $3
             WHERE tenant_id = $1 AND id = $2 RETURNING *`,
-          values,
+          [req.tenantId, req.params.garageId, action],
         );
         return rows[0];
       });
@@ -450,7 +405,7 @@ export function createApp() {
   operator.get('/garages/:garageId/reconciliation', async (req, res, next) => {
     try {
       const hours = clampWindow(req.query.hours, 24);
-      const maxHours = clampWindow(req.query.max_stay_hours, 48);
+      const maxHours = statedWindow(req.query.max_stay_hours, 'max_stay_hours');
       const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
       const report = await withTenant(req.tenantId, (client) =>
         reconcile(client, req.tenantId, req.params.garageId, { since, maxHours }),
@@ -521,11 +476,6 @@ export function createApp() {
         // it -- the lane supports 'deny' and always has, and nothing could
         // reach it. A garage that has set nothing still gets 'allow'.
         default_action: payload.garage.default_action,
-        // PUBLISHED NULL AND ALL. A garage that has set no maximum stay has no
-        // bound, and an operator reading this payload has to be able to see the
-        // absence -- an omitted key reads as "this platform does not know about
-        // maximum stays", which is a different fact and the wrong one.
-        max_stay_hours: payload.garage.max_stay_hours,
         plate_rules: [],
         synced_at: new Date().toISOString(),
       });
@@ -553,7 +503,12 @@ export function createApp() {
           laneId,
           eventId: String(e.event_id),
           kind: eventKind(e.kind),
-          occurredAt: parseTime(e.occurred_at, 'occurred_at'),
+          // The same bound as an entry_at and an exit_at, on the third
+          // lane-supplied time. A future-dated event satisfies every window a
+          // reconciliation report will ever ask for and nothing removes it, so
+          // one batch makes the surface that exists to show a lane being worked
+          // permanently deaf.
+          occurredAt: refuseFuture(parseTime(e.occurred_at, 'occurred_at'), 'occurred_at'),
           detail: e.detail ?? {},
         };
       });
@@ -707,31 +662,6 @@ export function createApp() {
           );
         }
 
-        // A stay longer than this garage says is possible is REFUSED, before a
-        // fee is computed from it and frozen onto the row. The alternative is
-        // not "no bound" -- it is a plausible-looking money record nobody
-        // queried, because a frozen fee is indistinguishable in the ledger from
-        // a stay somebody had. 409 for the same reason the stale exit is one:
-        // terminal, so the lane dead-letters it, counts it and logs it, and a
-        // human sees the exit that could not be closed.
-        //
-        // A garage that has set nothing has NO bound and this does not fire.
-        // That is the honest state, not a hole: a default here would be this
-        // route guessing at an operation it knows nothing about, and the first
-        // low guess refuses a real customer at the barrier.
-        const garage = await repo.getGarage(client, tenantId, garageId);
-        if (!garage) throw new HttpError(404, 'garage not found');
-        if (garage.max_stay_hours !== null) {
-          const stayHours = (exitAt.getTime() - open.entry_at.getTime()) / 3_600_000;
-          if (stayHours > garage.max_stay_hours) {
-            throw new HttpError(
-              409,
-              `the stay is ${Math.round(stayHours)}h, longer than the ${garage.max_stay_hours}h ` +
-                'this garage accepts — no fee has been frozen and the session is still open',
-            );
-          }
-        }
-
         const rate = await repo.currentRate(client, tenantId, garageId);
         if (!rate) throw new HttpError(409, 'garage has no rate configured');
 
@@ -799,4 +729,24 @@ function clampWindow(raw, fallback) {
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) return fallback;
   return Math.min(Math.floor(value), 24 * 90);
+}
+
+/**
+ * A window the caller must state, because nothing here can produce it.
+ *
+ * `max_stay_hours` had a typed default of 48. Nothing measured that number and
+ * no command emits it, yet it decided which open sessions an operator was
+ * shown -- a garage worked for six hours reads as clean under it. There is no
+ * honest replacement, so there is no default: the caller says how long is too
+ * long for the garage they are asking about, or is told which parameter is
+ * missing. The clamp stays where it is, in one place.
+ */
+function statedWindow(raw, label) {
+  const value = Number(raw);
+  if (raw === undefined || raw === '' || !Number.isFinite(value) || value <= 0) {
+    throw bad(
+      `${label} is required and must be a positive number of hours; this report has no default`,
+    );
+  }
+  return clampWindow(raw, null);
 }

@@ -121,10 +121,8 @@ own. A device token IS that lane's identity: it resolves server-side to one lane
 and one direction, so an entry token attempting a close and an exit token
 attempting an open are both refused `409` — run against this code, both ways,
 rather than promised. What is checked here is shape, direction, ordering (an
-exit before its own entry is refused), a time that has not happened yet (further
-ahead of this server's clock than the drift tolerated is refused), and the
-garage's maximum stay where it has set one. What cannot be checked from here is
-that a vehicle was ever there: the lane's loops and camera are the only things
+exit before its own entry is refused). What cannot be checked from here is that
+a vehicle was ever there: the lane's loops and camera are the only things
 that see a car, so **a stolen device token is a stolen lane**, and every record
 it writes is indistinguishable from a real one. Binding a session to physical
 evidence is not built.

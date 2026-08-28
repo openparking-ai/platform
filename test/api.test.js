@@ -628,9 +628,8 @@ const plusHours = (iso, h) => new Date(Date.parse(iso) + h * 3600 * 1000).toISOS
 
 /** A garage of its own with both lanes and a rate, so a refused close cannot
  *  disturb the shared world every other test reads. */
-async function garageWithBothLanes({ maxStayHours } = {}) {
+async function garageWithBothLanes() {
   const body = { name: 'Bounds Garage', timezone: 'America/New_York', currency: 'USD' };
-  if (maxStayHours !== undefined) body.max_stay_hours = maxStayHours;
   const created = await fetch(`${base}/api/v1/garages`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
@@ -726,98 +725,6 @@ test('a replay from the PAST is still accepted — that half is a decision', asy
   assert.equal(session.exit_confirmation, 'held');
 });
 
-// --- how long a stay this garage will accept --------------------------------
-//
-// The pair, as with default_action: the garage that configured nothing, which
-// must not have moved, and the garage that asked for a bound, which could not
-// exist before.
-
-test('a garage that has set no maximum stay has none, and the payload says so', async () => {
-  const { entry, exit } = await garageWithBothLanes();
-  const rules = await rulesFor(entry);
-  assert.ok('max_stay_hours' in rules, 'the key must be present so the absence can be read');
-  assert.equal(rules.max_stay_hours, null);
-
-  const entryAt = hoursAgo(49);
-  assert.equal((await openFor(entry, 'NOBOUND1', entryAt)).status, 201);
-  const res = await closeFor(exit, 'NOBOUND1', plusHours(entryAt, 49));
-  assert.equal(res.status, 200, 'with no bound set, a 49h stay closes');
-  assert.equal((await res.json()).session.fee_minor, 24500);
-});
-
-test('a stay longer than the garage accepts is refused before a fee is frozen', async () => {
-  const { entry, exit } = await garageWithBothLanes({ maxStayHours: 48 });
-  assert.equal((await rulesFor(entry)).max_stay_hours, 48);
-
-  const entryAt = hoursAgo(49);
-  assert.equal((await openFor(entry, 'TOOLONG1', entryAt)).status, 201);
-  const res = await closeFor(exit, 'TOOLONG1', plusHours(entryAt, 49));
-  assert.equal(res.status, 409);
-  assert.match((await res.json()).error, /longer than the 48h this garage accepts/);
-
-  const still = await fetch(`${base}/api/v1/lane/sessions/open?plate=TOOLONG1`, {
-    headers: { authorization: `Bearer ${exit}` },
-  });
-  assert.equal(still.status, 200, 'the refused close must leave the session open');
-  assert.equal((await still.json()).session.fee_minor, null, 'no fee may have been frozen');
-});
-
-test('a stay inside the garage maximum closes normally', async () => {
-  const { entry, exit } = await garageWithBothLanes({ maxStayHours: 48 });
-  const entryAt = hoursAgo(47);
-  assert.equal((await openFor(entry, 'INBOUND1', entryAt)).status, 201);
-  const res = await closeFor(exit, 'INBOUND1', plusHours(entryAt, 47));
-  assert.equal(res.status, 200);
-  assert.equal((await res.json()).session.fee_minor, 23500);
-});
-
-test('a maximum stay can be set on an existing garage, and cleared again', async () => {
-  const { garage, entry } = await garageWithBothLanes();
-  const patch = (body) =>
-    fetch(`${base}/api/v1/garages/${garage.id}`, {
-      method: 'PATCH',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
-      body: JSON.stringify(body),
-    });
-
-  assert.equal((await patch({ max_stay_hours: 24 })).status, 200);
-  assert.equal((await rulesFor(entry)).max_stay_hours, 24);
-
-  // And without restating default_action, which must not have moved.
-  assert.equal((await rulesFor(entry)).default_action, 'allow');
-
-  assert.equal((await patch({ max_stay_hours: null })).status, 200);
-  assert.equal((await rulesFor(entry)).max_stay_hours, null);
-
-  assert.equal((await patch({})).status, 400, 'a PATCH that asks for nothing is not a change');
-});
-
-test('a max_stay_hours the route would not accept is refused, not ignored', async () => {
-  for (const value of [0, -1, 1.5, '48', 'lots', true]) {
-    const res = await fetch(`${base}/api/v1/garages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
-      body: JSON.stringify({
-        name: 'Nonsense',
-        timezone: 'America/New_York',
-        currency: 'USD',
-        max_stay_hours: value,
-      }),
-    });
-    assert.equal(res.status, 400, `${JSON.stringify(value)} was accepted`);
-    assert.match((await res.json()).error, /max_stay_hours/);
-  }
-});
-
-test('the database refuses a maximum stay no route would have let through', async () => {
-  await assert.rejects(
-    withTenant(tenant, (c) =>
-      c.query(`UPDATE garages SET max_stay_hours = 0 WHERE tenant_id = $1`, [tenant]),
-    ),
-    /check constraint/i,
-  );
-});
-
 // --- what a lane may call an event ------------------------------------------
 
 test('an event kind no lane emits is refused, and the refusal names it', async () => {
@@ -848,6 +755,31 @@ test('every kind this platform publishes is a kind it accepts', async () => {
   const res = await fetch(`${base}/api/v1/lane/events`, asDevice(entryToken, { events }));
   assert.equal(res.status, 202);
   assert.deepEqual(await res.json(), { accepted: LANE_EVENT_KINDS.length, duplicates: 0 });
+});
+
+test('an event dated in the future is refused, on the same bound as a session', async () => {
+  // The third lane-supplied time. It was unbounded: `reconcile.js` filters
+  // `occurred_at >= since` with no upper bound and `retention.js` never touches
+  // `events`, so one future-dated row satisfies every window that will ever be
+  // asked for and nothing removes it. Either side of the same threshold the two
+  // session routes are bounded by, plus the past, which stays legitimate.
+  const post = (occurredAt) =>
+    fetch(
+      `${base}/api/v1/lane/events`,
+      asDevice(entryToken, {
+        events: [{ event_id: randomUUID(), kind: 'frames_captured', occurred_at: occurredAt }],
+      }),
+    );
+
+  const ahead = await post(secondsAhead(365 * 24 * 3600));
+  assert.equal(ahead.status, 409);
+  assert.match((await ahead.json()).error, /occurred_at is \d+s ahead/);
+
+  // Inside the drift tolerated: a lane device seconds fast is a normal lane.
+  assert.equal((await post(secondsAhead(119))).status, 202);
+
+  // A replay from the past is the case the lane-clock decision exists for.
+  assert.equal((await post(hoursAgo(8760))).status, 202);
 });
 
 test('every kind reconciliation counts is a kind a lane may still report', async () => {
