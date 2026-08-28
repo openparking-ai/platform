@@ -55,8 +55,10 @@ It prints a tenant, a garage and two device tokens, and writes them to
 python -m lane_controller.demo --credentials ../platform/.demo-credentials.json
 ```
 
-A simulated car arms the loop, is identified, is allowed, the gate vends, a session
-opens; it leaves and the session closes with the fee computed.
+A simulated car arms the loop, is identified, is allowed, the gate vends, and a
+session opens once the entry is settled; it leaves and the session closes with the
+fee computed. The demo lane has no closing loops, so its entries settle as
+`unconfirmable` — see below.
 
 ## What the lane talks to
 
@@ -64,8 +66,40 @@ opens; it leaves and the session closes with the fee computed.
 |---|---|
 | `GET /api/v1/lane/rules` | what the lane caches so it can decide offline |
 | `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` |
-| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id` |
-| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id` |
+| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation` |
+| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation` |
+
+### Every session records what saw the car
+
+A ticket is not an entry. A driver can pull up, take one and drive away, and a
+vend with nothing behind it is not an arrival at all — so every abandoned
+approach used to become a phantom occupant, counted as inside and never seen
+again. The lane now creates a pending entry at the vend and promotes it when two
+loops after the barrier see a vehicle cross them forward.
+
+`entry_confirmation` is **required and never defaulted**, and it says which:
+
+| | |
+|---|---|
+| `confirmed` | two loops after the barrier saw a vehicle cross them forward |
+| `unconfirmable` | that lane has no closing loops, so nothing could confirm or refute it |
+
+The response **echoes the value back**, and that is a contract term rather than a
+convenience: a platform older than the column accepts the same call and drops the
+field, so the lane treats an open that does not echo what it sent as undelivered.
+
+`exit_confirmation` is the same question about the other end of the stay, with
+one more value:
+
+| | |
+|---|---|
+| `held` | the exit vended and nothing confirmed a crossing. It closes and bills anyway — the barrier opened and the car is gone — carrying the flag, with an `exit_held` lane event beside it |
+
+Entries that were backed out of or never confirmed are **not sessions** — no
+session, no occupancy, no money. They are lane events and they land in `events`.
+
+`inside_count` on the operator surface counts CONFIRMED sessions. The rest are
+not hidden: `unconfirmable_count` and `open_count` are returned beside it.
 
 Every one of those is idempotent on purpose, and idempotent **on the lane's
 event id — never on state**. A lane that has been offline re-sends whatever it

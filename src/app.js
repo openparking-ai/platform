@@ -27,6 +27,54 @@ const bad = (message) => new HttpError(400, message);
  */
 const DEFAULT_ACTIONS = ['allow', 'deny'];
 
+/**
+ * What a lane is allowed to say confirmed an entry or an exit.
+ *
+ * `confirmed` means two loops after the barrier saw a vehicle cross them
+ * forward inside the confirmation window. `unconfirmable` means the lane has no
+ * closing loops installed, so nothing could have confirmed or refuted it — a
+ * weaker lane, saying so on every session it opens.
+ *
+ * `opened_on_vend` and `closed_on_vend` are NOT here. They are what migration
+ * 0005 backfilled onto rows written before any of this existed, and a lane that
+ * presented one would be claiming a history it does not have. The column's
+ * CHECK permits them because the old rows carry them; this list is what a
+ * REQUEST may say, and the two are deliberately different sets.
+ */
+const CONFIRMATIONS = ['confirmed', 'unconfirmable'];
+
+/**
+ * And what a lane may say about an EXIT, which is the same list plus one.
+ *
+ * `held` is an exit the loops did not confirm. It closes and bills anyway,
+ * because the exit vend is the payment moment and the barrier opened — the car
+ * is gone whatever the loops saw, and holding the session open would leave the
+ * stay unbilled and the vehicle inside for ever. It is a flag for a human, not
+ * a hole in the ledger, and the `exit_held` lane event sits beside it.
+ *
+ * There is deliberately NO entry equivalent. An entry nothing confirmed is not
+ * a session at all — no row, no occupancy, no money — so `held` on an open is
+ * refused, and a test asserts each side of that separately.
+ */
+const EXIT_CONFIRMATIONS = [...CONFIRMATIONS, 'held'];
+
+/**
+ * What a session open or close SAYS saw the car, and it is required — never
+ * defaulted.
+ *
+ * A default here would be a second copy of a claim about whether anything saw
+ * the car, sitting where nobody looks, and the copy is always the one that
+ * lies. An old lane build that does not send the field gets a 400 saying which
+ * values exist, which is a deployment being told to catch up rather than a
+ * money record quietly filling with a value nobody asserted.
+ */
+function confirmation(value, label, allowed = CONFIRMATIONS) {
+  if (!allowed.includes(value)) {
+    throw bad(`${label} is required and must be one of ${allowed.join(', ')}`);
+  }
+  return value;
+}
+
 function defaultAction(value, { required }) {
   if (value === undefined || value === null) {
     if (required) throw bad(`default_action is required and must be one of ${DEFAULT_ACTIONS.join(', ')}`);
@@ -202,13 +250,32 @@ export function createApp() {
     }
   });
 
+  /**
+   * What this garage believes is inside, and on what evidence.
+   *
+   * `inside_count` counts CONFIRMED sessions only — the ones where two loops
+   * after the barrier saw a vehicle cross them. That is a change in what the
+   * number means, and it is the point: it used to count every vend, so a driver
+   * who took a ticket and drove away was counted as inside forever, and a
+   * garage filled up on paper before it filled in concrete.
+   *
+   * The rest are not hidden, which would be the same defect in the other
+   * direction — a real car in an unconfirmable lane is still a real car.
+   * `unconfirmable_count` and `open_count` are returned beside it, so a
+   * consumer can see the whole of what is open and what is behind each part.
+   */
   operator.get('/garages/:garageId/sessions/open', async (req, res, next) => {
     try {
       const sessions = await withTenant(req.tenantId, (client) =>
         repo.openSessionsForGarage(client, req.tenantId, req.params.garageId),
       );
-      // The inside-count the occupancy module will want later, for free.
-      res.json({ inside_count: sessions.length, sessions });
+      const confirmed = sessions.filter((s) => s.entry_confirmation === 'confirmed');
+      res.json({
+        inside_count: confirmed.length,
+        unconfirmable_count: sessions.length - confirmed.length,
+        open_count: sessions.length,
+        sessions,
+      });
     } catch (err) {
       next(err);
     }
@@ -373,6 +440,7 @@ export function createApp() {
         attributes = null,
       } = req.body ?? {};
       if (!plate) throw bad('plate is required');
+      const entryConfirmation = confirmation(req.body?.entry_confirmation, 'entry_confirmation');
       // Required, not optional. Without it there is no key to be idempotent on
       // and the only thing left to check is state -- which is exactly how a
       // replay arriving after the car has left opens a second, phantom session.
@@ -392,9 +460,17 @@ export function createApp() {
           entryAt,
           currency: garage.currency,
           openEventId: String(openEventId),
+          entryConfirmation,
         });
       });
 
+      // The row that was written, echoed whole -- `entry_confirmation` with it.
+      // A LANE DEPENDS ON THAT FIELD BEING HERE: a platform that predates the
+      // column answers this call exactly as successfully and hands back a
+      // session without it, so the lane treats an open that does not come back
+      // carrying the value it sent as not delivered, and says so. Dropping the
+      // field from this response would be indistinguishable, to a lane, from
+      // deploying against a platform that cannot record it.
       res.status(result.created ? 201 : 200).json({
         session: presentSession(result.session),
         created: result.created,
@@ -418,6 +494,11 @@ export function createApp() {
       const { plate, event_id: closeEventId, session_id: sessionId = null } = req.body ?? {};
       if (!plate) throw bad('plate is required');
       if (!closeEventId) throw bad('event_id is required');
+      const exitConfirmation = confirmation(
+        req.body?.exit_confirmation,
+        'exit_confirmation',
+        EXIT_CONFIRMATIONS,
+      );
       const exitAt = parseTime(req.body?.exit_at, 'exit_at');
 
       const out = await withTenant(tenantId, async (client) => {
@@ -478,6 +559,7 @@ export function createApp() {
           hourlyMinor: rate.hourlyMinor,
           feeMinor,
           closeEventId: String(closeEventId),
+          exitConfirmation,
         });
         return { session: closed, closed: true, replay: false };
       });

@@ -131,7 +131,7 @@ test('a car drives in, and the same entry replayed does not open two sessions', 
 
   const first = await fetch(
     `${base}/api/v1/lane/sessions/open`,
-    asDevice(entryToken, { plate, entry_at: entryAt, event_id: eventId }),
+    asDevice(entryToken, { plate, entry_confirmation: 'confirmed', entry_at: entryAt, event_id: eventId }),
   );
   assert.equal(first.status, 201);
   const opened = (await first.json()).session;
@@ -139,7 +139,7 @@ test('a car drives in, and the same entry replayed does not open two sessions', 
 
   const replay = await fetch(
     `${base}/api/v1/lane/sessions/open`,
-    asDevice(entryToken, { plate, entry_at: entryAt, event_id: eventId }),
+    asDevice(entryToken, { plate, entry_confirmation: 'confirmed', entry_at: entryAt, event_id: eventId }),
   );
   assert.equal(replay.status, 200, 'a replayed entry is not a new session');
   const body = await replay.json();
@@ -159,19 +159,19 @@ test('an entry replayed AFTER the car has already left does not open a phantom',
     await (
       await fetch(
         `${base}/api/v1/lane/sessions/open`,
-        asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z', event_id: entryEvent }),
+        asDevice(entryToken, { plate, entry_confirmation: 'confirmed', entry_at: '2026-08-26T09:00:00Z', event_id: entryEvent }),
       )
     ).json()
   ).session;
 
   await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(exitToken, { plate, exit_at: '2026-08-26T11:00:00Z' }),
+    asDevice(exitToken, { plate, exit_confirmation: 'confirmed', exit_at: '2026-08-26T11:00:00Z' }),
   );
 
   const replay = await fetch(
     `${base}/api/v1/lane/sessions/open`,
-    asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z', event_id: entryEvent }),
+    asDevice(entryToken, { plate, entry_confirmation: 'confirmed', entry_at: '2026-08-26T09:00:00Z', event_id: entryEvent }),
   );
   assert.equal(replay.status, 200, 'a replayed entry must never be treated as a new arrival');
   const body = await replay.json();
@@ -198,22 +198,22 @@ test('a stale exit from an earlier visit is refused terminally, not with a 500',
 
   await fetch(
     `${base}/api/v1/lane/sessions/open`,
-    asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z' }),
+    asDevice(entryToken, { plate, entry_confirmation: 'confirmed', entry_at: '2026-08-26T09:00:00Z' }),
   );
   await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(exitToken, { plate, exit_at: '2026-08-26T11:00:00Z' }),
+    asDevice(exitToken, { plate, exit_confirmation: 'confirmed', exit_at: '2026-08-26T11:00:00Z' }),
   );
   // second visit, the next day
   await fetch(
     `${base}/api/v1/lane/sessions/open`,
-    asDevice(entryToken, { plate, entry_at: '2026-08-27T09:00:00Z' }),
+    asDevice(entryToken, { plate, entry_confirmation: 'confirmed', entry_at: '2026-08-27T09:00:00Z' }),
   );
 
   // the exit lane's queue finally drains and delivers visit one's close
   const stale = await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(exitToken, { plate, exit_at: '2026-08-26T11:00:00Z' }),
+    asDevice(exitToken, { plate, exit_confirmation: 'confirmed', exit_at: '2026-08-26T11:00:00Z' }),
   );
 
   assert.equal(stale.status, 409, 'must be terminal, so the lane stops retrying it');
@@ -225,7 +225,7 @@ test('a session call without an event_id is refused', async () => {
   const res = await fetch(`${base}/api/v1/lane/sessions/open`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${entryToken}` },
-    body: JSON.stringify({ plate: 'NOKEY-1', entry_at: new Date().toISOString() }),
+    body: JSON.stringify({ plate: 'NOKEY-1', entry_confirmation: 'confirmed', entry_at: new Date().toISOString() }),
   });
   assert.equal(res.status, 400, 'with no key there is nothing to be idempotent on');
 });
@@ -234,13 +234,13 @@ test('a car drives out and the fee is computed, frozen, and idempotent on replay
   const plate = `OUT-${randomUUID().slice(0, 8)}`;
   await fetch(
     `${base}/api/v1/lane/sessions/open`,
-    asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z' }),
+    asDevice(entryToken, { plate, entry_confirmation: 'confirmed', entry_at: '2026-08-26T09:00:00Z' }),
   );
 
   const closeEvent = randomUUID();
   const res = await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(exitToken, { plate, exit_at: '2026-08-26T12:30:00Z', event_id: closeEvent }),
+    asDevice(exitToken, { plate, exit_confirmation: 'confirmed', exit_at: '2026-08-26T12:30:00Z', event_id: closeEvent }),
   );
   assert.equal(res.status, 200);
   const { session, closed } = await res.json();
@@ -253,7 +253,7 @@ test('a car drives out and the fee is computed, frozen, and idempotent on replay
 
   const replay = await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(exitToken, { plate, exit_at: '2026-08-26T12:30:00Z', event_id: closeEvent }),
+    asDevice(exitToken, { plate, exit_confirmation: 'confirmed', exit_at: '2026-08-26T12:30:00Z', event_id: closeEvent }),
   );
   const replayBody = await replay.json();
   assert.equal(replayBody.replay, true);
@@ -263,10 +263,10 @@ test('a car drives out and the fee is computed, frozen, and idempotent on replay
 
 test('the fee survives the rate being changed afterwards', async () => {
   const plate = `FROZEN-${randomUUID().slice(0, 8)}`;
-  await fetch(`${base}/api/v1/lane/sessions/open`, asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z' }));
+  await fetch(`${base}/api/v1/lane/sessions/open`, asDevice(entryToken, { plate, entry_confirmation: 'confirmed', entry_at: '2026-08-26T09:00:00Z' }));
   const closed = (
     await (
-      await fetch(`${base}/api/v1/lane/sessions/close`, asDevice(exitToken, { plate, exit_at: '2026-08-26T10:00:00Z' }))
+      await fetch(`${base}/api/v1/lane/sessions/close`, asDevice(exitToken, { plate, exit_confirmation: 'confirmed', exit_at: '2026-08-26T10:00:00Z' }))
     ).json()
   ).session;
   assert.equal(closed.fee_minor, 250);
@@ -288,13 +288,13 @@ test('a device may only do the job of the lane it is on', async () => {
   const plate = `DIR-${randomUUID().slice(0, 8)}`;
   const wrongOpen = await fetch(
     `${base}/api/v1/lane/sessions/open`,
-    asDevice(exitToken, { plate, entry_at: new Date().toISOString() }),
+    asDevice(exitToken, { plate, entry_confirmation: 'confirmed', entry_at: new Date().toISOString() }),
   );
   assert.equal(wrongOpen.status, 409);
 
   const wrongClose = await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(entryToken, { plate, exit_at: new Date().toISOString() }),
+    asDevice(entryToken, { plate, exit_confirmation: 'confirmed', exit_at: new Date().toISOString() }),
   );
   assert.equal(wrongClose.status, 409);
 });
@@ -302,7 +302,7 @@ test('a device may only do the job of the lane it is on', async () => {
 test('closing a vehicle that never entered is a 404, not a phantom session', async () => {
   const res = await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(exitToken, { plate: `GHOST-${randomUUID().slice(0, 8)}`, exit_at: new Date().toISOString() }),
+    asDevice(exitToken, { plate: `GHOST-${randomUUID().slice(0, 8)}`, exit_confirmation: 'confirmed', exit_at: new Date().toISOString() }),
   );
   assert.equal(res.status, 404);
 });
@@ -311,7 +311,7 @@ test('closing a vehicle that never entered is a 404, not a phantom session', asy
 
 test('open sessions and the inside-count are readable per garage', async () => {
   const plate = `INSIDE-${randomUUID().slice(0, 8)}`;
-  await fetch(`${base}/api/v1/lane/sessions/open`, asDevice(entryToken, { plate, entry_at: new Date().toISOString() }));
+  await fetch(`${base}/api/v1/lane/sessions/open`, asDevice(entryToken, { plate, entry_confirmation: 'confirmed', entry_at: new Date().toISOString() }));
 
   const res = await fetch(`${base}/api/v1/garages/${world.garage}/sessions/open`, asOperator(operatorToken));
   assert.equal(res.status, 200);
@@ -325,7 +325,12 @@ test("another tenant's operator sees nothing of this garage's sessions", async (
   const otherToken = await issueOperatorToken(other);
   const res = await fetch(`${base}/api/v1/garages/${world.garage}/sessions/open`, asOperator(otherToken));
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { inside_count: 0, sessions: [] });
+  assert.deepEqual(await res.json(), {
+    inside_count: 0,
+    unconfirmable_count: 0,
+    open_count: 0,
+    sessions: [],
+  });
 });
 
 test('the operator surface refuses an unauthenticated call', async () => {
@@ -381,7 +386,7 @@ test('the exit lane can look up the open session for a plate', async () => {
     await (
       await fetch(
         `${base}/api/v1/lane/sessions/open`,
-        asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z' }),
+        asDevice(entryToken, { plate, entry_confirmation: 'confirmed', entry_at: '2026-08-26T09:00:00Z' }),
       )
     ).json()
   ).session;
@@ -401,24 +406,24 @@ test('C5(a): a stale exit cannot land on a later visit when it names the session
     await (
       await fetch(
         `${base}/api/v1/lane/sessions/open`,
-        asDevice(entryToken, { plate, entry_at: '2026-08-26T09:00:00Z' }),
+        asDevice(entryToken, { plate, entry_confirmation: 'confirmed', entry_at: '2026-08-26T09:00:00Z' }),
       )
     ).json()
   ).session;
   await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(exitToken, { plate, exit_at: '2026-08-26T10:00:00Z', session_id: first.id }),
+    asDevice(exitToken, { plate, exit_confirmation: 'confirmed', exit_at: '2026-08-26T10:00:00Z', session_id: first.id }),
   );
 
   // second visit, and its exit is LATER than the stale one we are about to replay
   await fetch(
     `${base}/api/v1/lane/sessions/open`,
-    asDevice(entryToken, { plate, entry_at: '2026-08-27T09:00:00Z' }),
+    asDevice(entryToken, { plate, entry_confirmation: 'confirmed', entry_at: '2026-08-27T09:00:00Z' }),
   );
 
   const stale = await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(exitToken, { plate, exit_at: '2026-08-27T11:00:00Z', session_id: first.id }),
+    asDevice(exitToken, { plate, exit_confirmation: 'confirmed', exit_at: '2026-08-27T11:00:00Z', session_id: first.id }),
   );
   assert.equal(stale.status, 404, 'the named session is closed; it must not fall through to the open one');
 
@@ -441,18 +446,18 @@ test('C5(a): naming a session belonging to another vehicle is refused', async ()
     await (
       await fetch(
         `${base}/api/v1/lane/sessions/open`,
-        asDevice(entryToken, { plate: a, entry_at: '2026-08-26T09:00:00Z' }),
+        asDevice(entryToken, { plate: a, entry_confirmation: 'confirmed', entry_at: '2026-08-26T09:00:00Z' }),
       )
     ).json()
   ).session;
   await fetch(
     `${base}/api/v1/lane/sessions/open`,
-    asDevice(entryToken, { plate: b, entry_at: '2026-08-26T09:05:00Z' }),
+    asDevice(entryToken, { plate: b, entry_confirmation: 'confirmed', entry_at: '2026-08-26T09:05:00Z' }),
   );
 
   const res = await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(exitToken, { plate: b, exit_at: '2026-08-26T12:00:00Z', session_id: sessionA.id }),
+    asDevice(exitToken, { plate: b, exit_confirmation: 'confirmed', exit_at: '2026-08-26T12:00:00Z', session_id: sessionA.id }),
   );
   assert.equal(res.status, 409);
   assert.match((await res.json()).error, /different vehicle/i);
@@ -465,13 +470,13 @@ test('C5(b): an event id re-presented for a different vehicle is a loud conflict
   const shared = randomUUID();
   const first = await fetch(
     `${base}/api/v1/lane/sessions/open`,
-    asDevice(entryToken, { plate: `DUP-A-${randomUUID().slice(0, 6)}`, entry_at: '2026-08-26T09:00:00Z', event_id: shared }),
+    asDevice(entryToken, { plate: `DUP-A-${randomUUID().slice(0, 6)}`, entry_confirmation: 'confirmed', entry_at: '2026-08-26T09:00:00Z', event_id: shared }),
   );
   assert.equal(first.status, 201);
 
   const second = await fetch(
     `${base}/api/v1/lane/sessions/open`,
-    asDevice(entryToken, { plate: `DUP-B-${randomUUID().slice(0, 6)}`, entry_at: '2026-08-26T09:10:00Z', event_id: shared }),
+    asDevice(entryToken, { plate: `DUP-B-${randomUUID().slice(0, 6)}`, entry_confirmation: 'confirmed', entry_at: '2026-08-26T09:10:00Z', event_id: shared }),
   );
   assert.equal(second.status, 409, 'must be a conflict, not a silent resolution to the first vehicle');
   assert.match((await second.json()).error, /different vehicle/i);
@@ -483,7 +488,7 @@ test('vehicle identity from the lane is stored', async () => {
     `${base}/api/v1/lane/sessions/open`,
     asDevice(entryToken, {
       plate,
-      entry_at: new Date().toISOString(),
+      entry_confirmation: 'confirmed', entry_at: new Date().toISOString(),
       make: 'Toyota',
       model: 'Corolla',
       color: 'silver',

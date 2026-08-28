@@ -5,8 +5,12 @@
  * code expects and the database does not have is not an error and not a null --
  * `JSON.stringify` drops the key and the route answers 200 with a payload one
  * key SHORTER. The lane reads the missing key as unmeasured and an unknown
- * plate that would have been admitted is refused instead. No error, no symptom,
- * a shorter payload; measured on `default_action` when 0004 was written.
+ * plate that would have been admitted takes the lane's FALLBACK path instead --
+ * a ticket and a human, which is not a refusal and not the barrier opening. No
+ * error, no symptom, a shorter payload; measured on `default_action` when 0004
+ * was written, and re-run here: a payload with the key reaches `allow` and
+ * vends, the same payload without it reaches `fallback`/`unknown_vehicle` and
+ * does not.
  *
  * That is an ordering constraint -- migrate first, then deploy -- and an
  * ordering constraint is a CHECK, never a memory. A line in a README is a
