@@ -59,6 +59,49 @@ const CONFIRMATIONS = ['confirmed', 'unconfirmable'];
 const EXIT_CONFIRMATIONS = [...CONFIRMATIONS, 'held'];
 
 /**
+ * The event kinds a lane reports, and it is the whole set it can produce.
+ *
+ * `POST /lane/events` used to take any string. A device token then bought an
+ * `events` table filled with kinds no lane emits -- fabricated evidence sitting
+ * beside the real record, and `reconcile.js` counts three of these kinds, so a
+ * log it cannot trust is a reconciliation it cannot trust.
+ *
+ * DERIVED FROM THE LANE, NOT INVENTED HERE: every string below is a name in
+ * `lane-controller`, taken from the constants in `sync.py` and the literals
+ * passed to `events.record()`. `session_open` and `session_close` are
+ * deliberately ABSENT -- the lane's transport routes those two to
+ * `/sessions/open` and `/sessions/close` and never to this endpoint, so one
+ * arriving here is a lane that has lost its routing, and refusing it is the
+ * loud answer.
+ *
+ * THIS IS A SECOND COPY OF A SET THAT LIVES IN ANOTHER REPOSITORY, and there is
+ * nothing in either repository's CI that compares them. A lane build that adds
+ * a kind and deploys before this list does is refused 400 by an endpoint that
+ * used to take anything. Stated here because it is the shape of the ordering
+ * hazard the vehicle-id pin check exists for, and this one has no check yet.
+ */
+const LANE_EVENT_KINDS = [
+  'armed',
+  'arming_incomplete',
+  'arming_rejected',
+  'decision',
+  'entry_backed_out',
+  'entry_confirmed',
+  'entry_held',
+  'entry_pending',
+  'entry_unconfirmable',
+  'exit_backed_in',
+  'exit_confirmed',
+  'exit_held',
+  'exit_pending',
+  'exit_unconfirmable',
+  'fallback_needs_human',
+  'frames_captured',
+  'vehicle_identified',
+  'vended',
+];
+
+/**
  * What a session open or close SAYS saw the car, and it is required — never
  * defaulted.
  *
@@ -71,6 +114,24 @@ const EXIT_CONFIRMATIONS = [...CONFIRMATIONS, 'held'];
 function confirmation(value, label, allowed = CONFIRMATIONS) {
   if (!allowed.includes(value)) {
     throw bad(`${label} is required and must be one of ${allowed.join(', ')}`);
+  }
+  return value;
+}
+
+/**
+ * What a lane may call an event, and it is refused rather than stored.
+ *
+ * Same shape as `confirmation()` above and for the same reason: the route is
+ * where the sender is told which values exist. The kind is NAMED in the
+ * refusal, because a lane build ahead of this one needs to see which of its
+ * kinds this platform does not know.
+ */
+function eventKind(value) {
+  if (!LANE_EVENT_KINDS.includes(value)) {
+    throw bad(
+      `kind ${JSON.stringify(value)} is not one a lane reports; it must be one of ` +
+        LANE_EVENT_KINDS.join(', '),
+    );
   }
   return value;
 }
@@ -93,6 +154,63 @@ function parseTime(value, label) {
   return at;
 }
 
+/**
+ * How far ahead of this server's clock a lane-supplied time may be, in seconds.
+ *
+ * Times come from the LANE and that is a decision with a reason: the car may
+ * have arrived while the lane had no network, so a time in the PAST is
+ * legitimate and is not bounded anywhere. A time in the FUTURE is a different
+ * claim -- that something has happened which has not -- and no decision covered
+ * it. Unbounded, an `exit_at` a lane can name freezes a fee for a stay nobody
+ * has had yet.
+ *
+ * The tolerance is for CLOCK DRIFT between a lane device and this server and
+ * for nothing else: comfortably more than NTP leaves on a device that is
+ * working, and far below any interval that could be billed. It is a DECISION,
+ * not a measurement of anything.
+ *
+ * Read once, at load, and a value that is not a number is refused HERE rather
+ * than becoming a NaN comparison that is false for every input -- which is this
+ * bound silently absent, on a process that started cleanly.
+ */
+const MAX_CLOCK_SKEW_SECONDS = (() => {
+  const raw = process.env.MAX_CLOCK_SKEW_SECONDS;
+  if (raw === undefined || raw === '') return 120;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(
+      `MAX_CLOCK_SKEW_SECONDS must be a non-negative number of seconds, not ${JSON.stringify(raw)}`,
+    );
+  }
+  return value;
+})();
+
+/**
+ * Refuse a lane time that has not happened yet.
+ *
+ * 409 and not 400, for the reason the stale exit is a 409: the lane classifies
+ * 5xx as retryable and re-sends forever with its whole outbox stuck behind it,
+ * while a 4xx is terminal -- dead-lettered, counted and logged at error. One
+ * function for both ends of a stay, because two copies of this rule would be
+ * two claims about the same thing and the copy is the one that goes wrong.
+ *
+ * The message carries how far ahead the time was and how far ahead is
+ * tolerated, both derived, so the operator reading the lane's error log does
+ * not have to find this constant to know what happened.
+ */
+function refuseFuture(at, label, now = new Date()) {
+  const ahead = (at.getTime() - now.getTime()) / 1000;
+  if (ahead > MAX_CLOCK_SKEW_SECONDS) {
+    throw new HttpError(
+      409,
+      `${label} is ${Math.round(ahead)}s ahead of this server's clock, more than the ` +
+        `${MAX_CLOCK_SKEW_SECONDS}s of drift tolerated — a time in the future is not a stay ` +
+        'that has happened',
+    );
+  }
+  return at;
+}
+
 export function createApp() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
@@ -101,10 +219,6 @@ export function createApp() {
 
   // -------------------------------------------------------------------------
   // Operator surface.
-  //
-  // Tenant comes from a header. This is a PLACEHOLDER for real operator
-  // authentication and is the only thing here that is not production shaped;
-  // whatever replaces it must set req.tenantId and nothing downstream changes.
   // -------------------------------------------------------------------------
   const operator = express.Router();
 
@@ -291,7 +405,7 @@ export function createApp() {
   operator.get('/garages/:garageId/reconciliation', async (req, res, next) => {
     try {
       const hours = clampWindow(req.query.hours, 24);
-      const maxHours = clampWindow(req.query.max_stay_hours, 48);
+      const maxHours = statedWindow(req.query.max_stay_hours, 'max_stay_hours');
       const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
       const report = await withTenant(req.tenantId, (client) =>
         reconcile(client, req.tenantId, req.params.garageId, { since, maxHours }),
@@ -388,8 +502,13 @@ export function createApp() {
           garageId,
           laneId,
           eventId: String(e.event_id),
-          kind: String(e.kind),
-          occurredAt: parseTime(e.occurred_at, 'occurred_at'),
+          kind: eventKind(e.kind),
+          // The same bound as an entry_at and an exit_at, on the third
+          // lane-supplied time. A future-dated event satisfies every window a
+          // reconciliation report will ever ask for and nothing removes it, so
+          // one batch makes the surface that exists to show a lane being worked
+          // permanently deaf.
+          occurredAt: refuseFuture(parseTime(e.occurred_at, 'occurred_at'), 'occurred_at'),
           detail: e.detail ?? {},
         };
       });
@@ -445,7 +564,7 @@ export function createApp() {
       // and the only thing left to check is state -- which is exactly how a
       // replay arriving after the car has left opens a second, phantom session.
       if (!openEventId) throw bad('event_id is required');
-      const entryAt = parseTime(req.body?.entry_at, 'entry_at');
+      const entryAt = refuseFuture(parseTime(req.body?.entry_at, 'entry_at'), 'entry_at');
 
       const result = await withTenant(tenantId, async (client) => {
         const garage = await repo.getGarage(client, tenantId, garageId);
@@ -499,7 +618,7 @@ export function createApp() {
         'exit_confirmation',
         EXIT_CONFIRMATIONS,
       );
-      const exitAt = parseTime(req.body?.exit_at, 'exit_at');
+      const exitAt = refuseFuture(parseTime(req.body?.exit_at, 'exit_at'), 'exit_at');
 
       const out = await withTenant(tenantId, async (client) => {
         // Keyed on the event first, so a replay returns the very session this
@@ -571,11 +690,10 @@ export function createApp() {
   });
 
   // Order matters and is load-bearing. '/api/v1' is a prefix of '/api/v1/lane',
-  // so the operator router — whose middleware demands an x-tenant-id header —
-  // must be mounted AFTER the lane router. Mounted first it answers every lane
-  // request with 401 'tenant context required' before the device router runs.
-  // The test 'a lane call with no token is refused' asserts the message, not
-  // just the status, because both orderings return 401.
+  // so the operator router must be mounted AFTER the lane router. Mounted first
+  // it answers every lane request 401 before the device router runs. The test
+  // 'a lane call with no token is refused BY THE LANE ROUTER' asserts the
+  // message, not just the status, because both orderings return 401.
   app.use('/api/v1/lane', lane);
   app.use('/api/v1', operator);
 
@@ -597,7 +715,7 @@ function presentSession(s) {
   };
 }
 
-export { pool };
+export { pool, LANE_EVENT_KINDS };
 
 /**
  * A window the caller asked for, bounded.
@@ -611,4 +729,24 @@ function clampWindow(raw, fallback) {
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) return fallback;
   return Math.min(Math.floor(value), 24 * 90);
+}
+
+/**
+ * A window the caller must state, because nothing here can produce it.
+ *
+ * `max_stay_hours` had a typed default of 48. Nothing measured that number and
+ * no command emits it, yet it decided which open sessions an operator was
+ * shown -- a garage worked for six hours reads as clean under it. There is no
+ * honest replacement, so there is no default: the caller says how long is too
+ * long for the garage they are asking about, or is told which parameter is
+ * missing. The clamp stays where it is, in one place.
+ */
+function statedWindow(raw, label) {
+  const value = Number(raw);
+  if (raw === undefined || raw === '' || !Number.isFinite(value) || value <= 0) {
+    throw bad(
+      `${label} is required and must be a positive number of hours; this report has no default`,
+    );
+  }
+  return clampWindow(raw, null);
 }
