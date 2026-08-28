@@ -56,14 +56,16 @@ async function openSession({ entryAt = new Date().toISOString(), close = false }
     ).rows[0].id;
     const { rows } = await c.query(
       `INSERT INTO sessions
-         (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, open_event_id, currency)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+         (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, open_event_id, currency,
+          entry_confirmation)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'confirmed') RETURNING id`,
       [tenant, world.garage, vehicle, world.entryLane, entryAt, randomUUID(), world.currency],
     );
     if (close) {
       await c.query(
         `UPDATE sessions SET exit_at = now(), exit_lane_id = $2, close_event_id = $3,
-                             fee_minor = 0, hourly_minor_applied = 0, rate_id = $4
+                             fee_minor = 0, hourly_minor_applied = 0, rate_id = $4,
+                             exit_confirmation = 'confirmed'
          WHERE id = $1`,
         [rows[0].id, world.exitLane, randomUUID(), world.rate],
       );

@@ -27,8 +27,9 @@ async function vehicleWithClosedStay(plate, { closedDaysAgo, enrolled = false })
     await c.query(
       `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, exit_lane_id,
                              entry_at, exit_at, currency, fee_minor, hourly_minor_applied,
-                             open_event_id, close_event_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'USD',250,250,$8,$9)`,
+                             open_event_id, close_event_id,
+                             entry_confirmation, exit_confirmation)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'USD',250,250,$8,$9,'confirmed','confirmed')`,
       [
         tenant, world.garage, v, world.entryLane, world.exitLane,
         ago(closedDaysAgo + 1), ago(closedDaysAgo), randomUUID(), randomUUID(),
@@ -107,8 +108,9 @@ test('a vehicle still inside the garage is never redacted', async () => {
       )
     ).rows[0].id;
     await c.query(
-      `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency, open_event_id)
-       VALUES ($1,$2,$3,$4,$5,'USD',$6)`,
+      `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                             open_event_id, entry_confirmation)
+       VALUES ($1,$2,$3,$4,$5,'USD',$6,'confirmed')`,
       [tenant, world.garage, v, world.entryLane, ago(400), randomUUID()],
     );
     return v;

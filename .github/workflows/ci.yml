@@ -93,9 +93,10 @@ jobs:
         # this code expects and the database has not got is not an error and
         # not a null. The key is dropped, the route answers 200 with a shorter
         # payload, and the lane reads the absence as unmeasured -- so an
-        # unknown plate that would have been admitted is refused instead, with
-        # no error and no symptom anywhere. Measured on `default_action` when
-        # 0004 was written.
+        # unknown plate that would have been admitted takes the lane's FALLBACK
+        # path instead, a ticket and a human rather than a refusal, with no
+        # error and no symptom anywhere. Measured on `default_action` when 0004
+        # was written.
         #
         # `src/schema.js` refuses to start the process while any migration this
         # build ships with has no row in `schema_migrations`. This requires
