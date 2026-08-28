@@ -100,7 +100,7 @@ test('arrivals that opened no session are counted, and named', async () => {
   await recordEvent('fallback_needs_human');
   await openSession();
 
-  const body = await report();
+  const body = await report('?max_stay_hours=48');
   const counts = body.arrivals_versus_sessions;
 
   assert.equal(counts.arrivals, 3);
@@ -148,24 +148,39 @@ test('a closed session is never reported however old it is', async () => {
 test('the report never carries a plate', async () => {
   // An operator needs to know WHICH sessions and for how long, and can look one
   // up deliberately. A reconciliation report is not a place to spray identities.
-  const body = await report();
+  const body = await report('?max_stay_hours=48');
   assert.ok(!JSON.stringify(body).includes('PLATE-'), 'a plate reached the report');
 });
 
 test('the check that cannot be built yet says so in the response', async () => {
   // Silently omitting it would let a consumer assume three checks ran. The gap
   // belongs in the output, not only in a receipt.
-  const body = await report();
+  const body = await report('?max_stay_hours=48');
   assert.equal(body.vehicles_counted_out.available, false);
   assert.match(body.vehicles_counted_out.reason, /counting module/);
 });
 
 test('the window is clamped rather than trusted', async () => {
   // ?hours=1000000 is a full table scan anyone outside can ask for.
-  const body = await report('?hours=99999999');
+  const body = await report('?hours=99999999&max_stay_hours=48');
   const since = new Date(body.arrivals_versus_sessions.since);
   const days = (Date.now() - since.getTime()) / (24 * 3600 * 1000);
   assert.ok(days <= 91, `window was ${days} days`);
+});
+
+test('the report refuses to invent the horizon it is asked about', async () => {
+  // It had a typed default of 48 hours -- a number no command produced, deciding
+  // which open sessions an operator was shown. A garage worked for six hours
+  // read as clean under it, and the caller could not tell the report had chosen
+  // for them. The horizon is now stated or the call is refused by name.
+  for (const query of ['', '?hours=24', '?max_stay_hours=0', '?max_stay_hours=lots']) {
+    const res = await fetch(
+      `${base}/api/v1/garages/${world.garage}/reconciliation${query}`,
+      asOperator(operatorToken),
+    );
+    assert.equal(res.status, 400, `${JSON.stringify(query)} was answered anyway`);
+    assert.match((await res.json()).error, /max_stay_hours/);
+  }
 });
 
 test('reconciliation needs an operator token', async () => {
@@ -177,7 +192,10 @@ test('one tenant cannot reconcile another tenant\'s garage', async () => {
   const other = await createTenant('reconcile-other');
   const otherToken = await issueOperatorToken(other);
   const body = await (
-    await fetch(`${base}/api/v1/garages/${world.garage}/reconciliation`, asOperator(otherToken))
+    await fetch(
+      `${base}/api/v1/garages/${world.garage}/reconciliation?max_stay_hours=48`,
+      asOperator(otherToken),
+    )
   ).json();
 
   // RLS, not a 404 check: the other tenant simply sees nothing in this garage.

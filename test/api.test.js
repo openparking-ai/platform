@@ -1,7 +1,8 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { createApp } from '../src/app.js';
+import { readFile } from 'node:fs/promises';
+import { createApp, LANE_EVENT_KINDS } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 
@@ -603,4 +604,192 @@ test('the database refuses a value no route would have let through', async () =>
     ),
     /check constraint/i,
   );
+});
+
+// --- a time that has not happened yet ---------------------------------------
+//
+// Times come from the lane, and a time in the PAST is legitimate — the car may
+// have arrived while the lane had no network. A time in the FUTURE is a claim
+// that something has happened which has not, and nothing bounded it: an
+// `exit_at` a lane could name froze a fee for a stay nobody had. Measured
+// against the running platform first: an entry a year back and an exit four
+// years on closed, billed, and sat in the ledger looking like a stay.
+//
+// The pair below lands either side of MAX_CLOCK_SKEW_SECONDS deliberately. A
+// threshold with fixture inputs on only one side of it is not exercised.
+
+const hoursAgo = (h) => new Date(Date.now() - h * 3600 * 1000).toISOString();
+const secondsAhead = (sec) => new Date(Date.now() + sec * 1000).toISOString();
+// An exit computed FROM the entry, not from a second reading of the clock: a
+// part-hour bills as a whole one, so two calls to `hoursAgo` an instant apart
+// make a 1h stay cost two hours and the expectation goes wrong for a reason
+// that has nothing to do with what is being tested.
+const plusHours = (iso, h) => new Date(Date.parse(iso) + h * 3600 * 1000).toISOString();
+
+/** A garage of its own with both lanes and a rate, so a refused close cannot
+ *  disturb the shared world every other test reads. */
+async function garageWithBothLanes() {
+  const body = { name: 'Bounds Garage', timezone: 'America/New_York', currency: 'USD' };
+  const created = await fetch(`${base}/api/v1/garages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
+    body: JSON.stringify(body),
+  });
+  assert.equal(created.status, 201);
+  const { garage } = await created.json();
+
+  const makeLane = async (name, direction) => {
+    const res = await fetch(`${base}/api/v1/garages/${garage.id}/lanes`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
+      body: JSON.stringify({ name, direction }),
+    });
+    assert.equal(res.status, 201);
+    return issueToken(tenant, (await res.json()).lane.id, `${direction} device`);
+  };
+
+  const rate = await fetch(`${base}/api/v1/garages/${garage.id}/rates`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
+    body: JSON.stringify({ name: 'Hourly', hourly_minor: 500 }),
+  });
+  assert.equal(rate.status, 201);
+
+  return {
+    garage,
+    entry: await makeLane('Entry 1', 'entry'),
+    exit: await makeLane('Exit 1', 'exit'),
+  };
+}
+
+const openFor = (token, plate, entryAt) =>
+  fetch(
+    `${base}/api/v1/lane/sessions/open`,
+    asDevice(token, { plate, entry_at: entryAt, entry_confirmation: 'confirmed' }),
+  );
+
+const closeFor = (token, plate, exitAt, confirmation = 'confirmed') =>
+  fetch(
+    `${base}/api/v1/lane/sessions/close`,
+    asDevice(token, { plate, exit_at: exitAt, exit_confirmation: confirmation }),
+  );
+
+test('an exit_at in the future is refused, and no fee is frozen', async () => {
+  const { entry, exit } = await garageWithBothLanes();
+  assert.equal((await openFor(entry, 'FUTURE01', hoursAgo(1))).status, 201);
+
+  const res = await closeFor(exit, 'FUTURE01', secondsAhead(365 * 24 * 3600));
+  assert.equal(res.status, 409);
+  assert.match((await res.json()).error, /ahead of this server's clock/);
+
+  // The session is untouched: still open, no exit, no money on it.
+  const still = await fetch(`${base}/api/v1/lane/sessions/open?plate=FUTURE01`, {
+    headers: { authorization: `Bearer ${exit}` },
+  });
+  assert.equal(still.status, 200, 'the refused close must not have closed anything');
+  const { session } = await still.json();
+  assert.equal(session.exit_at, null);
+  assert.equal(session.fee_minor, null);
+});
+
+test('an exit_at a few seconds ahead is inside the drift tolerated and closes', async () => {
+  // The other side of the threshold. A lane device whose clock is seconds fast
+  // is a normal lane, not an attack, and refusing it would strand a real car.
+  const { entry, exit } = await garageWithBothLanes();
+  assert.equal((await openFor(entry, 'SKEW0001', hoursAgo(1))).status, 201);
+
+  const res = await closeFor(exit, 'SKEW0001', secondsAhead(5));
+  assert.equal(res.status, 200);
+  // An hour and five seconds, and a part-hour bills as a whole one.
+  assert.equal((await res.json()).session.fee_minor, 1000);
+});
+
+test('an entry_at in the future is refused too', async () => {
+  const { entry } = await garageWithBothLanes();
+  const res = await openFor(entry, 'FUTURE02', secondsAhead(365 * 24 * 3600));
+  assert.equal(res.status, 409);
+  assert.match((await res.json()).error, /entry_at is \d+s ahead/);
+});
+
+test('a replay from the PAST is still accepted — that half is a decision', async () => {
+  // The lane-clock decision, unchanged and deliberately re-asserted here: an
+  // offline lane replaying yesterday's entries is the case the decision exists
+  // for, and the future bound must not have taken it with it.
+  const { entry, exit } = await garageWithBothLanes();
+  const entryAt = hoursAgo(8760);
+  assert.equal((await openFor(entry, 'PAST0001', entryAt)).status, 201);
+  const res = await closeFor(exit, 'PAST0001', plusHours(entryAt, 1), 'held');
+  assert.equal(res.status, 200);
+  const { session } = await res.json();
+  assert.equal(session.fee_minor, 500, 'a year-old stay of one hour still bills one hour');
+  assert.equal(session.exit_confirmation, 'held');
+});
+
+// --- what a lane may call an event ------------------------------------------
+
+test('an event kind no lane emits is refused, and the refusal names it', async () => {
+  const res = await fetch(
+    `${base}/api/v1/lane/events`,
+    asDevice(entryToken, {
+      events: [
+        {
+          event_id: randomUUID(),
+          kind: 'totally_invented_kind',
+          occurred_at: new Date().toISOString(),
+        },
+      ],
+    }),
+  );
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /totally_invented_kind/);
+});
+
+test('every kind this platform publishes is a kind it accepts', async () => {
+  // Derived from the exported set rather than from a list written here: a list
+  // typed into a test cannot notice anything added to the thing it covers.
+  const events = LANE_EVENT_KINDS.map((kind) => ({
+    event_id: randomUUID(),
+    kind,
+    occurred_at: new Date().toISOString(),
+  }));
+  const res = await fetch(`${base}/api/v1/lane/events`, asDevice(entryToken, { events }));
+  assert.equal(res.status, 202);
+  assert.deepEqual(await res.json(), { accepted: LANE_EVENT_KINDS.length, duplicates: 0 });
+});
+
+test('an event dated in the future is refused, on the same bound as a session', async () => {
+  // The third lane-supplied time. It was unbounded: `reconcile.js` filters
+  // `occurred_at >= since` with no upper bound and `retention.js` never touches
+  // `events`, so one future-dated row satisfies every window that will ever be
+  // asked for and nothing removes it. Either side of the same threshold the two
+  // session routes are bounded by, plus the past, which stays legitimate.
+  const post = (occurredAt) =>
+    fetch(
+      `${base}/api/v1/lane/events`,
+      asDevice(entryToken, {
+        events: [{ event_id: randomUUID(), kind: 'frames_captured', occurred_at: occurredAt }],
+      }),
+    );
+
+  const ahead = await post(secondsAhead(365 * 24 * 3600));
+  assert.equal(ahead.status, 409);
+  assert.match((await ahead.json()).error, /occurred_at is \d+s ahead/);
+
+  // Inside the drift tolerated: a lane device seconds fast is a normal lane.
+  assert.equal((await post(secondsAhead(119))).status, 202);
+
+  // A replay from the past is the case the lane-clock decision exists for.
+  assert.equal((await post(hoursAgo(8760))).status, 202);
+});
+
+test('every kind reconciliation counts is a kind a lane may still report', async () => {
+  // Two layers reading the same concept. Narrowing the accepted set without
+  // noticing that reconcile.js filters on three of its members would leave the
+  // report counting a kind nothing can write any more -- silently zero.
+  const source = await readFile(new URL('../src/reconcile.js', import.meta.url), 'utf8');
+  const counted = [...source.matchAll(/kind = '([a-z_]+)'/g)].map((m) => m[1]);
+  assert.ok(counted.length >= 3, 'the query found nothing to check — it is not measuring');
+  for (const kind of counted) {
+    assert.ok(LANE_EVENT_KINDS.includes(kind), `reconcile.js counts '${kind}', which is refused`);
+  }
 });
