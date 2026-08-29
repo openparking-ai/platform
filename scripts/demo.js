@@ -6,7 +6,7 @@
  * sibling repository can pick up the device tokens without anyone copying a
  * secret between two terminals.
  */
-import { writeFileSync } from 'node:fs';
+import { chmodSync, writeFileSync } from 'node:fs';
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -106,7 +106,17 @@ const credentials = {
   exit_token: exitToken,
   operator_token: operatorTokenValue,
 };
-writeFileSync('.demo-credentials.json', `${JSON.stringify(credentials, null, 2)}\n`);
+// Three live bearer tokens, one of them the operator token that mints device
+// tokens. `writeFileSync`'s mode argument is masked by the umask and is applied
+// only when the file is CREATED, so a permissive umask -- or a file left over
+// from an earlier run -- decides the permissions of a credential file. The
+// chmod is the part that holds, and it is the same shape as vehicle-id's
+// queue file (47d4334): a named mode, applied on every write.
+const CREDENTIALS_FILE_MODE = 0o600;
+writeFileSync('.demo-credentials.json', `${JSON.stringify(credentials, null, 2)}\n`, {
+  mode: CREDENTIALS_FILE_MODE,
+});
+chmodSync('.demo-credentials.json', CREDENTIALS_FILE_MODE);
 
 createApp().listen(port, () => {
   console.log(`
