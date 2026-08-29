@@ -407,6 +407,50 @@ export function createApp() {
   });
 
   /**
+   * Revoke an operator token.
+   *
+   * The same route as the device revoke above, because the schema is the same
+   * shape: `operator_tokens.revoked_at` (0003:71) and `resolve_operator_token`'s
+   * `AND t.revoked_at IS NULL` (0003:92) have been there since 0003, and
+   * nothing set the column. The L3 that reviewed the device fix found its twin.
+   *
+   * It is NOT as sharp a gap as the device one, and that is worth writing down
+   * rather than letting the identical code imply an identical case. An operator
+   * token is issued by `scripts/issue-operator-token.js`, so whoever would
+   * revoke one already holds the database access to UPDATE it by hand; a device
+   * token is issued through the API, so its holder had no such move. The reason
+   * to close it anyway is that "you still have psql" was not an acceptable
+   * answer for devices, and this route costs nothing the device one did not
+   * already pay for.
+   *
+   * `coalesce` so a second revocation cannot move the moment the credential
+   * stopped being trusted; 404 rather than 403 for another tenant's token,
+   * because row-level security makes it not-found; and no un-revoke, so a
+   * revoked token is issued again rather than quietly restored. Identical to
+   * the device route, for identical reasons.
+   *
+   * `token_hash` is not in the RETURNING list. Revoking a credential is not an
+   * occasion to hand it back out.
+   */
+  operator.post('/operator-tokens/:tokenId/revoke', async (req, res, next) => {
+    try {
+      const tokenRow = await withTenant(req.tenantId, async (client) => {
+        const { rows } = await client.query(
+          `UPDATE operator_tokens SET revoked_at = coalesce(revoked_at, now())
+            WHERE tenant_id = $1 AND id = $2
+            RETURNING id, name, created_at, last_seen_at, revoked_at`,
+          [req.tenantId, req.params.tokenId],
+        );
+        return rows[0];
+      });
+      if (!tokenRow) throw new HttpError(404, 'operator token not found');
+      res.json({ operator_token: tokenRow });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
    * What this garage believes is inside, and on what evidence.
    *
    * `inside_count` counts CONFIRMED sessions only — the ones where two loops

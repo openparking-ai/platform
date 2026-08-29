@@ -918,3 +918,156 @@ test('a device that does not exist is not found, and an unauthenticated revoke i
   const noToken = await fetch(`${base}/api/v1/devices/${randomUUID()}/revoke`, { method: 'POST' });
   assert.equal(noToken.status, 401);
 });
+
+// ---------------------------------------------------------------------------
+// Revoking an OPERATOR token — the device revoke's twin.
+//
+// `operator_tokens.revoked_at` (0003:71) and `resolve_operator_token`'s
+// `AND t.revoked_at IS NULL` (0003:92) have been there since 0003 with nothing
+// setting the column, exactly as `lane_devices` was until the route above. The
+// case is weaker than the device one — an operator token is issued by
+// `scripts/issue-operator-token.js`, so the person who would revoke one already
+// has the psql access to UPDATE it — and these tests are here for the same
+// reason the route is: "you still have psql" was not an acceptable answer for
+// devices either.
+//
+// As with the device tests, these are about the route and the seam it reaches,
+// not about the SQL, which was already there.
+
+/** An operator token AND its id, which `issueOperatorToken` does not return. */
+async function issueOperatorTokenRow(tenantId, name = 'ops') {
+  const token = generateDeviceToken();
+  const row = await withTenant(tenantId, async (c) => {
+    const { rows } = await c.query(
+      `INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,$2,$3)
+       RETURNING id, name`,
+      [tenantId, name, hashToken(token)],
+    );
+    return rows[0];
+  });
+  return { id: row.id, token };
+}
+
+const revokeOperatorToken = (tokenId, token = operatorToken) =>
+  fetch(`${base}/api/v1/operator-tokens/${tokenId}/revoke`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}` },
+  });
+
+/**
+ * Every operator route, DERIVED from src/app.js rather than typed here.
+ *
+ * A hard-coded list cannot notice a route added later, and a route added later
+ * is exactly the thing that could sit outside the auth middleware. This reads
+ * the same source the router is built from, so a new `operator.<verb>(...)`
+ * line joins this test automatically or breaks the parse loudly.
+ */
+async function operatorRoutesFromSource() {
+  const src = await readFile(new URL('../src/app.js', import.meta.url), 'utf8');
+  const routes = [...src.matchAll(/^ {2}operator\.(get|post|patch|put|delete)\('([^']+)'/gm)].map(
+    (m) => ({ method: m[1].toUpperCase(), path: m[2] }),
+  );
+  assert.ok(routes.length >= 9, `expected the operator surface, parsed ${routes.length} routes`);
+  return routes;
+}
+
+test('a revoked operator token is refused on EVERY operator route, and a sibling still works', async () => {
+  // The device test's shape: 200 before, revoke, 401 after, sibling unaffected.
+  // The sibling is what stops this passing because revocation broke the tenant
+  // rather than the credential.
+  const stolen = await issueOperatorTokenRow(tenant, 'stolen ops token');
+  const sibling = await issueOperatorTokenRow(tenant, 'sibling ops token');
+
+  const listGarages = (token) =>
+    fetch(`${base}/api/v1/garages/${world.garage}/sessions/open`, asOperator(token));
+
+  assert.equal((await listGarages(stolen.token)).status, 200, 'must work before it is revoked');
+
+  const revoked = await revokeOperatorToken(stolen.id);
+  assert.equal(revoked.status, 200);
+  const body = await revoked.json();
+  assert.ok(body.operator_token.revoked_at, 'the row must carry when it was revoked');
+  assert.ok(!('token_hash' in body.operator_token), 'revoking must not hand the credential back');
+
+  // Every operator route, not a sample: the credential stops resolving, so
+  // nothing behind it — validation, direction, tenancy — gets a say.
+  for (const route of await operatorRoutesFromSource()) {
+    const path = route.path
+      .replace(':garageId', world.garage)
+      .replace(':laneId', world.entryLane)
+      .replace(':deviceId', randomUUID())
+      .replace(':tokenId', randomUUID());
+    const res = await fetch(`${base}/api/v1${path}`, {
+      method: route.method,
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${stolen.token}` },
+      body: route.method === 'GET' ? undefined : '{}',
+    });
+    assert.equal(res.status, 401, `${route.method} ${route.path} must be 401 for a revoked token`);
+    assert.deepEqual(await res.json(), { error: 'unknown or revoked operator token' });
+  }
+
+  assert.equal(
+    (await listGarages(sibling.token)).status,
+    200,
+    'revoking one operator token must not lock the tenant out',
+  );
+});
+
+test('revoking an operator token twice does not move when it stopped being trusted', async () => {
+  const doomed = await issueOperatorTokenRow(tenant, 'ops revoked twice');
+
+  const first = await (await revokeOperatorToken(doomed.id)).json();
+  const second = await (await revokeOperatorToken(doomed.id)).json();
+
+  assert.ok(first.operator_token.revoked_at);
+  assert.equal(second.operator_token.revoked_at, first.operator_token.revoked_at);
+});
+
+test("an operator of another tenant cannot revoke this tenant's operator token", async () => {
+  // Row-level security makes it not-found rather than forbidden. The control is
+  // the same call with the RIGHT token, which must succeed — without it a 404
+  // proves only that the route is broken.
+  const mine = await issueOperatorTokenRow(tenant, 'another tenant may not touch this');
+
+  const other = await createTenant('ops-revoke-outsider');
+  const outsiderToken = await issueOperatorToken(other);
+
+  const refused = await revokeOperatorToken(mine.id, outsiderToken);
+  assert.equal(refused.status, 404);
+  assert.deepEqual(await refused.json(), { error: 'operator token not found' });
+
+  // And the row is untouched, not merely invisible: it still authenticates.
+  assert.equal(
+    (await fetch(`${base}/api/v1/garages/${world.garage}/sessions/open`, asOperator(mine.token)))
+      .status,
+    200,
+    'a refused cross-tenant revoke must not have revoked it anyway',
+  );
+
+  assert.equal((await revokeOperatorToken(mine.id)).status, 200, 'control: the owner can revoke it');
+});
+
+test('an operator token that does not exist is not found, and an unauthenticated revoke is refused', async () => {
+  assert.equal((await revokeOperatorToken(randomUUID())).status, 404);
+
+  const noToken = await fetch(`${base}/api/v1/operator-tokens/${randomUUID()}/revoke`, {
+    method: 'POST',
+  });
+  assert.equal(noToken.status, 401);
+});
+
+test('an operator can revoke the token it is holding, and is locked out immediately after', async () => {
+  // Not a special case in the route, and the test exists to prove that: the
+  // UPDATE has already happened when the response is written, so the call that
+  // revokes succeeds and the next one does not.
+  const selfRevoking = await issueOperatorTokenRow(tenant, 'revokes itself');
+
+  const res = await revokeOperatorToken(selfRevoking.id, selfRevoking.token);
+  assert.equal(res.status, 200);
+
+  const after = await fetch(
+    `${base}/api/v1/garages/${world.garage}/sessions/open`,
+    asOperator(selfRevoking.token),
+  );
+  assert.equal(after.status, 401);
+});
