@@ -793,3 +793,128 @@ test('every kind reconciliation counts is a kind a lane may still report', async
     assert.ok(LANE_EVENT_KINDS.includes(kind), `reconcile.js counts '${kind}', which is refused`);
   }
 });
+
+// --- revoking a device token ------------------------------------------------
+//
+// A device token IS a lane's identity, so a leaked one is a leaked lane. Until
+// this route existed nothing an operator could reach ended that: there is no
+// device DELETE, `PATCH /garages/:id` takes `default_action` and refuses every
+// other field, and setting a garage to `deny` stops vends while leaving
+// /lane/sessions/open and /close fully usable by the stolen token. The only
+// move left was an UPDATE against the production database by hand.
+//
+// The column and the filter are not new — `lane_devices.revoked_at` and
+// `resolve_lane_device`'s `AND d.revoked_at IS NULL` have been there since
+// 0002. What was missing was anything that sets it, so these tests are about
+// the route and about the seam it reaches, not about the SQL.
+
+/** Issue a device through the operator route, which is what returns its id. */
+async function issueDeviceViaRoute(laneId, name, token = operatorToken) {
+  const res = await fetch(`${base}/api/v1/lanes/${laneId}/devices`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify({ name }),
+  });
+  assert.equal(res.status, 201);
+  return res.json();
+}
+
+const revoke = (deviceId, token = operatorToken) =>
+  fetch(`${base}/api/v1/devices/${deviceId}/revoke`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}` },
+  });
+
+test('a revoked device token can no longer open a session, and its sibling still can', async () => {
+  // The probe the third outside pass ran, in both directions: 201 before,
+  // revoke, 401 after. The sibling is what stops this passing because
+  // revocation broke the lane rather than the credential.
+  const stolen = await issueDeviceViaRoute(world.entryLane, 'stolen entry device');
+  const sibling = await issueDeviceViaRoute(world.entryLane, 'sibling entry device');
+
+  const open = (token) =>
+    fetch(
+      `${base}/api/v1/lane/sessions/open`,
+      asDevice(token, {
+        plate: `REVOKE${Math.floor(Math.random() * 1e6)}`,
+        entry_at: new Date().toISOString(),
+        entry_confirmation: 'confirmed',
+      }),
+    );
+
+  assert.equal((await open(stolen.token)).status, 201, 'the token must work before it is revoked');
+
+  const revoked = await revoke(stolen.device.id);
+  assert.equal(revoked.status, 200);
+  assert.ok((await revoked.json()).device.revoked_at, 'the row must carry when it was revoked');
+
+  const after = await open(stolen.token);
+  assert.equal(after.status, 401);
+  assert.deepEqual(await after.json(), { error: 'unknown or revoked device token' });
+
+  assert.equal(
+    (await open(sibling.token)).status,
+    201,
+    'revoking one device must not disable the lane',
+  );
+});
+
+test('a revoked token cannot close either, and is refused BEFORE the direction check', async () => {
+  // An entry token posting a close is normally 409 — wrong direction. Once
+  // revoked it must be 401: the credential stops resolving, so nothing behind
+  // it gets a say. If this ever reads 409 the token is still being resolved.
+  const entry = await issueDeviceViaRoute(world.entryLane, 'entry, to be revoked');
+  const exit = await issueDeviceViaRoute(world.exitLane, 'exit, to be revoked');
+
+  const close = (token) =>
+    fetch(
+      `${base}/api/v1/lane/sessions/close`,
+      asDevice(token, {
+        plate: 'REVOKECLOSE1',
+        exit_at: new Date().toISOString(),
+        exit_confirmation: 'confirmed',
+      }),
+    );
+
+  assert.equal((await close(entry.token)).status, 409, 'an entry token cannot close, by direction');
+
+  assert.equal((await revoke(entry.device.id)).status, 200);
+  assert.equal((await revoke(exit.device.id)).status, 200);
+
+  assert.equal((await close(entry.token)).status, 401);
+  assert.equal((await close(exit.token)).status, 401);
+});
+
+test('revoking twice does not move when the credential stopped being trusted', async () => {
+  const device = await issueDeviceViaRoute(world.entryLane, 'revoked twice');
+
+  const first = await (await revoke(device.device.id)).json();
+  const second = await (await revoke(device.device.id)).json();
+
+  assert.ok(first.device.revoked_at);
+  assert.equal(second.device.revoked_at, first.device.revoked_at);
+});
+
+test("an operator of another tenant cannot revoke this tenant's device", async () => {
+  // Row-level security makes it not-found rather than forbidden: the row is
+  // not visible to ask about. The control is the same call with the RIGHT
+  // operator token, which must succeed — without it a 404 proves only that the
+  // route is broken.
+  const device = await issueDeviceViaRoute(world.entryLane, 'another tenant may not touch this');
+
+  const other = await createTenant('revoke-outsider');
+  const outsiderToken = await issueOperatorToken(other);
+
+  const refused = await revoke(device.device.id, outsiderToken);
+  assert.equal(refused.status, 404);
+  assert.deepEqual(await refused.json(), { error: 'device not found' });
+
+  assert.equal((await revoke(device.device.id)).status, 200, 'control: the owner can revoke it');
+});
+
+test('a device that does not exist is not found, and an unauthenticated revoke is refused', async () => {
+  assert.equal((await revoke(randomUUID())).status, 404);
+
+  const noToken = await fetch(`${base}/api/v1/devices/${randomUUID()}/revoke`, { method: 'POST' });
+  assert.equal(noToken.status, 401);
+});

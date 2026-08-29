@@ -365,6 +365,48 @@ export function createApp() {
   });
 
   /**
+   * Revoke a device token.
+   *
+   * A device token is a lane's identity: it resolves server-side to one lane,
+   * one direction, one garage, one tenant, and the platform records what the
+   * holder reports. A token that leaks is therefore a lane that leaked, and
+   * until this route existed there was no way for an operator to end that.
+   * Setting the garage to `deny` does not: it stops vends, while
+   * `/lane/sessions/open` and `/lane/sessions/close` stay fully usable by the
+   * stolen token. The only remaining move was an UPDATE against the production
+   * database by hand.
+   *
+   * `revoked_at` and the filter that reads it are not new -- they have been in
+   * `lane_devices` and in `resolve_lane_device` since 0002. What was missing
+   * was anything that sets the column.
+   *
+   * `coalesce` rather than a plain assignment: revoking twice is not an error,
+   * and the first revocation is when the credential stopped being trusted. A
+   * second call must not move that moment. There is no route back: a revoked
+   * device is issued again, not un-revoked, so a mistake costs an issuance and
+   * never quietly restores a credential somebody else may be holding.
+   */
+  operator.post('/devices/:deviceId/revoke', async (req, res, next) => {
+    try {
+      const device = await withTenant(req.tenantId, async (client) => {
+        const { rows } = await client.query(
+          `UPDATE lane_devices SET revoked_at = coalesce(revoked_at, now())
+            WHERE tenant_id = $1 AND id = $2
+            RETURNING id, lane_id, name, created_at, revoked_at`,
+          [req.tenantId, req.params.deviceId],
+        );
+        return rows[0];
+      });
+      // Another tenant's device is not found rather than forbidden, which is
+      // what row-level security makes it: the row is not visible to ask about.
+      if (!device) throw new HttpError(404, 'device not found');
+      res.json({ device });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
    * What this garage believes is inside, and on what evidence.
    *
    * `inside_count` counts CONFIRMED sessions only — the ones where two loops
