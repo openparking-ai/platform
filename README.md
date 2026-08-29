@@ -138,6 +138,39 @@ curl -H "authorization: Bearer $OPERATOR_TOKEN" \
   http://127.0.0.1:3000/api/v1/garages/<id>/sessions/open
 ```
 
+### A lane that has gone quiet
+
+`GET /api/v1/garages/<id>/devices` lists the devices on that garage's lanes with
+`last_seen_at` — the column written on every authenticated lane request. It is
+the only place anything can see that a lane has stopped reporting, because a
+lane that is switched off cannot report that it is switched off.
+
+The platform publishes the timestamp and **no verdict**. How long is too long is
+a per-site assumption, and a threshold chosen here would be one nobody measured,
+applied to every site. `revoked_at` is in the listing beside it, because a
+revoked device that stops being seen is not a fault. `token_hash` is not.
+
+### Every conflict names itself
+
+A `409` is this platform's **terminal** refusal: a lane classifies `5xx` as
+retryable and re-sends forever, so anything meant as final arrives as one of
+these and the lane dead-letters it. Seven different conditions produced one
+indistinguishable fact, and one of the seven is a clock skew large enough that
+every session open and close from that lane is being dropped — money leaving the
+record, reported to nobody.
+
+Every `409` body therefore carries a machine-readable `code` beside the human
+`error` message:
+
+```json
+{ "error": "entry_at is 600s ahead of this server's clock, more than the 120s of drift tolerated — a time in the future is not a stay that has happened", "code": "clock_skew" }
+```
+
+It is on **all** of them and not only on the skew, because a code present on one
+refusal and absent from six cannot distinguish "this was not a skew" from "this
+platform is too old to say". A consumer reading that absence as "not a skew"
+would report a healthy clock while the record lost every session the lane sent.
+
 ## Vehicle identity and retention
 
 The database stores real vehicle identity — plate, make, model, colour — because

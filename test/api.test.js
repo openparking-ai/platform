@@ -1071,3 +1071,149 @@ test('an operator can revoke the token it is holding, and is locked out immediat
   );
   assert.equal(after.status, 401);
 });
+
+// --- the devices route, and what a monitor reads off it ---------------------
+//
+// `lane_devices.last_seen_at` is written on every authenticated lane request
+// and was published on no route. A lane that has stopped reporting is one of
+// the malfunctions this estate is supposed to notice, and the platform is the
+// only thing that can see it -- a lane that is switched off cannot report that
+// it is switched off.
+//
+// Two things are proven here and they are different questions. That the ROUTE
+// serves the column, tenant-scoped; and that the column it serves is the one
+// `touch_lane_device` writes -- bumped through a real authenticated lane
+// request and read back changed. Without the second, this could be serving a
+// column nothing ever sets, which reads exactly the same until a lane dies.
+
+const devicesOf = (garageId, token = operatorToken) =>
+  fetch(`${base}/api/v1/garages/${garageId}/devices`, asOperator(token));
+
+test('the devices route lists this garage devices with last_seen_at', async () => {
+  const created = await issueDeviceViaRoute(world.entryLane, 'listed device');
+
+  const res = await devicesOf(world.garage);
+  assert.equal(res.status, 200);
+  const { devices } = await res.json();
+
+  const mine = devices.find((d) => d.id === created.device.id);
+  assert.ok(mine, 'the device just issued on this garage lane must be in the list');
+  assert.deepEqual(
+    Object.keys(mine).sort(),
+    ['created_at', 'id', 'last_seen_at', 'lane_id', 'name', 'revoked_at'].sort(),
+  );
+  // Listing devices is not an occasion to hand out a credential's hash.
+  assert.equal(JSON.stringify(devices).includes('token_hash'), false);
+  // Never used, so never seen. Null and not a fabricated moment.
+  assert.equal(mine.last_seen_at, null);
+});
+
+test('last_seen_at on that route is the column touch_lane_device writes', async () => {
+  // The check that stops this route serving a column nothing sets. A real
+  // authenticated lane request goes through the device router, which calls
+  // touch_lane_device, and the value the route publishes must move with it.
+  const device = await issueDeviceViaRoute(world.entryLane, 'touched device');
+
+  const before = (await (await devicesOf(world.garage)).json()).devices.find(
+    (d) => d.id === device.device.id,
+  );
+  assert.equal(before.last_seen_at, null, 'a device that has never called must read null');
+
+  const used = await fetch(`${base}/api/v1/lane/rules`, {
+    headers: { authorization: `Bearer ${device.token}` },
+  });
+  assert.equal(used.status, 200, 'the lane request itself must succeed, or nothing was touched');
+
+  // touch_lane_device is fire-and-forget on the request path, so the write is
+  // not ordered against the response. Poll rather than sleep a fixed time: a
+  // fixed sleep either flakes or is slower than it needs to be.
+  let after = null;
+  for (let i = 0; i < 50 && !after; i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+    const row = (await (await devicesOf(world.garage)).json()).devices.find(
+      (d) => d.id === device.device.id,
+    );
+    after = row.last_seen_at;
+  }
+  assert.ok(after, 'last_seen_at must move when the device makes an authenticated request');
+  assert.ok(Date.parse(after) > 0);
+});
+
+test("the devices route does not serve another tenant's garage", async () => {
+  // 404 and not 403, and not an empty list: the convention every garage-scoped
+  // operator route here already follows. An empty list would be the dangerous
+  // answer -- a monitor pointed at the wrong garage would report no devices
+  // and therefore nothing wrong.
+  const other = await createTenant('devices-other');
+  const otherWorld = await buildWorld(other);
+  const otherToken = await issueOperatorToken(other);
+
+  const cross = await devicesOf(otherWorld.garage);
+  assert.equal(cross.status, 404);
+  assert.deepEqual(await cross.json(), { error: 'garage not found' });
+
+  // The control: the same call with the RIGHT token finds the garage, so the
+  // 404 above is about the tenant and not about the garage id being wrong.
+  assert.equal((await devicesOf(otherWorld.garage, otherToken)).status, 200);
+});
+
+// --- every 409 names itself -------------------------------------------------
+//
+// A 409 is the platform's terminal refusal and the lane dead-letters it. Seven
+// different conditions produced one indistinguishable fact, and one of the
+// seven -- a clock skew -- means every session open and close that lane sends
+// is being dropped. That is money leaving the record, reported to nobody.
+
+test('a clock-skew refusal carries the code a lane can key on', async () => {
+  const { entry } = await garageWithBothLanes();
+  const res = await openFor(entry, 'SKEWCODE1', secondsAhead(600));
+
+  assert.equal(res.status, 409);
+  const body = await res.json();
+  assert.equal(body.code, 'clock_skew');
+  // The message is still there and is still for a human. The code is what a
+  // machine reads, and it is not derived from the message.
+  assert.match(body.error, /ahead of this server's clock/);
+});
+
+test('another 409 carries a DIFFERENT code, so the skew one distinguishes something', async () => {
+  // The control for the test above. A `code` field that answered `clock_skew`
+  // for every refusal would satisfy that assertion and tell a lane nothing.
+  const { entry } = await garageWithBothLanes();
+  const res = await closeFor(entry, 'SKEWCODE2', hoursAgo(1));
+
+  assert.equal(res.status, 409, 'an entry token cannot close, by direction');
+  const body = await res.json();
+  assert.equal(body.code, 'wrong_lane_direction');
+  assert.notEqual(body.code, 'clock_skew');
+});
+
+test('a 400 carries no code, and a 500 never publishes one', async () => {
+  // The field is published only for errors this file raised, and only below
+  // 500. A driver error carries a SQLSTATE in `code` of its own and must never
+  // reach the wire; it has no `status`, so it becomes a 500 and is answered
+  // 'internal error' with nothing else in the body.
+  const res = await fetch(
+    `${base}/api/v1/lane/sessions/open`,
+    asDevice(entryToken, { entry_at: new Date().toISOString(), entry_confirmation: 'confirmed' }),
+  );
+  assert.equal(res.status, 400);
+  assert.deepEqual(await res.json(), { error: 'plate is required' });
+});
+
+test('no conflict in src/app.js is raised without a name', async () => {
+  // A 409 constructed directly, bypassing `conflict()`, would arrive at a lane
+  // with no code -- indistinguishable from a platform too old to have this
+  // field at all. Swept from the source, because the alternative is a list of
+  // the seven call sites, and a list cannot notice an eighth.
+  const source = await readFile(new URL('../src/app.js', import.meta.url), 'utf8');
+  const bare = /new\s+HttpError\(\s*409\b/g;
+
+  assert.deepEqual(source.match(bare), null, 'every conflict goes through conflict()');
+  // THE CONTROL: the same sweep, over text known to contain one, must find it.
+  // Without this the assertion above passes for a regex that matches nothing.
+  assert.equal('throw new HttpError(409, "x");'.match(bare)?.length, 1);
+  // And the helper really is in use, so the zero above is not zero conflicts.
+  assert.ok(source.includes('const conflict = (code, message) =>'));
+  assert.ok((source.match(/\bconflict\(/g) ?? []).length >= 7);
+});

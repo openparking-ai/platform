@@ -7,13 +7,48 @@ import * as repo from './repository.js';
 import { reconcile } from './reconcile.js';
 
 class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, code = null) {
     super(message);
     this.status = status;
+    // A MACHINE-READABLE name for the refusal, published beside the message.
+    // Null for the statuses that do not carry one; see `conflict` below.
+    this.code = code;
   }
 }
 
 const bad = (message) => new HttpError(400, message);
+
+/**
+ * A 409, and every one of them names itself.
+ *
+ * A 409 is the platform's TERMINAL refusal: the lane classifies 5xx as
+ * retryable and re-sends forever, so anything the platform means as final
+ * arrives as one of these. It dead-letters the item, counts it and logs it --
+ * and until this existed, all seven of them arrived at the lane as the same
+ * fact. One of the seven is a clock skew large enough that every session open
+ * and close from that lane is being dropped, which is money leaving the record;
+ * the others are ordinary. A lane could not tell them apart.
+ *
+ * The distinguishing thing is a FIELD, not the message. A message is prose: it
+ * gets reworded, and a check keyed on its text goes quietly wrong the day
+ * somebody improves it. The lane's own client already decides every failure
+ * from a structure rather than from message text, for exactly this reason.
+ *
+ * It is on ALL seven and not only on the skew, because a code present on one
+ * refusal and absent from six cannot distinguish "this was not a skew" from
+ * "this platform is too old to say" -- and a consumer that read the absence as
+ * "not a skew" would report a healthy clock while the money record lost every
+ * session the lane sent. Under never-wrong-silently the unlabelled case has to
+ * stay distinguishable, so every 409 carries the field.
+ *
+ * Every conflict in this file is built HERE and nowhere else. The status is a
+ * constant rather than a literal precisely so the sweep in `test/api.test.js`
+ * can search the source for the literal and require zero hits: a conflict
+ * raised directly, without a name, would otherwise reintroduce exactly the
+ * ambiguity above and nothing would notice.
+ */
+const CONFLICT_STATUS = 409;
+const conflict = (code, message) => new HttpError(CONFLICT_STATUS, message, code);
 
 /**
  * What a lane does with a confidently-read plate that matches no rule.
@@ -173,6 +208,17 @@ function parseTime(value, label) {
  * than becoming a NaN comparison that is false for every input -- which is this
  * bound silently absent, on a process that started cleanly.
  */
+/**
+ * The name the skew refusal carries in `code`.
+ *
+ * Exported because it is the one 409 a lane derives a MALFUNCTION from -- a
+ * clock running fast dead-letters every session open and close that lane sends
+ * -- so the string is part of this platform's published surface and not an
+ * implementation detail. One copy; `lane-controller` pins this exact value and
+ * its own test names where it came from.
+ */
+export const CLOCK_SKEW = 'clock_skew';
+
 const MAX_CLOCK_SKEW_SECONDS = (() => {
   const raw = process.env.MAX_CLOCK_SKEW_SECONDS;
   if (raw === undefined || raw === '') return 120;
@@ -201,8 +247,8 @@ const MAX_CLOCK_SKEW_SECONDS = (() => {
 function refuseFuture(at, label, now = new Date()) {
   const ahead = (at.getTime() - now.getTime()) / 1000;
   if (ahead > MAX_CLOCK_SKEW_SECONDS) {
-    throw new HttpError(
-      409,
+    throw conflict(
+      CLOCK_SKEW,
       `${label} is ${Math.round(ahead)}s ahead of this server's clock, more than the ` +
         `${MAX_CLOCK_SKEW_SECONDS}s of drift tolerated — a time in the future is not a stay ` +
         'that has happened',
@@ -451,6 +497,44 @@ export function createApp() {
   });
 
   /**
+   * The devices on this garage's lanes, and when each was last heard from.
+   *
+   * `last_seen_at` has been written on every authenticated lane request since
+   * 0002 (`touch_lane_device`), and until this route existed the platform
+   * published it nowhere: the column was returned only by the device-create
+   * response, which is one row at one moment and never again. So the platform
+   * KNEW which lanes had gone quiet and could not tell anybody.
+   *
+   * There is no new column and no new write. This is a read of what is already
+   * recorded, and the malfunction a monitor derives from it -- a lane that has
+   * stopped reporting -- is that consumer's threshold to set, not this
+   * platform's. Publishing the timestamp and refusing to publish a verdict is
+   * deliberate: how long is too long is a per-site assumption, and a number
+   * chosen here would be one nobody measured, applied to every site.
+   *
+   * `token_hash` is not in the list, for the same reason the revoke route does
+   * not return it. `revoked_at` is, because a revoked device that stops being
+   * seen is not a fault and a consumer needs to be able to tell.
+   *
+   * Tenant from the token, as every operator route. Another tenant's garage is
+   * NOT FOUND rather than forbidden -- the row is not visible to ask about,
+   * which is what row-level security makes it, and it is the convention every
+   * other garage-scoped route here already follows.
+   */
+  operator.get('/garages/:garageId/devices', async (req, res, next) => {
+    try {
+      const devices = await withTenant(req.tenantId, async (client) => {
+        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!garage) throw new HttpError(404, 'garage not found');
+        return repo.devicesForGarage(client, req.tenantId, req.params.garageId);
+      });
+      res.json({ devices });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
    * What this garage believes is inside, and on what evidence.
    *
    * `inside_count` counts CONFIRMED sessions only — the ones where two loops
@@ -634,7 +718,9 @@ export function createApp() {
   lane.post('/sessions/open', async (req, res, next) => {
     try {
       const { tenantId, garageId, laneId, direction } = req.device;
-      if (direction !== 'entry') throw new HttpError(409, 'this device is not on an entry lane');
+      if (direction !== 'entry') {
+        throw conflict('wrong_lane_direction', 'this device is not on an entry lane');
+      }
       const {
         plate,
         plate_region: plateRegion = null,
@@ -682,7 +768,7 @@ export function createApp() {
       });
     } catch (err) {
       if (err.code === 'EVENT_ID_VEHICLE_CONFLICT') {
-        return next(new HttpError(409, 'event_id already used for a different vehicle'));
+        return next(conflict('event_id_reused', 'event_id already used for a different vehicle'));
       }
       next(err);
     }
@@ -695,7 +781,9 @@ export function createApp() {
   lane.post('/sessions/close', async (req, res, next) => {
     try {
       const { tenantId, garageId, laneId, direction } = req.device;
-      if (direction !== 'exit') throw new HttpError(409, 'this device is not on an exit lane');
+      if (direction !== 'exit') {
+        throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
+      }
       const { plate, event_id: closeEventId, session_id: sessionId = null } = req.body ?? {};
       if (!plate) throw bad('plate is required');
       if (!closeEventId) throw bad('event_id is required');
@@ -732,7 +820,7 @@ export function createApp() {
           );
         }
         if (sessionId && open.vehicle_id !== vehicle.id) {
-          throw new HttpError(409, 'the named session belongs to a different vehicle');
+          throw conflict('session_vehicle_mismatch', 'the named session belongs to a different vehicle');
         }
 
         if (exitAt < open.entry_at) {
@@ -742,14 +830,14 @@ export function createApp() {
           // classifies as RETRYABLE and would then re-send forever, jamming
           // everything behind it in its outbox. 409 is terminal: the lane
           // dead-letters it, counts it, and moves on.
-          throw new HttpError(
-            409,
+          throw conflict(
+            'stale_exit',
             'exit precedes the entry of the open session — stale exit from an earlier visit',
           );
         }
 
         const rate = await repo.currentRate(client, tenantId, garageId);
-        if (!rate) throw new HttpError(409, 'garage has no rate configured');
+        if (!rate) throw conflict('no_rate_configured', 'garage has no rate configured');
 
         const { feeMinor } = computeFee({
           entryAt: open.entry_at,
@@ -786,7 +874,14 @@ export function createApp() {
   app.use((err, _req, res, _next) => {
     const status = err.status ?? 500;
     if (status >= 500) console.error('[api]', err);
-    res.status(status).json({ error: status >= 500 ? 'internal error' : err.message });
+    if (status >= 500) return res.status(status).json({ error: 'internal error' });
+    // `code` is published only for an error THIS FILE raised. A driver error
+    // carries a `code` of its own -- a Postgres SQLSTATE -- and it has no
+    // `status`, so it becomes a 500 above and never reaches here. The instance
+    // check is the second control on that: nothing that is not ours can put a
+    // name on the wire.
+    const named = err instanceof HttpError && err.code;
+    res.status(status).json(named ? { error: err.message, code: err.code } : { error: err.message });
   });
 
   return app;

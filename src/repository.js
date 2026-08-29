@@ -226,3 +226,26 @@ export async function openSessionsForGarage(client, tenantId, garageId) {
   );
   return rows;
 }
+
+/**
+ * Every device on this garage's lanes, with when it was last heard from.
+ *
+ * The join is what scopes it to a garage: a device belongs to a LANE, and the
+ * lane is what belongs to a garage. `WHERE d.tenant_id = $1` is carried anyway,
+ * beside the tenant policy, exactly as every other function in this file does
+ * -- two independent controls, per docs/RLS_TEMPLATE.md.
+ *
+ * `token_hash` is not selected. Listing devices is not an occasion to hand a
+ * credential's hash to whoever is looking at the list.
+ */
+export async function devicesForGarage(client, tenantId, garageId) {
+  const { rows } = await client.query(
+    `SELECT d.id, d.lane_id, d.name, d.created_at, d.last_seen_at, d.revoked_at
+       FROM lane_devices d
+       JOIN lanes l ON l.id = d.lane_id
+      WHERE d.tenant_id = $1 AND l.garage_id = $2
+      ORDER BY d.created_at`,
+    [tenantId, garageId],
+  );
+  return rows;
+}

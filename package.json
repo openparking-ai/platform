@@ -15,6 +15,7 @@
     "lint": "eslint .",
     "rls-fail-control": "node scripts/rls-fail-control.js",
     "schema-gate-control": "node scripts/schema-gate-control.js",
+    "devices-and-codes-fail-control": "node scripts/devices-and-codes-fail-control.js",
     "demo": "node scripts/demo.js",
     "purge": "node scripts/purge-vehicles.js",
     "issue-operator-token": "node scripts/issue-operator-token.js",
