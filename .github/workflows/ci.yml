@@ -105,3 +105,15 @@ jobs:
         # the file. Then the migration is applied and the same command must
         # serve -- a gate that refuses everything is not a gate either.
         run: npm run schema-gate-control
+
+      - name: Devices-and-codes fail-control
+        # This round published two things a consumer OUTSIDE this platform
+        # depends on: `last_seen_at` on the devices route, so a lane that has
+        # gone quiet can be told from one that is idle; and a `code` on every
+        # conflict, so a clock skew dead-lettering every session can be told
+        # from an ordinary refusal. Each break removes exactly one of those
+        # properties -- including unwiring `touch_lane_device`, which leaves the
+        # route publishing a column nothing sets -- and requires the suite to go
+        # red. A route that serves a dead column reads exactly like one that
+        # works, right up until a lane dies.
+        run: npm run devices-and-codes-fail-control
