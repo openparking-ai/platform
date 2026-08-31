@@ -190,6 +190,35 @@ function confirmation(value, label, allowed = CONFIRMATIONS) {
  */
 const TICKET_REF_SHAPE = /^[A-Z0-9-]{6,64}$/;
 
+/**
+ * The longest `plate` this platform will hold, and it is an ADDITION: until now
+ * `plate` had no shape rule of any kind.
+ *
+ * A bound and not an alphabet. This platform does not know the world's plate
+ * formats -- they carry spaces, dots, accents and scripts, and a closed
+ * alphabet here would refuse real vehicles in jurisdictions nobody on this
+ * project has seen. What it CAN stand behind is that a plate is a string, that
+ * it is not blank, and that it is not a device token's worth of text: a value
+ * that is only whitespace is an identity nobody read, and an unbounded one is a
+ * lookup key an attacker chooses the size of.
+ *
+ * It is a DECISION, not a measurement of any plate anywhere.
+ */
+const PLATE_MAX = 32;
+
+/**
+ * THE TYPE IS TESTED BEFORE THE SHAPE, and that is the whole of this paragraph.
+ *
+ * `String(value)` on a JSON array or a number produces something a regex is
+ * happy to match -- `["ABCDEF"]` becomes `ABCDEF` -- so a coercion in front of
+ * a shape rule is a shape rule that reads a value the caller did not send. The
+ * lane refuses a non-string `ticket_ref` at `vend.parse`, and
+ * `lane-controller`'s `contract.py` publishes a claim about which side of that
+ * seam fails first; a claim about a rule should be true of the rule.
+ *
+ * A third party calls this route without going through our lane at all, which
+ * is the premise of the whole project, so this side does its own typing.
+ */
 function laneIdentity(source, { where = 'body' } = {}) {
   const plate = source?.plate ?? null;
   const ticketRef = source?.ticket_ref ?? null;
@@ -199,11 +228,21 @@ function laneIdentity(source, { where = 'body' } = {}) {
         `this request sent ${plate && ticketRef ? 'both' : 'neither'}`,
     );
   }
-  if (ticketRef && !TICKET_REF_SHAPE.test(String(ticketRef))) {
-    throw bad(
-      'ticket_ref must be 6 to 64 characters of A-Z, 0-9 and hyphen; ' +
-        'this platform verifies nothing else about a ticket',
-    );
+  if (ticketRef !== null && ticketRef !== undefined) {
+    if (typeof ticketRef !== 'string' || !TICKET_REF_SHAPE.test(ticketRef)) {
+      throw bad(
+        'ticket_ref must be a string of 6 to 64 characters of A-Z, 0-9 and hyphen; ' +
+          'this platform verifies nothing else about a ticket',
+      );
+    }
+  }
+  if (plate !== null && plate !== undefined) {
+    if (typeof plate !== 'string' || plate.trim() === '' || plate.length > PLATE_MAX) {
+      throw bad(
+        `plate must be a string of at most ${PLATE_MAX} characters and not only whitespace; ` +
+          'this platform bounds a plate and does not otherwise check its shape',
+      );
+    }
   }
   return { plate: plate ? String(plate) : null, ticketRef: ticketRef ? String(ticketRef) : null };
 }

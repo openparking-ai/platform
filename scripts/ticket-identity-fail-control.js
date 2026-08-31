@@ -36,6 +36,11 @@
  *                        prevent, and without it the whole purge fails.
  *   no_assisted_kind     the platform stops knowing the event kind the lane's
  *                        assisted vend writes BEFORE it pulses the relay.
+ *   ticket_coercion      the type test in front of the shape rule is replaced
+ *                        by `String(...)` again, so a JSON array or a number
+ *                        becomes a ticket the caller never sent.
+ *   no_plate_shape       `plate` loses the shape rule this round gave it, so a
+ *                        blank or unbounded plate identifies a stay again.
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with one
  * constraint edited out of 0007, so the constraint genuinely never existed
@@ -50,7 +55,10 @@
  * A control that cannot restore what it broke is a control that leaves the next
  * run meaningless.
  *
- *   drop_exactly_one     `vehicles_exactly_one_identity` never created.
+ *   drop_exactly_one     `vehicles_exactly_one_identity` never created, in
+ *                        either migration that touches it.
+ *   weak_exactly_one     0008 never applied, so the constraint is 0007's XOR
+ *                        alone and an empty string counts as an identity.
  *   drop_ticket_unique   `vehicles_tenant_ticket_ref_key` never created.
  */
 import { spawnSync } from 'node:child_process';
@@ -136,25 +144,80 @@ const SOURCE_BREAKS = [
     from: "  'assisted_identity',\n  'decision',",
     to: "  'decision',",
   },
+  {
+    name: 'ticket_coercion',
+    why: 'a JSON array or a number is coerced into a ticket and opens a stay',
+    file: 'src/app.js',
+    from: `    if (typeof ticketRef !== 'string' || !TICKET_REF_SHAPE.test(ticketRef)) {`,
+    to: `    if (!TICKET_REF_SHAPE.test(String(ticketRef))) {`,
+  },
+  {
+    name: 'no_plate_shape',
+    why: 'a plate is any value at all again, blank or unbounded',
+    file: 'src/app.js',
+    from: `    if (typeof plate !== 'string' || plate.trim() === '' || plate.length > PLATE_MAX) {`,
+    to: `    if (false) {`,
+  },
 ];
 
-const MIGRATION = '0007_vehicle_ticket_identity.sql';
+const ADDED_0007 = '0007_vehicle_ticket_identity.sql';
+const ADDED_0008 = '0008_identity_not_empty.sql';
+
+/**
+ * The 0008 statements, as one edit. The constraint lives in 0008 now — 0007 is
+ * never edited to move it, because 0007 is applied everywhere it will ever be
+ * applied — so a break that wants NO exactly-one constraint has to reach both
+ * files, and a break that wants the OLD one has to reach only the later.
+ */
+const DROP_AND_ADD_0008 = `ALTER TABLE vehicles DROP CONSTRAINT vehicles_exactly_one_identity;
+
+ALTER TABLE vehicles
+  ADD CONSTRAINT vehicles_exactly_one_identity
+    CHECK (
+      ((plate IS NULL) <> (ticket_ref IS NULL))
+      AND (plate IS NULL OR length(plate) > 0)
+      AND (ticket_ref IS NULL OR length(ticket_ref) > 0)
+    );`;
+
+const ADD_0007 = `ALTER TABLE vehicles
+  ADD CONSTRAINT vehicles_exactly_one_identity
+    CHECK ((plate IS NULL) <> (ticket_ref IS NULL));`;
 
 const SCHEMA_BREAKS = [
   {
     name: 'drop_exactly_one',
     why: 'a vehicle row may carry both identities, or neither',
-    from: `ALTER TABLE vehicles
-  ADD CONSTRAINT vehicles_exactly_one_identity
-    CHECK ((plate IS NULL) <> (ticket_ref IS NULL));`,
-    to: '-- the exactly-one constraint, removed by the fail-control',
+    edits: [
+      {
+        file: ADDED_0008,
+        from: DROP_AND_ADD_0008,
+        to: '-- 0008, removed by the fail-control',
+      },
+      { file: ADDED_0007, from: ADD_0007, to: '-- the exactly-one constraint, removed by the fail-control' },
+    ],
+  },
+  {
+    name: 'weak_exactly_one',
+    why: 'the constraint is 0007\'s again, so an empty string is an identity',
+    edits: [
+      {
+        file: ADDED_0008,
+        from: DROP_AND_ADD_0008,
+        to: '-- 0008, removed by the fail-control',
+      },
+    ],
   },
   {
     name: 'drop_ticket_unique',
     why: 'one ticket may identify two vehicles in one tenant',
-    from: `ALTER TABLE vehicles
+    edits: [
+      {
+        file: ADDED_0007,
+        from: `ALTER TABLE vehicles
   ADD CONSTRAINT vehicles_tenant_ticket_ref_key UNIQUE (tenant_id, ticket_ref);`,
-    to: '-- the ticket unique constraint, removed by the fail-control',
+        to: '-- the ticket unique constraint, removed by the fail-control',
+      },
+    ],
   },
 ];
 
@@ -238,13 +301,15 @@ async function buildScratch(dir, brk) {
   for (const file of readdirSync(join(ROOT, 'migrations')).filter((f) => f.endsWith('.sql'))) {
     copyFileSync(join(ROOT, 'migrations', file), join(partial, file));
   }
-  const path = join(partial, MIGRATION);
-  const sql = readFileSync(path, 'utf8');
-  if (!sql.includes(brk.from)) {
-    rmSync(partial, { recursive: true, force: true });
-    return { ok: false, partial: null };
+  for (const edit of brk.edits) {
+    const path = join(partial, edit.file);
+    const sql = readFileSync(path, 'utf8');
+    if (!sql.includes(edit.from)) {
+      rmSync(partial, { recursive: true, force: true });
+      return { ok: false, where: edit.file };
+    }
+    writeFileSync(path, sql.replace(edit.from, edit.to));
   }
-  writeFileSync(path, sql.replace(brk.from, brk.to));
 
   for (const [script, extra] of [
     ['scripts/migrate.js', { MIGRATIONS_DIR: partial }],
@@ -319,7 +384,7 @@ for (const brk of SCHEMA_BREAKS) {
   try {
     const built = await buildScratch(dir, brk);
     if (!built.ok) {
-      console.error(`  ${brk.name.padEnd(22)} *** ANCHOR NOT FOUND in ${MIGRATION} ***`);
+      console.error(`  ${brk.name.padEnd(22)} *** ANCHOR NOT FOUND in ${built.where} ***`);
       failures += 1;
       continue;
     }

@@ -187,6 +187,108 @@ test('a ticket outside the closed alphabet or the length bound is refused', asyn
   }
 });
 
+// --- the TYPE, before the shape --------------------------------------------
+
+test('a ticket_ref that is not a string is refused, and never coerced into one', async () => {
+  // `String(["ABCDEF"])` is "ABCDEF", so a coercion in front of the regex makes
+  // the shape rule read a value the caller never sent — and opens a stay on it.
+  // `lane-controller`'s contract.py publishes a claim that this platform's copy
+  // of the rule fails in the safe direction; the type is the half that was not
+  // true of it.
+  for (const ref of [['ABCDEF'], 123456, { toString: () => 'ABCDEF' }, true]) {
+    const res = await openStay({
+      ticket_ref: ref,
+      entry_at: halfAnHourAgo(),
+      entry_confirmation: 'confirmed',
+    });
+    assert.equal(res.status, 400, `${JSON.stringify(ref)} is not a string and is not a ticket_ref`);
+    assert.match((await res.json()).error, /must be a string/);
+  }
+  // THE CONTROL: the same request with a real string is accepted, so the four
+  // refusals above are the type test and not a route that refuses everything.
+  const res = await openStay({
+    ticket_ref: ticket(),
+    entry_at: halfAnHourAgo(),
+    entry_confirmation: 'confirmed',
+  });
+  assert.equal(res.status, 201);
+});
+
+test('a plate has a shape rule now: a string, not blank, bounded', async () => {
+  // AN ADDITION. Until this round `plate` had no rule of any kind: a 4 kB plate
+  // and a plate of three spaces both opened a stay. It is a bound and not an
+  // alphabet — this platform does not know the world's plate formats.
+  for (const value of [['ABC123'], 7, '   ', '\t\n ', 'P'.repeat(33)]) {
+    const res = await openStay({
+      plate: value,
+      entry_at: halfAnHourAgo(),
+      entry_confirmation: 'confirmed',
+    });
+    assert.equal(res.status, 400, `${JSON.stringify(value)} is not a plate`);
+    assert.match((await res.json()).error, /plate must be a string/);
+  }
+  // THE CONTROL: an ordinary plate, and one exactly at the bound, are accepted.
+  for (const value of [plate(), 'P'.repeat(32)]) {
+    const res = await openStay({
+      plate: value,
+      entry_at: halfAnHourAgo(),
+      entry_confirmation: 'confirmed',
+    });
+    assert.equal(res.status, 201, `${value} is inside the bound and must be accepted`);
+  }
+});
+
+// --- the constraint matches the route --------------------------------------
+
+test('an empty string is not an identity at the constraint either', async () => {
+  // `'' IS NULL` is false, so 0007's XOR alone counted the empty string as an
+  // identity: a row with a plate column that is not null and holds nothing.
+  // Migration 0008 is what makes "exactly one" mean one that is there.
+  for (const [column, value] of [
+    ['ticket_ref', ''],
+    ['plate', ''],
+  ]) {
+    await assert.rejects(
+      withTenant(tenant, (c) =>
+        c.query(`INSERT INTO vehicles (tenant_id, ${column}) VALUES ($1,$2)`, [tenant, value]),
+      ),
+      (err) => err.code === '23514',
+      `an empty ${column} must violate vehicles_exactly_one_identity`,
+    );
+  }
+  // THE CONTROLS: the same statement shape with a real value is accepted in
+  // both columns, so the two rejections are the constraint and not a broken
+  // INSERT — and the route's own refusal is unchanged.
+  await withTenant(tenant, (c) =>
+    c.query('INSERT INTO vehicles (tenant_id, ticket_ref) VALUES ($1,$2)', [tenant, ticket()]),
+  );
+  await withTenant(tenant, (c) =>
+    c.query('INSERT INTO vehicles (tenant_id, plate) VALUES ($1,$2)', [tenant, plate()]),
+  );
+});
+
+test('the redaction still satisfies the constraint it was written under', async () => {
+  // 0007 put no shape check in the database because the purge writes
+  // `redacted:<row id>` into whichever column the row carries. 0008 adds a
+  // non-empty test rather than a shape, so that value still satisfies it.
+  const id = await withTenant(tenant, async (c) =>
+    (
+      await c.query(
+        'INSERT INTO vehicles (tenant_id, ticket_ref) VALUES ($1,$2) RETURNING id',
+        [tenant, ticket()],
+      )
+    ).rows[0].id,
+  );
+  await withTenant(tenant, (c) =>
+    c.query(`UPDATE vehicles SET ticket_ref = 'redacted:' || id WHERE id = $1`, [id]),
+  );
+  const row = await withTenant(tenant, async (c) =>
+    (await c.query('SELECT plate, ticket_ref FROM vehicles WHERE id = $1', [id])).rows[0],
+  );
+  assert.equal(row.plate, null);
+  assert.equal(row.ticket_ref, `redacted:${id}`);
+});
+
 // --- uniqueness ------------------------------------------------------------
 
 test('a ticket is unique per tenant: the same ref is the same vehicle', async () => {

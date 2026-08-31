@@ -58,6 +58,14 @@ as the one identity retention could not remove. `test/retention.test.js` asserts
 the redaction and carries the control that a ticket inside the window is left
 alone.
 
+**Added with migration 0008:** the same constraint also refuses an identity that
+is an EMPTY STRING in either column. `'' IS NULL` is false, so 0007's XOR alone
+counted a blank as an identity and a direct `INSERT` could write a row that had
+one in name only. The placeholder the purge writes — `redacted:<row id>` — is 45
+characters, so redaction satisfies the stronger constraint exactly as it
+satisfied the weaker one; nothing about the window, the rules or the statement
+changes.
+
 The session keeps its times and its fee. `test/retention.test.js` asserts
 exactly that, because it is the property most likely to be broken by someone
 later deciding deletion is tidier.
