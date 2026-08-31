@@ -119,6 +119,13 @@ const LANE_EVENT_KINDS = [
   'armed',
   'arming_incomplete',
   'arming_rejected',
+  // The lane's assisted vend: an identity a display or a human completed,
+  // recorded BEFORE the relay is pulsed. Its detail names the identity's KIND,
+  // the authority, the caller's idempotency key and the decision it completes
+  // — and never the ticket reference itself. `events` is append-only by grant,
+  // so the retention purge cannot reach a detail: a reference written here
+  // would be the one identity on this platform that could never be removed.
+  'assisted_identity',
   'decision',
   'entry_backed_out',
   'entry_confirmed',
@@ -151,6 +158,93 @@ function confirmation(value, label, allowed = CONFIRMATIONS) {
     throw bad(`${label} is required and must be one of ${allowed.join(', ')}`);
   }
   return value;
+}
+
+/**
+ * The two identities a stay can be opened or found on, and the rule between them.
+ *
+ * A vehicle used to BE a plate. It is now exactly one of:
+ *
+ *   plate       a plate a camera READ
+ *   ticket_ref  an identity a display or a person ASSERTED, which is what the
+ *               intercom can produce for a driver whose plate could not be read
+ *
+ * EXACTLY ONE, and the refusal names the rule rather than one missing field.
+ * Neither means there is no identity to hold a stay against. BOTH would be a
+ * claim that this platform established the plate and the ticket belong to the
+ * same vehicle — a measurement and an assertion, joined by nothing here. That
+ * binding is the identity module's job; `vehicles_exactly_one_identity` in
+ * migration 0007 is what stops it being done accidentally in this one.
+ *
+ * `ticket_ref` IS OPAQUE TO THIS PLATFORM. What is checked is a closed alphabet
+ * and a length, and nothing else: no signature, no expiry, no issuer. The agent
+ * that mints and verifies tickets is a different module and this is not it, so
+ * this platform's own claim about a ticket is exactly "it is unique per tenant
+ * and it looks like a ticket" — which is what it can stand behind.
+ *
+ * The alphabet is closed rather than "any string" because this value is a
+ * lookup key that is quoted into no SQL but is echoed into responses, compared
+ * against a plate column's contents and read out over a telephone. Upper case,
+ * digits and a hyphen are what survives all three; a length bound is what stops
+ * a device token's worth of text becoming a vehicle's identity.
+ */
+const TICKET_REF_SHAPE = /^[A-Z0-9-]{6,64}$/;
+
+/**
+ * The longest `plate` this platform will hold, and it is an ADDITION: until now
+ * `plate` had no shape rule of any kind.
+ *
+ * A bound and not an alphabet. This platform does not know the world's plate
+ * formats -- they carry spaces, dots, accents and scripts, and a closed
+ * alphabet here would refuse real vehicles in jurisdictions nobody on this
+ * project has seen. What it CAN stand behind is that a plate is a string, that
+ * it is not blank, and that it is not a device token's worth of text: a value
+ * that is only whitespace is an identity nobody read, and an unbounded one is a
+ * lookup key an attacker chooses the size of.
+ *
+ * It is a DECISION, not a measurement of any plate anywhere.
+ */
+const PLATE_MAX = 32;
+
+/**
+ * THE TYPE IS TESTED BEFORE THE SHAPE, and that is the whole of this paragraph.
+ *
+ * `String(value)` on a JSON array or a number produces something a regex is
+ * happy to match -- `["ABCDEF"]` becomes `ABCDEF` -- so a coercion in front of
+ * a shape rule is a shape rule that reads a value the caller did not send. The
+ * lane refuses a non-string `ticket_ref` at `vend.parse`, and
+ * `lane-controller`'s `contract.py` publishes a claim about which side of that
+ * seam fails first; a claim about a rule should be true of the rule.
+ *
+ * A third party calls this route without going through our lane at all, which
+ * is the premise of the whole project, so this side does its own typing.
+ */
+function laneIdentity(source, { where = 'body' } = {}) {
+  const plate = source?.plate ?? null;
+  const ticketRef = source?.ticket_ref ?? null;
+  if (Boolean(plate) === Boolean(ticketRef)) {
+    throw bad(
+      `exactly one of plate or ticket_ref is required in the ${where}; ` +
+        `this request sent ${plate && ticketRef ? 'both' : 'neither'}`,
+    );
+  }
+  if (ticketRef !== null && ticketRef !== undefined) {
+    if (typeof ticketRef !== 'string' || !TICKET_REF_SHAPE.test(ticketRef)) {
+      throw bad(
+        'ticket_ref must be a string of 6 to 64 characters of A-Z, 0-9 and hyphen; ' +
+          'this platform verifies nothing else about a ticket',
+      );
+    }
+  }
+  if (plate !== null && plate !== undefined) {
+    if (typeof plate !== 'string' || plate.trim() === '' || plate.length > PLATE_MAX) {
+      throw bad(
+        `plate must be a string of at most ${PLATE_MAX} characters and not only whitespace; ` +
+          'this platform bounds a plate and does not otherwise check its shape',
+      );
+    }
+  }
+  return { plate: plate ? String(plate) : null, ticketRef: ticketRef ? String(ticketRef) : null };
 }
 
 /**
@@ -690,17 +784,21 @@ export function createApp() {
   });
 
   /**
-   * What is currently open for this plate, so the exit lane can name the
-   * session it is closing rather than leaving the platform to guess from a
-   * plate. Best effort: an offline lane simply closes without it.
+   * What is currently open for this identity, so the exit lane can name the
+   * session it is closing rather than leaving the platform to guess from it.
+   * Best effort: an offline lane simply closes without it.
+   *
+   * `?plate=` or `?ticket_ref=`, exactly one, by the same rule the open uses —
+   * a stay opened on a ticket has no plate to be looked up by, and a lookup
+   * that could only ask about plates would leave every ticket stay
+   * unfindable at the exit.
    */
   lane.get('/sessions/open', async (req, res, next) => {
     try {
       const { tenantId, garageId } = req.device;
-      const plate = req.query?.plate;
-      if (!plate) throw bad('plate is required');
+      const identity = laneIdentity(req.query, { where: 'query string' });
       const session = await withTenant(tenantId, (client) =>
-        repo.findOpenSessionByPlate(client, tenantId, garageId, String(plate)),
+        repo.findOpenSessionByIdentity(client, tenantId, garageId, identity),
       );
       if (!session) throw new HttpError(404, 'no open session for this vehicle');
       res.json({ session: presentSession(session) });
@@ -722,7 +820,6 @@ export function createApp() {
         throw conflict('wrong_lane_direction', 'this device is not on an entry lane');
       }
       const {
-        plate,
         plate_region: plateRegion = null,
         event_id: openEventId,
         make = null,
@@ -730,7 +827,11 @@ export function createApp() {
         color = null,
         attributes = null,
       } = req.body ?? {};
-      if (!plate) throw bad('plate is required');
+      // Exactly one of plate or ticket_ref. A lane that sends only a plate is
+      // an older lane and is unchanged by this; a lane that sends a ticket is
+      // the intercom completing an identity for a driver the camera could not
+      // read.
+      const { plate, ticketRef } = laneIdentity(req.body);
       const entryConfirmation = confirmation(req.body?.entry_confirmation, 'entry_confirmation');
       // Required, not optional. Without it there is no key to be idempotent on
       // and the only thing left to check is state -- which is exactly how a
@@ -742,7 +843,7 @@ export function createApp() {
         const garage = await repo.getGarage(client, tenantId, garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
         const vehicle = await repo.upsertVehicle(client, tenantId, {
-          plate, plateRegion, seenAt: entryAt, make, model, color, attributes,
+          plate, ticketRef, plateRegion, seenAt: entryAt, make, model, color, attributes,
         });
         return repo.openSession(client, tenantId, {
           garageId,
@@ -784,8 +885,12 @@ export function createApp() {
       if (direction !== 'exit') {
         throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
       }
-      const { plate, event_id: closeEventId, session_id: sessionId = null } = req.body ?? {};
-      if (!plate) throw bad('plate is required');
+      const { event_id: closeEventId, session_id: sessionId = null } = req.body ?? {};
+      // The same rule at the other end of the stay. Without it a stay opened on
+      // a ticket could never be closed: the close would upsert a vehicle from a
+      // plate it does not have, find no open session, and 404 — a car that got
+      // in and a stay that stays open and unbilled for ever.
+      const { plate, ticketRef } = laneIdentity(req.body);
       if (!closeEventId) throw bad('event_id is required');
       const exitConfirmation = confirmation(
         req.body?.exit_confirmation,
@@ -801,7 +906,9 @@ export function createApp() {
         const already = await repo.findSessionByCloseEvent(client, tenantId, String(closeEventId));
         if (already) return { session: already, closed: false, replay: true };
 
-        const vehicle = await repo.upsertVehicle(client, tenantId, { plate, seenAt: exitAt });
+        const vehicle = await repo.upsertVehicle(client, tenantId, {
+          plate, ticketRef, seenAt: exitAt,
+        });
 
         // When the lane names the session, that is the session -- no guessing
         // from a plate, so a stale exit from an earlier visit can never land on

@@ -36,6 +36,7 @@ everything identifying is replaced:
 
 ```
 plate         -> 'redacted:<row id>'   (keeps the unique index satisfied, carries nothing)
+ticket_ref    -> 'redacted:<row id>'   (the same, for a stay identified by a ticket)
 plate_region  -> NULL
 make          -> NULL
 model         -> NULL
@@ -43,6 +44,27 @@ color         -> NULL
 attributes    -> {}
 redacted_at   -> when it happened
 ```
+
+**Added with migration 0007:** a vehicle is identified by a plate **or** a
+ticket reference — exactly one, enforced by `vehicles_exactly_one_identity` —
+and a ticket is personal data on the same terms a plate is. It is a code minted
+for one arrival, read out over an intercom or carried on a downloadable ticket,
+and it identifies a stay for as long as it exists. So it ages out on the **same
+window**, under the **same never-redact rules**, in the same statement. The
+redaction writes the placeholder into whichever of the two columns the row
+carries and leaves the other NULL: filling both would violate the exactly-one
+constraint and fail the whole purge, and filling neither would leave the ticket
+as the one identity retention could not remove. `test/retention.test.js` asserts
+the redaction and carries the control that a ticket inside the window is left
+alone.
+
+**Added with migration 0008:** the same constraint also refuses an identity that
+is an EMPTY STRING in either column. `'' IS NULL` is false, so 0007's XOR alone
+counted a blank as an identity and a direct `INSERT` could write a row that had
+one in name only. The placeholder the purge writes — `redacted:<row id>` — is 45
+characters, so redaction satisfies the stronger constraint exactly as it
+satisfied the weaker one; nothing about the window, the rules or the statement
+changes.
 
 The session keeps its times and its fee. `test/retention.test.js` asserts
 exactly that, because it is the property most likely to be broken by someone

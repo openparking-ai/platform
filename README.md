@@ -69,6 +69,40 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 | `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation` |
 | `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation` |
 
+### A stay is identified by a plate or by a ticket — exactly one
+
+The camera used to be the only way into the record. A driver whose plate could
+not be read had no identity for a session to open on, so the intercom had
+nothing to hand this platform even after a human had decided to let the car in.
+
+`vehicles` now carries **exactly one** of:
+
+| | |
+|---|---|
+| `plate` | a plate a camera **read** |
+| `ticket_ref` | an identity a display or a person **asserted** |
+
+Every route that opens, finds or closes a stay takes either, in the same
+exactly-one form — `POST /lane/sessions/open`, `GET /lane/sessions/open`
+(`?plate=` or `?ticket_ref=`) and `POST /lane/sessions/close`. **A lane that
+sends only a plate is unchanged**, and a test asserts that end to end.
+
+Sending **both** is refused. A row carrying a plate and a ticket would be
+claiming this platform established they belong to the same vehicle, and nothing
+here can: the plate is a measurement and the ticket is an assertion. Binding the
+two is the identity module's job, and `vehicles_exactly_one_identity` is what
+keeps it from being done accidentally in this one.
+
+**A `ticket_ref` is opaque here.** What is checked is a closed alphabet and a
+length — 6 to 64 characters of `A-Z`, `0-9` and hyphen — and nothing else: no
+signature, no expiry, no issuer. The agent that mints and verifies tickets is a
+different module. This platform's whole claim about a ticket is that it is
+unique per tenant and that it looks like one.
+
+It is personal data on the same terms a plate is, and the retention purge
+redacts it on the same window — see
+[docs/DATA_RETENTION.md](docs/DATA_RETENTION.md).
+
 ### Every session records what saw the car
 
 A ticket is not an entry. A driver can pull up, take one and drive away, and a
