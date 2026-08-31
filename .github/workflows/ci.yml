@@ -117,3 +117,15 @@ jobs:
         # red. A route that serves a dead column reads exactly like one that
         # works, right up until a lane dies.
         run: npm run devices-and-codes-fail-control
+
+      - name: Ticket-identity fail-control
+        # A stay can now be identified by something no camera read. Each break
+        # removes exactly one property that makes that safe rather than merely
+        # possible -- the exactly-one rule at the route AND at the constraint,
+        # the ticket's shape, the lookup that must not match a plate and a
+        # ticket of the same text, the close that keeps a ticket stay billable,
+        # and the retention purge reaching the new column -- and requires the
+        # suite to go red. Two of them build a scratch database from a copy of
+        # `migrations/` with one constraint edited out, because a rule enforced
+        # only at a route is a rule one direct INSERT goes around.
+        run: npm run ticket-identity-fail-control

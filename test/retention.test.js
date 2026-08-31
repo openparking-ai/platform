@@ -149,6 +149,65 @@ test('the window is per tenant, and shortening it takes effect', async () => {
   assert.ok((await read(id)).redacted_at, 'at 7 days it is now outside the window');
 });
 
+test('a ticket reference is redacted exactly as a plate is', async () => {
+  // A ticket is identity too — a code a driver read out loud, minted for one
+  // arrival. It ages out on the same window, under the same never-redact
+  // rules, and it must not be the one column the purge leaves behind.
+  const ref = `TKT-${randomUUID().replace(/-/g, '').slice(0, 10).toUpperCase()}`;
+  const id = await withTenant(tenant, async (c) => {
+    const v = (
+      await c.query(
+        `INSERT INTO vehicles (tenant_id, ticket_ref, last_seen_at) VALUES ($1,$2,$3) RETURNING id`,
+        [tenant, ref, ago(400)],
+      )
+    ).rows[0].id;
+    await c.query(
+      `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, exit_lane_id,
+                             entry_at, exit_at, currency, fee_minor, hourly_minor_applied,
+                             open_event_id, close_event_id,
+                             entry_confirmation, exit_confirmation)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'USD',250,250,$8,$9,'confirmed','confirmed')`,
+      [
+        tenant, world.garage, v, world.entryLane, world.exitLane,
+        ago(401), ago(400), randomUUID(), randomUUID(),
+      ],
+    );
+    return v;
+  });
+
+  await redactExpiredVehicles(tenant);
+
+  const after = await withTenant(tenant, async (c) =>
+    (
+      await c.query('SELECT plate, ticket_ref, redacted_at FROM vehicles WHERE id = $1', [id])
+    ).rows[0],
+  );
+  assert.match(after.ticket_ref, /^redacted:/, 'the ticket is replaced, not kept');
+  assert.ok(after.redacted_at);
+  // And the row still carries EXACTLY ONE identity, which is what
+  // `vehicles_exactly_one_identity` requires: writing the placeholder into both
+  // columns would fail the whole purge, and into neither would leave nothing to
+  // hold the unique index.
+  assert.equal(after.plate, null, 'redaction must not give a ticket vehicle a plate');
+
+  // THE CONTROL: a ticket inside the window keeps its value, so the assertion
+  // above is the window doing its job and not a purge that redacts everything.
+  const fresh = `TKT-${randomUUID().replace(/-/g, '').slice(0, 10).toUpperCase()}`;
+  const keep = await withTenant(tenant, async (c) =>
+    (
+      await c.query(
+        `INSERT INTO vehicles (tenant_id, ticket_ref, last_seen_at) VALUES ($1,$2,$3) RETURNING id`,
+        [tenant, fresh, ago(1)],
+      )
+    ).rows[0].id,
+  );
+  await redactExpiredVehicles(tenant);
+  const untouched = await withTenant(tenant, async (c) =>
+    (await c.query('SELECT ticket_ref FROM vehicles WHERE id = $1', [keep])).rows[0],
+  );
+  assert.equal(untouched.ticket_ref, fresh);
+});
+
 test('redaction is idempotent', async () => {
   const first = await redactExpiredVehicles(tenant);
   const second = await redactExpiredVehicles(tenant);
