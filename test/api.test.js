@@ -1198,7 +1198,10 @@ test('a 400 carries no code, and a 500 never publishes one', async () => {
     asDevice(entryToken, { entry_at: new Date().toISOString(), entry_confirmation: 'confirmed' }),
   );
   assert.equal(res.status, 400);
-  assert.deepEqual(await res.json(), { error: 'plate is required' });
+  assert.deepEqual(await res.json(), {
+    error:
+      'exactly one of plate or ticket_ref is required in the body; this request sent neither',
+  });
 });
 
 test('no conflict in src/app.js is raised without a name', async () => {

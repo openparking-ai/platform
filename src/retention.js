@@ -11,6 +11,15 @@
  * identifies a person or a car is replaced. `redacted_at` records that it
  * happened, and the placeholder plate keeps the unique index satisfied without
  * carrying any information.
+ *
+ * A vehicle is identified by a plate OR a TICKET REFERENCE (migration 0007),
+ * and both are redacted the same way, on the same window, under the same
+ * never-redact rules. The `CASE` below is what keeps `vehicles_exactly_one_identity`
+ * true through the redaction: whichever column the row carries gets the
+ * placeholder and the other stays NULL. Writing the placeholder into both
+ * would violate the constraint and fail the whole purge; writing it into
+ * neither would leave a ticket — which a person read out loud and which
+ * identifies a stay — as the one piece of identity retention could not remove.
  */
 import { withTenant } from './db.js';
 import * as repo from './repository.js';
@@ -37,7 +46,7 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
 
     if (dryRun) {
       const { rows } = await client.query(
-        `SELECT v.id, v.plate FROM vehicles v ${where} ORDER BY v.last_seen_at`,
+        `SELECT v.id, v.plate, v.ticket_ref FROM vehicles v ${where} ORDER BY v.last_seen_at`,
         [tenantId, now, days],
       );
       return { tenantId, retentionDays: days, redacted: 0, wouldRedact: rows.length, rows };
@@ -45,7 +54,10 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
 
     const { rows } = await client.query(
       `UPDATE vehicles v
-          SET plate        = 'redacted:' || v.id,
+          SET plate        = CASE WHEN v.plate      IS NULL THEN NULL
+                                  ELSE 'redacted:' || v.id END,
+              ticket_ref   = CASE WHEN v.ticket_ref IS NULL THEN NULL
+                                  ELSE 'redacted:' || v.id END,
               plate_region = NULL,
               make         = NULL,
               model        = NULL,
