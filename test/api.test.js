@@ -757,6 +757,42 @@ test('every kind this platform publishes is a kind it accepts', async () => {
   assert.deepEqual(await res.json(), { accepted: LANE_EVENT_KINDS.length, duplicates: 0 });
 });
 
+test('entry_unadmitted is a kind a lane may report, and it opens nothing', async () => {
+  // Written as a LITERAL, not read off `LANE_EVENT_KINDS`: the test above maps
+  // over the exported set, so a kind removed from the list would vanish from
+  // that test's own input and it would stay green. This one names the kind,
+  // so removing it from the list is what turns this red.
+  //
+  // The second assertion is the part the name promises. This kind is the
+  // stuck-boom record -- a crossing nothing admitted -- and it lands in
+  // `events` only: no session opens, nothing counts toward occupancy, and
+  // `entry_confirmation` never sees it (migration 0006: an entry nothing
+  // confirmed is not a session at all).
+  const eventId = randomUUID();
+  const res = await fetch(
+    `${base}/api/v1/lane/events`,
+    asDevice(entryToken, {
+      events: [{ event_id: eventId, kind: 'entry_unadmitted', occurred_at: new Date().toISOString() }],
+    }),
+  );
+  assert.equal(res.status, 202);
+  assert.deepEqual(await res.json(), { accepted: 1, duplicates: 0 });
+
+  const stored = await withTenant(tenant, (c) =>
+    c.query(`SELECT kind FROM events WHERE tenant_id = $1 AND event_id = $2`, [tenant, eventId]),
+  );
+  assert.equal(stored.rows.length, 1);
+  assert.equal(stored.rows[0].kind, 'entry_unadmitted');
+
+  const opened = await withTenant(tenant, (c) =>
+    c.query(`SELECT count(*)::int AS n FROM sessions WHERE tenant_id = $1 AND open_event_id = $2`, [
+      tenant,
+      eventId,
+    ]),
+  );
+  assert.equal(opened.rows[0].n, 0, 'an unadmitted crossing opened a session');
+});
+
 test('an event dated in the future is refused, on the same bound as a session', async () => {
   // The third lane-supplied time. It was unbounded: `reconcile.js` filters
   // `occurred_at >= since` with no upper bound and `retention.js` never touches

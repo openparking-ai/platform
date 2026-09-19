@@ -103,7 +103,13 @@ const EXIT_CONFIRMATIONS = [...CONFIRMATIONS, 'held'];
  *
  * DERIVED FROM THE LANE, NOT INVENTED HERE: every string below is a name in
  * `lane-controller`, taken from the constants in `sync.py` and the literals
- * passed to `events.record()`. `session_open` and `session_close` are
+ * passed to `events.record()` -- with one exception, marked where it sits:
+ * `entry_unadmitted` lands here FIRST, because of the ordering hazard two
+ * paragraphs down, and the lane round that emits it follows. Until that round
+ * merges it is a kind this platform accepts and no lane yet reports, and that
+ * is the only direction the two copies may ever differ in: a platform ahead of
+ * the lane refuses nothing; a lane ahead of the platform is refused 400.
+ * `session_open` and `session_close` are
  * deliberately ABSENT -- the lane's transport routes those two to
  * `/sessions/open` and `/sessions/close` and never to this endpoint, so one
  * arriving here is a lane that has lost its routing, and refusing it is the
@@ -131,6 +137,21 @@ const LANE_EVENT_KINDS = [
   'entry_confirmed',
   'entry_held',
   'entry_pending',
+  // The closing loops saw a FORWARD crossing that no vend preceded. A car is
+  // inside and nothing admitted it: whatever the lane decided, or never saw,
+  // no vend followed, so no pending entry exists for the crossing to promote.
+  // It is none of the other entry kinds: `entry_confirmed` had a pending
+  // entry behind it, `entry_held` had a pending entry and no crossing,
+  // `entry_backed_out` had a pending entry and a REVERSE crossing,
+  // `entry_unconfirmable` is a lane with no closing loops at all, and
+  // `entry_pending` is the vend itself. A stream of these is the stuck-boom
+  // symptom: the camera's job has changed from deciding to recording, and
+  // this is the record. It does NOT open a session and it is NOT an
+  // `entry_confirmation` value -- that column answers "did anything see the
+  // car cross" (yes, the loops did); this kind answers "did anything admit
+  // it" (no), and migration 0006 says an entry nothing confirmed is not a
+  // session at all. Not counted by `reconcile.js`.
+  'entry_unadmitted',
   'entry_unconfirmable',
   'exit_backed_in',
   'exit_confirmed',
