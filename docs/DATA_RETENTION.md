@@ -112,6 +112,11 @@ The session keeps its times and its fee. `test/retention.test.js` asserts
 exactly that, because it is the property most likely to be broken by someone
 later deciding deletion is tidier.
 
+**Added with migration 0013:** `sessions.breakdown` (the engine's ledger lines),
+`sessions.pricing_refusal` (its findings) and `sessions.space_class` (the
+garage's) describe a price, not a person or a car; the purge leaves them where
+they are, as it leaves `fee_minor`.
+
 **Added with migration 0012:** `rate_plans` holds a garage's rate plan
 documents and nothing about a person or a car. The purge does not touch it, and
 `test/rate-plans.test.js` asserts the table is byte-identical across a run in

@@ -1,8 +1,7 @@
 import express from 'express';
 import { pool, withTenant } from './db.js';
 import { bearerFrom, generateDeviceToken, hashToken } from './auth.js';
-import { computeFee } from './fees.js';
-import { toMinor } from './money.js';
+import { assertMinor, toMinor } from './money.js';
 import * as repo from './repository.js';
 import { enqueueShadowSearch } from './shadow.js';
 import * as ratePlans from './ratePlans.js';
@@ -482,23 +481,25 @@ export function createApp() {
       // Optional. A garage that says nothing gets the column default, which is
       // the value this platform has always served.
       const action = defaultAction(req.body?.default_action, { required: false });
+      // Optional, and frozen after creation like the currency: every stay in
+      // the garage is priced as this class (0013), and a plan is refused at
+      // the store unless it declares it.
+      const spaceClass = spaceClassField(req.body?.space_class);
       const garage = await withTenant(req.tenantId, async (client) => {
-        // The column is left out entirely when nothing was asked for, so the
+        // Each column is left out entirely when nothing was asked for, so the
         // value an unconfigured garage gets is written down in exactly one
-        // place -- the column default in 0004. Naming it here too would be a
-        // second copy of the same claim, and the two would drift.
-        const { rows } =
-          action === undefined
-            ? await client.query(
-                `INSERT INTO garages (tenant_id, name, timezone, currency)
-                 VALUES ($1,$2,$3,$4) RETURNING *`,
-                [req.tenantId, name, timezone, currency],
-              )
-            : await client.query(
-                `INSERT INTO garages (tenant_id, name, timezone, currency, default_action)
-                 VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-                [req.tenantId, name, timezone, currency, action],
-              );
+        // place -- the column default in 0004 (0013 for the space class).
+        // Naming it here too would be a second copy of the same claim, and
+        // the two would drift.
+        const columns = ['tenant_id', 'name', 'timezone', 'currency'];
+        const values = [req.tenantId, name, timezone, currency];
+        if (action !== undefined) { columns.push('default_action'); values.push(action); }
+        if (spaceClass !== undefined) { columns.push('space_class'); values.push(spaceClass); }
+        const { rows } = await client.query(
+          `INSERT INTO garages (${columns.join(', ')})
+           VALUES (${values.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`,
+          values,
+        );
         return rows[0];
       });
       res.status(201).json({ garage });
@@ -582,9 +583,9 @@ export function createApp() {
    * version name already used, an effective instant already taken -- is
    * refused here. No engine reachable is a refusal too, not an acceptance.
    *
-   * Nothing prices from what is stored yet: the close route still prices with
-   * src/fees.js. This is the store and its read; re-pointing the close is the
-   * next round's, and the migration says so.
+   * The close route prices from what is stored here (0013): every plan of
+   * the garage goes to the engine, unfiltered, and the engine picks the
+   * version in force at entry.
    */
   operator.post('/garages/:garageId/rate-plans', async (req, res, next) => {
     try {
@@ -1096,14 +1097,23 @@ export function createApp() {
           );
         }
 
-        const rate = await repo.currentRate(client, tenantId, garageId);
-        if (!rate) throw conflict('no_rate_configured', 'garage has no rate configured');
-
-        const { feeMinor } = computeFee({
-          entryAt: open.entry_at,
-          exitAt,
-          hourlyMinor: rate.hourlyMinor,
-        });
+        // THE PRICE, from the engine and nothing else. Every plan of the
+        // garage goes to it unfiltered -- the engine picks the version in
+        // force at entry -- with the garage's currency and space class. What
+        // comes back is frozen onto the row below and echoed from the row,
+        // never recomputed for the response.
+        //
+        // A REFUSAL IS NOT A REFUSAL OF THE CLOSE. The barrier has opened and
+        // the car is gone; a 409 here is dropped by the lane and the stay
+        // stays open and unbilled for ever. So the engine's findings -- or
+        // the platform's own named reason when there is no plan to ask about
+        // -- close the stay UNPRICED, on the record, with an event beside it
+        // for a human. An engine that cannot be reached is not that: the stay
+        // can be priced, just not now, so it falls through as a 5xx, this
+        // transaction rolls back, and the lane retries.
+        const garage = await repo.getGarage(client, tenantId, garageId);
+        const plans = ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, garageId));
+        const pricing = await priceStay({ garage, plans, session: open, exitAt });
 
         // THE SHADOW SNAPSHOT, HERE AND NOWHERE ELSE: after the stay to close
         // is known, BEFORE `exit_at` is written on it, in this transaction.
@@ -1123,13 +1133,35 @@ export function createApp() {
         const closed = await repo.closeSession(client, tenantId, open.id, {
           exitAt,
           laneId,
-          rateId: rate.id,
-          hourlyMinor: rate.hourlyMinor,
-          feeMinor,
           closeEventId: String(closeEventId),
           exitConfirmation,
           exitDescriptor,
+          pricing,
         });
+        if (pricing.refusal) {
+          // The record: what was refused and why, named -- not a null fee.
+          // Append-only, beside the row, the thing a human works from.
+          await repo.appendEvents(client, tenantId, [
+            {
+              garageId,
+              laneId,
+              eventId: `close_unpriced:${closed.id}`,
+              kind: CLOSE_UNPRICED_EVENT_KIND,
+              occurredAt: exitAt,
+              detail: {
+                actor: 'platform:close',
+                session_id: closed.id,
+                close_event_id: String(closeEventId),
+                entry_at: closed.entry_at,
+                exit_at: closed.exit_at,
+                currency: closed.currency,
+                space_class: garage.space_class,
+                plan_versions_offered: plans.map((p) => p.plan_version),
+                findings: pricing.refusal,
+              },
+            },
+          ]);
+        }
         return { session: closed, closed: true, replay: false };
       });
 
@@ -1191,6 +1223,74 @@ function presentRatePlan(r) {
   };
 }
 
+/** The event a close that could not be priced leaves beside the row. */
+const CLOSE_UNPRICED_EVENT_KIND = 'close_unpriced';
+
+/**
+ * Price a stay, or say by name why it cannot be priced. Never both, never
+ * neither.
+ *
+ * `{ refusal }` carries findings in the engine's own shape (`code`, `text`,
+ * ...), so a human reads one list whichever side produced it. The platform
+ * produces exactly one: a garage with no plan stored, which the engine cannot
+ * be asked about because there is nothing to send it. Everything else is the
+ * engine's word, verbatim. `EngineUnavailable` is deliberately NOT caught
+ * here -- see the close route.
+ */
+async function priceStay({ garage, plans, session, exitAt }) {
+  if (plans.length === 0) {
+    return {
+      refusal: [
+        {
+          code: NO_RATE_PLAN_STORED,
+          kind: 'gap',
+          text: 'the garage has no rate plan stored; there is nothing to price from',
+          rule_ids: [],
+        },
+      ],
+    };
+  }
+  try {
+    const quote = await ratePlans.quoteWithEngine({
+      plans,
+      currency: garage.currency,
+      spaceClass: garage.space_class,
+      entryAt: session.entry_at,
+      exitAt,
+    });
+    if (quote.currency !== session.currency) {
+      // Cannot happen -- the store refuses a plan in another currency -- and
+      // if it does, this is not a stay to record as priced in the wrong money.
+      throw new Error(`the engine priced in ${quote.currency}; the stay is in ${session.currency}`);
+    }
+    return {
+      feeMinor: assertMinor(quote.feeMinor, 'fee_minor'),
+      planVersion: quote.planVersion,
+      breakdown: quote.breakdown,
+      spaceClass: garage.space_class,
+    };
+  } catch (err) {
+    if (err instanceof ratePlans.PricingRefused) return { refusal: err.findings };
+    throw err;
+  }
+}
+
+/** The platform's one refusal code, in the engine's namespace shape. */
+const NO_RATE_PLAN_STORED = 'GAP_NO_RATE_PLAN_STORED';
+
+/**
+ * The garage's space class, when the request names one. Frozen after
+ * creation; the shape rule is the column's (`garages_space_class_not_blank`)
+ * said here so the operator is told, not the driver.
+ */
+function spaceClassField(raw) {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string' || raw.trim() === '' || raw.length > 64) {
+    throw bad('space_class must be a non-empty string of at most 64 characters when given');
+  }
+  return raw;
+}
+
 /**
  * The store's refusals onto the wire. `plan_invalid` is a 400 -- the request
  * carried a document the engine cannot load, and a 400 carries no code, like
@@ -1208,7 +1308,7 @@ function ratePlanRefusal(err) {
   return out;
 }
 
-export { pool, LANE_EVENT_KINDS };
+export { pool, LANE_EVENT_KINDS, CLOSE_UNPRICED_EVENT_KIND, NO_RATE_PLAN_STORED };
 
 /**
  * A window the caller asked for, bounded.

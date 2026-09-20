@@ -90,8 +90,8 @@ const BREAKS = [
     name: 'bare_conflict',
     why: 'a conflict is raised directly and reaches a lane unnamed',
     file: 'src/app.js',
-    from: "        if (!rate) throw conflict('no_rate_configured', 'garage has no rate configured');",
-    to: "        if (!rate) throw new HttpError(409, 'garage has no rate configured');",
+    from: "        throw conflict('wrong_lane_direction', 'this device is not on an exit lane');",
+    to: "        throw new HttpError(409, 'this device is not on an exit lane');",
   },
 ];
 

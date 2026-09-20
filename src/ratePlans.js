@@ -32,6 +32,17 @@
  *             own test holds the entry-time rule. `documents()` is the
  *             projection down to what `quote()` takes as `plans`.
  *
+ *   quote     (migration 0013) the close hands EVERY plan of the garage, the
+ *             garage's currency and space class and the stay's two instants
+ *             to the engine's `POST /v1/quote`, and freezes what comes back --
+ *             fee, version, breakdown -- onto the stay. The engine chooses the
+ *             version in force at entry; this module hands it the whole list
+ *             and filters nothing. A refusal (the engine's 422, named
+ *             findings) is `PricingRefused`, which the close turns into an
+ *             UNPRICED close rather than a refused one. An engine that cannot
+ *             be reached is `EngineUnavailable`, which the close lets fall to
+ *             a 5xx so the lane retries: the stay can be priced, just not now.
+ *
  * THE ENGINE IS REACHED OVER HTTP, at RATE_ENGINE_URL, the same door
  * `rate-engine quote` uses (`docs/CONTRACT.md` F6 in that repo: one code path,
  * one encoder, both surfaces byte-identical). Unset, or unreachable, the
@@ -50,6 +61,17 @@ export class RatePlanRefused extends Error {
     this.details = details;
   }
 }
+
+/** The engine said no, by name: its findings, verbatim. The stay closes unpriced. */
+export class PricingRefused extends Error {
+  constructor(findings) {
+    super(`the rate engine refused to price the stay: ${findings.map((f) => f.code).join(', ')}`);
+    this.findings = findings;
+  }
+}
+
+/** No engine to ask. Not a refusal: the stay can be priced, just not now. */
+export class EngineUnavailable extends Error {}
 
 /** Where the engine is. Read at call time so a test can point it somewhere. */
 export function rateEngineUrl(env = process.env) {
@@ -157,6 +179,18 @@ export async function storeRatePlan(client, tenantId, { garage, document, valida
         'currency lives on the garage and a plan restates it',
     );
   }
+  // The engine prices a SPACE and refuses a class the plan does not declare.
+  // Every stay in this garage is priced as the garage's class (0013), so a
+  // plan that does not declare it would refuse every exit -- caught here, in
+  // front of an operator, and not at 3 a.m. at the barrier.
+  const classes = Array.isArray(document.space_classes) ? document.space_classes : [];
+  if (!classes.includes(garage.space_class)) {
+    throw new RatePlanRefused(
+      'plan_does_not_price_garage_space_class',
+      `every stay in this garage is priced as space class ${JSON.stringify(garage.space_class)}, ` +
+        `and the plan declares only: ${classes.map((c) => JSON.stringify(c)).join(', ') || 'nothing'}`,
+    );
+  }
   let row;
   try {
     const { rows } = await client.query(
@@ -225,4 +259,73 @@ export async function ratePlansForGarage(client, tenantId, garageId) {
 /** What `quote()` takes as `plans`: the documents, whole, and nothing of ours. */
 export function documents(rows) {
   return rows.map((r) => r.document);
+}
+
+/**
+ * Price one stay with the engine, from every plan of the garage.
+ *
+ * `plans` is the WHOLE list the store holds for the garage, unfiltered: the
+ * engine's `select_plan` picks the version in force at entry, and its own
+ * test (`test_f3_entry_time_governs`) is what holds that rule. A platform
+ * that handed it one version -- the latest, say -- would have made the choice
+ * itself, silently, and by exit time. `currency` and `spaceClass` are the
+ * garage's; the engine refuses a plan in another currency and a class the
+ * plan does not declare, both by name.
+ *
+ * Returns `{ feeMinor, currency, planVersion, breakdown, schemaVersion }` --
+ * the engine's words, converted only at the money boundary. Throws
+ * `PricingRefused` on the engine's 422 (named findings), `EngineUnavailable`
+ * when there is no engine or it answered something that is not a quote. An
+ * engine 400 here is a platform bug -- every plan it holds was validated
+ * before it was stored -- and is `EngineUnavailable` too: the close is not
+ * recorded as unpriced on the strength of a request this platform built wrong.
+ */
+export async function quoteWithEngine(
+  { plans, currency, spaceClass, entryAt, exitAt },
+  { url = rateEngineUrl(), timeoutMs = 10_000 } = {},
+) {
+  if (!url) throw new EngineUnavailable('RATE_ENGINE_URL is not set; the close prices through the engine and nothing else');
+  let res;
+  let text;
+  try {
+    res = await fetch(`${url}/v1/quote`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        plans,
+        currency,
+        space_class: spaceClass,
+        entry_at: entryAt.toISOString(),
+        exit_at: exitAt.toISOString(),
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    text = await res.text();
+  } catch (err) {
+    throw new EngineUnavailable(`the rate engine at ${url} could not be reached (${err?.cause?.code ?? err?.name ?? err})`);
+  }
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = null;
+  }
+  if (!body || typeof body !== 'object') {
+    throw new EngineUnavailable(`the rate engine at ${url} answered HTTP ${res.status} without a JSON body`);
+  }
+  if (res.status === 422 && body.refused === true && Array.isArray(body.findings)) {
+    throw new PricingRefused(body.findings);
+  }
+  if (res.status === 200 && Number.isInteger(body.fee_minor) && Array.isArray(body.breakdown)) {
+    return {
+      feeMinor: body.fee_minor,
+      currency: body.currency,
+      planVersion: body.plan_version,
+      breakdown: body.breakdown,
+      schemaVersion: body.schema_version,
+    };
+  }
+  throw new EngineUnavailable(
+    `the rate engine at ${url} answered HTTP ${res.status} with a body this platform does not recognise as a quote: ${text.slice(0, 300)}`,
+  );
 }

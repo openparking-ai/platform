@@ -489,64 +489,103 @@ async function openStay() {
 const closing = () => ({
   exitAt: new Date(),
   laneId: world.exitLane,
-  rateId: world.rate,
-  hourlyMinor: 250,
-  feeMinor: 500,
   closeEventId: randomUUID(),
   exitConfirmation: 'confirmed',
 });
 
-test('a close priced by a plan keeps the plan_version and the breakdown beside the fee, and reads them back equal', async () => {
+const ledger = [
+  { code: 'increment.first_period', rule_id: 'hourly', text: 'first hour 3.00', delta_minor: 300 },
+  { code: 'increment.repeat_periods', rule_id: 'hourly', text: 'one more hour at 3.00', delta_minor: 300 },
+];
+const priced = { feeMinor: 600, planVersion: 'flat-lot-2026-01', breakdown: ledger, spaceClass: 'standard' };
+
+test('a close priced by a plan keeps the fee, the plan_version, the breakdown and the space class, and reads them back equal', async () => {
   const id = await openStay();
-  const breakdown = [
-    { code: 'ACCUMULATE', rule_id: 'hourly-unbounded', text: 'first hour 3.00', delta_minor: 300 },
-    { code: 'ACCUMULATE', rule_id: 'hourly-unbounded', text: 'one more hour at 3.00', delta_minor: 300 },
-  ];
-  const closed = await withTenant(tenant, (c) =>
-    repo.closeSession(c, tenant, id, { ...closing(), feeMinor: 600, planVersion: 'flat-lot-2026-01', breakdown }),
-  );
+  const closed = await withTenant(tenant, (c) => repo.closeSession(c, tenant, id, { ...closing(), pricing: priced }));
+  assert.equal(Number(closed.fee_minor), 600);
   assert.equal(closed.plan_version, 'flat-lot-2026-01');
-  assert.deepEqual(closed.breakdown, breakdown);
+  assert.deepEqual(closed.breakdown, ledger);
+  assert.equal(closed.space_class, 'standard');
+  assert.equal(closed.pricing_refusal, null);
   const back = await withTenant(tenant, (c) => repo.getSession(c, tenant, id));
+  assert.deepEqual(back.breakdown, ledger, 'the ledger survives the round trip');
   assert.equal(back.plan_version, 'flat-lot-2026-01');
-  assert.deepEqual(back.breakdown, breakdown, 'the ledger survives the round trip');
-  assert.equal(Number(back.fee_minor), 600);
 });
 
-test('a close priced by src/fees.js keeps neither, and says so with NULLs', async () => {
+test('a close the engine refused keeps the refusal and no fee', async () => {
   const id = await openStay();
-  const closed = await withTenant(tenant, (c) => repo.closeSession(c, tenant, id, closing()));
+  const refusal = [{ code: 'GAP_NO_PLAN_IN_FORCE_AT_ENTRY', kind: 'gap', text: 'no plan version was in force at entry', rule_ids: [] }];
+  const closed = await withTenant(tenant, (c) => repo.closeSession(c, tenant, id, { ...closing(), pricing: { refusal } }));
+  assert.equal(closed.fee_minor, null);
   assert.equal(closed.plan_version, null);
   assert.equal(closed.breakdown, null);
+  assert.deepEqual(closed.pricing_refusal, refusal);
+  assert.ok(closed.exit_at, 'and the stay IS closed');
 });
 
-test('a closed stay with a breakdown and no plan_version -- or the reverse -- is refused by the database', async () => {
+test('a closed stay is priced whole, or refused whole: every partial shape is refused by the database', async () => {
   for (const partial of [
-    { breakdown: [{ code: 'X', rule_id: 'r', text: 't', delta_minor: 1 }] },
-    { planVersion: 'flat-lot-2026-01' },
+    { ...priced, planVersion: null },
+    { ...priced, breakdown: null },
+    { ...priced, spaceClass: null },
+    { ...priced, feeMinor: null },
   ]) {
     const id = await openStay();
     await assert.rejects(
-      withTenant(tenant, (c) => repo.closeSession(c, tenant, id, { ...closing(), ...partial })),
-      (err) => err.constraint === 'sessions_plan_pricing_is_complete',
-      `${JSON.stringify(Object.keys(partial))} alone was accepted`,
+      withTenant(tenant, (c) => repo.closeSession(c, tenant, id, { ...closing(), pricing: partial })),
+      (err) => err.constraint === 'sessions_closed_is_priced_or_refused',
+      `${JSON.stringify(partial)} was accepted`,
     );
   }
-});
-
-test('an OPEN stay cannot carry a plan pricing, and a breakdown must be a ledger', async () => {
+  // A fee AND a refusal on one row is neither shape.
   const id = await openStay();
   await assert.rejects(
     withTenant(tenant, (c) =>
-      c.query(`UPDATE sessions SET plan_version = 'v', breakdown = '[]'::jsonb WHERE id = $1`, [id]),
+      c.query(
+        `UPDATE sessions SET exit_at = now(), exit_lane_id = $2, close_event_id = $3, exit_confirmation = 'confirmed',
+                fee_minor = 600, plan_version = 'v', breakdown = '[]'::jsonb, space_class = 'standard',
+                pricing_refusal = '[{"code":"X"}]'::jsonb
+          WHERE id = $1`,
+        [id, world.exitLane, randomUUID()],
+      ),
     ),
-    (err) => err.constraint === 'sessions_plan_pricing_is_complete',
+    (err) => err.constraint === 'sessions_closed_is_priced_or_refused',
   );
-  const closedId = await openStay();
+});
+
+test('an OPEN stay cannot carry a pricing or a refusal, and a breakdown must be a ledger', async () => {
+  const id = await openStay();
   await assert.rejects(
     withTenant(tenant, (c) =>
-      repo.closeSession(c, tenant, closedId, { ...closing(), planVersion: 'v', breakdown: { not: 'a ledger' } }),
+      c.query(`UPDATE sessions SET plan_version = 'v', breakdown = '[]'::jsonb, space_class = 'standard', fee_minor = 1 WHERE id = $1`, [id]),
+    ),
+    (err) => err.constraint === 'sessions_closed_is_priced_or_refused',
+  );
+  await assert.rejects(
+    withTenant(tenant, (c) => c.query(`UPDATE sessions SET pricing_refusal = '[]'::jsonb WHERE id = $1`, [id])),
+    (err) => err.constraint === 'sessions_closed_is_priced_or_refused',
+  );
+  const other = await openStay();
+  await assert.rejects(
+    withTenant(tenant, (c) =>
+      repo.closeSession(c, tenant, other, { ...closing(), pricing: { ...priced, breakdown: { not: 'a ledger' } } }),
     ),
     (err) => err.constraint === 'sessions_breakdown_is_a_ledger',
   );
+});
+
+test('the rows the old hourly path wrote are still a valid closed stay, and nothing here writes that shape', async () => {
+  const id = await openStay();
+  await withTenant(tenant, (c) =>
+    c.query(
+      `UPDATE sessions SET exit_at = now(), exit_lane_id = $2, close_event_id = $3, exit_confirmation = 'confirmed',
+              fee_minor = 250, hourly_minor_applied = 250 WHERE id = $1`,
+      [id, world.exitLane, randomUUID()],
+    ),
+  );
+  const row = await withTenant(tenant, (c) => repo.getSession(c, tenant, id));
+  assert.equal(Number(row.fee_minor), 250);
+  assert.equal(row.plan_version, null);
+  const source = await readFile(new URL('../src/repository.js', import.meta.url), 'utf8');
+  assert.ok(!/hourly_minor_applied\s*=/.test(source), 'closeSession no longer writes hourly_minor_applied');
 });

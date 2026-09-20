@@ -17,8 +17,10 @@ import { randomUUID } from 'node:crypto';
 import { createApp } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
+import { startRateEngine } from './rate-engine.js';
 import { redactExpiredVehicles } from '../src/retention.js';
 
+let engine;
 let server;
 let base;
 let tenant;
@@ -69,6 +71,9 @@ const stored = (sessionId) =>
   );
 
 before(async () => {
+  // The close prices through the real engine (0013); see test/rate-engine.js.
+  engine = await startRateEngine();
+  process.env.RATE_ENGINE_URL = engine.url;
   tenant = await createTenant('exit-descriptor');
   world = await buildWorld(tenant, { hourlyMinor: 250 });
   entryToken = await issueDeviceToken(tenant, world.entryLane, 'entry device');
@@ -80,6 +85,7 @@ before(async () => {
 
 after(async () => {
   await new Promise((r) => server.close(r));
+  await engine?.stop();
   await pool.end();
 });
 
