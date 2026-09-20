@@ -112,6 +112,12 @@ The session keeps its times and its fee. `test/retention.test.js` asserts
 exactly that, because it is the property most likely to be broken by someone
 later deciding deletion is tidier.
 
+**Added with migration 0012:** `rate_plans` holds a garage's rate plan
+documents and nothing about a person or a car. The purge does not touch it, and
+`test/rate-plans.test.js` asserts the table is byte-identical across a run in
+which the purge redacted a vehicle. The `rate_plan_stored` event beside it names
+an operator token, not a person, and is append-only like every event.
+
 ## What is never redacted
 
 - **Enrolled vehicles**, while enrolled.

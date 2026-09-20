@@ -323,6 +323,61 @@ refusal and absent from six cannot distinguish "this was not a skew" from "this
 platform is too old to say". A consumer reading that absence as "not a skew"
 would report a healthy clock while the record lost every session the lane sent.
 
+### Rate plans: the plan store
+
+Pricing lives in [`rate-engine`](https://github.com/openparking-ai/rate-engine),
+a finished engine with **no persistence**: `quote(plans, stay)` takes every plan
+version of a garage on every call and picks the one in force at entry. Until
+migration 0012 nothing in this platform could hand it that list — `rates` is an
+hourly figure with no currency, no plan, no version and no effective date — so
+the platform is the engine's first caller, and this is the store.
+
+```sh
+curl -H "authorization: Bearer $OPERATOR_TOKEN" -H 'content-type: application/json' \
+  -d '{"plan": { ...the plan document, whole... }}' \
+  http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans     # 201, the row and the document
+curl -H "authorization: Bearer $OPERATOR_TOKEN" \
+  http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans     # every plan of the garage
+```
+
+What the store does, and does not do — the reasons are in `migrations/0012_rate_plans.sql`:
+
+- **The document is stored whole.** The engine's own loader refuses and names any
+  key its version does not understand; a schema that shredded the document into
+  columns would drop exactly those keys silently. `plan_version` and
+  `effective_from` are lifted out as index keys and CHECKed against the document.
+- **Validated by the engine before it is stored, never at the barrier.** The route
+  sends the document to the engine's `POST /v1/validate-plan` at `RATE_ENGINE_URL`.
+  A document the engine cannot load is a `400` carrying the engine's sentence
+  (which names the key). A document that loads but has **findings** — a gap
+  nothing prices, a conflict — is `409 plan_has_findings` with every finding in
+  `details`, settled ones included: a decision is an acknowledgement, not a
+  price. No engine reachable is `409 rate_engine_unavailable`, never a silent
+  accept.
+- **The read returns every plan; the engine selects.** There is no "current plan"
+  route and no selector here. The engine's `select_plan` picks by entry time and
+  its own test holds that rule; a second chooser would be the copy that drifts.
+- **Currency is the garage's, in one place.** The document restates it; a plan in
+  another currency is `409 plan_currency_disagrees_with_garage` at the route and
+  a trigger refusal on a direct INSERT.
+- **One version name and one effective instant per garage** —
+  `409 plan_version_exists`, `409 plan_effective_from_taken`. Two versions at one
+  instant is the ambiguity the engine refuses on every stay from then on; it is
+  refused here first.
+- **Append-only by grant, like `events`.** A changed price is a new version.
+  Storing one is recorded as a `rate_plan_stored` event naming the operator token.
+- **A closed stay keeps `plan_version` and `breakdown` beside `fee_minor`** —
+  the version that priced it and the engine's plain-English ledger, together or
+  not at all. They are NULL today: **nothing prices from the store yet.** The
+  close route still prices with `src/fees.js`; re-pointing it onto the engine is
+  the next round, and the migration says so.
+
+`test/rate-plans.test.js` starts the real engine — the commit in
+`rate-engine.pin`, installed by CI — because the store's claims are the engine's
+sentences and a stand-in would test this platform against itself.
+`npm run rate-plans-fail-control` breaks each property in turn and requires the
+suite to go red.
+
 ## Vehicle identity and retention
 
 The database stores real vehicle identity — plate, make, model, colour — because

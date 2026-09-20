@@ -5,6 +5,7 @@ import { computeFee } from './fees.js';
 import { toMinor } from './money.js';
 import * as repo from './repository.js';
 import { enqueueShadowSearch } from './shadow.js';
+import * as ratePlans from './ratePlans.js';
 import { reconcile } from './reconcile.js';
 
 class HttpError extends Error {
@@ -14,6 +15,10 @@ class HttpError extends Error {
     // A MACHINE-READABLE name for the refusal, published beside the message.
     // Null for the statuses that do not carry one; see `conflict` below.
     this.code = code;
+    // Structured detail beside the message, published only when set and only
+    // with a code. The plan store attaches the engine's findings here: a list
+    // an operator works through is data, not a sentence.
+    this.details = null;
   }
 }
 
@@ -565,6 +570,64 @@ export function createApp() {
     }
   });
 
+  /**
+   * Store a rate plan for a garage: the plan document, whole, as the engine
+   * validated it.
+   *
+   * Every refusal is named. The engine's own refusals come through with its
+   * sentence -- an unknown key is named by the engine, not paraphrased here --
+   * and a plan that loads but cannot price every stay it covers is refused
+   * with every finding listed, because a gap found here is a gap not found at
+   * the barrier. What only the store can see -- the garage's currency, a
+   * version name already used, an effective instant already taken -- is
+   * refused here. No engine reachable is a refusal too, not an acceptance.
+   *
+   * Nothing prices from what is stored yet: the close route still prices with
+   * src/fees.js. This is the store and its read; re-pointing the close is the
+   * next round's, and the migration says so.
+   */
+  operator.post('/garages/:garageId/rate-plans', async (req, res, next) => {
+    try {
+      const document = ratePlans.planDocument(req.body?.plan);
+      const out = await withTenant(req.tenantId, async (client) => {
+        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!garage) throw new HttpError(404, 'garage not found');
+        // Validated BEFORE it is stored, by the only thing that knows what a
+        // plan means. The currency check sits after it deliberately: a
+        // document the engine cannot load has no currency worth comparing.
+        const validated = await ratePlans.validateWithEngine(document);
+        const row = await ratePlans.storeRatePlan(client, req.tenantId, {
+          garage,
+          document,
+          validated,
+          actor: `operator_token:${req.operatorTokenId}`,
+        });
+        return row;
+      });
+      res.status(201).json({ rate_plan: presentRatePlan(out) });
+    } catch (err) {
+      next(ratePlanRefusal(err));
+    }
+  });
+
+  /**
+   * Every plan of the garage. The list the engine prices from, plus what the
+   * store knows about each: no selection, no "current plan" -- the engine
+   * chooses by entry time, and a second chooser here is the copy that drifts.
+   */
+  operator.get('/garages/:garageId/rate-plans', async (req, res, next) => {
+    try {
+      const rows = await withTenant(req.tenantId, async (client) => {
+        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!garage) throw new HttpError(404, 'garage not found');
+        return ratePlans.ratePlansForGarage(client, req.tenantId, garage.id);
+      });
+      res.json({ rate_plans: rows.map(presentRatePlan) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   operator.post('/lanes/:laneId/devices', async (req, res, next) => {
     try {
       const { name } = req.body ?? {};
@@ -1097,7 +1160,10 @@ export function createApp() {
     // check is the second control on that: nothing that is not ours can put a
     // name on the wire.
     const named = err instanceof HttpError && err.code;
-    res.status(status).json(named ? { error: err.message, code: err.code } : { error: err.message });
+    if (!named) return res.status(status).json({ error: err.message });
+    res
+      .status(status)
+      .json(err.details ? { error: err.message, code: err.code, details: err.details } : { error: err.message, code: err.code });
   });
 
   return app;
@@ -1110,6 +1176,36 @@ function presentSession(s) {
     hourly_minor_applied: toMinor(s.hourly_minor_applied, 'hourly_minor_applied'),
     fee_minor: toMinor(s.fee_minor, 'fee_minor'),
   };
+}
+
+/** A stored plan: the document whole, and what the store knows about it. */
+function presentRatePlan(r) {
+  return {
+    id: r.id,
+    garage_id: r.garage_id,
+    plan_version: r.plan_version,
+    effective_from: r.effective_from,
+    engine_schema_version: r.engine_schema_version,
+    created_at: r.created_at,
+    plan: r.document,
+  };
+}
+
+/**
+ * The store's refusals onto the wire. `plan_invalid` is a 400 -- the request
+ * carried a document the engine cannot load, and a 400 carries no code, like
+ * every other malformed body here. Everything else the store refuses is a
+ * named conflict: the document is well-formed and this platform will not hold
+ * it, and says why by name. An engine that cannot be reached is a conflict
+ * too, not a 5xx -- nothing was stored, the operator is told so by name, and
+ * a 5xx here would be answered 'internal error' with the name stripped.
+ */
+function ratePlanRefusal(err) {
+  if (!(err instanceof ratePlans.RatePlanRefused)) return err;
+  if (err.code === 'plan_invalid') return bad(err.message);
+  const out = conflict(err.code, err.message);
+  out.details = err.details;
+  return out;
 }
 
 export { pool, LANE_EVENT_KINDS };

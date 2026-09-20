@@ -156,22 +156,35 @@ export async function openSession(
   }
 }
 
+/**
+ * Close a stay, freezing what priced it onto the row.
+ *
+ * `planVersion` and `breakdown` are what a close priced by the engine keeps
+ * (migration 0012): the version that priced it and the engine's ledger, one
+ * line per part of the fee, beside `fee_minor`. They come together or not at
+ * all -- the constraint on the table holds that -- and a close priced by
+ * src/fees.js, which knows no plan, passes neither and stores NULLs that say
+ * so. The parameters are here so the round that re-points the close has a
+ * write path that already keeps the breakdown; nothing calls it with them yet.
+ */
 export async function closeSession(
   client,
   tenantId,
   sessionId,
   { exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId, exitConfirmation,
-    exitDescriptor = null },
+    exitDescriptor = null, planVersion = null, breakdown = null },
 ) {
   const { rows } = await client.query(
     `UPDATE sessions
         SET exit_at = $3, exit_lane_id = $4, rate_id = $5,
             hourly_minor_applied = $6, fee_minor = $7, close_event_id = $8,
-            exit_confirmation = $9, exit_descriptor = $10
+            exit_confirmation = $9, exit_descriptor = $10,
+            plan_version = $11, breakdown = $12
       WHERE tenant_id = $1 AND id = $2 AND exit_at IS NULL
       RETURNING *`,
     [tenantId, sessionId, exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId,
-     exitConfirmation, exitDescriptor],
+     exitConfirmation, exitDescriptor, planVersion,
+     breakdown === null ? null : JSON.stringify(breakdown)],
   );
   return rows[0] ?? null;
 }

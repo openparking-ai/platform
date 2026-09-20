@@ -62,6 +62,18 @@ jobs:
           cache: npm
       - run: npm ci
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the rate engine at its pin
+        # test/rate-plans.test.js starts the REAL engine, because the plan
+        # store's claims -- an unknown key refused and named, a gap refused
+        # and listed -- are the engine's sentences, and a stand-in would test
+        # this platform against itself. The commit is `rate-engine.pin`, one
+        # place, read here and nowhere else.
+        run: python3 -m pip install --quiet "git+https://github.com/openparking-ai/rate-engine@$(cat rate-engine.pin)"
+
       - name: Create the test database
         run: psql "$ADMIN_URL/postgres" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE openparking_test'
 
@@ -151,3 +163,14 @@ jobs:
         # the closed set is refused, a tie is not a match, and every rate is
         # over the rows that have an oracle. Each is broken in turn.
         run: npm run shadow-fail-control
+
+      - name: Rate-plans fail-control
+        # A garage's rate plans are held whole, validated by the engine
+        # before they are stored, read back as the whole list the engine
+        # prices from, and a closed stay keeps the version and the breakdown
+        # that priced it. Each property is broken in turn -- the route
+        # storing unvalidated, findings ignored, the document shredded, the
+        # read returning one, currency unchecked, an unreachable engine
+        # counted as a yes, no event, the breakdown dropped, and four schema
+        # statements never created -- and the suite must go red.
+        run: npm run rate-plans-fail-control
