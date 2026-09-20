@@ -67,8 +67,9 @@
 -- NULLABLE IN THIS MIGRATION BECAUSE NOTHING PRICES FROM A PLAN YET: the close
 -- route still prices with `src/fees.js`, which knows no plan, and a NULL here
 -- says so honestly. The round that re-points the close onto the engine is the
--- one that tightens this to NOT NULL on every closed stay; until then a closed
--- stay with a NULL `plan_version` is a stay `fees.js` priced.
+-- one that tightens this on every closed stay; until then a closed stay with a
+-- NULL `plan_version` is a stay `fees.js` priced. (0013 is that round: it
+-- replaces `sessions_plan_pricing_is_complete` with the three-shape rule.)
 --
 -- Tenant-owned; docs/RLS_TEMPLATE.md, with the grant narrowed as above.
 --

@@ -63,12 +63,10 @@ const SNAPSHOT_BLOCK = `        if (exitDescriptor !== null) {
         const closed = await repo.closeSession(client, tenantId, open.id, {
           exitAt,
           laneId,
-          rateId: rate.id,
-          hourlyMinor: rate.hourlyMinor,
-          feeMinor,
           closeEventId: String(closeEventId),
           exitConfirmation,
           exitDescriptor,
+          pricing,
         });
 `;
 
@@ -81,12 +79,10 @@ const BREAKS = [
     to: `        const closed = await repo.closeSession(client, tenantId, open.id, {
           exitAt,
           laneId,
-          rateId: rate.id,
-          hourlyMinor: rate.hourlyMinor,
-          feeMinor,
           closeEventId: String(closeEventId),
           exitConfirmation,
           exitDescriptor,
+          pricing,
         });
 
         if (exitDescriptor !== null) {

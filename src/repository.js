@@ -157,34 +157,44 @@ export async function openSession(
 }
 
 /**
- * Close a stay, freezing what priced it onto the row.
+ * Close a stay, freezing what priced it -- or what could not -- onto the row.
  *
- * `planVersion` and `breakdown` are what a close priced by the engine keeps
- * (migration 0012): the version that priced it and the engine's ledger, one
- * line per part of the fee, beside `fee_minor`. They come together or not at
- * all -- the constraint on the table holds that -- and a close priced by
- * src/fees.js, which knows no plan, passes neither and stores NULLs that say
- * so. The parameters are here so the round that re-points the close has a
- * write path that already keeps the breakdown; nothing calls it with them yet.
+ * `pricing` is one of two shapes, and the constraint
+ * `sessions_closed_is_priced_or_refused` (0013) holds the row to them:
+ *
+ *   { feeMinor, planVersion, breakdown, spaceClass }
+ *       the engine's quote, verbatim: the fee, the version that priced it,
+ *       the ledger with one line per part of the fee, and the class the stay
+ *       was priced as. Together or not at all.
+ *   { refusal }
+ *       the engine's findings (or the platform's own named reason), and NO
+ *       fee. The stay is closed -- the car is gone -- and unpriced, on the
+ *       record, for a human.
+ *
+ * Nothing writes the hourly-rate shape (`rate_id`, `hourly_minor_applied`)
+ * any more; the rows that carry it were priced by the path 0013 removed.
  */
 export async function closeSession(
   client,
   tenantId,
   sessionId,
-  { exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId, exitConfirmation,
-    exitDescriptor = null, planVersion = null, breakdown = null },
+  { exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor = null, pricing },
 ) {
+  const priced = pricing.refusal === undefined;
   const { rows } = await client.query(
     `UPDATE sessions
-        SET exit_at = $3, exit_lane_id = $4, rate_id = $5,
-            hourly_minor_applied = $6, fee_minor = $7, close_event_id = $8,
-            exit_confirmation = $9, exit_descriptor = $10,
-            plan_version = $11, breakdown = $12
+        SET exit_at = $3, exit_lane_id = $4, close_event_id = $5,
+            exit_confirmation = $6, exit_descriptor = $7,
+            fee_minor = $8, plan_version = $9, breakdown = $10, space_class = $11,
+            pricing_refusal = $12
       WHERE tenant_id = $1 AND id = $2 AND exit_at IS NULL
       RETURNING *`,
-    [tenantId, sessionId, exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId,
-     exitConfirmation, exitDescriptor, planVersion,
-     breakdown === null ? null : JSON.stringify(breakdown)],
+    [tenantId, sessionId, exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor,
+     priced ? pricing.feeMinor : null,
+     priced ? pricing.planVersion : null,
+     priced && pricing.breakdown !== null && pricing.breakdown !== undefined ? JSON.stringify(pricing.breakdown) : null,
+     priced ? pricing.spaceClass : null,
+     priced ? null : JSON.stringify(pricing.refusal)],
   );
   return rows[0] ?? null;
 }

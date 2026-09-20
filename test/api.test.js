@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createApp, LANE_EVENT_KINDS } from '../src/app.js';
-import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
+import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
+import { startRateEngine } from './rate-engine.js';
 
+let engine;
 let server;
 let base;
 let tenant;
@@ -49,6 +51,9 @@ async function issueOperatorToken(tenantId) {
 const asOperator = (token) => ({ headers: { authorization: `Bearer ${token}` } });
 
 before(async () => {
+  // The close prices through the real engine (0013); see test/rate-engine.js.
+  engine = await startRateEngine();
+  process.env.RATE_ENGINE_URL = engine.url;
   tenant = await createTenant('api');
   world = await buildWorld(tenant, { hourlyMinor: 250 });
   entryToken = await issueToken(tenant, world.entryLane, 'entry device');
@@ -61,6 +66,7 @@ before(async () => {
 
 after(async () => {
   await new Promise((r) => server.close(r));
+  await engine?.stop();
   await pool.end();
 });
 
@@ -246,11 +252,16 @@ test('a car drives out and the fee is computed, frozen, and idempotent on replay
   assert.equal(res.status, 200);
   const { session, closed } = await res.json();
   assert.equal(closed, true);
-  // 3h30m at 250 minor/hour, part hours rounded up => 4 hours => 1000.
+  // 3h30m at 250 minor/hour, part hours rounded up => 4 hours => 1000 --
+  // the engine's answer from the world's flat plan, frozen with the version
+  // that priced it and the engine's own ledger (0013).
   assert.equal(session.fee_minor, 1000);
-  assert.equal(session.hourly_minor_applied, 250);
   assert.equal(session.currency, 'USD');
-  assert.ok(session.rate_id, 'the rate that produced the fee is recorded on the session');
+  assert.equal(session.plan_version, 'flat-250-USD', 'the plan that produced the fee is recorded on the session');
+  assert.ok(Array.isArray(session.breakdown) && session.breakdown.length >= 1, 'and its breakdown beside it');
+  assert.equal(session.breakdown.reduce((sum, line) => sum + line.delta_minor, 0), 1000, 'the ledger adds up to the fee');
+  assert.equal(session.space_class, 'standard');
+  assert.equal(session.pricing_refusal, null);
 
   const replay = await fetch(
     `${base}/api/v1/lane/sessions/close`,
@@ -637,6 +648,9 @@ async function garageWithBothLanes() {
   });
   assert.equal(created.status, 201);
   const { garage } = await created.json();
+  // A garage that prices: a flat plan at 500/hour, so the fees below read as
+  // the rate this helper always carried.
+  await withTenant(tenant, (c) => storePlan(c, tenant, garage.id, flatHourlyPlan({ hourlyMinor: 500 })));
 
   const makeLane = async (name, direction) => {
     const res = await fetch(`${base}/api/v1/garages/${garage.id}/lanes`, {
@@ -647,13 +661,6 @@ async function garageWithBothLanes() {
     assert.equal(res.status, 201);
     return issueToken(tenant, (await res.json()).lane.id, `${direction} device`);
   };
-
-  const rate = await fetch(`${base}/api/v1/garages/${garage.id}/rates`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
-    body: JSON.stringify({ name: 'Hourly', hourly_minor: 500 }),
-  });
-  assert.equal(rate.status, 201);
 
   return {
     garage,

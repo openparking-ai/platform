@@ -22,8 +22,61 @@ export async function createTenant(name = 'tenant') {
   return id;
 }
 
-/** One garage with both lanes, a vehicle and a rate — enough to exercise everything. */
-export async function buildWorld(tenantId, { hourlyMinor = 250, currency = 'USD' } = {}) {
+/**
+ * A flat hourly plan in the engine's document shape: `hourlyMinor` for the
+ * first hour and every hour after, rounded up, no maximum. The same fee the
+ * old `computeFee` gave for whole hours, so the suite's numbers stand -- and
+ * the engine's for the rest, which is the point.
+ */
+export function flatHourlyPlan({ hourlyMinor = 250, currency = 'USD', spaceClass = 'standard', version = null, effectiveFrom = '2000-01-01T00:00:00Z' } = {}) {
+  return {
+    plan_version: version ?? `flat-${hourlyMinor}-${currency}`,
+    effective_from: effectiveFrom,
+    timezone: 'America/New_York',
+    currency,
+    space_classes: [spaceClass],
+    resolution: { QUALIFY: { mode: 'cheapest_wins' }, ACCUMULATE: { mode: 'cheapest_wins' } },
+    adjust_order: null,
+    rules: [
+      {
+        id: 'hourly',
+        type: 'increment',
+        stage: 'ACCUMULATE',
+        space_classes: [spaceClass],
+        first_period_minutes: 60,
+        first_period_minor: hourlyMinor,
+        repeat_period_minutes: 60,
+        repeat_period_minor: hourlyMinor,
+        rounding: 'ceil',
+        max_duration_minutes: null,
+      },
+    ],
+    decisions: [],
+  };
+}
+
+/**
+ * Store a plan document for a garage directly, as the database's side of the
+ * store would have it. The engine is not asked -- these are worlds for tests
+ * that need a garage that prices, and test/rate-plans.test.js is where the
+ * route and the engine's validation are exercised.
+ */
+export async function storePlan(client, tenantId, garageId, document) {
+  return (
+    await client.query(
+      `INSERT INTO rate_plans (tenant_id, garage_id, plan_version, effective_from, document, engine_schema_version)
+       VALUES ($1, $2, $3::jsonb->>'plan_version', ($3::jsonb->>'effective_from')::timestamptz, $3::jsonb, 1)
+       RETURNING id`,
+      [tenantId, garageId, JSON.stringify(document)],
+    )
+  ).rows[0].id;
+}
+
+/**
+ * One garage with both lanes, a vehicle, a rate and a flat plan — enough to
+ * exercise everything. `plan: false` builds a garage that cannot price.
+ */
+export async function buildWorld(tenantId, { hourlyMinor = 250, currency = 'USD', plan = true } = {}) {
   return withTenant(tenantId, async (client) => {
     const garage = (
       await client.query(
@@ -32,6 +85,7 @@ export async function buildWorld(tenantId, { hourlyMinor = 250, currency = 'USD'
         [tenantId, currency],
       )
     ).rows[0].id;
+    if (plan) await storePlan(client, tenantId, garage, flatHourlyPlan({ hourlyMinor, currency }));
 
     const lane = async (name, direction) =>
       (

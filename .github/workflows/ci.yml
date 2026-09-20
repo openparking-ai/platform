@@ -174,3 +174,13 @@ jobs:
         # counted as a yes, no event, the breakdown dropped, and four schema
         # statements never created -- and the suite must go red.
         run: npm run rate-plans-fail-control
+
+      - name: Pricing fail-control
+        # The close prices through the engine and a close that cannot price
+        # still closes. Each property is broken in turn -- the 409 put back,
+        # the refusal uncaught, an outage recorded as a refusal, the platform
+        # selecting the latest version, the class hard-coded, the ledger
+        # dropped, the event dropped, the report hiding the row, the store
+        # ignoring the class, and two schema statements never created -- and
+        # the suite must go red.
+        run: npm run pricing-fail-control

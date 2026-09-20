@@ -52,10 +52,6 @@
  *
  *   no_currency_trigger    the database stops refusing a plan in the wrong
  *                          currency; only the route does.
- *   no_pricing_pair        `sessions_plan_pricing_is_complete` never created:
- *                          a closed stay may carry a breakdown with no
- *                          version, or a version with no breakdown, or a
- *                          pricing while still open.
  *   keys_unchecked         the CHECKs tying `plan_version` and
  *                          `effective_from` to the document never created:
  *                          the index key and the contract can disagree.
@@ -141,8 +137,8 @@ const SOURCE_BREAKS = [
     name: 'breakdown_dropped',
     why: 'the close keeps the version and drops the breakdown',
     file: 'src/repository.js',
-    from: `     breakdown === null ? null : JSON.stringify(breakdown)],`,
-    to: `     breakdown === null ? null : JSON.stringify(breakdown.slice(0, 1))],`,
+    from: `     priced && pricing.breakdown !== null && pricing.breakdown !== undefined ? JSON.stringify(pricing.breakdown) : null,`,
+    to: `     priced && pricing.breakdown !== null && pricing.breakdown !== undefined ? JSON.stringify(pricing.breakdown.slice(0, 1)) : null,`,
   },
 ];
 
@@ -159,22 +155,6 @@ const SCHEMA_BREAKS = [
         from: `CREATE TRIGGER rate_plans_currency_is_the_garages
   BEFORE INSERT ON rate_plans
   FOR EACH ROW EXECUTE FUNCTION rate_plans_currency_is_the_garages();`,
-        to: '',
-      },
-    ],
-  },
-  {
-    name: 'no_pricing_pair',
-    why: 'a closed stay may carry a version without a breakdown, or the reverse',
-    edits: [
-      {
-        file: '0012_rate_plans.sql',
-        from: `ALTER TABLE sessions
-  ADD CONSTRAINT sessions_plan_pricing_is_complete CHECK (
-    (plan_version IS NULL AND breakdown IS NULL)
-    OR
-    (plan_version IS NOT NULL AND breakdown IS NOT NULL AND exit_at IS NOT NULL)
-  );`,
         to: '',
       },
     ],

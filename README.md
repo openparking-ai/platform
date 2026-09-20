@@ -263,8 +263,9 @@ exits and corrupts the garage's inside-count permanently. `event_id` is
 required on every session call for that reason.
 
 Times come from the **lane**, never the server clock — the car may have arrived
-while the lane had no network. The fee, and the rate that produced it, are frozen
-onto the session at exit, so editing a rate later cannot silently reprice history.
+while the lane had no network. The fee, and the plan version and breakdown that
+produced it, are frozen onto the session at exit, so a later version cannot
+silently reprice history.
 
 ### What this platform can and cannot establish
 
@@ -366,11 +367,49 @@ What the store does, and does not do — the reasons are in `migrations/0012_rat
   refused here first.
 - **Append-only by grant, like `events`.** A changed price is a new version.
   Storing one is recorded as a `rate_plan_stored` event naming the operator token.
-- **A closed stay keeps `plan_version` and `breakdown` beside `fee_minor`** —
-  the version that priced it and the engine's plain-English ledger, together or
-  not at all. They are NULL today: **nothing prices from the store yet.** The
-  close route still prices with `src/fees.js`; re-pointing it onto the engine is
-  the next round, and the migration says so.
+- **A closed stay keeps `plan_version`, `breakdown` and `space_class` beside
+  `fee_minor`** — the version that priced it, the engine's plain-English ledger
+  and the class it was priced as, together or not at all.
+
+### The close prices through the engine, and a close that cannot price still closes
+
+`src/fees.js` is gone (migration 0013). `POST /lane/sessions/close` hands
+**every** plan of the garage — unfiltered — with the garage's currency and
+space class to the engine's `POST /v1/quote`, and freezes what comes back onto
+the stay. The engine picks the version in force at **entry**; its own test holds
+that rule, and this platform does not pre-select, because a platform that handed
+it one version would have made the choice itself, silently, by exit time. The
+response is the row, never a recomputation, and a replay echoes what was
+frozen. A later version never reprices a closed stay.
+
+**A refusal is not a refusal of the close.** `computeFee` could not fail;
+`quote()` refuses by design — no version in force at entry (the ordinary first
+morning of a plan: cars that came in the night before), a gap the plan set left
+— and a garage with no plan has nothing to ask about. A `409` there is
+**dropped by the lane**: the barrier has already opened, the car is gone, the
+stay never closes, nothing is billed, and the car is counted inside for ever. So
+the stay closes **unpriced**: `200`, `fee_minor: null`, the refusal — the
+engine's findings verbatim, or `GAP_NO_RATE_PLAN_STORED` — in
+`pricing_refusal`, a `close_unpriced` event beside it, and a line under
+`closes_unpriced` in the reconciliation report (codes, no plate). A flag for a
+human, not a hole in the ledger; the same principle as `exit_held`.
+
+An engine that **cannot be reached** is different and is not recorded as
+unpriced: the stay can be priced, just not now. That close answers `500`, the
+transaction rolls back, and the lane's outbox retries with the same event id.
+
+**A space class, because the engine prices a space.** A garage carries
+`space_class` (default `standard`, set at creation, frozen like its currency);
+every stay in it is priced as that class, and the store refuses a plan that
+does not declare it (`409 plan_does_not_price_garage_space_class`). A garage
+with two kinds of space is not expressible today — stated, not hidden.
+
+`test/pricing.test.js` drives all of it through the lane route against the real
+engine. `npm run pricing-fail-control` breaks each property — the 409 put back,
+the refusal uncaught, an outage recorded as a refusal, the platform selecting
+the latest version, the class hard-coded, the ledger dropped, the event
+dropped, the report hiding the row, the store ignoring the class, and two
+schema statements never created — and requires the suite to go red.
 
 `test/rate-plans.test.js` starts the real engine — the commit in
 `rate-engine.pin`, installed by CI — because the store's claims are the engine's
