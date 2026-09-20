@@ -168,6 +168,32 @@ after the stay was already closed, and every plate-matched exit would read as
 no exit descriptor — `sessions_exit_descriptor_needs_exit`, checked at the
 database and not only at the route.
 
+### The candidate set
+
+The exit module's search takes one descriptor and a list of `{id, descriptor}`
+candidates and answers "which of *these*, if any?" — and the list it must be
+given is every stay that could be the one leaving: every stay still open in the
+garage the exit lane belongs to. `src/candidates.js` is that list.
+
+**Keyed on the session**, because what an exit needs back is which *stay* to
+close. Each candidate carries what identifies it — exactly one of `plate` or
+`ticket_ref` (named as `identity_kind`), the region and the vehicle attributes
+the entry read produced — beside the stored `descriptor`, so a later round can
+say which stay the plate picked without a second query. `forSearch` projects
+that down to what the identity service is sent: `{id, descriptor}` for exactly
+the stays that **have** a descriptor, and no plate, ticket or attribute — its
+contract says no plate is involved.
+
+**The denominator travels with the set.** Only plate- or ticket-identified cars
+ever get a session, and the descriptor is opt-in at the identity service, so a
+stay may be open with none. `open` and `with_descriptor` are on the result
+because a figure produced over this set has to be written beside them.
+
+**It runs on the caller's client.** The consumer that matters reads the set
+*inside* the close transaction, before `exit_at` is written, so the stay that
+is leaving is still open and in it. There is no operator route for it — the
+shadow run and the operator surface are later rounds.
+
 `exit_confirmation` is the same question about the other end of the stay, with
 one more value:
 

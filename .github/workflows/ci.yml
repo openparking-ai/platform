@@ -138,6 +138,7 @@ jobs:
         # write, the response ECHOING it (the lane's only way to see it was
         # kept), the bound, the retention purge reaching both columns, and the
         # constraint that an open stay holds no exit descriptor (a scratch
-        # database with the statement edited out) -- and requires the suite to
-        # go red.
+        # database with the statement edited out), and the candidate set built
+        # over them (closed stays out, other garages out, the descriptor on,
+        # no plate to the search) -- and requires the suite to go red.
         run: npm run descriptor-fail-control
