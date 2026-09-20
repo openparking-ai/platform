@@ -20,6 +20,13 @@
  * would violate the constraint and fail the whole purge; writing it into
  * neither would leave a ticket — which a person read out loud and which
  * identifies a stay — as the one piece of identity retention could not remove.
+ *
+ * A session's ENTRY DESCRIPTOR (migration 0009) is redacted in the same run.
+ * It lives on the session rather than the vehicle -- a descriptor is one READ,
+ * not an identity -- but it describes one specific car's appearance, so it is
+ * personal data on the same terms the plate is. It is nulled on every session
+ * of every vehicle this run redacts, and on no other: the session keeps its
+ * times and its fee, exactly as before.
  */
 import { withTenant } from './db.js';
 import * as repo from './repository.js';
@@ -68,6 +75,16 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
         RETURNING v.id`,
       [tenantId, now, days],
     );
+    // The descriptor, on the sessions of exactly the vehicles redacted above.
+    // Nulled rather than replaced: there is no unique index to keep satisfied,
+    // and NULL already means NOT MEASURED on this column.
+    if (rows.length) {
+      await client.query(
+        `UPDATE sessions SET entry_descriptor = NULL
+          WHERE tenant_id = $1 AND entry_descriptor IS NOT NULL AND vehicle_id = ANY($2::uuid[])`,
+        [tenantId, rows.map((r) => r.id)],
+      );
+    }
     return { tenantId, retentionDays: days, redacted: rows.length, wouldRedact: rows.length };
   });
 }

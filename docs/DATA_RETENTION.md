@@ -66,6 +66,21 @@ characters, so redaction satisfies the stronger constraint exactly as it
 satisfied the weaker one; nothing about the window, the rules or the statement
 changes.
 
+**Added with migration 0009:** a session may carry the **appearance descriptor**
+its entry read produced (`sessions.entry_descriptor`) — an opaque string that
+describes one specific car's appearance, which makes it personal data on the
+same terms the plate is. It lives on the session rather than the vehicle,
+because a descriptor is one *read* and not an identity, so it is reached by a
+second statement in the same run: nulled on every session of every vehicle the
+run redacts, and on no other.
+
+```
+sessions.entry_descriptor -> NULL   (on the sessions of the vehicles redacted above)
+```
+
+`test/entry-descriptor.test.js` asserts the redaction and carries the control
+that a stay inside the window keeps its descriptor.
+
 The session keeps its times and its fee. `test/retention.test.js` asserts
 exactly that, because it is the property most likely to be broken by someone
 later deciding deletion is tidier.

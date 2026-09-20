@@ -243,6 +243,50 @@ const TICKET_REF_SHAPE = /^[A-Z0-9-]{6,64}$/;
 const PLATE_MAX = 32;
 
 /**
+ * The longest appearance descriptor this platform will hold on a session.
+ *
+ * A descriptor is the identity service's opaque, versioned, compact string
+ * (`opvid-fp/<version>:…`), and this platform does not parse it -- migration
+ * 0009 says what it is and why it lives on the session. What this side CAN
+ * stand behind is that it is a string, that it is not blank, and that it is not
+ * a device token's worth of text: it is stored per stay and compared against
+ * every open stay in a garage at the exit, so an unbounded one is a row an
+ * attacker chooses the size of.
+ *
+ * The bound is a DECISION with a measurement behind it: the identity service
+ * caps ORB at 256 keypoints and SIFT at 128, and an INCOMPRESSIBLE (random)
+ * payload of that size encodes to 12,333 characters (ORB) and 23,262 (SIFT),
+ * measured 2026-09-20 against vehicle-id f29f64f. Sixty-four KiB is more than
+ * twice the worst case, with room for the descriptor's own version to grow.
+ */
+const DESCRIPTOR_MAX = 65536;
+
+/**
+ * The appearance descriptor on a session open: OPTIONAL, and typed before it is
+ * bounded, for the reason `laneIdentity` gives -- `String(value)` on an array
+ * produces something a length check is happy with.
+ *
+ * Absent or null is NOT MEASURED: a lane with the descriptor switched off,
+ * which is the default, sends none and is unchanged by this. Present, it is
+ * stored on the session and ECHOED back on the row -- and the echo is a
+ * contract term, not a convenience. A platform older than the column accepts
+ * the same call and drops the field silently (this route destructures known
+ * keys and ignores the rest), so the lane treats an open whose response does
+ * not carry the descriptor it sent as not delivered. That is the same rule
+ * `entry_confirmation` already lives under, and for the same reason.
+ */
+function descriptorField(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string' || value.trim() === '' || value.length > DESCRIPTOR_MAX) {
+    throw bad(
+      `descriptor must be a string of at most ${DESCRIPTOR_MAX} characters and not only ` +
+        'whitespace; this platform stores a descriptor and does not otherwise read it',
+    );
+  }
+  return value;
+}
+
+/**
  * THE TYPE IS TESTED BEFORE THE SHAPE, and that is the whole of this paragraph.
  *
  * `String(value)` on a JSON array or a number produces something a regex is
@@ -863,6 +907,7 @@ export function createApp() {
         color = null,
         attributes = null,
       } = req.body ?? {};
+      const entryDescriptor = descriptorField(req.body?.descriptor);
       // Exactly one of plate or ticket_ref. A lane that sends only a plate is
       // an older lane and is unchanged by this; a lane that sends a ticket is
       // the intercom completing an identity for a driver the camera could not
@@ -889,10 +934,12 @@ export function createApp() {
           currency: garage.currency,
           openEventId: String(openEventId),
           entryConfirmation,
+          entryDescriptor,
         });
       });
 
-      // The row that was written, echoed whole -- `entry_confirmation` with it.
+      // The row that was written, echoed whole -- `entry_confirmation` and
+      // `entry_descriptor` with it.
       // A LANE DEPENDS ON THAT FIELD BEING HERE: a platform that predates the
       // column answers this call exactly as successfully and hands back a
       // session without it, so the lane treats an open that does not come back
