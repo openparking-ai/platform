@@ -793,6 +793,45 @@ test('entry_unadmitted is a kind a lane may report, and it opens nothing', async
   assert.equal(opened.rows[0].n, 0, 'an unadmitted crossing opened a session');
 });
 
+test('arming_suppressed and arming_suppression_ended are kinds a lane may report, and they open nothing', async () => {
+  // LITERALS, for the same reason as the test above: the mapped test shrinks
+  // its own input when a kind is removed and stays green, so it is these two
+  // names that turn red if either leaves the list.
+  //
+  // Both land in `events` only. A suppressed arming interval is a car held at
+  // the barrier because another is too close behind it; nothing was
+  // identified, nothing was vended, so no session opens on either event and
+  // nothing counts toward occupancy. The END is a kind of its own, not a
+  // field on the start: a start that is never followed by an end is a car
+  // nobody photographed and a record that never closes, and an operator
+  // reading the log must be able to see that shape rather than infer it.
+  for (const kind of ['arming_suppressed', 'arming_suppression_ended']) {
+    const eventId = randomUUID();
+    const res = await fetch(
+      `${base}/api/v1/lane/events`,
+      asDevice(entryToken, {
+        events: [{ event_id: eventId, kind, occurred_at: new Date().toISOString() }],
+      }),
+    );
+    assert.equal(res.status, 202, `${kind} was refused`);
+    assert.deepEqual(await res.json(), { accepted: 1, duplicates: 0 });
+
+    const stored = await withTenant(tenant, (c) =>
+      c.query(`SELECT kind FROM events WHERE tenant_id = $1 AND event_id = $2`, [tenant, eventId]),
+    );
+    assert.equal(stored.rows.length, 1);
+    assert.equal(stored.rows[0].kind, kind);
+
+    const opened = await withTenant(tenant, (c) =>
+      c.query(`SELECT count(*)::int AS n FROM sessions WHERE tenant_id = $1 AND open_event_id = $2`, [
+        tenant,
+        eventId,
+      ]),
+    );
+    assert.equal(opened.rows[0].n, 0, `${kind} opened a session`);
+  }
+});
+
 test('an event dated in the future is refused, on the same bound as a session', async () => {
   // The third lane-supplied time. It was unbounded: `reconcile.js` filters
   // `occurred_at >= since` with no upper bound and `retention.js` never touches
