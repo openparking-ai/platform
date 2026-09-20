@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createApp, LANE_EVENT_KINDS } from '../src/app.js';
-import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan } from './helpers.js';
+import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
 
@@ -650,7 +650,10 @@ async function garageWithBothLanes() {
   const { garage } = await created.json();
   // A garage that prices: a flat plan at 500/hour, so the fees below read as
   // the rate this helper always carried.
-  await withTenant(tenant, (c) => storePlan(c, tenant, garage.id, flatHourlyPlan({ hourlyMinor: 500 })));
+  await withTenant(tenant, async (c) => {
+    await storePlan(c, tenant, garage.id, flatHourlyPlan({ hourlyMinor: 500 }));
+    await activateGarage(c, tenant, garage.id);
+  });
 
   const makeLane = async (name, direction) => {
     const res = await fetch(`${base}/api/v1/garages/${garage.id}/lanes`, {

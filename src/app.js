@@ -5,6 +5,7 @@ import { assertMinor, toMinor } from './money.js';
 import * as repo from './repository.js';
 import { enqueueShadowSearch } from './shadow.js';
 import * as ratePlans from './ratePlans.js';
+import * as activation from './activation.js';
 import { reconcile } from './reconcile.js';
 
 class HttpError extends Error {
@@ -485,6 +486,9 @@ export function createApp() {
       // the garage is priced as this class (0013), and a plan is refused at
       // the store unless it declares it.
       const spaceClass = spaceClassField(req.body?.space_class);
+      // Optional at creation, statable later, never defaulted: unstated is
+      // the absence of the field, and an unstated garage cannot activate.
+      const transient = transientField(req.body?.transient_available, { required: false });
       const garage = await withTenant(req.tenantId, async (client) => {
         // Each column is left out entirely when nothing was asked for, so the
         // value an unconfigured garage gets is written down in exactly one
@@ -495,6 +499,7 @@ export function createApp() {
         const values = [req.tenantId, name, timezone, currency];
         if (action !== undefined) { columns.push('default_action'); values.push(action); }
         if (spaceClass !== undefined) { columns.push('space_class'); values.push(spaceClass); }
+        if (transient !== undefined) { columns.push('transient_available'); values.push(transient); }
         const { rows } = await client.query(
           `INSERT INTO garages (${columns.join(', ')})
            VALUES (${values.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`,
@@ -509,27 +514,82 @@ export function createApp() {
   });
 
   /**
-   * Change what an existing garage does with an unknown plate.
+   * Change what an existing garage does with an unknown plate, and/or state
+   * its transient mode.
    *
    * Creation-time only would have left every garage that already exists unable
-   * to be strict, which is the whole of what was wrong. It takes this one
-   * field and nothing else: a garage's timezone and currency are frozen onto
-   * sessions and money and are not a thing to edit in passing.
+   * to be strict, which is the whole of what was wrong. It takes these two
+   * fields and nothing else: a garage's timezone, currency and space class are
+   * frozen onto sessions and money and are not a thing to edit in passing.
+   * `transient_available` is the activation gate's second condition (0014):
+   * true or false, statable here at any time, restatable, never un-statable
+   * -- the trigger refuses NULL after a value -- and never defaulted.
    */
   operator.patch('/garages/:garageId', async (req, res, next) => {
     try {
-      const action = defaultAction(req.body?.default_action, { required: true });
+      const action = defaultAction(req.body?.default_action, { required: false });
+      const transient = transientField(req.body?.transient_available, { required: false });
+      if (action === undefined && transient === undefined) {
+        throw bad('default_action or transient_available is required');
+      }
       const garage = await withTenant(req.tenantId, async (client) => {
+        const sets = [];
+        const values = [req.tenantId, req.params.garageId];
+        if (action !== undefined) { values.push(action); sets.push(`default_action = $${values.length}`); }
+        if (transient !== undefined) { values.push(transient); sets.push(`transient_available = $${values.length}`); }
         const { rows } = await client.query(
-          `UPDATE garages SET default_action = $3
+          `UPDATE garages SET ${sets.join(', ')}
             WHERE tenant_id = $1 AND id = $2 RETURNING *`,
-          [req.tenantId, req.params.garageId, action],
+          values,
         );
         return rows[0];
       });
       if (!garage) throw new HttpError(404, 'garage not found');
       res.json({ garage });
     } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * What the activation gate sees for this garage: active or not, and each
+   * condition with whether it holds and why not. The operator's readout
+   * before -- and after -- asking to activate.
+   */
+  operator.get('/garages/:garageId/activation', async (req, res, next) => {
+    try {
+      const state = await withTenant(req.tenantId, async (client) => {
+        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!garage) throw new HttpError(404, 'garage not found');
+        return activation.readout(client, req.tenantId, garage);
+      });
+      res.json({ activation: state });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * Activate the garage: the act his ruling names, with a timestamp and the
+   * operator token that did it. Refused by name, with every unmet condition
+   * listed in `details`, while either condition is unmet. Idempotent.
+   */
+  operator.post('/garages/:garageId/activate', async (req, res, next) => {
+    try {
+      const out = await withTenant(req.tenantId, async (client) => {
+        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!garage) throw new HttpError(404, 'garage not found');
+        return activation.activate(client, req.tenantId, garage, {
+          actor: `operator_token:${req.operatorTokenId}`,
+        });
+      });
+      res.status(out.activated ? 201 : 200).json({ garage: out.garage, activated: out.activated });
+    } catch (err) {
+      if (err instanceof activation.NotActivatable) {
+        const refusal = conflict('garage_not_activatable', err.message);
+        refusal.details = { unmet: err.unmet };
+        return next(refusal);
+      }
       next(err);
     }
   });
@@ -886,6 +946,10 @@ export function createApp() {
         // it -- the lane supports 'deny' and always has, and nothing could
         // reach it. A garage that has set nothing still gets 'allow'.
         default_action: payload.garage.default_action,
+        // The gate's verdict (0014). Served so a lane can see it; the lane
+        // does not read it yet, and a platform ahead of the lane refuses
+        // nothing by adding a key.
+        active: payload.garage.activated_at !== null,
         plate_rules: [],
         synced_at: new Date().toISOString(),
       });
@@ -986,9 +1050,13 @@ export function createApp() {
       if (!openEventId) throw bad('event_id is required');
       const entryAt = refuseFuture(parseTime(req.body?.entry_at, 'entry_at'), 'entry_at');
 
+      // THE GATE (0014): an inactive garage opens no stay. Recorded, then
+      // refused -- in that order, because the lane drops the 409.
+      const garage = await activeGarageOrRefuse({
+        tenantId, garageId, laneId, laneEventId: String(openEventId), action: 'open', at: entryAt,
+      });
+
       const result = await withTenant(tenantId, async (client) => {
-        const garage = await repo.getGarage(client, tenantId, garageId);
-        if (!garage) throw new HttpError(404, 'garage not found');
         const vehicle = await repo.upsertVehicle(client, tenantId, {
           plate, ticketRef, plateRegion, seenAt: entryAt, make, model, color, attributes,
         });
@@ -1052,6 +1120,14 @@ export function createApp() {
         EXIT_CONFIRMATIONS,
       );
       const exitAt = refuseFuture(parseTime(req.body?.exit_at, 'exit_at'), 'exit_at');
+
+      // THE GATE (0014), at the other end: an inactive garage closes no stay.
+      // Activation is monotonic, so a stay that exists was opened at an
+      // active garage and this never fires for one -- it is here so the rule
+      // is stated at both doors and not inferred from the other.
+      await activeGarageOrRefuse({
+        tenantId, garageId, laneId, laneEventId: String(closeEventId), action: 'close', at: exitAt,
+      });
 
       const out = await withTenant(tenantId, async (client) => {
         // Keyed on the event first, so a replay returns the very session this
@@ -1230,25 +1306,21 @@ const CLOSE_UNPRICED_EVENT_KIND = 'close_unpriced';
  * Price a stay, or say by name why it cannot be priced. Never both, never
  * neither.
  *
- * `{ refusal }` carries findings in the engine's own shape (`code`, `text`,
- * ...), so a human reads one list whichever side produced it. The platform
- * produces exactly one: a garage with no plan stored, which the engine cannot
- * be asked about because there is nothing to send it. Everything else is the
- * engine's word, verbatim. `EngineUnavailable` is deliberately NOT caught
- * here -- see the close route.
+ * `{ refusal }` carries the engine's findings, verbatim -- the engine's word
+ * is the only refusal this platform records. It used to add one of its own,
+ * a garage with no plan stored; the activation gate (0014) made that
+ * unreachable through every door and the database alike -- a garage cannot
+ * activate without a plan in force, plans are append-only, and an inactive
+ * garage closes nothing -- and a refusal nobody can reach is a sentence, not
+ * a behaviour. So an active garage with no plan is not a refusal to record:
+ * it is a broken invariant, and it fails loudly. `EngineUnavailable` is
+ * deliberately NOT caught here either -- see the close route.
  */
 async function priceStay({ garage, plans, session, exitAt }) {
   if (plans.length === 0) {
-    return {
-      refusal: [
-        {
-          code: NO_RATE_PLAN_STORED,
-          kind: 'gap',
-          text: 'the garage has no rate plan stored; there is nothing to price from',
-          rule_ids: [],
-        },
-      ],
-    };
+    throw new Error(
+      `garage ${garage.id} is active and holds no rate plan; activation requires one and plans are append-only`,
+    );
   }
   try {
     const quote = await ratePlans.quoteWithEngine({
@@ -1275,8 +1347,32 @@ async function priceStay({ garage, plans, session, exitAt }) {
   }
 }
 
-/** The platform's one refusal code, in the engine's namespace shape. */
-const NO_RATE_PLAN_STORED = 'GAP_NO_RATE_PLAN_STORED';
+/**
+ * The lane's side of the activation gate. Loads the garage; an inactive one
+ * is RECORDED (its own transaction, committed before anything is refused)
+ * and then refused by name. Returns the garage for the caller's use.
+ */
+async function activeGarageOrRefuse({ tenantId, garageId, laneId, laneEventId, action, at }) {
+  const garage = await withTenant(tenantId, (client) => repo.getGarage(client, tenantId, garageId));
+  if (!garage) throw new HttpError(404, 'garage not found');
+  if (garage.activated_at !== null) return garage;
+  await withTenant(tenantId, (client) =>
+    activation.recordInactiveRefusal(client, tenantId, { garageId, laneId, laneEventId, action, at }),
+  );
+  throw conflict(
+    'garage_not_active',
+    `this garage is not active: no stay is ${action === 'open' ? 'opened' : 'closed'} here until its rate setup is complete and its transient mode is stated`,
+  );
+}
+
+/** `transient_available` from a request body, through the one place its shape is written. */
+function transientField(raw, { required }) {
+  try {
+    return activation.transientAvailableField(raw, { required });
+  } catch (err) {
+    throw bad(err.message);
+  }
+}
 
 /**
  * The garage's space class, when the request names one. Frozen after
@@ -1308,7 +1404,7 @@ function ratePlanRefusal(err) {
   return out;
 }
 
-export { pool, LANE_EVENT_KINDS, CLOSE_UNPRICED_EVENT_KIND, NO_RATE_PLAN_STORED };
+export { pool, LANE_EVENT_KINDS, CLOSE_UNPRICED_EVENT_KIND };
 
 /**
  * A window the caller asked for, bounded.

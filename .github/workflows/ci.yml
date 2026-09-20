@@ -184,3 +184,14 @@ jobs:
         # ignoring the class, and two schema statements never created -- and
         # the suite must go red.
         run: npm run pricing-fail-control
+
+      - name: Activation-gate fail-control
+        # A garage is not usable until its rate setup is complete and its
+        # transient mode is stated; an inactive garage opens and closes
+        # nothing, by name and on the record. Each property is broken in
+        # turn -- the gate off at the lane, the refusal unrecorded, each
+        # condition satisfied by nothing, null accepted as a statement, a
+        # processor surface planted, the rules lying, the trigger never
+        # created, the trigger counting stored instead of in force -- and the
+        # suite must go red.
+        run: npm run activation-fail-control
