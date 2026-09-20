@@ -62,6 +62,28 @@ export const TENANT_TABLES = [
       ),
   },
   {
+    table: 'shadow_searches',
+    // Each row closes its own stay, and the unique key is the close event, so
+    // rows do not collide with anything but a policy.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH v AS (
+           INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'SH-' || gen_random_uuid()) RETURNING id
+         ), s AS (
+           INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                                 open_event_id, entry_confirmation)
+           SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD', gen_random_uuid()::text,
+                  'confirmed' FROM v
+           RETURNING id
+         )
+         INSERT INTO shadow_searches (tenant_id, garage_id, session_id, close_event_id, candidate_ids,
+                                      candidates_open, candidates_with_descriptor, true_stay_comparable)
+         SELECT $1, $2, s.id, gen_random_uuid()::text, ARRAY[s.id], 1, 1, true FROM s
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+  },
+  {
     table: 'events',
     insert: (c, t, w) =>
       c.query(

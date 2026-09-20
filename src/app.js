@@ -4,6 +4,7 @@ import { bearerFrom, generateDeviceToken, hashToken } from './auth.js';
 import { computeFee } from './fees.js';
 import { toMinor } from './money.js';
 import * as repo from './repository.js';
+import { enqueueShadowSearch } from './shadow.js';
 import { reconcile } from './reconcile.js';
 
 class HttpError extends Error {
@@ -1040,6 +1041,21 @@ export function createApp() {
           exitAt,
           hourlyMinor: rate.hourlyMinor,
         });
+
+        // THE SHADOW SNAPSHOT, HERE AND NOWHERE ELSE: after the stay to close
+        // is known, BEFORE `exit_at` is written on it, in this transaction.
+        // Taken after the UPDATE below, the true stay is already closed and
+        // every plate-matched exit reads as "absent true car". Ids and counts
+        // only (the measurement is in migration 0011); nothing is decided by
+        // it, and a close that carried no descriptor snapshots nothing.
+        if (exitDescriptor !== null) {
+          await enqueueShadowSearch(client, tenantId, {
+            garageId,
+            sessionId: open.id,
+            exitLaneId: laneId,
+            closeEventId: String(closeEventId),
+          });
+        }
 
         const closed = await repo.closeSession(client, tenantId, open.id, {
           exitAt,

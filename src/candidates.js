@@ -92,3 +92,34 @@ export function forSearch(set) {
     .filter((c) => c.descriptor !== null)
     .map((c) => ({ id: c.id, descriptor: c.descriptor }));
 }
+
+/**
+ * The SNAPSHOT the close takes: which stays were open and comparable at this
+ * moment, as ids and counts, and nothing heavier.
+ *
+ * Measured before it was designed (the numbers are in migration 0011): the
+ * full `candidateStays` set at 5,000 open stays with real-size descriptors is
+ * 62 MB inside the close transaction; ids and counts are 1.2 MB. A descriptor
+ * is immutable once written -- set at the open, nulled only by a retention
+ * purge that cannot reach an open stay -- so it can be read by id later, by
+ * whoever runs the search. What CANNOT be read later is which stays were open
+ * before `exit_at` was written on one of them: that is this function, and it
+ * is the only thing the close needs to hold.
+ *
+ * `ids` is exactly the subset `forSearch` would send: the open stays with a
+ * descriptor. `open` is every open stay, for the denominator.
+ */
+export async function candidateSnapshot(client, tenantId, garageId) {
+  const { rows } = await client.query(
+    `SELECT s.id, (s.entry_descriptor IS NOT NULL) AS comparable
+       FROM sessions s
+      WHERE s.tenant_id = $1 AND s.garage_id = $2 AND s.exit_at IS NULL
+      ORDER BY s.entry_at, s.id`,
+    [tenantId, garageId],
+  );
+  return {
+    ids: rows.filter((r) => r.comparable).map((r) => r.id),
+    open: rows.length,
+    with_descriptor: rows.filter((r) => r.comparable).length,
+  };
+}

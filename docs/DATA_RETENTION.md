@@ -82,6 +82,12 @@ sessions.exit_descriptor  -> NULL   (the same car read a second time, at the exi
 `test/entry-descriptor.test.js` and `test/exit-descriptor.test.js` assert the
 redaction and carry the control that a stay inside the window keeps both.
 
+**Added with migration 0011:** `shadow_searches` and the `shadow_search` event
+hold **session ids, counts and verdicts** — never a descriptor and never a
+plate — so the purge has nothing to reach in them. The descriptors they refer
+to live on `sessions`, where the purge reaches them. `test/shadow.test.js`
+sweeps both for every descriptor and plate it planted.
+
 The session keeps its times and its fee. `test/retention.test.js` asserts
 exactly that, because it is the property most likely to be broken by someone
 later deciding deletion is tidier.
