@@ -419,3 +419,138 @@ test('the report: every rate over the comparable rows, the denominator and the o
   assert.notEqual(report.match_rate, 1 / 6);
   assert.notEqual(report.match_rate, 1 / 5);
 });
+
+// --- retention -------------------------------------------------------------
+
+test('retention reaches a shadow row: the session references go, the outcome and the counts stay', async () => {
+  const { redactExpiredVehicles } = await import('../src/retention.js');
+  const DAY = 86_400_000;
+  const ago = (days) => new Date(Date.now() - days * DAY);
+
+  // A searched shadow row about a stay that closed `closedDaysAgo` days ago,
+  // written directly so the age is exact.
+  async function shadowedStay(prefix, closedDaysAgo) {
+    return withTenant(tenant, async (c) => {
+      const v = (
+        await c.query(
+          `INSERT INTO vehicles (tenant_id, plate, last_seen_at) VALUES ($1,$2,$3) RETURNING id`,
+          [tenant, plate(prefix), ago(closedDaysAgo)],
+        )
+      ).rows[0].id;
+      const s = (
+        await c.query(
+          `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, exit_lane_id,
+                                 entry_at, exit_at, currency, fee_minor, hourly_minor_applied,
+                                 open_event_id, close_event_id, entry_confirmation, exit_confirmation,
+                                 entry_descriptor, exit_descriptor)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'USD',250,250,$8,$9,'confirmed','confirmed',$10,$11)
+           RETURNING id, close_event_id`,
+          [
+            tenant, world.garage, v, world.entryLane, world.exitLane,
+            ago(closedDaysAgo + 1), ago(closedDaysAgo), randomUUID(), randomUUID(),
+            descriptor(`${prefix}-IN`), descriptor(`${prefix}-OUT`),
+          ],
+        )
+      ).rows[0];
+      const other = randomUUID();
+      const sh = (
+        await c.query(
+          `INSERT INTO shadow_searches (tenant_id, garage_id, session_id, exit_lane_id, close_event_id,
+                                        candidate_ids, candidates_open, candidates_with_descriptor,
+                                        true_stay_comparable, searched_at, outcome, matched_ids,
+                                        true_stay_matched, counts, thresholds, search_ref, attempts)
+           VALUES ($1,$2,$3,$4,$5,$6::uuid[],3,2,true,$7,'match',$8::uuid[],true,
+                   '{"candidates":2,"matched":1,"excluded":1,"refused":0}', '{"structure":0.75,"colour_bhattacharyya":0.69}',
+                   'ref', 1)
+           RETURNING id`,
+          [tenant, world.garage, s.id, world.exitLane, s.close_event_id, [s.id, other], ago(closedDaysAgo), [s.id]],
+        )
+      ).rows[0].id;
+      return { vehicle: v, session: s.id, shadow: sh };
+    });
+  }
+  const read = (id) =>
+    withTenant(tenant, async (c) =>
+      (await c.query('SELECT * FROM shadow_searches WHERE id = $1', [id])).rows[0],
+    );
+
+  const old = await shadowedStay('SHOLD', 40);
+  const recent = await shadowedStay('SHNEW', 3);
+  const before = await shadowReport(tenant, world.garage);
+
+  const result = await redactExpiredVehicles(tenant);
+  assert.ok(result.redacted >= 1);
+
+  // THE ROW SURVIVES THE PURGE, CARRYING ITS OUTCOME AND NO IDS.
+  const gone = await read(old.shadow);
+  assert.ok(gone, 'the row is not deleted');
+  assert.equal(gone.session_id, null);
+  assert.equal(gone.candidate_ids, null);
+  assert.equal(gone.matched_ids, null);
+  assert.ok(gone.redacted_at, 'and the fact of redaction is recorded');
+  assert.equal(gone.outcome, 'match');
+  assert.equal(gone.true_stay_matched, true);
+  assert.equal(gone.true_stay_comparable, true);
+  assert.equal(gone.candidates_open, 3);
+  assert.equal(gone.candidates_with_descriptor, 2);
+  assert.deepEqual(gone.counts, { candidates: 2, matched: 1, excluded: 1, refused: 0 });
+  assert.ok(gone.searched_at);
+  assert.ok(!JSON.stringify(gone).includes(old.session), 'no session id anywhere on the row');
+
+  // THE CONTROL, in the same run: a row about a stay inside the window keeps
+  // its references, so the nulls above are the purge reaching this table and
+  // not the columns being empty.
+  const kept = await read(recent.shadow);
+  assert.equal(kept.session_id, recent.session);
+  assert.ok(kept.candidate_ids.includes(recent.session));
+  assert.deepEqual(kept.matched_ids, [recent.session]);
+  assert.equal(kept.redacted_at, null);
+
+  // And the figure is unchanged by the purge: the redacted row still counts.
+  const after = await shadowReport(tenant, world.garage);
+  assert.deepEqual(after, before);
+  assert.ok(after.counts.true_stay_matched >= 2);
+
+  // The vehicle behind the old row really was redacted -- the control that the
+  // purge ran over the right stay.
+  const veh = await withTenant(tenant, async (c) =>
+    (await c.query('SELECT plate, redacted_at FROM vehicles WHERE id = $1', [old.vehicle])).rows[0],
+  );
+  assert.match(veh.plate, /^redacted:/);
+  assert.ok(veh.redacted_at);
+});
+
+test('a redacted row is not picked up by the worker, and a pending row about a redacted stay is left as such', async () => {
+  // A pending (never searched) shadow row whose stay aged out: the purge nulls
+  // its references, the worker has nothing to search and skips it -- it is
+  // neither an error nor a silent retry for ever.
+  const { redactExpiredVehicles } = await import('../src/retention.js');
+  const DAY = 86_400_000;
+  const ago = (days) => new Date(Date.now() - days * DAY);
+  const pending = await withTenant(tenant, async (c) => {
+    const v = (await c.query(`INSERT INTO vehicles (tenant_id, plate, last_seen_at) VALUES ($1,$2,$3) RETURNING id`, [tenant, plate('SHPEND'), ago(40)])).rows[0].id;
+    const s = (await c.query(
+      `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, exit_lane_id, entry_at, exit_at, currency,
+                             fee_minor, hourly_minor_applied, open_event_id, close_event_id, entry_confirmation, exit_confirmation, exit_descriptor)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'USD',250,250,$8,$9,'confirmed','confirmed',$10) RETURNING id, close_event_id`,
+      [tenant, world.garage, v, world.entryLane, world.exitLane, ago(41), ago(40), randomUUID(), randomUUID(), descriptor('SHPEND-OUT')],
+    )).rows[0];
+    return (await c.query(
+      `INSERT INTO shadow_searches (tenant_id, garage_id, session_id, close_event_id, candidate_ids, candidates_open, candidates_with_descriptor, true_stay_comparable)
+       VALUES ($1,$2,$3,$4,$5::uuid[],1,1,true) RETURNING id`,
+      [tenant, world.garage, s.id, s.close_event_id, [s.id]],
+    )).rows[0].id;
+  });
+  await redactExpiredVehicles(tenant);
+  const row = await withTenant(tenant, async (c) => (await c.query('SELECT * FROM shadow_searches WHERE id = $1', [pending])).rows[0]);
+  assert.equal(row.session_id, null);
+  assert.ok(row.redacted_at);
+  assert.equal(row.searched_at, null);
+  const { search, sent } = fakeSearch((body) => recordMatching([], body));
+  const summary = await runShadowSearches(tenant, { search, thresholds: THRESHOLDS });
+  assert.equal(summary.failed, 0);
+  assert.ok(!sent.some((b) => b.candidates.length === 0 && b.descriptor.includes('SHPEND')), 'not searched');
+  const again = await withTenant(tenant, async (c) => (await c.query('SELECT searched_at, attempts FROM shadow_searches WHERE id = $1', [pending])).rows[0]);
+  assert.equal(again.searched_at, null);
+  assert.equal(again.attempts, 0);
+});

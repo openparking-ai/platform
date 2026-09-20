@@ -34,6 +34,15 @@
  *                        where the true stay was comparable -- a figure with
  *                        no oracle behind part of its denominator, which the
  *                        brief says may not be published.
+ *   retention_skips_shadow
+ *                        the purge redacts the vehicle and leaves the shadow
+ *                        row pointing at its stay. The reassuring direction:
+ *                        it still reports rows redacted.
+ *   retention_drops_outcome
+ *                        the purge nulls the outcome with the references. The
+ *                        figure disappears with the identity, and a report
+ *                        run after the window shows fewer exits than there
+ *                        were.
  */
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -142,6 +151,25 @@ const BREAKS = [
     file: 'src/shadow.js',
     from: '    const rate = (n) => (r.comparable > 0 ? n / r.comparable : null);',
     to: '    const rate = (n) => (r.exits > 0 ? n / r.exits : null);',
+  },
+  {
+    name: 'retention_skips_shadow',
+    why: 'the purge leaves the shadow row pointing at a redacted stay',
+    file: 'src/retention.js',
+    from: `          WHERE sh.tenant_id = $1 AND sh.redacted_at IS NULL
+            AND sh.session_id IN (SELECT s.id FROM sessions s WHERE s.vehicle_id = ANY($2::uuid[]))\`,`,
+    to: `          WHERE sh.tenant_id = $1 AND sh.redacted_at IS NULL AND false
+            AND sh.session_id IN (SELECT s.id FROM sessions s WHERE s.vehicle_id = ANY($2::uuid[]))\`,`,
+  },
+  {
+    name: 'retention_drops_outcome',
+    why: 'the purge nulls the outcome with the references',
+    file: 'src/retention.js',
+    from: `            SET session_id = NULL, candidate_ids = NULL, matched_ids = NULL,
+                redacted_at = COALESCE($3::timestamptz, now())`,
+    to: `            SET session_id = NULL, candidate_ids = NULL, matched_ids = NULL,
+                outcome = NULL, true_stay_matched = NULL, searched_at = NULL, counts = NULL,
+                redacted_at = COALESCE($3::timestamptz, now())`,
   },
 ];
 

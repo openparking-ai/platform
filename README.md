@@ -221,7 +221,10 @@ It sends `{id, descriptor}` per candidate and nothing else, and writes the
 outcome onto the row and a `shadow_search` event beside it: **session ids,
 never descriptors** — `events` is append-only by grant and outside the
 retention purge. A search that cannot be obtained leaves the row pending and
-counted, and is retried.
+counted, and is retried. **Retention reaches the row:** when the purge redacts
+the stay it shadowed, the session references go and the outcome and counts
+stay, so the figure survives the identity — see
+[docs/DATA_RETENTION.md](docs/DATA_RETENTION.md).
 
 **What may be published** — `npm run shadow-report <tenant> <garage>`. Every
 figure names its denominator and its oracle: on every row the close picked the

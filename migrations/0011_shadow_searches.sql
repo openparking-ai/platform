@@ -41,10 +41,22 @@
 -- own errors. A rate over ALL exits is not measurable here: a close that
 -- matches nothing answers 404 and inserts no row.
 --
+-- RETENTION REACHES IT. A shadow row ages out with the stay it shadowed: when
+-- the purge redacts that stay's vehicle it nulls this row's SESSION REFERENCES
+-- -- `session_id`, `candidate_ids`, `matched_ids` -- stamps `redacted_at`, and
+-- KEEPS the counts and the outcome. The figure survives; what it was a figure
+-- about does not. That is the same shape as the vehicle's own redaction: the
+-- row stays, the identity goes. (A session id is a platform-minted uuid, not
+-- identity in itself, but it is the join to one; the candidate lists of
+-- YOUNGER rows keep their ids, because the stays they point at persist,
+-- redacted, and each row ages on its own stay's window.) The `shadow_search`
+-- EVENT beside this row is append-only by grant and the purge cannot reach it
+-- -- the open item docs/DATA_RETENTION.md already records for `events.detail`.
+--
 -- Tenant-owned; docs/RLS_TEMPLATE.md, the full template: the worker UPDATEs
--- the row it read with the outcome, and a queue row is a working record that
--- may one day be pruned -- unlike the `shadow_search` EVENT beside it, which is
--- append-only by `events`' grant and is the record.
+-- the row it read with the outcome, the purge UPDATEs it again, and a queue row
+-- is a working record that may one day be pruned -- unlike the EVENT, which is
+-- the record.
 --
 -- Run as the database OWNER.
 
@@ -54,12 +66,13 @@ CREATE TABLE shadow_searches (
   id                         uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id                  uuid        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
   garage_id                  uuid        NOT NULL REFERENCES garages(id) ON DELETE CASCADE,
-  -- The stay the close closed: the oracle's answer.
-  session_id                 uuid        NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  -- The stay the close closed: the oracle's answer. NULL once redacted.
+  session_id                 uuid        REFERENCES sessions(id) ON DELETE CASCADE,
   exit_lane_id               uuid        REFERENCES lanes(id) ON DELETE SET NULL,
   close_event_id             text        NOT NULL,
-  -- The open stays that had a descriptor at the snapshot: what the search is sent.
-  candidate_ids              uuid[]      NOT NULL,
+  -- The open stays that had a descriptor at the snapshot: what the search is
+  -- sent. NULL once redacted.
+  candidate_ids              uuid[],
   candidates_open            integer     NOT NULL CHECK (candidates_open >= 0),
   candidates_with_descriptor integer     NOT NULL CHECK (candidates_with_descriptor >= 0),
   true_stay_comparable       boolean     NOT NULL,
@@ -74,10 +87,19 @@ CREATE TABLE shadow_searches (
   search_ref                 text,
   attempts                   integer     NOT NULL DEFAULT 0,
   last_error                 text,
+  -- Written by the purge. The references go, the figure stays.
+  redacted_at                timestamptz,
   CONSTRAINT shadow_searches_outcome_matches_searched CHECK (
     (searched_at IS NULL AND outcome IS NULL AND matched_ids IS NULL AND true_stay_matched IS NULL)
     OR
-    (searched_at IS NOT NULL AND outcome IS NOT NULL AND matched_ids IS NOT NULL AND true_stay_matched IS NOT NULL)
+    (searched_at IS NOT NULL AND outcome IS NOT NULL AND true_stay_matched IS NOT NULL
+       AND (matched_ids IS NOT NULL OR redacted_at IS NOT NULL))
+  ),
+  -- Redacted means the references are gone; not redacted means they are there.
+  CONSTRAINT shadow_searches_redacted_has_no_references CHECK (
+    (redacted_at IS NULL AND session_id IS NOT NULL AND candidate_ids IS NOT NULL)
+    OR
+    (redacted_at IS NOT NULL AND session_id IS NULL AND candidate_ids IS NULL AND matched_ids IS NULL)
   ),
   UNIQUE (tenant_id, close_event_id)
 );

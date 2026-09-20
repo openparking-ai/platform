@@ -128,7 +128,7 @@ export async function runShadowSearches(tenantId, { search, thresholds, limit = 
   const pending = await withTenant(tenantId, async (client) => {
     const { rows } = await client.query(
       `SELECT id FROM shadow_searches
-        WHERE tenant_id = $1 AND searched_at IS NULL
+        WHERE tenant_id = $1 AND searched_at IS NULL AND redacted_at IS NULL
         ORDER BY created_at LIMIT $2`,
       [tenantId, limit],
     );
@@ -257,10 +257,12 @@ async function runOne(client, tenantId, id, { search, thresholds, now }) {
  * outcome naming the true stay and nothing else; a tie that includes the true
  * stay is a TIE, counted in the tie rate and not the match rate, because a
  * search that names two cars has not identified one. The four rates partition
- * `comparable`: match, wrong match, tie, no match. `exits` is every shadowed close; `searched` every one the worker
- * has finished; the difference between `searched` and `comparable` is the
- * count this measurement cannot say anything about, stated rather than folded
- * in.
+ * `comparable`: match, wrong match, tie, no match. `exits` is every shadowed
+ * close; `searched` every one the worker has finished; the difference between
+ * `searched` and `comparable` is the count this measurement cannot say
+ * anything about, stated rather than folded in. A row the purge has redacted
+ * still counts: its references are gone and its outcome is not, which is
+ * exactly what a figure over it needs.
  */
 export async function shadowReport(tenantId, garageId) {
   return withTenant(tenantId, async (client) => {
