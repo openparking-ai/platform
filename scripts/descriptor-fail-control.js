@@ -44,6 +44,21 @@
  *   retention_keeps_exit the purge nulls the entry descriptor and leaves the
  *                        exit one -- which is the same car, read a second time.
  *
+ * THE CANDIDATE SET (`src/candidates.js`): the open stays of one garage, keyed
+ * on the session, with what identifies each and its descriptor -- what the
+ * search is given. A set that is wrong in the reassuring direction is a
+ * search over the wrong cars that still returns an answer.
+ *
+ *   closed_stays_in_set  a stay that has exited is still a candidate, so the
+ *                        search can match an exit to a car that already left.
+ *   other_garage_in_set  the set is the tenant's, not the garage's: a car at
+ *                        this exit is matched against stays across town.
+ *   set_drops_descriptor the set carries every identity and no descriptor, so
+ *                        nothing is comparable and every exit reads as such.
+ *   search_gets_the_plate
+ *                        the projection sent to the identity service carries
+ *                        the plate. Its contract says no plate is involved.
+ *
  * SCHEMA break: `sessions_exit_descriptor_needs_exit` never created, so an open
  * stay may carry an exit descriptor -- a claim about an exit that has not
  * happened. A rule enforced only at a route is a rule one direct INSERT goes
@@ -149,6 +164,34 @@ const BREAKS = [
     from: '        `UPDATE sessions SET entry_descriptor = NULL, exit_descriptor = NULL',
     to: '        `UPDATE sessions SET entry_descriptor = NULL',
   },
+  {
+    name: 'closed_stays_in_set',
+    why: 'a stay that has exited is still a candidate',
+    file: 'src/candidates.js',
+    from: '      WHERE s.tenant_id = $1 AND s.garage_id = $2 AND s.exit_at IS NULL',
+    to: '      WHERE s.tenant_id = $1 AND s.garage_id = $2',
+  },
+  {
+    name: 'other_garage_in_set',
+    why: 'the candidate set is the tenant\'s, not the garage\'s',
+    file: 'src/candidates.js',
+    from: '      WHERE s.tenant_id = $1 AND s.garage_id = $2 AND s.exit_at IS NULL',
+    to: '      WHERE s.tenant_id = $1 AND ($2::uuid IS NOT NULL) AND s.exit_at IS NULL',
+  },
+  {
+    name: 'set_drops_descriptor',
+    why: 'the candidate set carries no descriptor',
+    file: 'src/candidates.js',
+    from: '    `SELECT s.id, s.entry_at, s.entry_confirmation, s.entry_descriptor AS descriptor,',
+    to: '    `SELECT s.id, s.entry_at, s.entry_confirmation, NULL::text AS descriptor,',
+  },
+  {
+    name: 'search_gets_the_plate',
+    why: 'the projection sent to the identity service carries the plate',
+    file: 'src/candidates.js',
+    from: '    .map((c) => ({ id: c.id, descriptor: c.descriptor }));',
+    to: '    .map((c) => ({ id: c.id, descriptor: c.descriptor, plate: c.plate }));',
+  },
 ];
 
 const SCHEMA_BREAKS = [
@@ -168,7 +211,12 @@ const SCHEMA_BREAKS = [
   },
 ];
 
-const SUITE = ['--test', 'test/entry-descriptor.test.js', 'test/exit-descriptor.test.js'];
+const SUITE = [
+  '--test',
+  'test/entry-descriptor.test.js',
+  'test/exit-descriptor.test.js',
+  'test/candidate-set.test.js',
+];
 
 function stage() {
   const dir = mkdtempSync(join(tmpdir(), 'openparking-e1-descriptor-control-'));
@@ -356,4 +404,6 @@ if (failures) {
   console.error(`\n${failures} control(s) failed. Do not trust this round's platform tests.`);
   process.exit(1);
 }
-console.log('\nall controls OK — the suite fails on every property the two descriptors rest on.');
+console.log(
+  '\nall controls OK — the suite fails on every property the two descriptors and the candidate set rest on.',
+);
