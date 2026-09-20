@@ -67,7 +67,7 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 | `GET /api/v1/lane/rules` | what the lane caches so it can decide offline |
 | `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` |
 | `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor` |
-| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation` |
+| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation`; carries and echoes an optional `descriptor` |
 
 ### A stay is identified by a plate or by a ticket — exactly one
 
@@ -155,6 +155,18 @@ ignored, not stored, not echoed, unbounded, or left behind by retention.
 appearance, so it is personal data on the same terms the plate is: the purge
 nulls it on the sessions of every vehicle it redacts, on the same window, in
 the same run — see [docs/DATA_RETENTION.md](docs/DATA_RETENTION.md).
+
+**The exit's descriptor rides the CLOSE, and no other channel.** A lane whose
+exit read produced one sends it on `POST /lane/sessions/close` as `descriptor`,
+and the platform holds it as `exit_descriptor` (migration 0010), echoes it, and
+redacts it with the entry one. The exit reaches this platform on two channels
+that arrive in no specified order — the sessions sync and the events ingest —
+and the shadow search snapshots the open stays *inside* the close transaction,
+before `exit_at` is written; on the events channel the descriptor could land
+after the stay was already closed, and every plate-matched exit would read as
+"absent true car". One channel, one ordering. A stay that has not exited holds
+no exit descriptor — `sessions_exit_descriptor_needs_exit`, checked at the
+database and not only at the route.
 
 `exit_confirmation` is the same question about the other end of the stay, with
 one more value:

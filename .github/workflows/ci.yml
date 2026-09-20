@@ -130,11 +130,14 @@ jobs:
         # only at a route is a rule one direct INSERT goes around.
         run: npm run ticket-identity-fail-control
 
-      - name: Entry-descriptor fail-control
-        # A session now carries the appearance descriptor its entry read
-        # produced (migration 0009). Each break removes one property that makes
-        # holding it safe -- the route reading it at all (the silent-drop defect
-        # the round exists for), the INSERT writing it, the response ECHOING it
-        # (the lane's only way to see it was kept), the bound, and the retention
-        # purge reaching it -- and requires the suite to go red.
-        run: npm run entry-descriptor-fail-control
+      - name: Descriptor fail-control
+        # A session carries the appearance descriptor its entry read produced
+        # (migration 0009) and the one its exit read produced (0010). Each break
+        # removes one property that makes holding them safe -- a route reading
+        # the field at all (the silent-drop defect the round exists for), the
+        # write, the response ECHOING it (the lane's only way to see it was
+        # kept), the bound, the retention purge reaching both columns, and the
+        # constraint that an open stay holds no exit descriptor (a scratch
+        # database with the statement edited out) -- and requires the suite to
+        # go red.
+        run: npm run descriptor-fail-control

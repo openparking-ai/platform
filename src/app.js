@@ -262,18 +262,19 @@ const PLATE_MAX = 32;
 const DESCRIPTOR_MAX = 65536;
 
 /**
- * The appearance descriptor on a session open: OPTIONAL, and typed before it is
- * bounded, for the reason `laneIdentity` gives -- `String(value)` on an array
- * produces something a length check is happy with.
+ * The appearance descriptor on a session open OR close: OPTIONAL, and typed
+ * before it is bounded, for the reason `laneIdentity` gives -- `String(value)`
+ * on an array produces something a length check is happy with.
  *
  * Absent or null is NOT MEASURED: a lane with the descriptor switched off,
  * which is the default, sends none and is unchanged by this. Present, it is
  * stored on the session and ECHOED back on the row -- and the echo is a
  * contract term, not a convenience. A platform older than the column accepts
- * the same call and drops the field silently (this route destructures known
- * keys and ignores the rest), so the lane treats an open whose response does
+ * the same call and drops the field silently (both routes destructure known
+ * keys and ignore the rest), so the lane treats an action whose response does
  * not carry the descriptor it sent as not delivered. That is the same rule
- * `entry_confirmation` already lives under, and for the same reason.
+ * `entry_confirmation` and `exit_confirmation` already live under, and for the
+ * same reason. ONE function for both ends, as `confirmation()` is.
  */
 function descriptorField(value) {
   if (value === undefined || value === null) return null;
@@ -969,6 +970,11 @@ export function createApp() {
         throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
       }
       const { event_id: closeEventId, session_id: sessionId = null } = req.body ?? {};
+      // The exit read's descriptor, on the CLOSE and on no other channel: the
+      // sessions sync and the events ingest arrive in no specified order, and
+      // the shadow search snapshots the open stays inside this transaction --
+      // so what it compares has to be in this call. Migration 0010.
+      const exitDescriptor = descriptorField(req.body?.descriptor);
       // The same rule at the other end of the stay. Without it a stay opened on
       // a ticket could never be closed: the close would upsert a vehicle from a
       // plate it does not have, find no open session, and 404 — a car that got
@@ -1043,10 +1049,14 @@ export function createApp() {
           feeMinor,
           closeEventId: String(closeEventId),
           exitConfirmation,
+          exitDescriptor,
         });
         return { session: closed, closed: true, replay: false };
       });
 
+      // The row as written, `exit_descriptor` with it -- echoed for the reason
+      // `entry_descriptor` is on the open, and a replay echoes what the close
+      // that actually closed the stay stored.
       res.status(200).json({ session: presentSession(out.session), closed: out.closed, replay: out.replay });
     } catch (err) {
       next(err);

@@ -160,17 +160,18 @@ export async function closeSession(
   client,
   tenantId,
   sessionId,
-  { exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId, exitConfirmation },
+  { exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId, exitConfirmation,
+    exitDescriptor = null },
 ) {
   const { rows } = await client.query(
     `UPDATE sessions
         SET exit_at = $3, exit_lane_id = $4, rate_id = $5,
             hourly_minor_applied = $6, fee_minor = $7, close_event_id = $8,
-            exit_confirmation = $9
+            exit_confirmation = $9, exit_descriptor = $10
       WHERE tenant_id = $1 AND id = $2 AND exit_at IS NULL
       RETURNING *`,
     [tenantId, sessionId, exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId,
-     exitConfirmation],
+     exitConfirmation, exitDescriptor],
   );
   return rows[0] ?? null;
 }

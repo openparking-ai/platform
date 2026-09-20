@@ -76,10 +76,11 @@ run redacts, and on no other.
 
 ```
 sessions.entry_descriptor -> NULL   (on the sessions of the vehicles redacted above)
+sessions.exit_descriptor  -> NULL   (the same car read a second time, at the exit — migration 0010)
 ```
 
-`test/entry-descriptor.test.js` asserts the redaction and carries the control
-that a stay inside the window keeps its descriptor.
+`test/entry-descriptor.test.js` and `test/exit-descriptor.test.js` assert the
+redaction and carry the control that a stay inside the window keeps both.
 
 The session keeps its times and its fee. `test/retention.test.js` asserts
 exactly that, because it is the property most likely to be broken by someone
