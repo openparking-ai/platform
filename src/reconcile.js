@@ -83,7 +83,9 @@ export async function sessionsOpenTooLong(client, tenantId, garageId, maxHours) 
 
 /**
  * The closes that could not be priced (migration 0013): the stay is closed --
- * the car is gone -- and carries no fee, only the refusal, by name. Listed
+ * the car is gone -- and carries no fee, only the refusal, by name. A COVERED
+ * close (0015) carries no fee either and is NOT one of these: it is keyed on
+ * the refusal, not on the absent fee. Listed
  * here because a report is where a human looks, and an unpriced close that
  * only exists as a row and an event is a gap in the money record nobody is
  * shown. No plate, for the reason above; the codes ARE returned, because
@@ -95,7 +97,7 @@ export async function closesUnpriced(client, tenantId, garageId, since) {
     `SELECT id, entry_at, exit_at, pricing_refusal
      FROM sessions
      WHERE tenant_id = $1 AND garage_id = $2
-       AND exit_at IS NOT NULL AND fee_minor IS NULL
+       AND exit_at IS NOT NULL AND pricing_refusal IS NOT NULL
        AND exit_at >= $3
      ORDER BY exit_at`,
     [tenantId, garageId, since],

@@ -112,6 +112,13 @@ The session keeps its times and its fee. `test/retention.test.js` asserts
 exactly that, because it is the property most likely to be broken by someone
 later deciding deletion is tidier.
 
+**Added with migration 0015:** `sessions.entitlement` — what the pass and
+monthly modules were asked (the argv names the identity) and answered — is
+nulled on the sessions of every vehicle the purge redacts; `sessions.exit_outcome`
+is kept. `garages.garage_pass_link` / `monthly_billing_link` name garages in
+other systems, not people. The `exit_covered` and `entitlement_links_stated`
+events are append-only like every event.
+
 **Added with migration 0013:** `sessions.breakdown` (the engine's ledger lines),
 `sessions.pricing_refusal` (its findings) and `sessions.space_class` (the
 garage's) describe a price, not a person or a car; the purge leaves them where

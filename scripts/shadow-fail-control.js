@@ -67,6 +67,7 @@ const SNAPSHOT_BLOCK = `        if (exitDescriptor !== null) {
           exitConfirmation,
           exitDescriptor,
           pricing,
+          entitlement: asked.record,
         });
 `;
 
@@ -83,6 +84,7 @@ const BREAKS = [
           exitConfirmation,
           exitDescriptor,
           pricing,
+          entitlement: asked.record,
         });
 
         if (exitDescriptor !== null) {
