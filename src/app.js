@@ -103,12 +103,14 @@ const EXIT_CONFIRMATIONS = [...CONFIRMATIONS, 'held'];
  *
  * DERIVED FROM THE LANE, NOT INVENTED HERE: every string below is a name in
  * `lane-controller`, taken from the constants in `sync.py` and the literals
- * passed to `events.record()` -- with one exception, marked where it sits:
- * `entry_unadmitted` lands here FIRST, because of the ordering hazard two
- * paragraphs down, and the lane round that emits it follows. Until that round
- * merges it is a kind this platform accepts and no lane yet reports, and that
- * is the only direction the two copies may ever differ in: a platform ahead of
- * the lane refuses nothing; a lane ahead of the platform is refused 400.
+ * passed to `events.record()` -- with the exceptions marked where they sit:
+ * a kind lands here FIRST, because of the ordering hazard two paragraphs down,
+ * and the lane round that emits it follows. Until that round merges it is a
+ * kind this platform accepts and no lane yet reports, and that is the only
+ * direction the two copies may ever differ in: a platform ahead of the lane
+ * refuses nothing; a lane ahead of the platform is refused 400.
+ * `entry_unadmitted` landed this way and its lane round has since merged;
+ * `arming_suppressed` and `arming_suppression_ended` are the ones ahead now.
  * `session_open` and `session_close` are
  * deliberately ABSENT -- the lane's transport routes those two to
  * `/sessions/open` and `/sessions/close` and never to this endpoint, so one
@@ -125,6 +127,19 @@ const LANE_EVENT_KINDS = [
   'armed',
   'arming_incomplete',
   'arming_rejected',
+  // THE DEACTIVATE LOOP, before the arming loop: the arming cycle is held
+  // while it reads occupied -- a second vehicle too close behind the one at
+  // the barrier -- so the barrier does not open for a car another can follow
+  // through. `arming_suppressed` is the START of one such held interval, with
+  // its reason; `arming_suppression_ended` is its END, saying which of the two
+  // ways it ended: the lane armed once the loop cleared, or the car at the
+  // arming loop left without arming. Two kinds and not one, because an
+  // interval that only ever started is a car nobody photographed and a record
+  // that never closes -- the silent non-event the lane refuses to write. A
+  // lane whose config declares no deactivate loop emits neither. Not counted
+  // by `reconcile.js`. Ahead of the lane, per the header.
+  'arming_suppressed',
+  'arming_suppression_ended',
   // The lane's assisted vend: an identity a display or a human completed,
   // recorded BEFORE the relay is pulsed. Its detail names the identity's KIND,
   // the authority, the caller's idempotency key and the decision it completes
