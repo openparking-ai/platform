@@ -73,10 +73,25 @@ export async function storePlan(client, tenantId, garageId, document) {
 }
 
 /**
- * One garage with both lanes, a vehicle, a rate and a flat plan — enough to
- * exercise everything. `plan: false` builds a garage that cannot price.
+ * Activate a garage directly: state its transient mode and set
+ * `activated_at`, through the trigger that checks the gate's conditions
+ * (0014) -- so a world that could not activate through the route cannot
+ * activate here either. Tests of the gate itself go through the route.
  */
-export async function buildWorld(tenantId, { hourlyMinor = 250, currency = 'USD', plan = true } = {}) {
+export async function activateGarage(client, tenantId, garageId, { transientAvailable = true } = {}) {
+  await client.query(
+    `UPDATE garages SET transient_available = $3, activated_at = now() WHERE tenant_id = $1 AND id = $2`,
+    [tenantId, garageId, transientAvailable],
+  );
+}
+
+/**
+ * One garage with both lanes, a vehicle, a rate and a flat plan, ACTIVE —
+ * enough to exercise everything. `plan: false` builds a garage that cannot
+ * price and therefore cannot activate; `active: false` leaves an otherwise
+ * ready garage inactive.
+ */
+export async function buildWorld(tenantId, { hourlyMinor = 250, currency = 'USD', plan = true, active = true } = {}) {
   return withTenant(tenantId, async (client) => {
     const garage = (
       await client.query(
@@ -86,6 +101,7 @@ export async function buildWorld(tenantId, { hourlyMinor = 250, currency = 'USD'
       )
     ).rows[0].id;
     if (plan) await storePlan(client, tenantId, garage, flatHourlyPlan({ hourlyMinor, currency }));
+    if (plan && active) await activateGarage(client, tenantId, garage);
 
     const lane = async (name, direction) =>
       (

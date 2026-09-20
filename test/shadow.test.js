@@ -17,7 +17,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { createApp } from '../src/app.js';
-import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
+import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
 import { runShadowSearches, shadowReport, thresholdsFromEnv, SHADOW_EVENT_KIND } from '../src/shadow.js';
@@ -371,7 +371,8 @@ test('the report: every rate over the comparable rows, the denominator and the o
     const lane = async (name, dir) => (await c.query(`INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1,$2,$3,$4) RETURNING id`, [tenant, garage, name, dir])).rows[0].id;
     const entryLane = await lane('E', 'entry');
     const exitLane = await lane('X', 'exit');
-    await c.query(`INSERT INTO rates (tenant_id, garage_id, name, hourly_minor) VALUES ($1,$2,'H',100)`, [tenant, garage]);
+    await storePlan(c, tenant, garage, flatHourlyPlan({ hourlyMinor: 100 }));
+    await activateGarage(c, tenant, garage);
     return { garage, entryLane, exitLane };
   });
   const gEntry = await issueDeviceToken(tenant, g.entryLane, 'e');

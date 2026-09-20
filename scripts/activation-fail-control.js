@@ -1,49 +1,43 @@
 #!/usr/bin/env node
 /**
- * The control for pricing by the engine, and the close that cannot price.
+ * The control for the activation gate.
  *
- * The close hands every plan of the garage to the engine and freezes what
- * comes back; a refusal closes the stay UNPRICED, on the record, instead of
- * refusing the close; an unreachable engine is a retry, not a record. Every
- * property that makes that TRUE rather than merely stated is broken below,
- * one at a time, and the suite is REQUIRED to go red. A pass is the failure.
+ * A garage is not usable until its rate setup is complete and its transient
+ * mode is stated, the refusal at the lane is named and recorded, and no
+ * payment-processor surface exists in this round at all. Every property is
+ * broken below, one at a time, and the suite is REQUIRED to go red. A pass
+ * is the failure.
  *
  * SOURCE breaks, applied to a COPY of the tree; no tracked file is edited.
  *
- *   refusal_is_a_409         the engine's refusal answers 409 -- the drop
- *                            path the round exists to close: the lane
- *                            dead-letters it, the car is gone, the stay
- *                            never closes.
- *   refusal_is_a_500         the engine's refusal is not caught: the close
- *                            answers 5xx, the lane retries for ever, the
- *                            stay never closes. The same hole, other door.
- *   engine_down_is_unpriced  an engine that cannot be reached is recorded
- *                            as a refusal. A priceable stay closes unpriced
- *                            on the strength of an outage.
- *   platform_selects_latest  the close hands the engine only the newest
- *                            version. The platform has made the selection,
- *                            silently, by exit time; the entry-time rule
- *                            is gone and nothing says so.
- *   space_class_literal      the stay is priced as 'standard' whatever the
- *                            garage says.
- *   breakdown_not_frozen     the close stores an empty ledger beside the
- *                            fee: a number with no explanation.
- *   unpriced_not_recorded    the unpriced close writes the row and no event.
- *   report_hides_unpriced    the reconciliation report lists no unpriced
- *                            close. The row exists and nobody is shown it.
- *   store_ignores_space_class
- *                            the store accepts a plan that does not declare
- *                            the garage's class; every exit then refuses.
+ *   gate_off_at_the_lane       the lane routes treat every garage as active.
+ *                              An unready garage opens stays again.
+ *   refusal_not_recorded       the inactive refusal answers 409 and writes
+ *                              nothing. The lane drops it; nobody knows.
+ *   no_plan_counts_as_setup    the route's readout calls the rate setup
+ *                              complete with no plan stored.
+ *   stored_counts_as_in_force  a plan stored for next month satisfies the
+ *                              route: set up, but nothing prices today.
+ *   unstated_counts_as_stated  an unstated transient mode satisfies the
+ *                              route -- the guessed default the three-state
+ *                              field exists to forbid.
+ *   null_is_a_statement        the request boundary accepts
+ *                              `transient_available: null` as a value.
+ *   processor_surface          the processor's name appears in a source
+ *                              file. The brief: any such surface in this
+ *                              round's diff at all breaks the build.
+ *   rules_say_active           /lane/rules tells every lane its garage is
+ *                              active.
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
- * statement edited out of 0013, so the property genuinely never existed.
+ * statement edited out of 0014, so the property genuinely never existed.
  *
- *   no_priced_or_refused     `sessions_closed_is_priced_or_refused` never
- *                            created: a closed stay may carry half a pricing,
- *                            or a fee and a refusal at once.
- *   closed_still_needs_fee   0002's `sessions_closed_is_complete` is never
- *                            replaced, so a closed stay must still carry a
- *                            fee, and the unpriced close cannot be written.
+ *   no_trigger                 the gate trigger never created: a direct
+ *                              UPDATE activates anything, a garage can be
+ *                              created active, a mode can be un-stated,
+ *                              activation can be undone.
+ *   trigger_ignores_in_force   the trigger counts stored plans, not plans in
+ *                              force.
  *
  * Needs the same environment as the suite, plus the engine
  * (RATE_ENGINE_PYTHON). The suite starts and stops the engine itself.
@@ -57,117 +51,98 @@ import { join, resolve } from 'node:path';
 import pg from 'pg';
 
 const ROOT = resolve(import.meta.dirname, '..');
-const SCRATCH = process.env.PRICING_SCRATCH_DB || 'openparking_pricing_control';
+const SCRATCH = process.env.ACTIVATION_SCRATCH_DB || 'openparking_activation_control';
 
 const SOURCE_BREAKS = [
   {
-    name: 'refusal_is_a_409',
-    why: "the engine's refusal refuses the close",
+    name: 'gate_off_at_the_lane',
+    why: 'the lane routes treat every garage as active',
     file: 'src/app.js',
-    from: '    if (err instanceof ratePlans.PricingRefused) return { refusal: err.findings };',
-    to: "    if (err instanceof ratePlans.PricingRefused) throw conflict('cannot_price', err.message);",
+    from: '  if (garage.activated_at !== null) return garage;',
+    to: '  if (true) return garage;',
   },
   {
-    name: 'refusal_is_a_500',
-    why: "the engine's refusal is not caught and the close fails",
+    name: 'refusal_not_recorded',
+    why: 'the inactive refusal writes nothing before answering',
     file: 'src/app.js',
-    from: '    if (err instanceof ratePlans.PricingRefused) return { refusal: err.findings };',
-    to: '    if (false) return { refusal: err.findings };',
+    from: '  await withTenant(tenantId, (client) =>\n    activation.recordInactiveRefusal(',
+    to: '  if (false) await withTenant(tenantId, (client) =>\n    activation.recordInactiveRefusal(',
   },
   {
-    name: 'engine_down_is_unpriced',
-    why: 'an unreachable engine is recorded as a refusal',
+    name: 'no_plan_counts_as_setup',
+    why: 'the readout calls the rate setup complete with no plan',
+    file: 'src/activation.js',
+    from: "      condition: 'rate_setup_complete',\n      met: plans.in_force > 0,",
+    to: "      condition: 'rate_setup_complete',\n      met: true,",
+  },
+  {
+    name: 'stored_counts_as_in_force',
+    why: 'a plan not yet in force satisfies the readout',
+    file: 'src/activation.js',
+    from: "      condition: 'rate_setup_complete',\n      met: plans.in_force > 0,",
+    to: "      condition: 'rate_setup_complete',\n      met: plans.stored > 0,",
+  },
+  {
+    name: 'unstated_counts_as_stated',
+    why: 'an unstated transient mode satisfies the readout',
+    file: 'src/activation.js',
+    from: "      condition: 'transient_mode_stated',\n      met: garage.transient_available !== null && garage.transient_available !== undefined,",
+    to: "      condition: 'transient_mode_stated',\n      met: true,",
+  },
+  {
+    name: 'null_is_a_statement',
+    why: 'the request boundary accepts null as a transient mode',
+    file: 'src/activation.js',
+    from: '  if (raw !== true && raw !== false) {',
+    to: '  if (raw === null) return null;\n  if (raw !== true && raw !== false) {',
+  },
+  {
+    name: 'processor_surface',
+    why: "the processor's name appears in a source file",
+    file: 'src/activation.js',
+    from: "export const GARAGE_ACTIVATED_EVENT_KIND = 'garage_activated';",
+    to: "export const GARAGE_ACTIVATED_EVENT_KIND = 'garage_activated';\nexport const STRIPE_ACCOUNT_FIELD = 'stripe_account_id';",
+  },
+  {
+    name: 'rules_say_active',
+    why: '/lane/rules tells every lane its garage is active',
     file: 'src/app.js',
-    from: '    if (err instanceof ratePlans.PricingRefused) return { refusal: err.findings };',
-    to: `    if (err instanceof ratePlans.PricingRefused) return { refusal: err.findings };
-    if (err instanceof ratePlans.EngineUnavailable) {
-      return { refusal: [{ code: 'ENGINE_UNAVAILABLE', kind: 'gap', text: err.message, rule_ids: [] }] };
-    }`,
-  },
-  {
-    name: 'platform_selects_latest',
-    why: 'the platform hands the engine only the newest version',
-    file: 'src/app.js',
-    from: '        const pricing = await priceStay({ garage, plans, session: open, exitAt });',
-    to: '        const pricing = await priceStay({ garage, plans: plans.slice(-1), session: open, exitAt });',
-  },
-  {
-    name: 'space_class_literal',
-    why: "every stay is priced as 'standard' whatever the garage says",
-    file: 'src/app.js',
-    from: '      spaceClass: garage.space_class,\n      entryAt: session.entry_at,',
-    to: "      spaceClass: 'standard',\n      entryAt: session.entry_at,",
-  },
-  {
-    name: 'breakdown_not_frozen',
-    why: 'the close stores an empty ledger beside the fee',
-    file: 'src/app.js',
-    from: '      breakdown: quote.breakdown,\n      spaceClass: garage.space_class,',
-    to: '      breakdown: [],\n      spaceClass: garage.space_class,',
-  },
-  {
-    name: 'unpriced_not_recorded',
-    why: 'the unpriced close writes the row and no event',
-    file: 'src/app.js',
-    from: '        if (pricing.refusal) {\n          // The record:',
-    to: '        if (false) {\n          // The record:',
-  },
-  {
-    name: 'report_hides_unpriced',
-    why: 'the reconciliation report lists no unpriced close',
-    file: 'src/reconcile.js',
-    from: '       AND exit_at IS NOT NULL AND fee_minor IS NULL\n       AND exit_at >= $3',
-    to: '       AND exit_at IS NOT NULL AND fee_minor IS NULL AND false\n       AND exit_at >= $3',
-  },
-  {
-    name: 'store_ignores_space_class',
-    why: "the store accepts a plan that does not declare the garage's class",
-    file: 'src/ratePlans.js',
-    from: '  if (!classes.includes(garage.space_class)) {',
-    to: '  if (false) {',
+    from: '        active: payload.garage.activated_at !== null,',
+    to: '        active: true,',
   },
 ];
 
 const SCHEMA_BREAKS = [
   {
-    name: 'no_priced_or_refused',
-    why: 'a closed stay may carry half a pricing, or a fee and a refusal at once',
+    name: 'no_trigger',
+    why: 'the gate trigger never created',
     edits: [
       {
-        file: '0013_pricing_by_the_engine.sql',
-        from: `ALTER TABLE sessions
-  ADD CONSTRAINT sessions_closed_is_priced_or_refused CHECK (`,
-        to: `ALTER TABLE sessions
-  ADD CONSTRAINT sessions_closed_is_priced_or_refused_disabled CHECK (true OR`,
+        file: '0014_activation_gate.sql',
+        from: `CREATE TRIGGER garages_activation_gate
+  BEFORE INSERT OR UPDATE OF transient_available, activated_at ON garages
+  FOR EACH ROW EXECUTE FUNCTION garages_activation_gate();`,
+        to: '',
       },
     ],
   },
   {
-    name: 'closed_still_needs_fee',
-    why: "0002's closed-needs-a-fee rule is never replaced, so no unpriced close can be written",
+    name: 'trigger_ignores_in_force',
+    why: 'the trigger counts stored plans, not plans in force',
     edits: [
       {
-        file: '0013_pricing_by_the_engine.sql',
-        from: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_complete;
-ALTER TABLE sessions DROP CONSTRAINT sessions_plan_pricing_is_complete;
-
--- The closing facts come together or not at all.
-ALTER TABLE sessions
-  ADD CONSTRAINT sessions_closed_is_complete CHECK (
-    (exit_at IS NULL AND exit_lane_id IS NULL AND close_event_id IS NULL)
-    OR
-    (exit_at IS NOT NULL AND exit_lane_id IS NOT NULL AND close_event_id IS NOT NULL)
-  );`,
-        to: 'ALTER TABLE sessions DROP CONSTRAINT sessions_plan_pricing_is_complete;',
+        file: '0014_activation_gate.sql',
+        from: '    SELECT count(*), count(*) FILTER (WHERE effective_from <= now())',
+        to: '    SELECT count(*), count(*)',
       },
     ],
   },
 ];
 
-const SUITE = ['--test', 'test/pricing.test.js', 'test/rate-plans.test.js'];
+const SUITE = ['--test', 'test/activation.test.js'];
 
 function stage() {
-  const dir = mkdtempSync(join(tmpdir(), 'openparking-pricing-control-'));
+  const dir = mkdtempSync(join(tmpdir(), 'openparking-activation-control-'));
   for (const entry of ['src', 'test', 'scripts', 'migrations', 'package.json']) {
     cpSync(join(ROOT, entry), join(dir, entry), { recursive: true });
   }
@@ -234,7 +209,7 @@ async function buildScratch(dir, brk) {
     await c.query(`CREATE DATABASE ${pg.escapeIdentifier(SCRATCH)}`);
   });
 
-  const partial = mkdtempSync(join(tmpdir(), 'openparking-pricing-migrations-'));
+  const partial = mkdtempSync(join(tmpdir(), 'openparking-activation-migrations-'));
   for (const file of readdirSync(join(ROOT, 'migrations')).filter((f) => f.endsWith('.sql'))) {
     copyFileSync(join(ROOT, 'migrations', file), join(partial, file));
   }
@@ -359,4 +334,4 @@ if (failures) {
   console.error(`\n${failures} control(s) failed. Do not trust this round's platform tests.`);
   process.exit(1);
 }
-console.log('\nall controls OK — the suite fails on every property the engine-priced close rests on.');
+console.log('\nall controls OK — the suite fails on every property the activation gate rests on.');

@@ -26,8 +26,8 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { createApp, CLOSE_UNPRICED_EVENT_KIND, NO_RATE_PLAN_STORED } from '../src/app.js';
-import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan } from './helpers.js';
+import { createApp, CLOSE_UNPRICED_EVENT_KIND } from '../src/app.js';
+import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
 
@@ -62,7 +62,7 @@ const asDevice = (token, body) => ({
 });
 
 /** A garage with both lanes, its tokens, and the plans the test names. */
-async function garage({ plans = [flatHourlyPlan()], currency = 'USD', spaceClass = undefined } = {}) {
+async function garage({ plans = [flatHourlyPlan()], currency = 'USD', spaceClass = undefined, active = true } = {}) {
   const created = await withTenant(tenant, async (c) => {
     const g = (
       await c.query(
@@ -76,6 +76,9 @@ async function garage({ plans = [flatHourlyPlan()], currency = 'USD', spaceClass
     const entryLane = await lane('Entry', 'entry');
     const exitLane = await lane('Exit', 'exit');
     for (const p of plans) await storePlan(c, tenant, g.id, p);
+    // Active when it can be: a garage with no plan in force cannot activate
+    // (0014), and a test that needs one inactive says so.
+    if (active && plans.length) await activateGarage(c, tenant, g.id);
     return { id: g.id, spaceClass: g.space_class, entryLane, exitLane };
   });
   return {
@@ -186,41 +189,19 @@ test('THE ENTRY-TIME RULE, through the platform: a stay entering under v1 and le
 
 // --- the close that cannot price closes ---------------------------------------------------
 
-test('a garage with no plan closes the stay UNPRICED: 200, no fee, the reason by name, an event, and a line in the report', async () => {
+test('a garage with no plan cannot be reached by a close at all: the gate (0014) refuses the open, so the platform has no refusal of its own', async () => {
+  // Before the gate this platform closed such a stay unpriced with a code of
+  // its own. An active garage now always holds a plan in force -- activation
+  // needs one, plans are append-only -- so that refusal became one nobody
+  // could reach, and it is gone rather than kept as a sentence.
   const g = await garage({ plans: [] });
-  const p = plate();
-  await open(g.entry, p, '2026-08-26T09:00:00Z');
-  const res = await close(g.exit, p, '2026-08-26T10:00:00Z');
-  assert.equal(res.status, 200, 'never a 409 -- the lane drops those and the stay never closes');
-  const { session, closed } = await res.json();
-  assert.equal(closed, true);
-  assert.ok(session.exit_at, 'the stay IS closed');
-  assert.equal(session.fee_minor, null);
-  assert.equal(session.plan_version, null);
-  assert.deepEqual(session.pricing_refusal.map((f) => f.code), [NO_RATE_PLAN_STORED]);
-  assert.match(session.pricing_refusal[0].text, /no rate plan stored/);
-
-  const [event] = await unpricedEventsFor(session.id);
-  assert.ok(event, 'the record, beside the row');
-  assert.equal(event.lane_id, g.exitLane);
-  assert.equal(event.detail.actor, 'platform:close');
-  assert.deepEqual(event.detail.findings.map((f) => f.code), [NO_RATE_PLAN_STORED]);
-  assert.deepEqual(event.detail.plan_versions_offered, []);
-  assert.equal(event.detail.space_class, 'standard');
-
-  const report = await (
-    await fetch(`${base}/api/v1/garages/${g.id}/reconciliation?max_stay_hours=24&hours=2160`, { headers: { authorization: `Bearer ${operatorToken}` } })
-  ).json();
-  const listed = report.closes_unpriced.sessions.find((s) => s.session_id === session.id);
-  assert.ok(listed, 'the reconciliation report lists it');
-  assert.deepEqual(listed.refusal_codes, [NO_RATE_PLAN_STORED]);
-  assert.equal('plate' in listed, false, 'and sprays no identity');
-
-  // The car is not counted inside for ever.
-  const stillOpen = await withTenant(tenant, async (c) =>
-    (await c.query('SELECT count(*) FROM sessions WHERE garage_id = $1 AND exit_at IS NULL', [g.id])).rows[0].count,
-  );
-  assert.equal(Number(stillOpen), 0);
+  const res = await open(g.entry, plate(), '2026-08-26T09:00:00Z');
+  assert.equal(res.status, 409);
+  assert.equal((await res.json()).code, 'garage_not_active');
+  const source = await (await import('node:fs/promises')).readFile(new URL('../src/app.js', import.meta.url), 'utf8');
+  assert.ok(!source.includes('NO_RATE_PLAN_STORED'), 'the unreachable refusal is not published');
+  // CONTROL: the sweep reads the file that holds the engine-refusal path.
+  assert.ok(source.includes('ratePlans.PricingRefused'));
 });
 
 test("no version in force at entry closes UNPRICED with the engine's own finding -- the first morning of a plan", async () => {
@@ -231,8 +212,20 @@ test("no version in force at entry closes UNPRICED with the engine's own finding
   assert.equal(session.fee_minor, null);
   assert.deepEqual(session.pricing_refusal.map((f) => f.code), ['GAP_NO_PLAN_IN_FORCE_AT_ENTRY']);
   assert.match(session.pricing_refusal[0].text, /no plan version was in force at entry/);
+  assert.ok(session.exit_at, 'the stay IS closed');
+  assert.equal(session.plan_version, null);
   const [event] = await unpricedEventsFor(session.id);
+  assert.ok(event, 'the record, beside the row');
+  assert.equal(event.lane_id, g.exitLane);
+  assert.equal(event.detail.actor, 'platform:close');
+  assert.deepEqual(event.detail.findings.map((f) => f.code), ['GAP_NO_PLAN_IN_FORCE_AT_ENTRY']);
   assert.deepEqual(event.detail.plan_versions_offered, ['from-sep'], 'the record says which versions the engine was given');
+  assert.equal(event.detail.space_class, 'standard');
+  // The car is not counted inside for ever.
+  const stillOpen = await withTenant(tenant, async (c) =>
+    (await c.query('SELECT count(*) FROM sessions WHERE garage_id = $1 AND exit_at IS NULL', [g.id])).rows[0].count,
+  );
+  assert.equal(Number(stillOpen), 0);
 
   // CONTROL: the next car, entering after midnight, prices.
   const q = plate();
@@ -240,11 +233,13 @@ test("no version in force at entry closes UNPRICED with the engine's own finding
   const next = await (await close(g.exit, q, '2026-09-01T01:00:00-04:00')).json();
   assert.equal(next.session.fee_minor, 250);
   assert.equal(next.session.plan_version, 'from-sep');
-  // And the report tells the two mornings apart from a garage with no plan.
+  // And the reconciliation report lists the unpriced one, by code, no plate.
   const report = await (
     await fetch(`${base}/api/v1/garages/${g.id}/reconciliation?max_stay_hours=24&hours=2160`, { headers: { authorization: `Bearer ${operatorToken}` } })
   ).json();
   assert.deepEqual(report.closes_unpriced.sessions.map((s) => s.refusal_codes), [['GAP_NO_PLAN_IN_FORCE_AT_ENTRY']]);
+  assert.equal(report.closes_unpriced.sessions[0].session_id, session.id);
+  assert.equal('plate' in report.closes_unpriced.sessions[0], false, 'and sprays no identity');
 });
 
 test('an engine that cannot be reached is NOT an unpriced close: 5xx, nothing written, and the same close prices when it is back', async () => {

@@ -385,11 +385,10 @@ frozen. A later version never reprices a closed stay.
 **A refusal is not a refusal of the close.** `computeFee` could not fail;
 `quote()` refuses by design — no version in force at entry (the ordinary first
 morning of a plan: cars that came in the night before), a gap the plan set left
-— and a garage with no plan has nothing to ask about. A `409` there is
-**dropped by the lane**: the barrier has already opened, the car is gone, the
-stay never closes, nothing is billed, and the car is counted inside for ever. So
-the stay closes **unpriced**: `200`, `fee_minor: null`, the refusal — the
-engine's findings verbatim, or `GAP_NO_RATE_PLAN_STORED` — in
+— and a `409` there is **dropped by the lane**: the barrier has already
+opened, the car is gone, the stay never closes, nothing is billed, and the car
+is counted inside for ever. So the stay closes **unpriced**: `200`,
+`fee_minor: null`, the refusal — the engine's findings, verbatim — in
 `pricing_refusal`, a `close_unpriced` event beside it, and a line under
 `closes_unpriced` in the reconciliation report (codes, no plate). A flag for a
 human, not a hole in the ledger; the same principle as `exit_held`.
@@ -416,6 +415,44 @@ schema statements never created — and requires the suite to go red.
 sentences and a stand-in would test this platform against itself.
 `npm run rate-plans-fail-control` breaks each property in turn and requires the
 suite to go red.
+
+### The activation gate
+
+A garage is not usable until its **rate setup is complete** and its **transient
+mode is stated** (migration 0014). Two conditions, observed from the schema:
+
+- **rate_setup_complete** — at least one plan is stored and a version is in
+  force now. The store already refused a plan the engine found fault with, so
+  this is presence and coverage, not a second validation.
+- **transient_mode_stated** — `transient_available` is `true` (sells transient
+  parking) or `false` (pass and monthly only). It is the three-state field
+  `garage-pass` ships, copied: unstated (`null`) is not false, nothing defaults
+  it, and a request cannot send `null` as a value. Stated at creation or by
+  `PATCH /api/v1/garages/<id>` at any time; restatable, never un-statable.
+
+There is no third condition. The payment-processor onboarding and the tested
+money collection are a separate requirement with its own place; this gate
+carries no such condition at all rather than an unchecked one, and a test
+sweeps `src/` and `migrations/` for the processor's name.
+
+```sh
+curl -H "authorization: Bearer $OPERATOR_TOKEN" \
+  http://127.0.0.1:3000/api/v1/garages/<id>/activation   # active?, and each condition with why not
+curl -X POST -H "authorization: Bearer $OPERATOR_TOKEN" \
+  http://127.0.0.1:3000/api/v1/garages/<id>/activate     # 201 and a garage_activated event, or 409 garage_not_activatable with `details.unmet`
+```
+
+Activation is an act, with a timestamp and the operator token that did it, and
+the database's own trigger checks the same conditions as the row is written —
+a direct `UPDATE` does not go around the route. Once set it cannot be cleared
+or moved. **An inactive garage does not operate:** `POST /lane/sessions/open`
+and `/close` answer `409 garage_not_active`, and because the lane drops a 409,
+the refusal is **recorded first** as a `garage_inactive_refusal` event keyed on
+the lane's event id. `/lane/rules` carries `active` so a lane can see it.
+
+What the gate does not reach: a stay that outlived the plan that covered it. It
+still arrives at the exit with no price, and the unpriced close above is its
+backstop. `npm run activation-fail-control` breaks each property in turn.
 
 ## Vehicle identity and retention
 
