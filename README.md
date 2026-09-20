@@ -66,7 +66,7 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 |---|---|
 | `GET /api/v1/lane/rules` | what the lane caches so it can decide offline |
 | `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` |
-| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation` |
+| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor` |
 | `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation` |
 
 ### A stay is identified by a plate or by a ticket — exactly one
@@ -121,6 +121,40 @@ loops after the barrier see a vehicle cross them forward.
 The response **echoes the value back**, and that is a contract term rather than a
 convenience: a platform older than the column accepts the same call and drops the
 field, so the lane treats an open that does not echo what it sent as undelivered.
+
+### A session carries the appearance descriptor its entry read produced
+
+The exit module matches an exiting car to a **stay** by comparing one descriptor
+against the descriptors of every open stay in the garage. This is the entry
+half: a lane whose identity service produced a descriptor sends it on the open
+as `descriptor`, and the platform holds it on the session as `entry_descriptor`
+(migration 0009).
+
+A descriptor is the identity service's opaque, versioned, compact string
+(`opvid-fp/<version>:…`) — a bounded set of keypoint descriptors, a colour
+histogram and a coarse edge grid, after a fixed resize. It is not an image, a
+photograph cannot be reconstructed from it, and this platform does not parse
+it: what is checked is that it is a string, not blank, and at most 64 KiB (a
+bound with a measurement behind it, in `src/app.js`).
+
+**It is optional, and absent means NOT MEASURED.** The identity service produces
+one only when a deployment asks for it, so a lane with it switched off — the
+default — sends none and is unchanged, and every row written before the column
+carries `null`.
+
+**The response echoes it back, and that is the contract term.** This route
+destructures the keys it knows and ignores the rest, so a platform older than
+the column accepts the same call with a `201` and drops the field — silently,
+which is worse than a refusal because nothing reports it. The lane treats an
+open whose response does not carry the descriptor it sent as undelivered,
+exactly as it does for `entry_confirmation`. A fail control
+(`npm run entry-descriptor-fail-control`) turns the suite red when the field is
+ignored, not stored, not echoed, unbounded, or left behind by retention.
+
+**It is identity, and retention reaches it.** It describes one specific car's
+appearance, so it is personal data on the same terms the plate is: the purge
+nulls it on the sessions of every vehicle it redacts, on the same window, in
+the same run — see [docs/DATA_RETENTION.md](docs/DATA_RETENTION.md).
 
 `exit_confirmation` is the same question about the other end of the stay, with
 one more value:
