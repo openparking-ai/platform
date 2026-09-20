@@ -84,6 +84,26 @@ export const TENANT_TABLES = [
       ),
   },
   {
+    table: 'rate_plans',
+    // A document the STORE would accept from the database's side: the version
+    // and the instant are unique per garage, and the currency is the world's
+    // garage's, which the trigger checks. What the engine would say about it
+    // is the route's business, not this table's.
+    insert: (c, t, w) => {
+      const version = `Row-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const at = new Date(Date.now() - Math.floor(Math.random() * 1e9)).toISOString();
+      return c.query(
+        `INSERT INTO rate_plans (tenant_id, garage_id, plan_version, effective_from, document, engine_schema_version)
+         VALUES ($1, $2, $3, $4::timestamptz, $5::jsonb, 1) RETURNING id`,
+        [t, w.garage, version, at,
+         JSON.stringify({ plan_version: version, effective_from: at, currency: w.currency })],
+      );
+    },
+    // Append-only by grant, like events; that the grants are absent is
+    // asserted in rate-plans.test.js rather than assumed here.
+    appendOnly: true,
+  },
+  {
     table: 'events',
     insert: (c, t, w) =>
       c.query(

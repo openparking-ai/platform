@@ -141,9 +141,9 @@ const BREAKS = [
     why: 'the UPDATE writes null for the descriptor the close accepted',
     file: 'src/repository.js',
     from: `    [tenantId, sessionId, exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId,
-     exitConfirmation, exitDescriptor],`,
+     exitConfirmation, exitDescriptor, planVersion,`,
     to: `    [tenantId, sessionId, exitAt, laneId, rateId, hourlyMinor, feeMinor, closeEventId,
-     exitConfirmation, null],`,
+     exitConfirmation, null, planVersion,`,
   },
   {
     name: 'close_not_echoed',

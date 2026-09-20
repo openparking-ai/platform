@@ -19,6 +19,7 @@
     "ticket-identity-fail-control": "node scripts/ticket-identity-fail-control.js",
     "descriptor-fail-control": "node scripts/descriptor-fail-control.js",
     "shadow-fail-control": "node scripts/shadow-fail-control.js",
+    "rate-plans-fail-control": "node scripts/rate-plans-fail-control.js",
     "demo": "node scripts/demo.js",
     "purge": "node scripts/purge-vehicles.js",
     "shadow-search": "node scripts/shadow-search.js",
