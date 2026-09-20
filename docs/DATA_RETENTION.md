@@ -82,6 +82,32 @@ sessions.exit_descriptor  -> NULL   (the same car read a second time, at the exi
 `test/entry-descriptor.test.js` and `test/exit-descriptor.test.js` assert the
 redaction and carry the control that a stay inside the window keeps both.
 
+**Added with migration 0011:** `shadow_searches` and the `shadow_search` event
+hold **session ids, counts and verdicts** — never a descriptor and never a
+plate. The descriptors they refer to live on `sessions`, where the purge
+reaches them. A shadow row **ages out with the stay it shadowed**: when the
+purge redacts that stay's vehicle it nulls the row's session references and
+keeps the figure —
+
+```
+shadow_searches.session_id     -> NULL
+shadow_searches.candidate_ids  -> NULL
+shadow_searches.matched_ids    -> NULL
+shadow_searches.redacted_at    -> when it happened
+(outcome, counts, true_stay_comparable, true_stay_matched, thresholds: kept)
+```
+
+— so a report run after the window still counts every exit and what the search
+said about it, and cannot say which stay any of it was about. The candidate
+lists of *younger* rows keep their ids: the stays they point at persist,
+redacted, and each row ages on its own stay's window. `test/shadow.test.js`
+asserts the redaction with the control that a row inside the window keeps its
+references, and that the report is unchanged by the purge.
+
+**Still open, and now one more instance of it:** the `shadow_search` event
+carries session ids in `events.detail`, which is append-only by grant and
+outside the purge — the same open item as the plate in `events.detail`.
+
 The session keeps its times and its fee. `test/retention.test.js` asserts
 exactly that, because it is the property most likely to be broken by someone
 later deciding deletion is tidier.

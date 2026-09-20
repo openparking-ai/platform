@@ -21,6 +21,14 @@
  * neither would leave a ticket — which a person read out loud and which
  * identifies a stay — as the one piece of identity retention could not remove.
  *
+ * A SHADOW SEARCH (migration 0011) ages out with the stay it shadowed: the
+ * row's session references -- `session_id`, `candidate_ids`, `matched_ids` --
+ * are nulled and `redacted_at` stamped, and the counts and the outcome are
+ * KEPT. The figure survives; what it was a figure about does not, which is the
+ * vehicle's own redaction in the same shape. The `shadow_search` event beside
+ * it is append-only by grant and the purge cannot reach it (see
+ * docs/DATA_RETENTION.md, the open item).
+ *
  * A session's ENTRY DESCRIPTOR (migration 0009) and EXIT DESCRIPTOR (0010) are
  * redacted in the same run. They live on the session rather than the vehicle
  * -- a descriptor is one READ, not an identity -- but each describes one
@@ -86,6 +94,15 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
             AND (entry_descriptor IS NOT NULL OR exit_descriptor IS NOT NULL)
             AND vehicle_id = ANY($2::uuid[])`,
         [tenantId, rows.map((r) => r.id)],
+      );
+      // The shadow rows about those vehicles' stays: references out, figure kept.
+      await client.query(
+        `UPDATE shadow_searches sh
+            SET session_id = NULL, candidate_ids = NULL, matched_ids = NULL,
+                redacted_at = COALESCE($3::timestamptz, now())
+          WHERE sh.tenant_id = $1 AND sh.redacted_at IS NULL
+            AND sh.session_id IN (SELECT s.id FROM sessions s WHERE s.vehicle_id = ANY($2::uuid[]))`,
+        [tenantId, rows.map((r) => r.id), now],
       );
     }
     return { tenantId, retentionDays: days, redacted: rows.length, wouldRedact: rows.length };

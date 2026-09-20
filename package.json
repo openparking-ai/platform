@@ -18,8 +18,11 @@
     "devices-and-codes-fail-control": "node scripts/devices-and-codes-fail-control.js",
     "ticket-identity-fail-control": "node scripts/ticket-identity-fail-control.js",
     "descriptor-fail-control": "node scripts/descriptor-fail-control.js",
+    "shadow-fail-control": "node scripts/shadow-fail-control.js",
     "demo": "node scripts/demo.js",
     "purge": "node scripts/purge-vehicles.js",
+    "shadow-search": "node scripts/shadow-search.js",
+    "shadow-report": "node scripts/shadow-report.js",
     "issue-operator-token": "node scripts/issue-operator-token.js",
     "check-no-real-data": "node .github/scripts/check-no-real-data.js"
   },

@@ -191,8 +191,54 @@ because a figure produced over this set has to be written beside them.
 
 **It runs on the caller's client.** The consumer that matters reads the set
 *inside* the close transaction, before `exit_at` is written, so the stay that
-is leaving is still open and in it. There is no operator route for it — the
-shadow run and the operator surface are later rounds.
+is leaving is still open and in it. There is no operator route for it.
+
+### The shadow run
+
+The search is called for real exits, its answer **recorded**, and nothing acts
+on it. Two halves, with a row in `shadow_searches` (migration 0011) between them.
+
+**The snapshot is taken inside the close, before `exit_at` is written.** A
+close that carries a descriptor reads which stays are open and comparable in
+the same transaction, after the stay to close is found and before it is
+closed, and writes them as **session ids and counts** — nothing heavier. That
+was measured, not preferred: at 5,000 open stays with real-size descriptors the
+full candidate set is 62 MB inside the close transaction; ids and counts are
+1.2 MB. A descriptor is immutable once written, so the worker reads them by id
+later; which stays were open *before* the close is the one thing that cannot
+be re-read, and it is the one thing the close holds. A snapshot taken after the
+close finds the true stay already gone, and every plate-matched exit reads as
+"absent true car" — the fail control puts that ordering back and the suite goes
+red.
+
+**The worker runs later, outside any request** — `npm run shadow-search`, on a
+schedule beside the purge. It needs `VEHICLE_ID_URL` (the identity service's
+search route, on loopback or a tokened bind: `VEHICLE_ID_TOKEN_FILE`) and the
+two thresholds the search is told to apply, `SHADOW_THRESHOLD_STRUCTURE` and
+`SHADOW_THRESHOLD_COLOUR` — **required, never defaulted**, because no operating
+point has been measured for the descriptor on real entry-and-exit photographs.
+It sends `{id, descriptor}` per candidate and nothing else, and writes the
+outcome onto the row and a `shadow_search` event beside it: **session ids,
+never descriptors** — `events` is append-only by grant and outside the
+retention purge. A search that cannot be obtained leaves the row pending and
+counted, and is retried. **Retention reaches the row:** when the purge redacts
+the stay it shadowed, the session references go and the outcome and counts
+stay, so the figure survives the identity — see
+[docs/DATA_RETENTION.md](docs/DATA_RETENTION.md).
+
+**What may be published** — `npm run shadow-report <tenant> <garage>`. Every
+figure names its denominator and its oracle: on every row the close picked the
+stay by plate or ticket independently of the search, so whether the search
+named that stay is a measurement with ground truth — over plate- or
+ticket-identified cars only, inheriting the plate reader's own errors. The four
+rates (match, wrong match, tie, no match) partition the rows where the true
+stay was comparable; a tie that includes the true stay is a tie, not a match.
+**A match rate over all exits is not measurable here** — a close that matches
+nothing answers 404 and inserts no row — and none is published.
+
+**Nothing decides anything.** No vend, fee or session is touched by an outcome.
+The identity service this needs — one serving the search route on the platform
+host — is a deployment dependency and is not started by anything here.
 
 `exit_confirmation` is the same question about the other end of the stay, with
 one more value:

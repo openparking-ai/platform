@@ -142,3 +142,12 @@ jobs:
         # over them (closed stays out, other garages out, the descriptor on,
         # no plate to the search) -- and requires the suite to go red.
         run: npm run descriptor-fail-control
+
+      - name: Shadow-run fail-control
+        # The search is called for real exits, its answer recorded, nothing
+        # acts on it -- and the record means something only if the snapshot
+        # is taken inside the close BEFORE exit_at is written (the race), the
+        # event carries session ids and never a descriptor, an outcome outside
+        # the closed set is refused, a tie is not a match, and every rate is
+        # over the rows that have an oracle. Each is broken in turn.
+        run: npm run shadow-fail-control
