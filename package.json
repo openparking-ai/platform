@@ -22,6 +22,7 @@
     "rate-plans-fail-control": "node scripts/rate-plans-fail-control.js",
     "pricing-fail-control": "node scripts/pricing-fail-control.js",
     "activation-fail-control": "node scripts/activation-fail-control.js",
+    "exit-outcomes-fail-control": "node scripts/exit-outcomes-fail-control.js",
     "demo": "node scripts/demo.js",
     "purge": "node scripts/purge-vehicles.js",
     "shadow-search": "node scripts/shadow-search.js",

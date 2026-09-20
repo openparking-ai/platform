@@ -6,6 +6,7 @@ import * as repo from './repository.js';
 import { enqueueShadowSearch } from './shadow.js';
 import * as ratePlans from './ratePlans.js';
 import * as activation from './activation.js';
+import * as entitlement from './entitlement.js';
 import { reconcile } from './reconcile.js';
 
 class HttpError extends Error {
@@ -589,6 +590,41 @@ export function createApp() {
         const refusal = conflict('garage_not_activatable', err.message);
         refusal.details = { unmet: err.unmet };
         return next(refusal);
+      }
+      next(err);
+    }
+  });
+
+  /**
+   * State which garage-pass garage and which monthly-billing garage this
+   * garage is, under which tenant of each -- or that it is not linked to one
+   * (null). Each stated link is PROBED before it is stored: the module must
+   * answer a question about that garage at all, and a link it cannot answer
+   * is refused by name. Restatable; every statement is recorded with what
+   * changed and what the probes saw.
+   */
+  operator.put('/garages/:garageId/entitlement-links', async (req, res, next) => {
+    try {
+      const body = req.body ?? {};
+      for (const key of Object.keys(body)) {
+        if (!(key in entitlement.MODULES)) throw bad(`unknown module ${JSON.stringify(key)}; the links are garage_pass and monthly_billing`);
+      }
+      const links = {};
+      for (const module of Object.keys(entitlement.MODULES)) {
+        if (!(module in body)) throw bad(`${module} is required: null (not linked) or {tenant_id, garage_id}`);
+        links[module] = linkField(body[module], module);
+      }
+      const garage = await withTenant(req.tenantId, async (client) => {
+        const current = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!current) throw new HttpError(404, 'garage not found');
+        return entitlement.stateLinks(client, req.tenantId, current, links, {
+          actor: `operator_token:${req.operatorTokenId}`,
+        });
+      });
+      res.json({ garage });
+    } catch (err) {
+      if (err instanceof entitlement.LinkUnanswerable) {
+        return next(conflict('entitlement_link_unanswerable', err.message));
       }
       next(err);
     }
@@ -1188,8 +1224,29 @@ export function createApp() {
         // can be priced, just not now, so it falls through as a 5xx, this
         // transaction rolls back, and the lane retries.
         const garage = await repo.getGarage(client, tenantId, garageId);
-        const plans = ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, garageId));
-        const pricing = await priceStay({ garage, plans, session: open, exitAt });
+
+        // THE ENTITLEMENT QUESTION, BEFORE PRICING (0015): the pass module and
+        // the monthly module, each through its own door, each linked one
+        // always, and the record of what they said goes on the row whichever
+        // way it went. Covered means no transient fee; not covered means the
+        // stay prices like any other, with the modules' named reasons kept.
+        // A module that could not decide is not a not-covered: it falls
+        // through as a 5xx like an unreachable engine, and the lane retries.
+        const asked = await entitlement.consult({
+          garage,
+          identity: vehicle.plate ?? vehicle.ticket_ref,
+          laneId,
+          entryAt: open.entry_at,
+          exitAt,
+        });
+        let pricing;
+        let plans = [];
+        if (asked.outcome === entitlement.EXIT_OUTCOMES.COVERED) {
+          pricing = { outcome: entitlement.EXIT_OUTCOMES.COVERED };
+        } else {
+          plans = ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, garageId));
+          pricing = { outcome: entitlement.EXIT_OUTCOMES.TRANSIENT, ...(await priceStay({ garage, plans, session: open, exitAt })) };
+        }
 
         // THE SHADOW SNAPSHOT, HERE AND NOWHERE ELSE: after the stay to close
         // is known, BEFORE `exit_at` is written on it, in this transaction.
@@ -1213,7 +1270,32 @@ export function createApp() {
           exitConfirmation,
           exitDescriptor,
           pricing,
+          entitlement: asked.record,
         });
+        if (pricing.outcome === entitlement.EXIT_OUTCOMES.COVERED) {
+          // The record: a stay that leaves with no transient fee, and who
+          // said it could. Money not charged is a decision as much as money
+          // charged, and it is written where it cannot be edited.
+          await repo.appendEvents(client, tenantId, [
+            {
+              garageId,
+              laneId,
+              eventId: `exit_covered:${closed.id}`,
+              kind: entitlement.EXIT_COVERED_EVENT_KIND,
+              occurredAt: exitAt,
+              detail: {
+                actor: 'platform:close',
+                session_id: closed.id,
+                close_event_id: String(closeEventId),
+                entry_at: closed.entry_at,
+                exit_at: closed.exit_at,
+                covered_by: asked.covered_by,
+                pass_id: asked.record.garage_pass?.answer?.pass_id ?? null,
+                agreement: asked.record.monthly_billing?.answer?.lines?.find((l) => l.includes('under agreement'))?.trim() ?? null,
+              },
+            },
+          ]);
+        }
         if (pricing.refusal) {
           // The record: what was refused and why, named -- not a null fee.
           // Append-only, beside the row, the thing a human works from.
@@ -1363,6 +1445,15 @@ async function activeGarageOrRefuse({ tenantId, garageId, laneId, laneEventId, a
     'garage_not_active',
     `this garage is not active: no stay is ${action === 'open' ? 'opened' : 'closed'} here until its rate setup is complete and its transient mode is stated`,
   );
+}
+
+/** A link from a request body, through the one place its shape is written. */
+function linkField(raw, name) {
+  try {
+    return entitlement.linkField(raw, name);
+  } catch (err) {
+    throw bad(err.message);
+  }
 }
 
 /** `transient_available` from a request body, through the one place its shape is written. */

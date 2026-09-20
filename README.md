@@ -454,6 +454,49 @@ What the gate does not reach: a stay that outlived the plan that covered it. It
 still arrives at the exit with no price, and the unpriced close above is its
 backstop. `npm run activation-fail-control` breaks each property in turn.
 
+### The exit's three outcomes, and the two modules consulted
+
+His words: *"we have several different customers: monthly/garage pass,
+transient, transient with card on file."* Every close now names which
+(migration 0015), in `sessions.exit_outcome`:
+
+- **`covered`** — a garage pass or a monthly agreement covers the stay. No
+  transient fee; which module said so, and what it said, is in
+  `sessions.entitlement`, and an `exit_covered` event records the money not
+  charged.
+- **`transient`** — priced through the engine (or unpriced with its refusal).
+- **`transient_card_on_file`** — priced, charged off-session, no tap.
+  **Declared and produced nowhere:** this platform holds no customer, account
+  or card, so no close can say it yet. It is in the vocabulary so the third
+  customer has a seat; a test asserts nothing writes it.
+
+Before pricing, the close consults **`garage-pass`** (`access-in-store
+--direction exit`) and **`monthly-billing`** (`covered-in-store --entered-at`)
+— each through its own command line, run as a subprocess with the environment
+this platform was given (`GARAGE_PASS_DSN`, `MONTHLY_BILLING_DSN` are theirs;
+`ENTITLEMENT_BIN_DIR` names where the scripts are, else the PATH). This platform
+imports neither and holds none of their data. Both linked modules are always
+asked; what each printed, its exit code and the argv are kept verbatim on the
+row — the named reason for a not-covered answer as much as for a covered one,
+and no amount ever travels. **A module that cannot answer is not a
+not-covered:** the close answers `500`, rolls back, and the lane retries — a
+pass holder is not billed on the strength of an outage.
+
+**Links are stated, never inferred.** `PUT /api/v1/garages/<id>/entitlement-links`
+with `{"garage_pass": {"tenant_id", "garage_id"} | null, "monthly_billing": … | null}`
+says which garage this is in each module, under which tenant of that module.
+Each stated link is **probed** — the module must answer a question about that
+garage at all — and refused `409 entitlement_link_unanswerable` when it cannot.
+A garage linked to neither prices every exit as transient, on the record. Every
+statement is recorded (`entitlement_links_stated`).
+
+The retention purge nulls `entitlement` (it names the identity) on the sessions
+of every vehicle it redacts and keeps `exit_outcome`. `test/exit-outcomes.test.js`
+builds a database for each module from its own migrations (`garage-pass.pin`,
+`monthly-billing.pin`; CI checks them out), seeds through their doors, and drives
+all of it through the lane's close. `npm run exit-outcomes-fail-control` breaks
+each property in turn.
+
 ## Vehicle identity and retention
 
 The database stores real vehicle identity — plate, make, model, colour — because

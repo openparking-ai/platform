@@ -1,54 +1,47 @@
 #!/usr/bin/env node
 /**
- * The control for pricing by the engine, and the close that cannot price.
+ * The control for the exit's three outcomes and the two modules consulted.
  *
- * The close hands every plan of the garage to the engine and freezes what
- * comes back; a refusal closes the stay UNPRICED, on the record, instead of
- * refusing the close; an unreachable engine is a retry, not a record. Every
- * property that makes that TRUE rather than merely stated is broken below,
- * one at a time, and the suite is REQUIRED to go red. A pass is the failure.
+ * A covered stay leaves with no fee, a transient one is priced, the third
+ * outcome is declared and produced nowhere, both modules are asked through
+ * their own doors and their answers kept, a module that cannot decide is not
+ * a not-covered, links are stated and probed, and the purge reaches the
+ * record. Every property is broken below, one at a time, and the suite is
+ * REQUIRED to go red. A pass is the failure.
  *
  * SOURCE breaks, applied to a COPY of the tree; no tracked file is edited.
  *
- *   refusal_is_a_409         the engine's refusal answers 409 -- the drop
- *                            path the round exists to close: the lane
- *                            dead-letters it, the car is gone, the stay
- *                            never closes.
- *   refusal_is_a_500         the engine's refusal is not caught: the close
- *                            answers 5xx, the lane retries for ever, the
- *                            stay never closes. The same hole, other door.
- *   engine_down_is_unpriced  an engine that cannot be reached is recorded
- *                            as a refusal. A priceable stay closes unpriced
- *                            on the strength of an outage.
- *   platform_selects_latest  the close hands the engine only the newest
- *                            version. The platform has made the selection,
- *                            silently, by exit time; the entry-time rule
- *                            is gone and nothing says so.
- *   space_class_literal      the stay is priced as 'standard' whatever the
- *                            garage says.
- *   breakdown_not_frozen     the close stores an empty ledger beside the
- *                            fee: a number with no explanation.
- *   unpriced_not_recorded    the unpriced close writes the row and no event.
- *   report_hides_unpriced    the reconciliation report lists no unpriced
- *                            close. The row exists and nobody is shown it.
- *   store_ignores_space_class
- *                            the store accepts a plan that does not declare
- *                            the garage's class; every exit then refuses.
+ *   covered_still_priced       the close ignores a covered answer and prices
+ *                              the stay: a pass holder billed.
+ *   not_covered_is_covered     a not-covered answer counts as covered: every
+ *                              car leaves free.
+ *   monthly_not_consulted      only garage-pass is asked; a monthly vehicle
+ *                              is billed as transient.
+ *   garage_pass_not_consulted  only monthly-billing is asked.
+ *   cannot_decide_is_transient a module that could not answer is recorded as
+ *                              not covered and the stay is priced -- the
+ *                              outage-bills-a-pass-holder defect.
+ *   link_unprobed              a stated link is stored without the module
+ *                              answering for it.
+ *   covered_not_recorded       a covered exit writes the row and no event.
+ *   answer_not_kept            the modules' answers are dropped from the
+ *                              record; only the verdict survives.
+ *   card_on_file_produced      a transient close is written as the third
+ *                              outcome, which nothing can produce yet.
+ *   purge_keeps_entitlement    the purge redacts the vehicle and leaves the
+ *                              record naming it.
+ *   identity_guessed           the platform consults with the plate even for
+ *                              a ticket stay (the ticket text replaced by an
+ *                              empty identity).
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
- * statement edited out of 0013, so the property genuinely never existed.
+ * statement edited out of 0015, so the property genuinely never existed.
  *
- *   no_priced_or_refused     the closed-stay shape constraint (0015's
- *                            `sessions_closed_is_covered_priced_or_refused`,
- *                            which replaced 0013's) never created: a closed
- *                            stay may carry half a pricing, or a fee and a
- *                            refusal at once.
- *   closed_still_needs_fee   0002's `sessions_closed_is_complete` is never
- *                            replaced, so a closed stay must still carry a
- *                            fee, and the unpriced close cannot be written.
+ *   covered_may_carry_a_fee    the four-shape constraint never created.
+ *   link_shape_unchecked       the link CHECKs never created.
  *
- * Needs the same environment as the suite, plus the engine
- * (RATE_ENGINE_PYTHON). The suite starts and stops the engine itself.
+ * Needs the same environment as the suite: the engine, the two modules'
+ * scripts, and checkouts of both modules for their migrations.
  */
 import { spawnSync } from 'node:child_process';
 import {
@@ -59,81 +52,98 @@ import { join, resolve } from 'node:path';
 import pg from 'pg';
 
 const ROOT = resolve(import.meta.dirname, '..');
-const SCRATCH = process.env.PRICING_SCRATCH_DB || 'openparking_pricing_control';
+const SCRATCH = process.env.OUTCOMES_SCRATCH_DB || 'openparking_outcomes_control';
 
 const SOURCE_BREAKS = [
   {
-    name: 'refusal_is_a_409',
-    why: "the engine's refusal refuses the close",
+    name: 'covered_still_priced',
+    why: 'a covered answer is ignored and the stay is priced',
     file: 'src/app.js',
-    from: '    if (err instanceof ratePlans.PricingRefused) return { refusal: err.findings };',
-    to: "    if (err instanceof ratePlans.PricingRefused) throw conflict('cannot_price', err.message);",
+    from: '        if (asked.outcome === entitlement.EXIT_OUTCOMES.COVERED) {\n          pricing = { outcome: entitlement.EXIT_OUTCOMES.COVERED };',
+    to: '        if (false) {\n          pricing = { outcome: entitlement.EXIT_OUTCOMES.COVERED };',
   },
   {
-    name: 'refusal_is_a_500',
-    why: "the engine's refusal is not caught and the close fails",
-    file: 'src/app.js',
-    from: '    if (err instanceof ratePlans.PricingRefused) return { refusal: err.findings };',
-    to: '    if (false) return { refusal: err.findings };',
+    name: 'not_covered_is_covered',
+    why: 'a not-covered answer counts as covered',
+    file: 'src/entitlement.js',
+    from: '    if (answer.covered) coveredBy.push(module);',
+    to: '    coveredBy.push(module);',
   },
   {
-    name: 'engine_down_is_unpriced',
-    why: 'an unreachable engine is recorded as a refusal',
-    file: 'src/app.js',
-    from: '    if (err instanceof ratePlans.PricingRefused) return { refusal: err.findings };',
-    to: `    if (err instanceof ratePlans.PricingRefused) return { refusal: err.findings };
-    if (err instanceof ratePlans.EngineUnavailable) {
-      return { refusal: [{ code: 'ENGINE_UNAVAILABLE', kind: 'gap', text: err.message, rule_ids: [] }] };
-    }`,
+    name: 'monthly_not_consulted',
+    why: 'only garage-pass is asked',
+    file: 'src/entitlement.js',
+    from: "  for (const module of Object.keys(MODULES)) {\n    const link = garage[MODULES[module].linkColumn];",
+    to: "  for (const module of ['garage_pass']) {\n    const link = garage[MODULES[module].linkColumn];",
   },
   {
-    name: 'platform_selects_latest',
-    why: 'the platform hands the engine only the newest version',
+    name: 'garage_pass_not_consulted',
+    why: 'only monthly-billing is asked',
+    file: 'src/entitlement.js',
+    from: "  for (const module of Object.keys(MODULES)) {\n    const link = garage[MODULES[module].linkColumn];",
+    to: "  for (const module of ['monthly_billing']) {\n    const link = garage[MODULES[module].linkColumn];",
+  },
+  {
+    name: 'cannot_decide_is_transient',
+    why: 'a module that could not answer is recorded as not covered',
+    file: 'src/entitlement.js',
+    from: '    const answer = await ask(module, link, { identity, laneId, entryAt, exitAt }, options);\n    record[module] = answer;',
+    to: `    let answer;
+    try {
+      answer = await ask(module, link, { identity, laneId, entryAt, exitAt }, options);
+    } catch (err) {
+      answer = { consulted: true, module, link, covered: false, error: String(err.message) };
+    }
+    record[module] = answer;`,
+  },
+  {
+    name: 'link_unprobed',
+    why: 'a stated link is stored without the module answering for it',
+    file: 'src/entitlement.js',
+    from: '    if (links[module]) probes[module] = await probeLink(module, links[module], options);',
+    to: '    if (links[module]) probes[module] = { answered: true, exit_code: 1 };',
+  },
+  {
+    name: 'covered_not_recorded',
+    why: 'a covered exit writes the row and no event',
+    file: 'src/app.js',
+    from: '        if (pricing.outcome === entitlement.EXIT_OUTCOMES.COVERED) {\n          // The record: a stay that leaves',
+    to: '        if (false) {\n          // The record: a stay that leaves',
+  },
+  {
+    name: 'answer_not_kept',
+    why: "the modules' answers are dropped from the record",
+    file: 'src/entitlement.js',
+    from: '      return { ...record, covered: answer.outcome === \'covered\', answer };',
+    to: '      return { ...record, covered: answer.outcome === \'covered\' };',
+  },
+  {
+    name: 'card_on_file_produced',
+    why: 'a transient close is written as the third outcome',
     file: 'src/app.js',
     from: '          pricing = { outcome: entitlement.EXIT_OUTCOMES.TRANSIENT, ...(await priceStay({ garage, plans, session: open, exitAt })) };',
-    to: '          pricing = { outcome: entitlement.EXIT_OUTCOMES.TRANSIENT, ...(await priceStay({ garage, plans: plans.slice(-1), session: open, exitAt })) };',
+    to: '          pricing = { outcome: entitlement.EXIT_OUTCOMES.TRANSIENT_CARD_ON_FILE, ...(await priceStay({ garage, plans, session: open, exitAt })) };',
   },
   {
-    name: 'space_class_literal',
-    why: "every stay is priced as 'standard' whatever the garage says",
+    name: 'purge_keeps_entitlement',
+    why: 'the purge leaves the record naming the redacted identity',
+    file: 'src/retention.js',
+    from: '          WHERE tenant_id = $1 AND entitlement IS NOT NULL AND vehicle_id = ANY($2::uuid[])`,',
+    to: '          WHERE tenant_id = $1 AND entitlement IS NOT NULL AND false AND vehicle_id = ANY($2::uuid[])`,',
+  },
+  {
+    name: 'identity_guessed',
+    why: 'a ticket stay is consulted without its ticket',
     file: 'src/app.js',
-    from: '      spaceClass: garage.space_class,\n      entryAt: session.entry_at,',
-    to: "      spaceClass: 'standard',\n      entryAt: session.entry_at,",
-  },
-  {
-    name: 'breakdown_not_frozen',
-    why: 'the close stores an empty ledger beside the fee',
-    file: 'src/app.js',
-    from: '      breakdown: quote.breakdown,\n      spaceClass: garage.space_class,',
-    to: '      breakdown: [],\n      spaceClass: garage.space_class,',
-  },
-  {
-    name: 'unpriced_not_recorded',
-    why: 'the unpriced close writes the row and no event',
-    file: 'src/app.js',
-    from: '        if (pricing.refusal) {\n          // The record:',
-    to: '        if (false) {\n          // The record:',
-  },
-  {
-    name: 'report_hides_unpriced',
-    why: 'the reconciliation report lists no unpriced close',
-    file: 'src/reconcile.js',
-    from: '       AND exit_at IS NOT NULL AND pricing_refusal IS NOT NULL\n       AND exit_at >= $3',
-    to: '       AND exit_at IS NOT NULL AND pricing_refusal IS NOT NULL AND false\n       AND exit_at >= $3',
-  },
-  {
-    name: 'store_ignores_space_class',
-    why: "the store accepts a plan that does not declare the garage's class",
-    file: 'src/ratePlans.js',
-    from: '  if (!classes.includes(garage.space_class)) {',
-    to: '  if (false) {',
+    from: '          identity: vehicle.plate ?? vehicle.ticket_ref,',
+    to: "          identity: vehicle.plate ?? 'unknown',",
   },
 ];
 
 const SCHEMA_BREAKS = [
   {
-    name: 'no_priced_or_refused',
-    why: 'a closed stay may carry half a pricing, or a fee and a refusal at once',
+    name: 'covered_may_carry_a_fee',
+    why: 'the four-shape constraint never created',
     edits: [
       {
         file: '0015_exit_outcomes.sql',
@@ -145,31 +155,24 @@ const SCHEMA_BREAKS = [
     ],
   },
   {
-    name: 'closed_still_needs_fee',
-    why: "0002's closed-needs-a-fee rule is never replaced, so no unpriced close can be written",
+    name: 'link_shape_unchecked',
+    why: 'the link CHECKs never created',
     edits: [
       {
-        file: '0013_pricing_by_the_engine.sql',
-        from: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_complete;
-ALTER TABLE sessions DROP CONSTRAINT sessions_plan_pricing_is_complete;
-
--- The closing facts come together or not at all.
-ALTER TABLE sessions
-  ADD CONSTRAINT sessions_closed_is_complete CHECK (
-    (exit_at IS NULL AND exit_lane_id IS NULL AND close_event_id IS NULL)
-    OR
-    (exit_at IS NOT NULL AND exit_lane_id IS NOT NULL AND close_event_id IS NOT NULL)
-  );`,
-        to: 'ALTER TABLE sessions DROP CONSTRAINT sessions_plan_pricing_is_complete;',
+        file: '0015_exit_outcomes.sql',
+        from: `  ADD CONSTRAINT garages_garage_pass_link_is_a_link CHECK (
+    garage_pass_link IS NULL OR (`,
+        to: `  ADD CONSTRAINT garages_garage_pass_link_is_a_link CHECK (
+    true OR garage_pass_link IS NULL OR (`,
       },
     ],
   },
 ];
 
-const SUITE = ['--test', 'test/pricing.test.js', 'test/rate-plans.test.js'];
+const SUITE = ['--test', 'test/exit-outcomes.test.js'];
 
 function stage() {
-  const dir = mkdtempSync(join(tmpdir(), 'openparking-pricing-control-'));
+  const dir = mkdtempSync(join(tmpdir(), 'openparking-outcomes-control-'));
   for (const entry of ['src', 'test', 'scripts', 'migrations', 'package.json']) {
     cpSync(join(ROOT, entry), join(dir, entry), { recursive: true });
   }
@@ -236,7 +239,7 @@ async function buildScratch(dir, brk) {
     await c.query(`CREATE DATABASE ${pg.escapeIdentifier(SCRATCH)}`);
   });
 
-  const partial = mkdtempSync(join(tmpdir(), 'openparking-pricing-migrations-'));
+  const partial = mkdtempSync(join(tmpdir(), 'openparking-outcomes-migrations-'));
   for (const file of readdirSync(join(ROOT, 'migrations')).filter((f) => f.endsWith('.sql'))) {
     copyFileSync(join(ROOT, 'migrations', file), join(partial, file));
   }
@@ -361,4 +364,4 @@ if (failures) {
   console.error(`\n${failures} control(s) failed. Do not trust this round's platform tests.`);
   process.exit(1);
 }
-console.log('\nall controls OK — the suite fails on every property the engine-priced close rests on.');
+console.log('\nall controls OK — the suite fails on every property the three outcomes rest on.');

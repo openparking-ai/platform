@@ -74,6 +74,24 @@ jobs:
         # place, read here and nowhere else.
         run: python3 -m pip install --quiet "git+https://github.com/openparking-ai/rate-engine@$(cat rate-engine.pin)"
 
+      - name: Install the two entitlement modules at their pins, and check out their migrations
+        # test/exit-outcomes.test.js consults the REAL garage-pass and
+        # monthly-billing through their command lines, each against a
+        # database built from its own migrations (0015). The commits are
+        # `garage-pass.pin` and `monthly-billing.pin`; the checkouts are only
+        # for the migrations, which the installed packages do not ship.
+        run: |
+          python3 -m pip install --quiet \
+            "openparking-garage-pass[store] @ git+https://github.com/openparking-ai/garage-pass@$(cat garage-pass.pin)" \
+            "openparking-monthly-billing[store] @ git+https://github.com/openparking-ai/monthly-billing@$(cat monthly-billing.pin)"
+          for m in garage-pass monthly-billing; do
+            git init -q "$RUNNER_TEMP/$m"
+            git -C "$RUNNER_TEMP/$m" fetch -q --depth 1 "https://github.com/openparking-ai/$m" "$(cat $m.pin)"
+            git -C "$RUNNER_TEMP/$m" checkout -q FETCH_HEAD
+          done
+          echo "GARAGE_PASS_SRC=$RUNNER_TEMP/garage-pass" >> "$GITHUB_ENV"
+          echo "MONTHLY_BILLING_SRC=$RUNNER_TEMP/monthly-billing" >> "$GITHUB_ENV"
+
       - name: Create the test database
         run: psql "$ADMIN_URL/postgres" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE openparking_test'
 
@@ -195,3 +213,14 @@ jobs:
         # created, the trigger counting stored instead of in force -- and the
         # suite must go red.
         run: npm run activation-fail-control
+
+      - name: Exit-outcomes fail-control
+        # The exit has three named outcomes and two modules are consulted
+        # through their own doors before pricing. Each property is broken in
+        # turn -- covered still priced, not-covered counted as covered, one
+        # module skipped either way, could-not-decide recorded as transient,
+        # a link stored unprobed, a covered exit unrecorded, the answers
+        # dropped, the third outcome produced, the purge keeping the record,
+        # a ticket stay consulted without its ticket, and two schema
+        # statements never created -- and the suite must go red.
+        run: npm run exit-outcomes-fail-control

@@ -157,36 +157,36 @@ export async function openSession(
 }
 
 /**
- * Close a stay, freezing what priced it -- or what could not -- onto the row.
+ * Close a stay, freezing its outcome, what priced it -- or what could not --
+ * and what the entitlement modules said, onto the row.
  *
- * `pricing` is one of two shapes, and the constraint
- * `sessions_closed_is_priced_or_refused` (0013) holds the row to them:
+ * `pricing` is one of three shapes, and the constraint
+ * `sessions_closed_is_covered_priced_or_refused` (0015) holds the row to them:
  *
- *   { feeMinor, planVersion, breakdown, spaceClass }
- *       the engine's quote, verbatim: the fee, the version that priced it,
- *       the ledger with one line per part of the fee, and the class the stay
- *       was priced as. Together or not at all.
- *   { refusal }
- *       the engine's findings (or the platform's own named reason), and NO
- *       fee. The stay is closed -- the car is gone -- and unpriced, on the
- *       record, for a human.
+ *   { outcome: 'covered' }
+ *       a pass or a monthly agreement covers the stay: no fee, no plan
+ *       pricing, no refusal. Who said so is in `entitlement`.
+ *   { outcome: 'transient', feeMinor, planVersion, breakdown, spaceClass }
+ *       the engine's quote, verbatim, together or not at all.
+ *   { outcome: 'transient', refusal }
+ *       the engine's findings and NO fee: closed, unpriced, on the record.
  *
- * Nothing writes the hourly-rate shape (`rate_id`, `hourly_minor_applied`)
- * any more; the rows that carry it were priced by the path 0013 removed.
+ * `entitlement` is what both modules answered (or that they were not
+ * linked), on every shape. Nothing writes the hourly-rate shape any more.
  */
 export async function closeSession(
   client,
   tenantId,
   sessionId,
-  { exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor = null, pricing },
+  { exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor = null, pricing, entitlement },
 ) {
-  const priced = pricing.refusal === undefined;
+  const priced = pricing.outcome !== 'covered' && pricing.refusal === undefined;
   const { rows } = await client.query(
     `UPDATE sessions
         SET exit_at = $3, exit_lane_id = $4, close_event_id = $5,
             exit_confirmation = $6, exit_descriptor = $7,
             fee_minor = $8, plan_version = $9, breakdown = $10, space_class = $11,
-            pricing_refusal = $12
+            pricing_refusal = $12, exit_outcome = $13, entitlement = $14
       WHERE tenant_id = $1 AND id = $2 AND exit_at IS NULL
       RETURNING *`,
     [tenantId, sessionId, exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor,
@@ -194,7 +194,9 @@ export async function closeSession(
      priced ? pricing.planVersion : null,
      priced && pricing.breakdown !== null && pricing.breakdown !== undefined ? JSON.stringify(pricing.breakdown) : null,
      priced ? pricing.spaceClass : null,
-     priced ? null : JSON.stringify(pricing.refusal)],
+     pricing.refusal === undefined ? null : JSON.stringify(pricing.refusal),
+     pricing.outcome,
+     entitlement === null || entitlement === undefined ? null : JSON.stringify(entitlement)],
   );
   return rows[0] ?? null;
 }

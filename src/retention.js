@@ -29,6 +29,11 @@
  * it is append-only by grant and the purge cannot reach it (see
  * docs/DATA_RETENTION.md, the open item).
  *
+ * A session's ENTITLEMENT RECORD (migration 0015) -- what the pass and
+ * monthly modules were asked and answered, which names the identity -- is
+ * nulled in the same run, on the same sessions; the exit outcome it decided
+ * is kept.
+ *
  * A session's ENTRY DESCRIPTOR (migration 0009) and EXIT DESCRIPTOR (0010) are
  * redacted in the same run. They live on the session rather than the vehicle
  * -- a descriptor is one READ, not an identity -- but each describes one
@@ -93,6 +98,15 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
           WHERE tenant_id = $1
             AND (entry_descriptor IS NOT NULL OR exit_descriptor IS NOT NULL)
             AND vehicle_id = ANY($2::uuid[])`,
+        [tenantId, rows.map((r) => r.id)],
+      );
+      // The entitlement record (0015) names the identity the modules were
+      // asked about, inside the argv and their answers. Nulled with the
+      // descriptors; `exit_outcome` stays -- the outcome survives, who it was
+      // about does not.
+      await client.query(
+        `UPDATE sessions SET entitlement = NULL
+          WHERE tenant_id = $1 AND entitlement IS NOT NULL AND vehicle_id = ANY($2::uuid[])`,
         [tenantId, rows.map((r) => r.id)],
       );
       // The shadow rows about those vehicles' stays: references out, figure kept.
