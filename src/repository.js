@@ -5,7 +5,6 @@
  * context is set and the queries still carry their own `WHERE tenant_id = $1`.
  * Two independent controls, as docs/RLS_TEMPLATE.md requires.
  */
-import { toMinor } from './money.js';
 
 const VEHICLE_COLUMNS = 'id, plate, plate_region, ticket_ref, make, model, color';
 
@@ -209,15 +208,70 @@ export async function getSession(client, tenantId, sessionId) {
   return rows[0] ?? null;
 }
 
-export async function currentRate(client, tenantId, garageId) {
+/** The garage's cursor: the highest `change_seq` any of its sessions carries, open or closed. */
+export async function stayCursor(client, tenantId, garageId) {
   const { rows } = await client.query(
-    `SELECT id, name, hourly_minor FROM rates
-      WHERE tenant_id = $1 AND garage_id = $2
-      ORDER BY created_at DESC LIMIT 1`,
+    `SELECT coalesce(max(change_seq), 0)::text AS cursor FROM sessions
+      WHERE tenant_id = $1 AND garage_id = $2`,
     [tenantId, garageId],
   );
-  if (!rows[0]) return null;
-  return { id: rows[0].id, name: rows[0].name, hourlyMinor: toMinor(rows[0].hourly_minor, 'hourly_minor') };
+  return rows[0].cursor;
+}
+
+/**
+ * One stay as the lane's feed carries it: the identity as the row holds it
+ * (a plate, or the ticket a plate-less stay was opened on), the entry, the
+ * entry lane, and the cursor value of the row. `open` says whether it is
+ * still inside; a delta carries closed rows so a reader can drop them.
+ */
+// Spelled in its own order on purpose: the operator listing's column list
+// below is a fail-control anchor, and a second copy of it would catch the
+// plant meant for the listing.
+const STAY_COLUMNS = `s.id, s.entry_at, s.exit_at, s.change_seq::text AS change_seq,
+            l.name AS entry_lane, v.plate, v.ticket_ref, v.plate_region`;
+const stayRow = (r) => ({
+  session_id: r.id,
+  open: r.exit_at === null,
+  plate: r.plate,
+  plate_region: r.plate_region,
+  ticket_ref: r.ticket_ref,
+  entry_at: r.entry_at,
+  entry_lane: r.entry_lane,
+  change_seq: r.change_seq,
+});
+
+/** Every open stay of the garage, in cursor order: the full set a reader starts from. */
+export async function openStaysForLane(client, tenantId, garageId) {
+  const { rows } = await client.query(
+    `SELECT ${STAY_COLUMNS}
+       FROM sessions s
+       JOIN vehicles v ON v.id = s.vehicle_id
+       JOIN lanes    l ON l.id = s.entry_lane_id
+      WHERE s.tenant_id = $1 AND s.garage_id = $2 AND s.exit_at IS NULL
+      ORDER BY s.change_seq`,
+    [tenantId, garageId],
+  );
+  return rows.map(stayRow);
+}
+
+/**
+ * Every stay whose `change_seq` is past `since`, open or closed, in cursor
+ * order, at most `limit` of them. A page that fills says `more`, and its
+ * cursor is the last row's, so the next call continues where it stopped.
+ */
+export async function stayChangesSince(client, tenantId, garageId, since, limit) {
+  const { rows } = await client.query(
+    `SELECT ${STAY_COLUMNS}
+       FROM sessions s
+       JOIN vehicles v ON v.id = s.vehicle_id
+       JOIN lanes    l ON l.id = s.entry_lane_id
+      WHERE s.tenant_id = $1 AND s.garage_id = $2 AND s.change_seq > $3
+      ORDER BY s.change_seq
+      LIMIT $4`,
+    [tenantId, garageId, since, limit + 1],
+  );
+  const more = rows.length > limit;
+  return { changes: rows.slice(0, limit).map(stayRow), more };
 }
 
 export async function getGarage(client, tenantId, garageId) {

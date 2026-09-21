@@ -224,3 +224,13 @@ jobs:
         # a ticket stay consulted without its ticket, and two schema
         # statements never created -- and the suite must go red.
         run: npm run exit-outcomes-fail-control
+
+      - name: Rules-payload fail-control
+        # The rules payload carries the plans whole, the space class, each
+        # linked module's register verbatim (an outage said, never filled
+        # in), the open stays with a cursor, a delta with closed rows and a
+        # cursor that never runs ahead of what it delivered, and no hourly
+        # figure; the rates route refuses by name. Each property is broken in
+        # turn, plus the cursor trigger never created, and the suite must go
+        # red.
+        run: npm run rules-payload-fail-control

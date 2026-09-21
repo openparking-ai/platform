@@ -174,6 +174,62 @@ export async function consult({ garage, identity, laneId, entryAt, exitAt }, opt
   };
 }
 
+export const REGISTER_VERB = 'show-garage-register';
+
+/**
+ * THE ENTITLEMENT FACTS FOR A GARAGE, for the lane's cache: each linked
+ * module's register, read whole through its own `show-garage-register`
+ * verb -- garage-pass G27, monthly-billing G48 -- the JSON it printed kept
+ * verbatim under `register`, beside the argv and the exit code, exactly as
+ * `consult` keeps a movement's answer. This platform paraphrases neither
+ * module: which vehicle a pass or an agreement holds at the garage, its
+ * state and its days are the modules' words, and the lane reads them with
+ * its own clock, which is how both verbs are written to be read.
+ *
+ * A READ THAT COULD NOT BE MADE IS SAID, NEVER FILLED IN. A module that is
+ * not linked is `{ consulted: false, reason }`. A door that could not be run,
+ * or answered with something that is not its register, is
+ * `{ consulted: true, unavailable, argv, exit_code }` -- no `register` key --
+ * and `complete` is false. An empty register is a fact a module states
+ * (exit 0, `registrations: []`); an absent one is an outage, and a reader
+ * that replaced what it holds with nothing on the strength of an outage
+ * would have every pass holder paying at the next exit. So: a module's facts
+ * are replaced only when its `register` is present. The rest of the payload
+ * is still served -- plans and stays are this platform's own -- which is why
+ * this is a field and not a 5xx.
+ */
+export async function registers(garage, options = {}) {
+  const facts = { read_at: new Date().toISOString(), complete: true };
+  for (const module of Object.keys(MODULES)) {
+    const link = garage[MODULES[module].linkColumn];
+    if (!link) {
+      facts[module] = { consulted: false, reason: 'not linked: the garage names no garage in this module' };
+      continue;
+    }
+    const argv = [REGISTER_VERB, '--tenant', link.tenant_id, '--garage', link.garage_id];
+    let out;
+    try {
+      out = await door(module, argv, options);
+    } catch (err) {
+      facts[module] = { consulted: true, module, link, argv, unavailable: err.message };
+      facts.complete = false;
+      continue;
+    }
+    const record = { consulted: true, module, link, argv, exit_code: out.exit_code };
+    const register = out.exit_code === 0 ? parseJson(out.stdout) : null;
+    if (!register || !Array.isArray(register.registrations)) {
+      facts[module] = {
+        ...record,
+        unavailable: `exit ${out.exit_code}: ${(out.stderr || out.stdout).trim().slice(0, 300)}`,
+      };
+      facts.complete = false;
+      continue;
+    }
+    facts[module] = { ...record, register };
+  }
+  return facts;
+}
+
 /**
  * Prove a stated link can be used: the module must ANSWER a question about
  * that garage -- covered or not, for a probe identity nothing is registered

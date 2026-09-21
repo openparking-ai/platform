@@ -40,7 +40,7 @@ for (const script of ['scripts/migrate.js', 'scripts/ensure-app-role.js']) {
   if (r.status !== 0) process.exit(r.status ?? 1);
 }
 
-// 3. a garage with two lanes, a rate, and a device on each lane
+// 3. a garage with two lanes, a flat plan, activated, and a device on each lane
 const tenantId = randomUUID();
 await withTenant(tenantId, (c) =>
   c.query('INSERT INTO tenants (id, slug, name) VALUES ($1,$2,$3)', [
@@ -74,10 +74,32 @@ const demo = await withTenant(tenantId, async (c) => {
   const entryLane = await lane('Entry 1', 'entry');
   const exitLane = await lane('Exit 1', 'exit');
 
+  // The price is a PLAN (0012): one flat hourly rule at 2.50, effective from
+  // the beginning of time, stored as the plan store would have it. The
+  // one-figure `rates` table is retired (0016) and nothing prices from it.
+  // Then the gate (0014): the garage states it sells transient parking and
+  // is activated, or the lane's open would be refused `garage_not_active`.
+  const plan = {
+    plan_version: 'flat-250-USD',
+    effective_from: '2000-01-01T00:00:00Z',
+    timezone: 'America/New_York',
+    currency: 'USD',
+    space_classes: ['standard'],
+    resolution: { QUALIFY: { mode: 'cheapest_wins' }, ACCUMULATE: { mode: 'cheapest_wins' } },
+    adjust_order: null,
+    rules: [{
+      id: 'hourly', type: 'increment', stage: 'ACCUMULATE', space_classes: ['standard'],
+      first_period_minutes: 60, first_period_minor: 250, repeat_period_minutes: 60, repeat_period_minor: 250,
+      rounding: 'ceil', max_duration_minutes: null,
+    }],
+    decisions: [],
+  };
   await c.query(
-    `INSERT INTO rates (tenant_id, garage_id, name, hourly_minor) VALUES ($1,$2,'Hourly',250)`,
-    [tenantId, garage],
+    `INSERT INTO rate_plans (tenant_id, garage_id, plan_version, effective_from, document, engine_schema_version)
+     VALUES ($1, $2, $3::jsonb->>'plan_version', ($3::jsonb->>'effective_from')::timestamptz, $3::jsonb, 1)`,
+    [tenantId, garage, JSON.stringify(plan)],
   );
+  await c.query(`UPDATE garages SET transient_available = true, activated_at = now() WHERE tenant_id = $1 AND id = $2`, [tenantId, garage]);
 
   for (const [laneId, token, name] of [
     [entryLane, entryToken, 'Entry lane controller'],
@@ -101,7 +123,6 @@ const credentials = {
   tenant_id: tenantId,
   garage_id: demo.garage,
   currency: 'USD',
-  hourly_minor: 250,
   entry_token: entryToken,
   exit_token: exitToken,
   operator_token: operatorTokenValue,

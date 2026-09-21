@@ -64,7 +64,8 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 
 | | |
 |---|---|
-| `GET /api/v1/lane/rules` | what the lane caches so it can decide offline |
+| `GET /api/v1/lane/rules` | what the lane caches so it can decide offline: the garage's plans whole, its space class, each linked module's register, the open stays with a cursor — the slow cadence |
+| `GET /api/v1/lane/stays?since=<cursor>` | every stay changed since the cursor, closed rows included — the fast cadence; without `since`, the full open set |
 | `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` |
 | `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor` |
 | `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation`; carries and echoes an optional `descriptor` |
@@ -496,6 +497,58 @@ builds a database for each module from its own migrations (`garage-pass.pin`,
 `monthly-billing.pin`; CI checks them out), seeds through their doors, and drives
 all of it through the lane's close. `npm run exit-outcomes-fail-control` breaks
 each property in turn.
+
+### The rules payload: what the exit decides from, off the barrier's path
+
+His requirement: *"we must identify the car and display the fee in about a
+second. if no fee (garage pass, monthly) open the gate in about a second."*
+Nothing on the barrier's path may wait on the network, so the lane decides
+from what it already holds — and what it holds comes from `GET /lane/rules`
+(migration 0016):
+
+- **`rate_plans`** — every plan of the garage, whole, as 0012 stores them,
+  oldest first. The engine selects among them by entry time; this platform
+  filters nothing. **`space_class`** — the garage's, which every quote takes.
+- **`entitlements`** — each linked module's register, read through its own
+  `show-garage-register` verb (garage-pass G27, monthly-billing G48) and kept
+  verbatim under `register`, beside the argv and exit code: which vehicle a
+  pass or an agreement holds *at this garage*, its state and its days, in the
+  modules' own words — the lane reads them with its own clock, which is how
+  both verbs are written to be read. A module that is not linked says so; a
+  module whose register **could not be read** says `unavailable`, carries no
+  `register`, and `complete` is false. An outage is never an empty register:
+  a reader replaces a module's facts only when its `register` is present.
+- **`stays`** — the garage's open stays (`plate` or `ticket_ref`, `entry_at`,
+  `entry_lane`) and a **cursor**. A transient cannot be priced without its
+  entry time, and the entry time lives here.
+
+**Two cadences.** Plans, entitlements and settings change rarely; open stays
+change with every car. So `GET /lane/stays?since=<cursor>` is the fast one:
+every stay whose `change_seq` is past the cursor, in order, **closed rows
+included** so a reader drops them; `cursor` is where to continue from and
+`more` says a page filled. `sessions.change_seq` is drawn from one sequence and
+bumped by a trigger whenever the entry, the exit, the vehicle or the entry lane
+changes — every writer moves it without knowing it exists. **The cursor's
+honest limit:** a sequence value is taken when a row is written, and a
+transaction can commit after a later value was already read, so a delta can
+miss such a row. The full open set — on `/lane/rules`, and on `/lane/stays`
+without `since` — is what bounds the miss: a reader takes the full set on the
+slow cadence and the delta on the fast one. `test/rules-payload.test.js` plants
+exactly that race and asserts both halves. The interval a lane polls the fast
+route at is the size of the class of cars that entered too recently to be
+priced at the barrier; that interval is the lane's configuration, not this
+platform's.
+
+**What left the payload:** `hourly_minor` and `rate_id` — an hourly figure
+from the `rates` table that nothing has priced with since 0013 (serving it
+beside the real plans would be two prices on one channel) — and `plate_rules`,
+an empty list. `POST /api/v1/garages/<id>/rates` is **retired by name**: `410
+rates_retired`, pointing at `/rate-plans`. The table stays (`sessions.rate_id`
+and the hourly-legacy rows reference it); nothing writes it.
+
+A rules read records nothing: like the two module verbs it calls, it writes
+no row and appends no event. `npm run rules-payload-fail-control` breaks each
+property in turn.
 
 ## Vehicle identity and retention
 
