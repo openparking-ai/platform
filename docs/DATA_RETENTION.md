@@ -150,6 +150,25 @@ not touch it. Closing this needs a privileged, audited redaction path that does
 not hand the application a general power to rewrite history. **Recorded as open,
 not as done.**
 
+## What travels to the lane
+
+Since migration 0016, `GET /api/v1/lane/rules` and `GET /api/v1/lane/stays`
+carry personal data to the device on the lane: the plate or ticket of **every
+open stay** at the garage, and — verbatim from garage-pass and monthly-billing
+— the identity of every vehicle a pass or a monthly agreement holds **at that
+garage**. Nothing more of a person travels: the modules' register verbs are
+written to carry no holder, no payer, no phone, no email, and this platform
+adds nothing (`test/rules-payload.test.js` asserts the payload is the modules'
+own bytes).
+
+What the lane does with it is the lane's rule, stated there: today the cache
+is memory, replaced on every refresh and gone on restart. When a durable cache
+lands on the box, this platform's purge does not reach it, and the lane's own
+retention has to — recorded here so it is not discovered later. On this side,
+nothing was added to the schema that the purge does not already reach: a stay
+travels only while it is open, and an open stay's vehicle is never redacted
+(above).
+
 ## No real data in this repository
 
 Separate rule, same spirit. The repository — code, docs, tests, fixtures —

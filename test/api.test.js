@@ -100,8 +100,31 @@ test('a device resolves to its own tenant, lane and direction', async () => {
   const rules = await res.json();
   assert.equal(rules.garage_id, world.garage);
   assert.equal(rules.direction, 'entry');
-  assert.equal(rules.hourly_minor, 250, 'money must arrive as a number, not a string');
   assert.equal(rules.currency, 'USD');
+  // 0016: the hourly figure nothing prices with is gone, and the plans are
+  // here whole. The payload's full shape is test/rules-payload.test.js's.
+  assert.equal('hourly_minor' in rules, false, 'hourly_minor left the payload with 0016');
+  assert.equal('rate_id' in rules, false);
+  assert.equal('plate_rules' in rules, false);
+  assert.equal(rules.rate_plans.length, 1);
+  assert.equal(rules.rate_plans[0].currency, 'USD');
+});
+
+test('POST /garages/:id/rates is retired by name: 410, and the refusal says where the price lives', async () => {
+  const res = await fetch(`${base}/api/v1/garages/${world.garage}/rates`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
+    body: JSON.stringify({ name: 'Hourly', hourly_minor: 9900 }),
+  });
+  assert.equal(res.status, 410);
+  const body = await res.json();
+  assert.equal(body.code, 'rates_retired');
+  assert.match(body.error, /rate-plans/);
+  // Nothing was written: the table is history, and the route writes none.
+  const { rows } = await withTenant(tenant, (c) =>
+    c.query(`SELECT count(*)::int AS n FROM rates WHERE garage_id = $1 AND name = 'Hourly' AND hourly_minor = 9900`, [world.garage]),
+  );
+  assert.equal(rows[0].n, 0);
 });
 
 // --- events ---------------------------------------------------------------
@@ -283,12 +306,10 @@ test('the fee survives the rate being changed afterwards', async () => {
   ).session;
   assert.equal(closed.fee_minor, 250);
 
-  // Somebody edits pricing. History must not move.
+  // Somebody edits pricing -- a new plan version, the only way a price
+  // changes since 0013. History must not move.
   await withTenant(tenant, (c) =>
-    c.query(`INSERT INTO rates (tenant_id, garage_id, name, hourly_minor) VALUES ($1,$2,'New',9900)`, [
-      tenant,
-      world.garage,
-    ]),
+    storePlan(c, tenant, world.garage, flatHourlyPlan({ hourlyMinor: 9900, version: 'v-later', effectiveFrom: '2026-08-27T00:00:00Z' })),
   );
   const after = await withTenant(tenant, async (c) =>
     (await c.query('SELECT fee_minor FROM sessions WHERE id = $1', [closed.id])).rows[0],

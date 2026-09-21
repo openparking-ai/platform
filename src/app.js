@@ -57,6 +57,17 @@ const bad = (message) => new HttpError(400, message);
 const CONFLICT_STATUS = 409;
 const conflict = (code, message) => new HttpError(CONFLICT_STATUS, message, code);
 
+/** `POST /garages/:id/rates` is gone for good: 410, with the name a caller can match on. */
+const RATES_RETIRED_STATUS = 410;
+const RATES_RETIRED_CODE = 'rates_retired';
+
+/**
+ * The most stays one delta carries. A garage that changes faster than a
+ * reader polls follows `more` at once; the size bounds one answer, not the
+ * feed.
+ */
+const STAY_PAGE = 500;
+
 /**
  * What a lane does with a confidently-read plate that matches no rule.
  *
@@ -649,22 +660,25 @@ export function createApp() {
     }
   });
 
-  operator.post('/garages/:garageId/rates', async (req, res, next) => {
-    try {
-      const { name, hourly_minor: hourlyMinor } = req.body ?? {};
-      if (!name || hourlyMinor === undefined) throw bad('name and hourly_minor are required');
-      const value = toMinor(hourlyMinor, 'hourly_minor');
-      const rate = await withTenant(req.tenantId, async (client) => {
-        const { rows } = await client.query(
-          `INSERT INTO rates (tenant_id, garage_id, name, hourly_minor) VALUES ($1,$2,$3,$4) RETURNING *`,
-          [req.tenantId, req.params.garageId, name, value],
-        );
-        return rows[0];
-      });
-      res.status(201).json({ rate: { ...rate, hourly_minor: toMinor(rate.hourly_minor) } });
-    } catch (err) {
-      next(err);
-    }
+  /**
+   * RETIRED, BY NAME. The one-hourly-figure `rates` table was superseded by
+   * the plan store (0012) and the engine-priced close (0013): nothing has
+   * priced from it since, and 0016 took it off the lane's payload too. The
+   * route stays as a refusal rather than vanishing into a 404, so an operator
+   * who still calls it is told where the price now lives instead of being
+   * left to guess whether the path was mistyped. The table itself stays --
+   * `sessions.rate_id` references it and the hourly-legacy rows name it --
+   * and nothing writes it any more.
+   */
+  operator.post('/garages/:garageId/rates', (_req, _res, next) => {
+    next(
+      new HttpError(
+        RATES_RETIRED_STATUS,
+        `the hourly rate table is retired: nothing prices from it since migration 0013. ` +
+          `Store a rate plan with POST /api/v1/garages/:garageId/rate-plans instead.`,
+        RATES_RETIRED_CODE,
+      ),
+    );
   });
 
   /**
@@ -953,30 +967,60 @@ export function createApp() {
     }
   });
 
-  /** What the lane caches so it can decide with the network down. */
+  /**
+   * WHAT THE LANE CACHES SO IT CAN DECIDE WITH THE NETWORK DOWN -- and, since
+   * 0016, what the exit needs to decide a covered car and price a transient
+   * on the box, off the barrier's path:
+   *
+   *   rate_plans     the garage's plans, WHOLE, as 0012 stores them, oldest
+   *                  effective date first. The engine selects among them by
+   *                  entry time; this platform filters nothing (the same
+   *                  list the close hands the engine, `ratePlans.documents`).
+   *   space_class    the garage's, which every quote takes (0013).
+   *   entitlements   each linked module's register, read through its own
+   *                  `show-garage-register` verb and kept verbatim; a module
+   *                  whose register could not be read says so and
+   *                  `complete` is false (`entitlement.registers`).
+   *   stays          the garage's OPEN stays and the cursor to continue from
+   *                  on `GET /lane/stays?since=` -- the fast cadence. This
+   *                  is the slow one: plans, entitlements and settings change
+   *                  rarely; open stays change with every car.
+   *
+   * What LEFT the payload: `hourly_minor` and `rate_id`, an hourly figure
+   * nothing has priced with since 0013 (serving it beside the real plans
+   * would be two prices on one channel); and `plate_rules`, an empty list
+   * that said the platform had nothing to put in it, now that it has.
+   *
+   * THIS IS A READ AND IT RECORDS NOTHING: like the two module verbs it
+   * calls, it writes no row and appends no event.
+   */
   lane.get('/rules', async (req, res, next) => {
     try {
       const { tenantId, garageId, laneId, direction } = req.device;
       const payload = await withTenant(tenantId, async (client) => {
         const garage = await repo.getGarage(client, tenantId, garageId);
-        const rate = await repo.currentRate(client, tenantId, garageId);
-        return { garage, rate };
+        if (!garage) return { garage };
+        const plans = ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, garageId));
+        // The cursor is read BEFORE the open set in the same transaction: a
+        // row that lands between the two reads is then past the cursor and
+        // arrives on the first delta, rather than being in the set AND past
+        // it -- which is harmless -- or, read the other way round, before the
+        // cursor and in no delta.
+        const cursor = await repo.stayCursor(client, tenantId, garageId);
+        const open = await repo.openStaysForLane(client, tenantId, garageId);
+        return { garage, plans, stays: { cursor, open } };
       });
       if (!payload.garage) throw new HttpError(404, 'garage not found');
+      // Outside the transaction: two subprocesses, and nothing of theirs is
+      // this database's.
+      const entitlements = await entitlement.registers(payload.garage);
       res.json({
         garage_id: garageId,
         lane_id: laneId,
         direction,
         timezone: payload.garage.timezone,
         currency: payload.garage.currency,
-        // One simple hourly rate per garage, as specified. A lane with no rate
-        // configured gets null and must fall back rather than invent one.
-        hourly_minor: payload.rate ? payload.rate.hourlyMinor : null,
-        rate_id: payload.rate ? payload.rate.id : null,
-        // No per-plate rules exist yet, so the lane's default action governs.
-        // The lane already supports per-plate rules; the platform has nothing
-        // to put in them until an access-list module exists.
-        //
+        space_class: payload.garage.space_class,
         // The garage's own value, not a literal. It was a literal until 0004,
         // which meant a garage that wanted the strict behaviour could not have
         // it -- the lane supports 'deny' and always has, and nothing could
@@ -986,9 +1030,54 @@ export function createApp() {
         // does not read it yet, and a platform ahead of the lane refuses
         // nothing by adding a key.
         active: payload.garage.activated_at !== null,
-        plate_rules: [],
+        rate_plans: payload.plans,
+        entitlements,
+        stays: payload.stays,
         synced_at: new Date().toISOString(),
       });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * THE STAY FEED, the fast cadence. `?since=<cursor>` answers every stay of
+   * the garage whose `change_seq` is past the cursor -- opened, closed, or
+   * re-identified since -- in cursor order, closed rows included so a reader
+   * drops them; `cursor` is where to continue from, and `more` says a page
+   * filled and the next call should follow at once. Without `since` it is
+   * the full open set with the garage's cursor, the same as `/lane/rules`
+   * carries: the resync a reader takes on the slow cadence, and the bound on
+   * what a delta can miss (0016 says why a delta can).
+   *
+   * `since` is the cursor as this route handed it out: a string of digits.
+   * Anything else is refused by name.
+   */
+  lane.get('/stays', async (req, res, next) => {
+    try {
+      const { tenantId, garageId } = req.device;
+      const since = req.query.since;
+      if (since !== undefined && !/^\d{1,18}$/.test(String(since))) {
+        throw bad('since must be a cursor this route handed out: a string of digits');
+      }
+      const answer = await withTenant(tenantId, async (client) => {
+        const garage = await repo.getGarage(client, tenantId, garageId);
+        if (!garage) return null;
+        if (since === undefined) {
+          const cursor = await repo.stayCursor(client, tenantId, garageId);
+          const open = await repo.openStaysForLane(client, tenantId, garageId);
+          return { cursor, open };
+        }
+        const { changes, more } = await repo.stayChangesSince(client, tenantId, garageId, String(since), STAY_PAGE);
+        // The cursor never runs ahead of what was delivered: the last row's
+        // value, or `since` itself when nothing changed. A cursor taken from
+        // the table after the rows were read could cover a row that committed
+        // in between, and that row would then be in no delta.
+        const cursor = changes.length ? changes[changes.length - 1].change_seq : String(since);
+        return { since: String(since), cursor, changes, more };
+      });
+      if (!answer) throw new HttpError(404, 'garage not found');
+      res.json(answer);
     } catch (err) {
       next(err);
     }
