@@ -13,6 +13,7 @@
  * module says so in its own output rather than only in a receipt -- see
  * `vehicles_counted_out` below.
  */
+import { withTenant } from './db.js';
 import * as ratePlans from './ratePlans.js';
 import * as repo from './repository.js';
 
@@ -241,6 +242,152 @@ export async function laneDecidedCloses(client, tenantId, garageId, since, { quo
   return report;
 }
 
+export const DECISION_CHECK_EVENT_KIND = 'lane_decision_checked';
+
+/**
+ * THE CHECK ITSELF, one row, out of band. Returns the verdict; writes the two
+ * columns 0018 added and, on a divergence, one event -- and nothing else.
+ */
+export async function checkOneDecision(client, tenantId, row, { documents, ask, at }) {
+  const inputs = row.decision_inputs ?? {};
+  // Spelled once, here, and not repeated: `laneDecidedCloses` above asks the
+  // same question of the same column in the same words, and a fail-control's
+  // anchor lands on the FIRST match in the file -- so a break aimed at this
+  // branch would have been planted in that one and measured nothing.
+  const laneSaidCovered = row.exit_outcome === 'covered';
+  let check;
+  if (laneSaidCovered) {
+    check = {
+      verdict: 'covered',
+      covered_by: row.entitlement?.covered_by ?? [],
+      matched: row.entitlement?.local_decision?.matched ?? [],
+    };
+  } else if (row.fee_minor === null) {
+    check = { verdict: 'unrecomputable', reason: 'the close carries no fee to re-derive' };
+  } else {
+    const rowEntry = new Date(row.entry_at).toISOString();
+    const rowExit = new Date(row.exit_at).toISOString();
+    const disagreement = [];
+    if (inputs.entry_at && new Date(inputs.entry_at).toISOString() !== rowEntry) disagreement.push('entry_at');
+    if (inputs.exit_at && new Date(inputs.exit_at).toISOString() !== rowExit) disagreement.push('exit_at');
+    if (inputs.space_class && inputs.space_class !== row.space_class) disagreement.push('space_class');
+    if (inputs.currency && inputs.currency !== row.currency) disagreement.push('currency');
+    let recomputed = null;
+    let refusal = null;
+    try {
+      recomputed = await ask({
+        plans: documents,
+        currency: inputs.currency ?? row.currency,
+        spaceClass: inputs.space_class ?? row.space_class,
+        entryAt: new Date(inputs.entry_at ?? row.entry_at),
+        exitAt: new Date(inputs.exit_at ?? row.exit_at),
+      });
+    } catch (err) {
+      refusal = {
+        reason: err instanceof ratePlans.PricingRefused
+          ? 'the engine refused the inputs'
+          : `the engine could not be asked: ${err.message}`,
+        findings: err instanceof ratePlans.PricingRefused ? err.findings : undefined,
+      };
+    }
+    const laneFee = Number(row.fee_minor);
+    if (refusal) {
+      check = { verdict: 'unrecomputable', ...refusal };
+    } else if (recomputed.feeMinor !== laneFee || recomputed.planVersion !== row.plan_version) {
+      check = {
+        verdict: 'diverged',
+        lane: { fee_minor: laneFee, plan_version: row.plan_version },
+        recomputed: { fee_minor: recomputed.feeMinor, plan_version: recomputed.planVersion },
+        synced_at: inputs.synced_at ?? null,
+      };
+    } else if (disagreement.length) {
+      check = {
+        verdict: 'inputs_disagree',
+        fields: disagreement,
+        lane: { entry_at: inputs.entry_at, exit_at: inputs.exit_at, space_class: inputs.space_class, currency: inputs.currency },
+        row: { entry_at: rowEntry, exit_at: rowExit, space_class: row.space_class, currency: row.currency },
+      };
+    } else {
+      check = { verdict: 'agreed', fee_minor: laneFee, plan_version: row.plan_version };
+    }
+    if (disagreement.length && check.verdict === 'diverged') check.fields = disagreement;
+  }
+  check.at = at;
+  // The row says it was checked and what was found. THE MONEY COLUMNS ARE NOT
+  // TOUCHED -- `recordDecisionCheck` has no other column in its statement.
+  await repo.recordDecisionCheck(client, tenantId, row.id, { at, check });
+  if (check.verdict !== 'agreed' && check.verdict !== 'covered') {
+    // And into `events`, which is append-only by grant: a finding that
+    // something which can write `sessions` cannot edit away. Ids and figures,
+    // never an identity.
+    await repo.appendEvents(client, tenantId, [
+      {
+        garageId: row.garage_id,
+        laneId: row.exit_lane_id,
+        eventId: `decision-check:${row.id}`,
+        kind: DECISION_CHECK_EVENT_KIND,
+        occurredAt: at,
+        detail: { actor: 'platform:reconciler', session_id: row.id, ...check },
+      },
+    ]);
+  }
+  return check;
+}
+
+/**
+ * THE SWEEP. Every lane-decided close this tenant has that nothing has checked
+ * yet, oldest first, WITHOUT ANY WINDOW OVER IT -- and it runs unprompted
+ * (`scripts/reconcile-lane-decisions.js`, on a schedule beside the purge and
+ * the shadow search), not when an operator thinks to ask.
+ *
+ * That is the difference this exists for. The reconciliation route reports on
+ * the period an operator asked about; a fee written by a device that nobody
+ * queries inside that period is exactly the one that needs re-deriving, and
+ * until this it was the one nothing looked at.
+ *
+ * IT CORRECTS NOTHING, unattended least of all: the verdict goes in the two
+ * columns 0018 added and, when it is not `agreed`, in an append-only event.
+ * The fee, the plan version, the inputs and the outcome are left exactly as
+ * the close wrote them.
+ */
+export async function sweepLaneDecisions(tenantId, { limit = 200, quote, now = null, plans } = {}) {
+  const at = (now ? new Date(now) : new Date()).toISOString();
+  const ask = quote ?? ratePlans.quoteWithEngine;
+  const summary = {
+    tenant_id: tenantId, pending: 0, checked: 0, failed: 0,
+    agreed: 0, diverged: 0, inputs_disagree: 0, unrecomputable: 0, covered: 0,
+  };
+  const rows = await withTenant(tenantId, (client) => repo.uncheckedLaneDecisions(client, tenantId, limit));
+  summary.pending = rows.length;
+  const byGarage = new Map();
+  for (const row of rows) {
+    try {
+      // One row at a time, on purpose: a failure costs its own row and the
+      // sweep goes on, as the shadow run does.
+      await withTenant(tenantId, async (client) => {
+        if (!byGarage.has(row.garage_id)) {
+          byGarage.set(
+            row.garage_id,
+            plans ?? ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, row.garage_id)),
+          );
+        }
+        const check = await checkOneDecision(client, tenantId, row, {
+          documents: byGarage.get(row.garage_id), ask, at,
+        });
+        summary.checked += 1;
+        summary[check.verdict] += 1;
+      });
+    } catch (err) {
+      summary.failed += 1;
+      // Said, not swallowed, and the sweep goes on: one row that cannot be
+      // checked is not a reason to stop checking the rest. It stays unchecked,
+      // so the next sweep takes it again.
+      console.error(`lane-decision check failed for ${row.id}: ${err.message ?? err}`);
+    }
+  }
+  return summary;
+}
+
 export async function reconcile(client, tenantId, garageId, { since, maxHours }) {
   return {
     garage_id: garageId,
@@ -254,6 +401,7 @@ export async function reconcile(client, tenantId, garageId, { since, maxHours })
       sessions: await closesUnpriced(client, tenantId, garageId, since),
     },
     lane_decisions: await laneDecidedCloses(client, tenantId, garageId, since),
+    lane_decisions_unchecked: await repo.uncheckedLaneDecisionCount(client, tenantId, garageId),
     vehicles_counted_out: VEHICLES_COUNTED_OUT_UNAVAILABLE,
   };
 }
