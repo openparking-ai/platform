@@ -305,6 +305,87 @@ function descriptorField(value) {
   return value;
 }
 
+/** What a lane's exit decision can say it was (`lane-controller/exit_pricing.py`). */
+const LOCAL_DECISION_STATUSES = new Set([
+  'covered', 'priced', 'no_cached_entry', 'engine_refused', 'engine_invalid', 'stale_facts',
+]);
+
+/**
+ * The lane's exit decision, as the close carries it (0017): the record the
+ * lane made at the barrier, before the boom moved, from its cache and the
+ * engine in-process. Shape by name; a decision that is not one is refused
+ * 400 here, not consumed as something.
+ *
+ * Whether the close CONSUMES it is decided beside the open stay
+ * (`consumableDecision`), not here: this only says the value is a decision.
+ */
+function localDecisionField(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw bad('local_decision must be an object: the lane\'s exit decision as it recorded it');
+  }
+  const { status } = value;
+  if (!LOCAL_DECISION_STATUSES.has(status)) {
+    throw bad(`local_decision.status must be one of ${[...LOCAL_DECISION_STATUSES].join(', ')}`);
+  }
+  const from = value.computed_from;
+  if (typeof from !== 'object' || from === null || Array.isArray(from)) {
+    throw bad('local_decision.computed_from must be an object: when the lane\'s cache was refreshed');
+  }
+  if (status === 'priced') {
+    if (!Number.isInteger(value.fee_minor) || value.fee_minor < 0) {
+      throw bad('local_decision.fee_minor must be a whole number of minor units');
+    }
+    for (const key of ['currency', 'plan_version', 'entry_at', 'exit_at', 'session_id', 'space_class']) {
+      if (typeof value[key] !== 'string' || value[key] === '') {
+        throw bad(`local_decision.${key} must be a non-empty string on a priced decision`);
+      }
+    }
+    if (!Array.isArray(value.breakdown)) throw bad('local_decision.breakdown must be the engine\'s ledger, a list');
+  }
+  if (status === 'covered' && (!Array.isArray(value.covered_by) || value.covered_by.length === 0)) {
+    throw bad('local_decision.covered_by must name the module(s) that covered the stay');
+  }
+  return value;
+}
+
+/**
+ * WHETHER THE CLOSE CONSUMES THE LANE'S DECISION, and why not when not.
+ *
+ * Consumed: `covered` (the lane read a register that stands today) and
+ * `priced` (the lane priced from its cached entry) -- when the priced
+ * decision is about THIS stay, in this stay's currency, in this garage's
+ * space class, on a plan version this garage holds. Everything else is said
+ * by name and the close prices for itself: the lane could not decide
+ * (`no_cached_entry`, `stale_facts`, the engine's refusals -- brief 4.5),
+ * or it decided about a different stay or with different money, which is
+ * the one case a lane's word is not taken and the record keeps the word.
+ *
+ * Returns `{ consume: true }` or `{ consume: false, reason }`. Never throws:
+ * a mismatch is a STATED RECONCILE on the record, never a 5xx the lane would
+ * retry for ever and never a 4xx that leaves the stay open.
+ */
+function consumableDecision(decision, { open, garage, planVersions }) {
+  if (decision === null) return { consume: false, reason: 'no local decision on the close' };
+  if (decision.status === 'covered') return { consume: true };
+  if (decision.status !== 'priced') {
+    return { consume: false, reason: `the lane could not decide at the barrier: ${decision.status}` };
+  }
+  if (decision.session_id !== open.id) {
+    return { consume: false, reason: 'the decision names a different session than the one being closed' };
+  }
+  if (decision.currency !== open.currency) {
+    return { consume: false, reason: `the decision prices in ${decision.currency}; the stay is in ${open.currency}` };
+  }
+  if (decision.space_class !== garage.space_class) {
+    return { consume: false, reason: `the decision priced space class ${decision.space_class}; the garage's is ${garage.space_class}` };
+  }
+  if (!planVersions.includes(decision.plan_version)) {
+    return { consume: false, reason: `the decision names plan version ${decision.plan_version}, which this garage does not hold` };
+  }
+  return { consume: true };
+}
+
 /**
  * THE TYPE IS TESTED BEFORE THE SHAPE, and that is the whole of this paragraph.
  *
@@ -1233,6 +1314,10 @@ export function createApp() {
       // the shadow search snapshots the open stays inside this transaction --
       // so what it compares has to be in this call. Migration 0010.
       const exitDescriptor = descriptorField(req.body?.descriptor);
+      // The lane's decision at the barrier (0017), or null on a close that
+      // carries none -- a lane built before it existed, or one that was
+      // offline at the exit and closes from its outbox.
+      const localDecision = localDecisionField(req.body?.local_decision);
       // The same rule at the other end of the stay. Without it a stay opened on
       // a ticket could never be closed: the close would upsert a vehicle from a
       // plate it does not have, find no open session, and 404 — a car that got
@@ -1321,20 +1406,75 @@ export function createApp() {
         // stay prices like any other, with the modules' named reasons kept.
         // A module that could not decide is not a not-covered: it falls
         // through as a 5xx like an unreachable engine, and the lane retries.
-        const asked = await entitlement.consult({
-          garage,
-          identity: vehicle.plate ?? vehicle.ticket_ref,
-          laneId,
-          entryAt: open.entry_at,
-          exitAt,
+        // THE LANE'S DECISION FIRST (0017). One computation feeds the screen,
+        // the card and the row: a close that carries a decision the platform
+        // can consume WRITES THAT DECISION'S NUMBERS and neither consults nor
+        // prices again. What it decided from goes beside the fee, and the
+        // reconciler re-derives the number from it out of band.
+        let plans = ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, garageId));
+        const consumable = consumableDecision(localDecision, {
+          open, garage, planVersions: plans.map((p) => p.plan_version),
         });
+        const identity = vehicle.plate ?? vehicle.ticket_ref;
+        let asked;
         let pricing;
-        let plans = [];
-        if (asked.outcome === entitlement.EXIT_OUTCOMES.COVERED) {
-          pricing = { outcome: entitlement.EXIT_OUTCOMES.COVERED };
+        let decidedBy = 'platform';
+        let decisionInputs = null;
+        if (consumable.consume) {
+          decidedBy = 'lane';
+          const coveredBy = localDecision.status === 'covered' ? localDecision.covered_by : [];
+          asked = {
+            outcome: coveredBy.length ? entitlement.EXIT_OUTCOMES.COVERED : entitlement.EXIT_OUTCOMES.TRANSIENT,
+            covered_by: coveredBy,
+            record: {
+              identity,
+              asked_at: exitAt.toISOString(),
+              decided_by: 'lane',
+              local_decision: localDecision,
+              covered_by: coveredBy,
+            },
+          };
+          pricing = coveredBy.length
+            ? { outcome: entitlement.EXIT_OUTCOMES.COVERED }
+            : {
+                outcome: entitlement.EXIT_OUTCOMES.TRANSIENT,
+                feeMinor: assertMinor(localDecision.fee_minor, 'local_decision.fee_minor'),
+                planVersion: localDecision.plan_version,
+                breakdown: localDecision.breakdown,
+                spaceClass: localDecision.space_class,
+              };
+          decisionInputs = {
+            status: localDecision.status,
+            entry_at: localDecision.entry_at ?? open.entry_at.toISOString(),
+            exit_at: localDecision.exit_at ?? exitAt.toISOString(),
+            space_class: localDecision.space_class ?? garage.space_class,
+            plan_version: localDecision.plan_version ?? null,
+            currency: localDecision.currency ?? open.currency,
+            fee_minor: localDecision.fee_minor ?? null,
+            session_id: localDecision.session_id ?? open.id,
+            synced_at: localDecision.computed_from,
+          };
         } else {
-          plans = ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, garageId));
-          pricing = { outcome: entitlement.EXIT_OUTCOMES.TRANSIENT, ...(await priceStay({ garage, plans, session: open, exitAt })) };
+          // TODAY'S PATH, EXACTLY: the entitlement question through both
+          // doors (0015), then the engine (0013) -- and, when a decision was
+          // carried and not taken, the decision and the reason kept on the
+          // record for the reconciler, never dropped.
+          asked = await entitlement.consult({
+            garage,
+            identity,
+            laneId,
+            entryAt: open.entry_at,
+            exitAt,
+          });
+          if (localDecision !== null) {
+            asked.record.local_decision_ignored = { reason: consumable.reason, local_decision: localDecision };
+          }
+          if (asked.outcome === entitlement.EXIT_OUTCOMES.COVERED) {
+            pricing = { outcome: entitlement.EXIT_OUTCOMES.COVERED };
+            plans = [];
+          } else {
+            pricing = { outcome: entitlement.EXIT_OUTCOMES.TRANSIENT, ...(await priceStay({ garage, plans, session: open, exitAt })) };
+          }
         }
 
         // THE SHADOW SNAPSHOT, HERE AND NOWHERE ELSE: after the stay to close
@@ -1360,6 +1500,8 @@ export function createApp() {
           exitDescriptor,
           pricing,
           entitlement: asked.record,
+          decidedBy,
+          decisionInputs,
         });
         if (pricing.outcome === entitlement.EXIT_OUTCOMES.COVERED) {
           // The record: a stay that leaves with no transient fee, and who
@@ -1373,13 +1515,15 @@ export function createApp() {
               kind: entitlement.EXIT_COVERED_EVENT_KIND,
               occurredAt: exitAt,
               detail: {
-                actor: 'platform:close',
+                actor: decidedBy === 'lane' ? 'lane:decision' : 'platform:close',
+                decided_by: decidedBy,
                 session_id: closed.id,
                 close_event_id: String(closeEventId),
                 entry_at: closed.entry_at,
                 exit_at: closed.exit_at,
                 covered_by: asked.covered_by,
-                pass_id: asked.record.garage_pass?.answer?.pass_id ?? null,
+                pass_id: asked.record.garage_pass?.answer?.pass_id
+                  ?? localDecision?.matched?.find((m) => m.pass)?.pass ?? null,
                 agreement: asked.record.monthly_billing?.answer?.lines?.find((l) => l.includes('under agreement'))?.trim() ?? null,
               },
             },

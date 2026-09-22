@@ -177,7 +177,14 @@ export async function closeSession(
   client,
   tenantId,
   sessionId,
-  { exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor = null, pricing, entitlement },
+  {
+    exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor = null, pricing, entitlement,
+    // WHO DECIDED (0017): 'platform' when this close priced or consulted for
+    // itself, 'lane' when it consumed the lane's decision -- and then the
+    // inputs the lane said it decided from, stored beside the fee so the
+    // number can be re-derived out of band (`reconcile.laneDecidedCloses`).
+    decidedBy = 'platform', decisionInputs = null,
+  },
 ) {
   const priced = pricing.outcome !== 'covered' && pricing.refusal === undefined;
   const { rows } = await client.query(
@@ -185,7 +192,8 @@ export async function closeSession(
         SET exit_at = $3, exit_lane_id = $4, close_event_id = $5,
             exit_confirmation = $6, exit_descriptor = $7,
             fee_minor = $8, plan_version = $9, breakdown = $10, space_class = $11,
-            pricing_refusal = $12, exit_outcome = $13, entitlement = $14
+            pricing_refusal = $12, exit_outcome = $13, entitlement = $14,
+            decided_by = $15, decision_inputs = $16
       WHERE tenant_id = $1 AND id = $2 AND exit_at IS NULL
       RETURNING *`,
     [tenantId, sessionId, exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor,
@@ -195,9 +203,29 @@ export async function closeSession(
      priced ? pricing.spaceClass : null,
      pricing.refusal === undefined ? null : JSON.stringify(pricing.refusal),
      pricing.outcome,
-     entitlement === null || entitlement === undefined ? null : JSON.stringify(entitlement)],
+     entitlement === null || entitlement === undefined ? null : JSON.stringify(entitlement),
+     decidedBy,
+     decisionInputs === null || decisionInputs === undefined ? null : JSON.stringify(decisionInputs)],
   );
   return rows[0] ?? null;
+}
+
+/**
+ * Every stay this garage closed on the lane's decision since `since`, with
+ * what the lane decided from -- the reconciler's denominator. The plans are
+ * not joined here: the reconciler reads them once, whole, as the close hands
+ * them to the engine.
+ */
+export async function laneDecidedSessions(client, tenantId, garageId, since) {
+  const { rows } = await client.query(
+    `SELECT id, entry_at, exit_at, currency, fee_minor, plan_version, space_class,
+            exit_outcome, decision_inputs, entitlement
+       FROM sessions
+      WHERE tenant_id = $1 AND garage_id = $2 AND decided_by = 'lane' AND exit_at >= $3
+      ORDER BY exit_at`,
+    [tenantId, garageId, since],
+  );
+  return rows;
 }
 
 export async function getSession(client, tenantId, sessionId) {

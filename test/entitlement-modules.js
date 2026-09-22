@@ -31,6 +31,8 @@ const MODULES = {
   monthly_billing: { srcEnv: 'MONTHLY_BILLING_SRC', dsnEnv: 'MONTHLY_BILLING_DSN', role: 'monthly_billing_app', script: 'monthly-billing' },
 };
 const PASSWORD = 'test-only-password';
+//: One key, one meaning: "a module database is being built in this cluster".
+const MODULE_BUILD_LOCK_KEY = 0x6d6f64756c6573; // 'modules', as a bigint
 
 function python() {
   return process.env.ENTITLEMENT_PYTHON || process.env.RATE_ENGINE_PYTHON || 'python3';
@@ -71,11 +73,26 @@ export async function startEntitlementModules() {
       }
     });
   };
+  // ONE BUILD AT A TIME IN THE CLUSTER. Each module's migration ALTERs its
+  // application ROLE, and a role is cluster-global: two test files building
+  // module databases at once -- node --test runs files in parallel -- collide
+  // on it ("tuple concurrently updated"). The lock is a cluster-wide advisory
+  // lock on the maintenance database, held for the length of the build, the
+  // same shape the modules' own harnesses use.
+  const gate = new pg.Client({ connectionString: maintenance.toString() });
+  await gate.connect();
   try {
-    await build();
-  } catch (err) {
-    await dropAll();
-    throw err;
+    await gate.query('SELECT pg_advisory_lock($1)', [MODULE_BUILD_LOCK_KEY]);
+    try {
+      await build();
+    } catch (err) {
+      await dropAll();
+      throw err;
+    } finally {
+      await gate.query('SELECT pg_advisory_unlock($1)', [MODULE_BUILD_LOCK_KEY]);
+    }
+  } finally {
+    await gate.end();
   }
   async function build() {
   for (const [module, spec] of Object.entries(MODULES)) {

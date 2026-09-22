@@ -13,6 +13,8 @@
  * module says so in its own output rather than only in a receipt -- see
  * `vehicles_counted_out` below.
  */
+import * as ratePlans from './ratePlans.js';
+import * as repo from './repository.js';
 
 /**
  * Arrivals against sessions, over a window.
@@ -130,6 +132,115 @@ export const VEHICLES_COUNTED_OUT_UNAVAILABLE = {
     'compare a number with itself and agree by construction.',
 };
 
+/**
+ * Stays closed on the LANE'S decision (0017), re-derived out of band.
+ *
+ * The close wrote a fee a device computed; this recomputes it from what the
+ * device said it decided from -- `decision_inputs`: the entry and exit
+ * instants, the space class, the currency -- and from the plans as this
+ * platform stores them, through the same engine call the close would have
+ * made. It compares fee and plan version, and it REPORTS. It corrects
+ * nothing, changes no row, and does not even suggest the right number is the
+ * recomputed one: a divergence is evidence that two computations disagree,
+ * and which is wrong is a question for whoever reads this.
+ *
+ * Three lists, each named for what it is, never folded:
+ *   diverged        the engine, from the lane's own inputs, priced a different
+ *                   fee or chose a different plan than the row carries.
+ *   inputs_disagree the lane's inputs are not this row's: it priced between
+ *                   instants other than the stay's own, or in another class.
+ *                   The fee may still recompute; the disagreement is reported
+ *                   on its own because it is a different fact.
+ *   unrecomputable  the engine could not be asked, or refused the inputs.
+ *                   NOT a divergence and not an agreement: nothing was
+ *                   measured, and the report says so rather than counting it
+ *                   either way.
+ * ...and `covered_by_lane`: stays the lane let out covered, listed with the
+ * pass or agreement it matched. They are NOT re-consulted: the modules answer
+ * for an instant against the register as it is NOW, and a pass revoked since
+ * the exit would read as a false divergence. Listed so a reader can check
+ * them against the modules' own records; not judged here.
+ *
+ * `quote` is `ratePlans.quoteWithEngine` unless a test hands in another; it
+ * is called once per priced row, off the barrier's path, on the operator's
+ * reconciliation route.
+ */
+export async function laneDecidedCloses(client, tenantId, garageId, since, { quote, plans } = {}) {
+  const rows = await repo.laneDecidedSessions(client, tenantId, garageId, since);
+  const report = {
+    since,
+    checked: 0,
+    agreed: 0,
+    diverged: [],
+    inputs_disagree: [],
+    unrecomputable: [],
+    covered_by_lane: [],
+  };
+  const priceable = rows.filter((r) => r.exit_outcome === 'transient' && r.fee_minor !== null);
+  const documents = plans ?? (priceable.length
+    ? ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, garageId))
+    : []);
+  const ask = quote ?? ratePlans.quoteWithEngine;
+  for (const row of rows) {
+    if (row.exit_outcome === 'covered') {
+      report.covered_by_lane.push({
+        session_id: row.id,
+        exit_at: row.exit_at,
+        covered_by: row.entitlement?.covered_by ?? [],
+        matched: row.entitlement?.local_decision?.matched ?? [],
+      });
+      continue;
+    }
+    if (row.fee_minor === null) continue;
+    const inputs = row.decision_inputs ?? {};
+    report.checked += 1;
+    const rowEntry = new Date(row.entry_at).toISOString();
+    const rowExit = new Date(row.exit_at).toISOString();
+    const disagreement = [];
+    if (inputs.entry_at && new Date(inputs.entry_at).toISOString() !== rowEntry) disagreement.push('entry_at');
+    if (inputs.exit_at && new Date(inputs.exit_at).toISOString() !== rowExit) disagreement.push('exit_at');
+    if (inputs.space_class && inputs.space_class !== row.space_class) disagreement.push('space_class');
+    if (inputs.currency && inputs.currency !== row.currency) disagreement.push('currency');
+    if (disagreement.length) {
+      report.inputs_disagree.push({
+        session_id: row.id, fields: disagreement,
+        lane: { entry_at: inputs.entry_at, exit_at: inputs.exit_at, space_class: inputs.space_class, currency: inputs.currency },
+        row: { entry_at: rowEntry, exit_at: rowExit, space_class: row.space_class, currency: row.currency },
+      });
+    }
+    let recomputed;
+    try {
+      recomputed = await ask({
+        plans: documents,
+        currency: inputs.currency ?? row.currency,
+        spaceClass: inputs.space_class ?? row.space_class,
+        entryAt: new Date(inputs.entry_at ?? row.entry_at),
+        exitAt: new Date(inputs.exit_at ?? row.exit_at),
+      });
+    } catch (err) {
+      report.unrecomputable.push({
+        session_id: row.id,
+        reason: err instanceof ratePlans.PricingRefused ? 'the engine refused the inputs' : `the engine could not be asked: ${err.message}`,
+        findings: err instanceof ratePlans.PricingRefused ? err.findings : undefined,
+      });
+      continue;
+    }
+    const laneFee = Number(row.fee_minor);
+    if (recomputed.feeMinor !== laneFee || recomputed.planVersion !== row.plan_version) {
+      report.diverged.push({
+        session_id: row.id,
+        exit_at: rowExit,
+        lane: { fee_minor: laneFee, plan_version: row.plan_version },
+        recomputed: { fee_minor: recomputed.feeMinor, plan_version: recomputed.planVersion },
+        synced_at: inputs.synced_at ?? null,
+      });
+    } else {
+      report.agreed += 1;
+    }
+  }
+  return report;
+}
+
 export async function reconcile(client, tenantId, garageId, { since, maxHours }) {
   return {
     garage_id: garageId,
@@ -142,6 +253,7 @@ export async function reconcile(client, tenantId, garageId, { since, maxHours })
       since,
       sessions: await closesUnpriced(client, tenantId, garageId, since),
     },
+    lane_decisions: await laneDecidedCloses(client, tenantId, garageId, since),
     vehicles_counted_out: VEHICLES_COUNTED_OUT_UNAVAILABLE,
   };
 }

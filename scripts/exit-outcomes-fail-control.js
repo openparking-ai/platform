@@ -59,8 +59,8 @@ const SOURCE_BREAKS = [
     name: 'covered_still_priced',
     why: 'a covered answer is ignored and the stay is priced',
     file: 'src/app.js',
-    from: '        if (asked.outcome === entitlement.EXIT_OUTCOMES.COVERED) {\n          pricing = { outcome: entitlement.EXIT_OUTCOMES.COVERED };',
-    to: '        if (false) {\n          pricing = { outcome: entitlement.EXIT_OUTCOMES.COVERED };',
+    from: '          if (asked.outcome === entitlement.EXIT_OUTCOMES.COVERED) {\n            pricing = { outcome: entitlement.EXIT_OUTCOMES.COVERED };',
+    to: '          if (false) {\n            pricing = { outcome: entitlement.EXIT_OUTCOMES.COVERED };',
   },
   {
     name: 'not_covered_is_covered',
@@ -135,8 +135,8 @@ const SOURCE_BREAKS = [
     name: 'identity_guessed',
     why: 'a ticket stay is consulted without its ticket',
     file: 'src/app.js',
-    from: '          identity: vehicle.plate ?? vehicle.ticket_ref,',
-    to: "          identity: vehicle.plate ?? 'unknown',",
+    from: '        const identity = vehicle.plate ?? vehicle.ticket_ref;',
+    to: "        const identity = vehicle.plate ?? 'unknown';",
   },
 ];
 

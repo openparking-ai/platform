@@ -234,3 +234,11 @@ jobs:
         # turn, plus the cursor trigger never created, and the suite must go
         # red.
         run: npm run rules-payload-fail-control
+
+      - name: Lane-decided-close fail-control
+        # The close consumes the lane's decision and stores what it decided
+        # from; the reconciler recomputes out of band, names the lane that
+        # wrote fee + 1, and corrects nothing. Each property is broken in
+        # turn, plus the attribution constraint never created, and the suite
+        # must go red.
+        run: npm run lane-decided-close-fail-control
