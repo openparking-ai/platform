@@ -550,6 +550,58 @@ A rules read records nothing: like the two module verbs it calls, it writes
 no row and appends no event. `npm run rules-payload-fail-control` breaks each
 property in turn.
 
+### The close consumes the lane's decision, and the reconciler checks it out of band
+
+The exit round moved the price to the lane: the barrier shows a fee computed
+on the box, before the boom moves, by the same engine function this platform
+calls, from the plans this platform handed it. One computation feeds the
+screen, the card and the row — so a close that carries the lane's decision
+(`local_decision` on the close body, the lane's `exit_pricing` detail) **writes
+that decision's numbers and does not run the engine again** (migration 0017).
+A close that carries none prices exactly as before. Which path closed the stay
+is on the row: `sessions.decided_by` is `'platform'` or `'lane'`, and every
+closed stay says which.
+
+**What the close does not consume.** A decision that names a session other
+than the one being closed, prices in another currency or space class, or names
+a plan version this garage does not hold is not written as the fee: the close
+prices itself and keeps the decision it did not take on the entitlement record
+under `local_decision_ignored`, with its reason. A lane that could not decide
+(`no_cached_entry`, `stale_facts`, `engine_refused`, `engine_invalid`) says so
+and the close prices itself, as before. A decision whose shape is wrong is a
+`400` by name, and the stay stays open. None of those is a `5xx`: a `5xx` the
+lane classifies as retryable and jams its outbox behind. A covered decision
+closes the stay `exit_covered` without asking either module — the lane read the
+same registers this platform would have — and the event's actor says
+`lane:decision`.
+
+**What stands behind a device-written fee.** The platform now stores a fee a
+device wrote, on a device token. Two things stand behind it:
+
+- **`sessions.decision_inputs`** — everything the lane said it decided from:
+  the entry and exit instants it priced between, the space class, the plan
+  version, the currency, the fee, and the cache's `synced_at` (the rules' and
+  the stays' timestamps and the stays cursor). Stored beside the fee, held to
+  the fee by a CHECK (`lane` carries inputs, `platform` carries none), so the
+  number can be re-derived later from what the lane said it used.
+- **The reconciler** — `laneDecidedCloses` in `src/reconcile.js`, on the
+  operator's reconciliation route, never the barrier's path. It recomputes each
+  lane-decided fee through the engine from those inputs and the plans as
+  stored, and **reports divergence and stops**: `agreed`, `diverged` (the lane's
+  figure and the recomputed one side by side, with the cache's `synced_at`),
+  `inputs_disagree` (the inputs the lane said it used against the row's own
+  entry, exit and class), `unrecomputable` (the engine's refusal, verbatim),
+  `covered_by_lane` (listed, not re-consulted). It corrects nothing: an
+  auto-correcting reconciler on a money record is a way to lose the evidence of
+  the thing it was built to detect. The same shape the file already had.
+
+`test/lane-decided-close.test.js` plants a lane that writes fee + 1 and asserts
+the reconciler names it and the row is byte-identical after.
+`npm run lane-decided-close-fail-control` breaks each property in turn — the
+close pricing again, the inputs not stored, a mismatch consumed, a covered
+decision asking the doors, a blind reconciler, a correcting one, and the
+attribution constraint never created.
+
 ## Vehicle identity and retention
 
 The database stores real vehicle identity — plate, make, model, colour — because

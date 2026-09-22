@@ -68,6 +68,8 @@ const SNAPSHOT_BLOCK = `        if (exitDescriptor !== null) {
           exitDescriptor,
           pricing,
           entitlement: asked.record,
+          decidedBy,
+          decisionInputs,
         });
 `;
 
@@ -85,6 +87,8 @@ const BREAKS = [
           exitDescriptor,
           pricing,
           entitlement: asked.record,
+          decidedBy,
+          decisionInputs,
         });
 
         if (exitDescriptor !== null) {
