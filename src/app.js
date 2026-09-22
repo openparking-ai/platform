@@ -1455,10 +1455,12 @@ export function createApp() {
             synced_at: localDecision.computed_from,
           };
         } else {
-          // TODAY'S PATH, EXACTLY: the entitlement question through both
-          // doors (0015), then the engine (0013) -- and, when a decision was
-          // carried and not taken, the decision and the reason kept on the
-          // record for the reconciler, never dropped.
+          // TODAY'S PATH, EXACTLY: the entitlement question to every module
+          // the garage links, each through its own door (0015) -- two, one or
+          // none -- and the engine (0013) only when none of them covers the
+          // stay; a covered stay closes covered with no engine call. And, when
+          // a decision was carried and not taken, the decision and the reason
+          // kept on the record for the reconciler, never dropped.
           asked = await entitlement.consult({
             garage,
             identity,
