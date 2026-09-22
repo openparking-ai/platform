@@ -242,3 +242,10 @@ jobs:
         # turn, plus the attribution constraint never created, and the suite
         # must go red.
         run: npm run lane-decided-close-fail-control
+
+      - name: Lane-decision-sweep fail-control
+        # The reconciler looks without being asked, with no window over it,
+        # records what it found on the row and in an append-only event, and
+        # corrects nothing. Each property is broken in turn, plus the verdict
+        # constraint never created, and the suite must go red.
+        run: npm run lane-decision-sweep-fail-control

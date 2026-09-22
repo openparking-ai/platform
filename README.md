@@ -595,9 +595,29 @@ device wrote, on a device token. Two things stand behind it:
   auto-correcting reconciler on a money record is a way to lose the evidence of
   the thing it was built to detect. The same shape the file already had.
 
+**And it looks without being asked** (migration 0018). The reconciliation route
+reports on the period an operator asked about — 24 hours by default — so a fee
+written by a device that nobody queries inside that day was never re-derived by
+anything: the record was there, and nothing looked. `npm run
+reconcile-lane-decisions`, on a schedule beside the purge and the shadow
+search, sweeps **every lane-decided close nothing has checked yet, oldest
+first, with no window over it**. `sessions.decision_checked_at` is the queue
+(NULL means never checked) and `sessions.decision_check` is the verdict —
+`agreed`, `diverged`, `inputs_disagree`, `unrecomputable` or `covered` — held
+to it by a CHECK. A verdict that is not `agreed` is also written to `events`,
+which is append-only by grant, so the finding cannot be edited away by
+something that can write `sessions`. **The sweep corrects nothing**, unattended
+least of all: the two columns above are the only ones its statement names. The
+operator's route publishes `lane_decisions_unchecked`, so a sweep that has
+stopped running is visible as a backlog rather than as silence.
+
 `test/lane-decided-close.test.js` plants a lane that writes fee + 1 and asserts
-the reconciler names it and the row is byte-identical after.
-`npm run lane-decided-close-fail-control` breaks each property in turn — the
+the reconciler names it and the row is byte-identical after;
+`test/lane-decision-sweep.test.js` plants the same lane on a close **a year
+old** — outside every window the route would report on — and asserts the sweep
+finds it, and that every column of that row but the two is byte-identical
+afterwards.
+`npm run lane-decided-close-fail-control` and `npm run lane-decision-sweep-fail-control` break each property in turn — the
 close pricing again, the inputs not stored, a mismatch consumed, a covered
 decision asking the doors, a blind reconciler, a correcting one, and the
 attribution constraint never created.

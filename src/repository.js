@@ -228,6 +228,62 @@ export async function laneDecidedSessions(client, tenantId, garageId, since) {
   return rows;
 }
 
+/**
+ * The lane-decided closes NOTHING HAS CHECKED YET, oldest first, across every
+ * garage of the tenant -- the unprompted sweep's queue (0018).
+ *
+ * NO WINDOW. The reconciliation route bounds what it reports by `hours`
+ * because an operator asked a question about a period; the sweep is not
+ * answering a question, it is making sure every device-written fee is
+ * re-derived once, and a fee nobody asked about inside a day is exactly the
+ * one that needs it. `decision_checked_at IS NULL` is the queue and the index
+ * `sessions_lane_unchecked_idx` is its shape. `id` breaks the tie on `exit_at`:
+ * two closes at the same instant are a tie the database may order either way,
+ * and a queue whose order under a LIMIT is arbitrary is one nothing can assert
+ * about -- including a test, which is how this was found.
+ */
+export async function uncheckedLaneDecisions(client, tenantId, limit) {
+  const { rows } = await client.query(
+    `SELECT id, garage_id, exit_lane_id, entry_at, exit_at, currency, fee_minor, plan_version,
+            space_class, exit_outcome, decision_inputs, entitlement, close_event_id
+       FROM sessions
+      WHERE tenant_id = $1 AND decided_by = 'lane' AND decision_checked_at IS NULL
+      ORDER BY exit_at, id
+      LIMIT $2`,
+    [tenantId, limit],
+  );
+  return rows;
+}
+
+/** How many lane-decided closes nothing has checked yet. The sweep's backlog. */
+export async function uncheckedLaneDecisionCount(client, tenantId, garageId) {
+  const { rows } = await client.query(
+    `SELECT count(*)::int AS n FROM sessions
+      WHERE tenant_id = $1 AND garage_id = $2 AND decided_by = 'lane'
+        AND decision_checked_at IS NULL`,
+    [tenantId, garageId],
+  );
+  return rows[0].n;
+}
+
+/**
+ * Write what the check found, and NOTHING ELSE.
+ *
+ * The two columns 0018 added, by name, and no other: the sweep may not touch
+ * `fee_minor`, `plan_version`, `exit_outcome` or `decision_inputs`, and this
+ * is the only statement it has for saying anything at all. A reconciler that
+ * corrects a money record unattended loses the evidence of the thing it was
+ * built to detect.
+ */
+export async function recordDecisionCheck(client, tenantId, sessionId, { at, check }) {
+  const { rowCount } = await client.query(
+    `UPDATE sessions SET decision_checked_at = $3, decision_check = $4
+      WHERE tenant_id = $1 AND id = $2 AND decided_by = 'lane'`,
+    [tenantId, sessionId, at, check],
+  );
+  return rowCount;
+}
+
 export async function getSession(client, tenantId, sessionId) {
   const { rows } = await client.query('SELECT * FROM sessions WHERE tenant_id = $1 AND id = $2', [
     tenantId,
