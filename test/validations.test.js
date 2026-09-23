@@ -125,7 +125,7 @@ function setMode(mode) {
 }
 const calls = () => readFileSync(LOG, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
 const validation = (over = {}) => ({
-  phone: PHONE_DIGITS, validator_name: 'Invented Bistro', discount_type: 'flat', discount_value: 2, discount_minor: 200, claimed_ref: null, ...over,
+  phone: PHONE_DIGITS, validator_name: 'Example Name', discount_type: 'flat', discount_value: 2, discount_minor: 200, claimed_ref: null, ...over,
 });
 
 const heldRef = (g) => readState().garages[`${g.link.tenant_id}/${g.link.garage_id}`][0].claimed_ref;
@@ -229,7 +229,7 @@ test('the phone is claimed when it is entered: the reader is answered the discou
   const { validation } = await res.json();
   assert.deepEqual(validation, {
     outcome: 'held', replay: false, currency: 'USD', fee_before_minor: 500, discount_minor: 200, fee_minor: 300,
-    line: { code: LINE_CODE, rule_id: null, delta_minor: -200, text: 'Validation from Invented Bistro (2.00 USD off): -2.00 USD' },
+    line: { code: LINE_CODE, rule_id: null, delta_minor: -200, text: 'Validation from Example Name (2.00 USD off): -2.00 USD' },
     held_at: validation.held_at,
   });
   const row = await rowFor(id);
