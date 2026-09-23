@@ -70,6 +70,7 @@ const SNAPSHOT_BLOCK = `        if (exitDescriptor !== null) {
           entitlement: asked.record,
           decidedBy,
           decisionInputs,
+          validation: validated.record,
         });
 `;
 
@@ -89,6 +90,7 @@ const BREAKS = [
           entitlement: asked.record,
           decidedBy,
           decisionInputs,
+          validation: validated.record,
         });
 
         if (exitDescriptor !== null) {

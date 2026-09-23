@@ -16,6 +16,17 @@
 import { withTenant } from './db.js';
 import * as ratePlans from './ratePlans.js';
 import * as repo from './repository.js';
+import { validationDelta } from './validations.js';
+
+/**
+ * The fee the ENGINE came to on a row: the row's fee less its validation
+ * lines (0019). A validation is the module's assertion, appended after the
+ * engine's lines; the engine never priced it, so a re-derivation is compared
+ * with the fee without it.
+ */
+function engineFee(row) {
+  return Number(row.fee_minor) - validationDelta(row.breakdown);
+}
 
 /**
  * Arrivals against sessions, over a window.
@@ -226,7 +237,7 @@ export async function laneDecidedCloses(client, tenantId, garageId, since, { quo
       });
       continue;
     }
-    const laneFee = Number(row.fee_minor);
+    const laneFee = engineFee(row);
     if (recomputed.feeMinor !== laneFee || recomputed.planVersion !== row.plan_version) {
       report.diverged.push({
         session_id: row.id,
@@ -290,7 +301,7 @@ export async function checkOneDecision(client, tenantId, row, { documents, ask, 
         findings: err instanceof ratePlans.PricingRefused ? err.findings : undefined,
       };
     }
-    const laneFee = Number(row.fee_minor);
+    const laneFee = engineFee(row);
     if (refusal) {
       check = { verdict: 'unrecomputable', ...refusal };
     } else if (recomputed.feeMinor !== laneFee || recomputed.planVersion !== row.plan_version) {

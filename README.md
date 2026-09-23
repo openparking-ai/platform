@@ -622,6 +622,45 @@ close pricing again, the inputs not stored, a mismatch consumed, a covered
 decision asking the doors, a blind reconciler, a correcting one, and the
 attribution constraint never created.
 
+### A validation at the exit: a linked module, and one more line on the ledger
+
+A **validation** is a discount a merchant gives a driver ahead of the exit,
+carried by the driver's phone number. The module that holds validations is its
+own system, asked through its own door as garage-pass and monthly-billing are,
+and **this repository gets the ability to ask, never the module** (migration
+0019). A garage states which garage of a validations module it is —
+`PUT /api/v1/garages/<id>/validations-link` with `{validations: {tenant_id,
+garage_id}}` or `null` — and the link is probed before it is stored.
+
+At the close, `phone` on the body (optional; absent is "the driver skipped
+it") and a priced fee above zero ask the module: a read, and when a validation
+is live, a claim for this stay. The claim's discount is **the module's
+assertion**, checked for shape — whole minor units, not more than the fee, the
+fee and currency it was asked about echoed back — and written as **one more
+line on the ledger**, `code: 'validation'`, after the engine's lines. The fee
+is the running total including it; nothing is re-priced. `sessions.validation`
+keeps what was asked and what was answered.
+
+**The phone number is never kept.** It goes to the door on stdin — never argv,
+because argv is kept on the record — and into no column, event or log line;
+the door's `phone_last4` is dropped from every answer before it is stored, and
+a refused `phone` field names the field, not the value.
+
+A covered stay, an unpriced stay and a zero fee do not ask: a claim would spend
+the driver's validation for nothing. A door that **could not decide** (it could
+not be run, or exited 2) is not "no validation": the close answers 5xx and the
+lane retries, and a read that says `already_claimed` is asked on, because the
+claim it names may be this stay's own from a close that rolled back — the
+module answers that claim again. A door that **refused** the request (a garage
+it does not know, a currency it does not take) closes the stay undiscounted,
+with a `validation_refused` event for a human. The reconciler compares the
+engine's number with the fee **without** the validation line.
+
+`test/validations.test.js` runs against the real engine and a stand-in for the
+door (`test/fixtures/validations-door`) that speaks the door's contract and
+computes nothing; `npm run validations-fail-control` breaks each property in
+turn.
+
 ## Vehicle identity and retention
 
 The database stores real vehicle identity — plate, make, model, colour — because

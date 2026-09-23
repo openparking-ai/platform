@@ -7,6 +7,7 @@ import { enqueueShadowSearch } from './shadow.js';
 import * as ratePlans from './ratePlans.js';
 import * as activation from './activation.js';
 import * as entitlement from './entitlement.js';
+import * as validations from './validations.js';
 import { reconcile } from './reconcile.js';
 
 class HttpError extends Error {
@@ -301,6 +302,29 @@ function descriptorField(value) {
       `descriptor must be a string of at most ${DESCRIPTOR_MAX} characters and not only ` +
         'whitespace; this platform stores a descriptor and does not otherwise read it',
     );
+  }
+  return value;
+}
+
+const PHONE_MAX = 32;
+
+/**
+ * The driver's phone number on a close (0019): OPTIONAL, and it is the one
+ * field of the close this platform must never keep. It is read here, handed
+ * to the validations door on stdin (`validations.atClose`), and dropped --
+ * no column, no event, no log line holds it. So a refusal below names the
+ * field and never the value: an error message is the one place a value can
+ * leave by accident.
+ *
+ * Absent or null is "the driver skipped it". Present, it must be a string of
+ * digits and the punctuation people type in a number; whether it IS a number
+ * the module can match is the module's question, and a number it cannot read
+ * is a not-validated answer, not a refused close.
+ */
+function phoneField(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string' || !/^[0-9 +().-]+$/.test(value) || value.length > PHONE_MAX || !/[0-9]/.test(value)) {
+    throw bad(`phone must be a string of at most ${PHONE_MAX} characters of digits, spaces and + ( ) . -`);
   }
   return value;
 }
@@ -717,6 +741,38 @@ export function createApp() {
     } catch (err) {
       if (err instanceof entitlement.LinkUnanswerable) {
         return next(conflict('entitlement_link_unanswerable', err.message));
+      }
+      next(err);
+    }
+  });
+
+  /**
+   * State which garage of a validations module this garage is, under which
+   * of its tenants (`{tenant_id, garage_id}`), or that it links none (null).
+   * PROBED before it is stored: the module must answer a read about that
+   * garage, and a link it cannot answer is refused by name. Recorded with
+   * what changed. The module itself is the operator's; this platform only
+   * asks it (0019).
+   */
+  operator.put('/garages/:garageId/validations-link', async (req, res, next) => {
+    try {
+      const body = req.body ?? {};
+      for (const key of Object.keys(body)) {
+        if (key !== 'validations') throw bad(`unknown field ${JSON.stringify(key)}; the body is {validations}`);
+      }
+      if (!('validations' in body)) throw bad('validations is required: null (not linked) or {tenant_id, garage_id}');
+      const link = linkField(body.validations, 'validations');
+      const garage = await withTenant(req.tenantId, async (client) => {
+        const current = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!current) throw new HttpError(404, 'garage not found');
+        return validations.stateLink(client, req.tenantId, current, link, {
+          actor: `operator_token:${req.operatorTokenId}`,
+        });
+      });
+      res.json({ garage });
+    } catch (err) {
+      if (err instanceof validations.LinkUnanswerable) {
+        return next(conflict('validations_link_unanswerable', err.message));
       }
       next(err);
     }
@@ -1318,6 +1374,8 @@ export function createApp() {
       // carries none -- a lane built before it existed, or one that was
       // offline at the exit and closes from its outbox.
       const localDecision = localDecisionField(req.body?.local_decision);
+      // The driver's phone, entered at the reader (0019), or null: see phoneField.
+      const phone = phoneField(req.body?.phone);
       // The same rule at the other end of the stay. Without it a stay opened on
       // a ticket could never be closed: the close would upsert a vehicle from a
       // plate it does not have, find no open session, and 404 — a car that got
@@ -1479,6 +1537,20 @@ export function createApp() {
           }
         }
 
+        // THE VALIDATION (0019), after the fee is decided -- by the lane or by
+        // this platform, the same either way -- and before it is written. A
+        // phone and a priced fee above zero ask the linked module; a claim it
+        // answers becomes ONE MORE LINE on the ledger and the fee is the
+        // running total including it. Nothing is re-priced. The phone goes to
+        // the door on stdin and is not kept. A module that could not decide
+        // falls through as a 5xx, like the entitlement doors: the lane
+        // retries, and the module answers the same stay's claim again with
+        // the same claim.
+        const validated = await validations.atClose({
+          garage, sessionId: open.id, phone, pricing, currency: open.currency, exitAt,
+        });
+        pricing = validated.pricing;
+
         // THE SHADOW SNAPSHOT, HERE AND NOWHERE ELSE: after the stay to close
         // is known, BEFORE `exit_at` is written on it, in this transaction.
         // Taken after the UPDATE below, the true stay is already closed and
@@ -1504,7 +1576,29 @@ export function createApp() {
           entitlement: asked.record,
           decidedBy,
           decisionInputs,
+          validation: validated.record,
         });
+        if (validated.refusal) {
+          // The module refused the request (a garage it does not know, a
+          // currency it does not take): the stay closed undiscounted, and a
+          // human is told why. The module's words, without the phone.
+          await repo.appendEvents(client, tenantId, [
+            {
+              garageId,
+              laneId,
+              eventId: `validation_refused:${closed.id}`,
+              kind: validations.REFUSED_EVENT_KIND,
+              occurredAt: exitAt,
+              detail: {
+                actor: 'platform:close',
+                session_id: closed.id,
+                close_event_id: String(closeEventId),
+                link: garage.validations_link,
+                refused: validated.refusal,
+              },
+            },
+          ]);
+        }
         if (pricing.outcome === entitlement.EXIT_OUTCOMES.COVERED) {
           // The record: a stay that leaves with no transient fee, and who
           // said it could. Money not charged is a decision as much as money

@@ -184,6 +184,9 @@ export async function closeSession(
     // inputs the lane said it decided from, stored beside the fee so the
     // number can be re-derived out of band (`reconcile.laneDecidedCloses`).
     decidedBy = 'platform', decisionInputs = null,
+    // THE VALIDATION RECORD (0019): null when the close carried no phone.
+    // It never holds the phone number.
+    validation = null,
   },
 ) {
   const priced = pricing.outcome !== 'covered' && pricing.refusal === undefined;
@@ -193,7 +196,7 @@ export async function closeSession(
             exit_confirmation = $6, exit_descriptor = $7,
             fee_minor = $8, plan_version = $9, breakdown = $10, space_class = $11,
             pricing_refusal = $12, exit_outcome = $13, entitlement = $14,
-            decided_by = $15, decision_inputs = $16
+            decided_by = $15, decision_inputs = $16, validation = $17
       WHERE tenant_id = $1 AND id = $2 AND exit_at IS NULL
       RETURNING *`,
     [tenantId, sessionId, exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor,
@@ -205,7 +208,8 @@ export async function closeSession(
      pricing.outcome,
      entitlement === null || entitlement === undefined ? null : JSON.stringify(entitlement),
      decidedBy,
-     decisionInputs === null || decisionInputs === undefined ? null : JSON.stringify(decisionInputs)],
+     decisionInputs === null || decisionInputs === undefined ? null : JSON.stringify(decisionInputs),
+     validation === null || validation === undefined ? null : JSON.stringify(validation)],
   );
   return rows[0] ?? null;
 }
@@ -219,7 +223,7 @@ export async function closeSession(
 export async function laneDecidedSessions(client, tenantId, garageId, since) {
   const { rows } = await client.query(
     `SELECT id, entry_at, exit_at, currency, fee_minor, plan_version, space_class,
-            exit_outcome, decision_inputs, entitlement
+            exit_outcome, decision_inputs, entitlement, breakdown
        FROM sessions
       WHERE tenant_id = $1 AND garage_id = $2 AND decided_by = 'lane' AND exit_at >= $3
       ORDER BY exit_at`,
@@ -245,7 +249,7 @@ export async function laneDecidedSessions(client, tenantId, garageId, since) {
 export async function uncheckedLaneDecisions(client, tenantId, limit) {
   const { rows } = await client.query(
     `SELECT id, garage_id, exit_lane_id, entry_at, exit_at, currency, fee_minor, plan_version,
-            space_class, exit_outcome, decision_inputs, entitlement, close_event_id
+            space_class, exit_outcome, decision_inputs, entitlement, close_event_id, breakdown
        FROM sessions
       WHERE tenant_id = $1 AND decided_by = 'lane' AND decision_checked_at IS NULL
       ORDER BY exit_at, id
