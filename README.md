@@ -661,6 +661,13 @@ record committed here — `claiming` before a claim, `releasing` before a releas
 answered leaves one of them, and the close or the sweep gives it back:
 releasing a claim that never landed is harmless, the door answers `none`.
 
+**A release names the claim it gives back.** Those door calls happen outside
+any lock here, so a release can reach the module after the same stay has
+claimed again. Every claim is named by the attempt that made it (`--claim`),
+a record keeps the names of the claims it may still hold, and a release names
+those and nothing else; the module refuses to release a claim it no longer
+holds (`already_superseded`). A late release cannot undo a newer claim.
+
 **A hold no close takes is given back** through the module's door
 (`release-in-store`), so a driver who entered a phone and then did not pay and
 leave strands nothing: the validation is unclaimed again, live if its day has

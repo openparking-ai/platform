@@ -39,6 +39,10 @@
  *   releasing_recorded         a stay whose release began records the discount (A2.3).
  *   release_never_finished     the close never asks the door after it commits (A2.3).
  *   unfinished_left            the sweep never finishes a release begun (A2.3).
+ *   claim_not_named            every attempt's claim has the same name, so a late
+ *                              release can undo a newer claim (A3).
+ *   prior_claims_dropped       a new attempt forgets the claims it replaced (A3).
+ *   release_asks_one_claim     a release stops at the first claim it names (A3).
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0019, so the property genuinely never existed:
@@ -241,6 +245,27 @@ const SOURCE_BREAKS = [
     file: 'src/validations.js',
     from: "    unfinished: await repo.releasingRecords(c, tenantId),",
     to: "    unfinished: [],",
+  },
+  {
+    name: 'claim_not_named',
+    why: "every attempt's claim has the same name, so a late release can undo a newer claim",
+    file: 'src/app.js',
+    from: "          garage, sessionId, claimId: pre.attempt, phone,",
+    to: "          garage, sessionId, claimId: 'one-name-for-every-claim', phone,",
+  },
+  {
+    name: 'prior_claims_dropped',
+    why: 'a new attempt forgets the claims it replaced',
+    file: 'src/validations.js',
+    from: "    ...(prior ? { prior_state: prior.state, prior_claims: claimIdsOf(prior) } : {}),",
+    to: "    ...(prior ? { prior_state: prior.state } : {}),",
+  },
+  {
+    name: 'release_asks_one_claim',
+    why: 'a release stops at the first claim it names',
+    file: 'src/validations.js',
+    from: "    if (answer.reason !== 'already_superseded') return last;",
+    to: "    return last;",
   },
 ];
 

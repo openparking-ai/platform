@@ -1451,9 +1451,13 @@ export function createApp() {
           throw conflict('claim_superseded', 'another claim or a release for this stay came first; nothing was asked');
         }
         const garage = await repo.getGarage(client, tenantId, garageId);
-        const released = pre.prior ? await validations.release({ garage, sessionId, at: new Date() }) : null;
+        const released = pre.prior
+          ? await validations.release({ garage, sessionId, at: new Date(), claimIds: validations.claimIdsOf(pre.prior) })
+          : null;
+        // The claim is named by this attempt (A3): a release that arrives late
+        // names an earlier one and cannot undo it.
         const claimed = await validations.claimAtReader({
-          garage, sessionId, phone, feeMinor: decision.fee_minor, currency: decision.currency, exitAt: new Date(decision.exit_at),
+          garage, sessionId, claimId: pre.attempt, phone, feeMinor: decision.fee_minor, currency: decision.currency, exitAt: new Date(decision.exit_at),
         });
         const record = claimed.record
           ?? (pre.prior

@@ -13,12 +13,12 @@
  *       exit 0 validated · 1 not validated (the JSON names why) · 2 could not
  *       decide (configuration) · 3 the request was refused.
  *   valet-validations claim-in-store --tenant T --garage G --at EXIT
- *       --consumer openparking --ref SESSION --base-minor FEE --currency C  < phone
+ *       --consumer openparking --ref SESSION --claim ATTEMPT --base-minor FEE --currency C  < phone
  *       exit 0 claimed, with the discount in minor units · 1 nothing to claim
  *       · 2 could not decide · 3 refused.
  *   valet-validations release-in-store --tenant T --garage G --at NOW
- *       --consumer openparking --ref SESSION
- *       exit 0 released · 1 not released (none, superseded) · 2 · 3.
+ *       --consumer openparking --ref SESSION --claim ATTEMPT
+ *       exit 0 released · 1 not released (none, already_superseded, superseded) · 2 · 3.
  *
  * WHEN (amendment A1): the claim is made AT THE READER, the moment the phone
  * is entered, on the fee the lane priced -- `claimAtReader` -- and HELD on the
@@ -48,6 +48,16 @@
  * `finishRelease` asks the door and writes `released`; the close and the sweep
  * finish anything left in either state. Releasing a claim that never landed is
  * harmless: the door answers `none`.
+ *
+ * A RELEASE NAMES THE CLAIM IT RELEASES (amendment A3). The door calls above
+ * are made outside any lock here, so a release can reach the module AFTER this
+ * stay has claimed again. Each claim is therefore named by the attempt that made
+ * it (`--claim`, the attempt id committed in `claiming` before the door is
+ * asked), and a release names the claims it means (`claimIdsOf`): the record's
+ * own, and any earlier one it may still hold (`prior_claims`, kept when a new
+ * attempt replaces an unresolved record, so a prior claim whose release failed
+ * is still named). The module refuses to release a claim it no longer holds
+ * (`already_superseded`), so a late release cannot undo a newer claim.
  *
  * THE PHONE NUMBER GOES ON STDIN AND NOWHERE ELSE. Argv is kept on the record,
  * so it carries the tenant, the garage, the instant, the consumer, this
@@ -185,7 +195,7 @@ function lineFor(claim, currency) {
 }
 
 /** The claim's money, checked for shape against what it was asked. Throws on a mismatch. */
-function checkedClaim(answer, { feeMinor, currency }) {
+function checkedClaim(answer, { feeMinor, currency, claimId }) {
   const claim = answer?.claim;
   if (answer?.outcome !== 'claimed' || !claim || typeof claim !== 'object') {
     throw new ValidationsUnavailable(`claim exit 0 with an answer this platform does not recognise: ${JSON.stringify(kept(answer)).slice(0, 200)}`);
@@ -204,6 +214,9 @@ function checkedClaim(answer, { feeMinor, currency }) {
   if (claim.discount_minor < 0 || claim.discount_minor > feeMinor) {
     throw new ValidationsUnavailable(`the claim's discount ${claim.discount_minor} is outside 0..${feeMinor}`);
   }
+  if (claim.claim_id !== claimId) {
+    throw new ValidationsUnavailable('the claim answered under another claim id than the one it was asked for');
+  }
   return claim;
 }
 
@@ -221,7 +234,7 @@ function checkedClaim(answer, { feeMinor, currency }) {
  *   refusal  the door's refusal when it refused, for an event.
  * Throws `ValidationsUnavailable` when the door could not decide.
  */
-export async function claimAtReader({ garage, sessionId, phone, feeMinor, currency, exitAt }, options = {}) {
+export async function claimAtReader({ garage, sessionId, claimId, phone, feeMinor, currency, exitAt }, options = {}) {
   const link = garage.validations_link;
   if (!link) return { outcome: 'not_linked', record: null, refusal: null, reason: 'the garage names no garage in a validations module' };
 
@@ -246,7 +259,7 @@ export async function claimAtReader({ garage, sessionId, phone, feeMinor, curren
 
   const claimArgv = [
     'claim-in-store', '--tenant', link.tenant_id, '--garage', link.garage_id, '--at', at,
-    '--consumer', CONSUMER, '--ref', sessionId,
+    '--consumer', CONSUMER, '--ref', sessionId, '--claim', claimId,
     '--base-minor', String(feeMinor), '--currency', currency,
   ];
   const claimed = await door(claimArgv, phone, options);
@@ -258,7 +271,7 @@ export async function claimAtReader({ garage, sessionId, phone, feeMinor, curren
   }
   if (claimed.exit_code !== 0) throw unavailable('claim-in-store', claimed);
 
-  const claim = checkedClaim(claimAnswer, { feeMinor, currency });
+  const claim = checkedClaim(claimAnswer, { feeMinor, currency, claimId });
   const line = lineFor(claim, currency);
   return {
     outcome: 'held',
@@ -268,6 +281,7 @@ export async function claimAtReader({ garage, sessionId, phone, feeMinor, curren
       state: 'held',
       module: 'validations',
       link,
+      claim_id: claimId,
       asked,
       claimed: claimRecord,
       held_at: new Date().toISOString(),
@@ -293,8 +307,21 @@ export function claimingRecord({ attempt, link, feeMinor, currency, prior, at = 
     claiming_at: at.toISOString(),
     base_minor: feeMinor,
     currency,
-    ...(prior ? { prior_state: prior.state } : {}),
+    // The claims the replaced record may still hold at the module: named here
+    // so the release of this record gives them back too (A3).
+    ...(prior ? { prior_state: prior.state, prior_claims: claimIdsOf(prior) } : {}),
   };
+}
+
+/**
+ * The claims a record may hold at the module, newest first (A3): its own -- the
+ * attempt that made it -- and any earlier ones a replaced record left unreleased.
+ * A release names these and nothing else.
+ */
+export function claimIdsOf(record) {
+  if (!record) return [];
+  const ids = [record.claim_id, record.attempt, ...(record.prior_claims ?? [])];
+  return [...new Set(ids.filter((id) => typeof id === 'string' && id !== ''))];
 }
 
 /** The states in which the module may hold a claim for this stay that no close will record. */
@@ -363,7 +390,7 @@ export async function finishRelease(tenantId, sessionId, { now = new Date(), opt
   const before = await withTenant(tenantId, (c) => repo.validationRow(c, tenantId, sessionId));
   if (!before || before.validation?.state !== 'releasing') return null;
   const garage = await withTenant(tenantId, (c) => repo.getGarage(c, tenantId, before.garage_id));
-  const released = await release({ garage, sessionId, at: now }, options);
+  const released = await release({ garage, sessionId, at: now, claimIds: claimIdsOf(before.validation) }, options);
   await withTenant(tenantId, async (client) => {
     const row = await repo.lockValidationRow(client, tenantId, sessionId);
     if (row?.validation?.state !== 'releasing' || row.validation.releasing_at !== before.validation.releasing_at) return;
@@ -375,25 +402,38 @@ export async function finishRelease(tenantId, sessionId, { now = new Date(), opt
 }
 
 /**
- * Give a hold back through the door. Returns the door's answer, kept; throws
- * `ValidationsUnavailable` when the door could not decide. `not_released` is
- * an answer, not a failure: `none` means the module holds no claim for this
- * stay (already given back), `superseded` that the phone has another live
- * validation for the day, which is the driver's.
+ * Give a hold back through the door, NAMING THE CLAIMS it means (`claimIds`,
+ * from `claimIdsOf`; A3). The module holds at most one claim for this stay, so
+ * the ids are asked in turn until one is answered for: `released`, `none` (it
+ * holds no claim for this stay: already given back) or `superseded` (the phone
+ * has another live validation for the day, which is the driver's). An id
+ * answered `already_superseded` is a claim the module no longer holds -- this
+ * stay has claimed again since, and that newer claim is not this release's to
+ * undo -- and the next id is asked. Returns the last answer, kept; throws
+ * `ValidationsUnavailable` when the door could not decide, or when there is no
+ * claim to name.
  */
-export async function release({ garage, sessionId, at }, options = {}) {
+export async function release({ garage, sessionId, at, claimIds }, options = {}) {
   const link = garage.validations_link;
   if (!link) throw new ValidationsUnavailable('a hold on a garage that no longer links a validations module cannot be released here');
-  const argv = [
-    'release-in-store', '--tenant', link.tenant_id, '--garage', link.garage_id, '--at', at.toISOString(),
-    '--consumer', CONSUMER, '--ref', sessionId,
-  ];
-  const out = await door(argv, '', options);
-  const answer = parseJson(out.stdout);
-  if ((out.exit_code === 0 || out.exit_code === 1) && answer && typeof answer.outcome === 'string') {
-    return { argv, exit_code: out.exit_code, answer: kept(answer) };
+  if (!Array.isArray(claimIds) || claimIds.length === 0) {
+    throw new ValidationsUnavailable('a release must name the claim it gives back, and this record names none');
   }
-  throw unavailable('release-in-store', out);
+  let last = null;
+  for (const claimId of claimIds) {
+    const argv = [
+      'release-in-store', '--tenant', link.tenant_id, '--garage', link.garage_id, '--at', at.toISOString(),
+      '--consumer', CONSUMER, '--ref', sessionId, '--claim', claimId,
+    ];
+    const out = await door(argv, '', options);
+    const answer = parseJson(out.stdout);
+    if (!((out.exit_code === 0 || out.exit_code === 1) && answer && typeof answer.outcome === 'string')) {
+      throw unavailable('release-in-store', out);
+    }
+    last = { argv, exit_code: out.exit_code, answer: kept(answer) };
+    if (answer.reason !== 'already_superseded') return last;
+  }
+  return last;
 }
 
 /**

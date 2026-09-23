@@ -17,8 +17,13 @@
  *     "garages": { "<tenant>/<garage>": [ { "phone": "2025550143",
  *        "validator_name": "...", "discount_type": "flat",
  *        "discount_value": 5, "discount_minor": 500, "claimed_ref": null } ] } }
- * `release-in-store` gives a claim back (claimed_ref to null), or answers
- * none / superseded as the real door does.
+ * A claim is held as `claimed_ref` (the stay) and `claim_id` (which attempt of
+ * it, `--claim`; amendment A3). `release-in-store` gives back ONLY the claim its
+ * `--claim` names -- a newer claim by the same stay is answered
+ * `already_superseded` and left alone -- or answers none / superseded as the
+ * real door does. `release_delay_once_ms` makes the NEXT release wait before it
+ * reads the state and acts (a release that arrives late); `fail_release_once`
+ * makes the next release exit 2 (it could not decide).
  * Every call is appended to VALIDATIONS_STANDIN_LOG as one JSON line
  * {argv, stdin}, so a test can see what arrived where.
  */
@@ -46,6 +51,10 @@ if (state.mode === 'exit2') {
 const [verb, ...rest] = argv;
 const args = {};
 for (let i = 0; i < rest.length; i += 2) args[rest[i]] = rest[i + 1];
+if ((verb === 'claim-in-store' || verb === 'release-in-store') && !args['--claim']) {
+  print({ refused: 'missing_option', field: '--claim', detail: `${verb} needs --claim` });
+  process.exit(3);
+}
 if ('--phone' in args) {
   print({ refused: 'phone_on_argv', field: '--phone', detail: 'the phone number is read from stdin, never from the command line' });
   process.exit(3);
@@ -56,17 +65,36 @@ if (!list) {
   process.exit(3);
 }
 if (verb === 'release-in-store') {
-  // No phone: the reference names the claim.
-  const held = list.find((v) => v.claimed_ref === args['--ref']);
+  if (state.fail_release_once) {
+    delete state.fail_release_once;
+    writeFileSync(statePath, JSON.stringify(state));
+    process.stderr.write('the database refused: SQLSTATE 57P01: terminating connection\n');
+    process.exit(2);
+  }
+  if (state.release_delay_once_ms) {
+    const ms = state.release_delay_once_ms;
+    delete state.release_delay_once_ms;
+    writeFileSync(statePath, JSON.stringify(state));
+    await new Promise((r) => setTimeout(r, ms));
+    Object.assign(state, JSON.parse(readFileSync(statePath, 'utf8')));
+  }
+  const now = state.garages[`${args['--tenant']}/${args['--garage']}`];
+  // No phone: the reference and the claim id name the claim.
+  const held = now.find((v) => v.claimed_ref === args['--ref']);
   if (!held) {
     print({ outcome: 'not_released', reason: 'none' });
     process.exit(1);
   }
-  if (list.some((v) => v !== held && v.phone === held.phone && v.claimed_ref === null)) {
+  if (held.claim_id !== args['--claim']) {
+    print({ outcome: 'not_released', reason: 'already_superseded' });
+    process.exit(1);
+  }
+  if (now.some((v) => v !== held && v.phone === held.phone && v.claimed_ref === null)) {
     print({ outcome: 'not_released', reason: 'superseded' });
     process.exit(1);
   }
   held.claimed_ref = null;
+  held.claim_id = null;
   writeFileSync(statePath, JSON.stringify(state));
   print({ outcome: 'released', validation_id: 1, live_again: true });
   process.exit(0);
@@ -105,11 +133,15 @@ if (verb === 'claim-in-store') {
       discount_minor: state.mode === 'bad_money' ? base + 1 : v.discount_minor,
       discounted_minor: base - v.discount_minor,
       currency: 'USD',
+      claim_id: v.claim_id,
     },
     phone_last4: last4,
   });
   const replayed = mine.find((v) => v.claimed_ref === args['--ref']);
   if (replayed) {
+    // A replay under a new claim id re-names the claim: the newest attempt owns it.
+    replayed.claim_id = args['--claim'];
+    writeFileSync(statePath, JSON.stringify(state));
     print(answer(replayed, true));
     process.exit(0);
   }
@@ -118,6 +150,7 @@ if (verb === 'claim-in-store') {
     process.exit(1);
   }
   live.claimed_ref = args['--ref'];
+  live.claim_id = args['--claim'];
   writeFileSync(statePath, JSON.stringify(state));
   print(answer(live, false));
   process.exit(0);

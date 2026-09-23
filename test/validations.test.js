@@ -244,7 +244,9 @@ test('the phone is claimed when it is entered: the reader is answered the discou
     assert.equal(c.stdin, `${PHONE}\n`);
     assert.equal(holdsPhone(JSON.stringify(c.argv)), false);
   }
-  assert.deepEqual(asked[1].argv.slice(-8), ['--consumer', 'openparking', '--ref', id, '--base-minor', '500', '--currency', 'USD']);
+  const claimArgv = asked[1].argv.slice(-10);
+  assert.deepEqual([...claimArgv.slice(0, 5), ...claimArgv.slice(6)], ['--consumer', 'openparking', '--ref', id, '--claim', '--base-minor', '500', '--currency', 'USD']);
+  assert.equal(claimArgv[5], (await rowFor(id)).validation.claim_id, 'the claim is named by the attempt that made it (A3)');
   assert.equal(holdsPhone(await storedAbout(g.id)), false);
 });
 
@@ -508,6 +510,67 @@ test('REVERSE: a release the module made whose bookkeeping here did not finish i
   assert.equal(ra.validation.state, 'released');
   assert.equal(rb.fee_minor, '300');
   assert.equal(heldRef(g), b, 'the one validation, used once, by the stay that holds it');
+});
+
+// --- amendment A3: a release names the claim it releases ------------------------------------
+
+const heldClaimId = (g) => readState().garages[`${g.link.tenant_id}/${g.link.garage_id}`][0].claim_id;
+
+test('A3: the sweep\'s release arrives AFTER the driver claimed again -- it cannot undo the newer claim, and the validation is used once', async () => {
+  const g = await linked();
+  const first = plate('LATE1');
+  const a = await opened(g, first);
+  const held = (await (await claimAt(g.exit, a, PHONE, priced(a))).json()).validation;
+  assert.equal(held.outcome, 'held');
+  const claimA = (await rowFor(a)).validation.claim_id;
+  // The hold is past its window; the sweep begins its release, and the door is slow.
+  await withTenant(tenant, (c) => c.query(
+    `UPDATE sessions SET validation = validation || '{"held_at":"2026-09-10T12:00:00.000Z"}'::jsonb WHERE id = $1`, [a]));
+  writeFileSync(STATE, JSON.stringify({ ...readState(), release_delay_once_ms: 1500 }));
+  const sweeping = releaseStaleHolds(tenant, { holdMinutes: 30 });
+  for (let i = 0; i < 50 && (await rowFor(a)).validation.state !== 'releasing'; i += 1) await new Promise((r) => setTimeout(r, 20));
+  assert.equal((await rowFor(a)).validation.state, 'releasing', 'the sweep has begun its release');
+  // ...and its door call has taken the one-shot delay, so it is the late one.
+  for (let i = 0; i < 100 && 'release_delay_once_ms' in readState(); i += 1) await new Promise((r) => setTimeout(r, 20));
+  assert.equal('release_delay_once_ms' in readState(), false);
+  // The driver enters the phone again while that release is still on its way.
+  const again = (await (await claimAt(g.exit, a, PHONE, priced(a))).json()).validation;
+  assert.equal(again.outcome, 'held');
+  const claimB = (await rowFor(a)).validation.claim_id;
+  assert.notEqual(claimB, claimA);
+  const summary = await sweeping;
+  assert.equal(summary.not_released, 1, 'the late release was answered, and changed nothing');
+  const late = calls().filter((c) => c.argv[0] === 'release-in-store' && c.argv.includes(claimA));
+  assert.ok(late.length >= 1, 'the late release named the older claim');
+
+  assert.equal((await rowFor(a)).validation.state, 'held');
+  assert.deepEqual([heldRef(g), heldClaimId(g)], [a, claimB], 'the module still holds the newer claim');
+  const second = plate('LATE2');
+  const b = await opened(g, second);
+  assert.equal((await (await claimAt(g.exit, b, PHONE, priced(b))).json()).validation.outcome, 'not_validated');
+  assert.equal((await close(g.exit, first, { local_decision: priced(a), reader_shown: SHOWN })).status, 200);
+  assert.equal((await close(g.exit, second, { local_decision: priced(b) })).status, 200);
+  assert.deepEqual([(await rowFor(a)).fee_minor, (await rowFor(b)).fee_minor], ['300', '500'], 'one validation, recorded once');
+});
+
+test('A3: a new attempt whose release of the old claim failed still names the old claim, and the sweep gives it back', async () => {
+  const g = await linked();
+  const car = plate('PRIO');
+  const id = await opened(g, car);
+  assert.equal((await (await claimAt(g.exit, id, PHONE, priced(id))).json()).validation.outcome, 'held');
+  const claimA = (await rowFor(id)).validation.claim_id;
+  // Claimed again on another fee: the old claim must be given back first, and the door cannot.
+  writeFileSync(STATE, JSON.stringify({ ...readState(), fail_release_once: true }));
+  const later = priced(id, { feeMinor: 750, exitAt: '2026-09-10T15:00:00+00:00' });
+  assert.equal((await claimAt(g.exit, id, PHONE, later)).status >= 500, true);
+  const left = (await rowFor(id)).validation;
+  assert.equal(left.state, 'claiming');
+  assert.deepEqual(left.prior_claims, [claimA]);
+  assert.deepEqual([heldRef(g), heldClaimId(g)], [id, claimA], 'the module still holds the old claim');
+  const summary = await releaseStaleHolds(tenant, { holdMinutes: 30, claimingGraceSeconds: 0 });
+  assert.equal(summary.released, 1);
+  assert.equal(heldRef(g), null, 'nothing stranded: the old claim, named, was given back');
+  assert.equal((await rowFor(id)).validation.state, 'released');
 });
 
 // --- the claim route's answers// --- the claim route's answers ------------------------------------------------------------
