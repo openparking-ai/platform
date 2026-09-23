@@ -2,44 +2,43 @@
 /**
  * The control for a validation at the exit (migration 0019).
  *
- * The phone reaches the door on stdin and is kept nowhere; a claimed discount
- * is one line on the ledger and the fee is its running total; a module that
- * could not decide is not no-validation; a refusal does not refuse the close;
- * the reconciler compares the engine's number with the fee without the line.
+ * The claim is made at the reader, on the fee the close will write, and held
+ * on the open stay; the close records it as one line on the ledger, the fee
+ * its running total; a hold no close takes is given back, by the close or by
+ * the sweep; the phone reaches the door on stdin and is kept nowhere; the
+ * reconciler compares the engine's number with the fee without the line.
  * Every property is broken below, one at a time, and `test/validations.test.js`
  * is REQUIRED to go red. A pass is the failure.
  *
  * SOURCE breaks, applied to a COPY of the tree; no tracked file is edited.
  * Each anchor must occur exactly once in its file, or the break is reported
- * as not planted rather than run.
- *
- *   phone_kept_on_record     the phone is written into the validation record.
- *   last4_kept               the door's phone_last4 is kept with its answer.
- *   phone_echoed_on_400      a refused phone field echoes the value.
- *   line_not_on_ledger       the fee is discounted and no line says so: the
- *                            fee stops being the running total of its ledger.
- *   fee_not_discounted       the line is written and the fee left as priced.
- *   outage_is_no_validation  a door that exits 2 is read as "not validated"
- *                            and the stay closes at full price.
- *   refusal_refuses_close    a door that refused the request fails the close.
- *   already_claimed_final    an already-claimed read is taken as final, so a
- *                            retried close never gets its own claim back.
- *   base_echo_unchecked      a claim the module answered for a different fee
- *                            than it was asked about is applied.
- *   covered_is_asked         a covered stay asks the door and spends the
- *                            driver's validation for nothing.
- *   zero_fee_is_asked        a zero fee asks the door, the same.
- *   reconciler_sees_line     the reconciler compares the engine's number with
- *                            the fee INCLUDING the validation line, and every
- *                            validated lane close reads as diverged.
+ * as not planted rather than run:
+ *   phone_kept_on_record       the phone is written into the hold.
+ *   last4_kept                 the door's last four digits are kept.
+ *   phone_echoed_on_400        a refused phone echoes its value.
+ *   close_ignores_hold         the close does not read the hold.
+ *   line_not_on_ledger         the fee is discounted with no line.
+ *   fee_not_discounted         the line is written and the fee left as priced.
+ *   hold_taken_at_another_fee  a hold is recorded on a fee it was not claimed on.
+ *   close_strands_hold         a hold the close cannot take is not given back.
+ *   sweep_never_runs           the sweep finds nothing to give back.
+ *   sweep_ignores_window       the sweep gives back holds inside the window.
+ *   sweep_keeps_record_held    the sweep releases and the stay still says held.
+ *   outage_is_no_validation    a door that exits 2 is read as not validated.
+ *   already_claimed_final      an already-claimed read is final.
+ *   discount_over_fee_held     a discount larger than the fee is held.
+ *   base_echo_unchecked        a claim answered for another fee is held.
+ *   replay_asks_door           a held claim asked again goes to the door.
+ *   claim_after_close          a closed stay can be claimed for.
+ *   unconsumable_claimed       a decision the close would not write is claimed on.
+ *   unpriced_is_claimed        a covered or zero decision is claimed on.
+ *   reconciler_sees_line       the reconciler compares with the fee including the line.
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
- * statement edited out of 0019, so the property genuinely never existed.
- *
- *   discount_over_fee_taken  a discount larger than the fee is applied, with
- *                            0002's fee_minor >= 0 CHECK also never created.
- *   record_on_open_stay      sessions_validation_only_when_closed never created.
- *   link_shape_unchecked     the validations link CHECK never created.
+ * statement edited out of 0019, so the property genuinely never existed:
+ *   hold_on_closed_stay        a closed stay may still hold.
+ *   record_shape_unchecked     a record with no state is accepted.
+ *   link_shape_unchecked       the link CHECK never created.
  *
  * Needs the same environment as the suite: the engine.
  */
@@ -57,17 +56,17 @@ const SCRATCH = process.env.VALIDATIONS_SCRATCH_DB || 'openparking_validations_c
 const SOURCE_BREAKS = [
   {
     name: 'phone_kept_on_record',
-    why: 'the phone is written into the record',
+    why: 'the phone is written into the hold',
     file: 'src/validations.js',
-    from: "  const record = { consulted: true, module: 'validations', link, asked };",
-    to: "  const record = { consulted: true, module: 'validations', link, asked, phone };",
+    from: "      consulted: true,\n      state: 'held',",
+    to: "      consulted: true,\n      phone,\n      state: 'held',",
   },
   {
     name: 'last4_kept',
     why: "the door's last four digits are kept",
     file: 'src/validations.js',
-    from: '  delete rest.phone_last4;\n',
-    to: '',
+    from: "  delete rest.phone_last4;\n",
+    to: "",
   },
   {
     name: 'phone_echoed_on_400',
@@ -77,111 +76,141 @@ const SOURCE_BREAKS = [
     to: "    throw bad(`phone must be a string of at most ${PHONE_MAX} characters of digits, spaces and + ( ) . -, not ${JSON.stringify(value)}`);",
   },
   {
+    name: 'close_ignores_hold',
+    why: 'the close does not read the hold',
+    file: 'src/app.js',
+    from: "          held: await repo.lockValidation(client, tenantId, open.id),",
+    to: "          held: null,",
+  },
+  {
     name: 'line_not_on_ledger',
     why: 'the fee is discounted with no line',
     file: 'src/validations.js',
-    from: '    pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, line] },',
-    to: '    pricing: { ...pricing, feeMinor, breakdown: pricing.breakdown },',
+    from: "      pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, held.line] },",
+    to: "      pricing: { ...pricing, feeMinor, breakdown: pricing.breakdown },",
   },
   {
     name: 'fee_not_discounted',
     why: 'the line is written and the fee left as priced',
     file: 'src/validations.js',
-    from: '    pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, line] },',
-    to: '    pricing: { ...pricing, breakdown: [...pricing.breakdown, line] },',
+    from: "      pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, held.line] },",
+    to: "      pricing: { ...pricing, breakdown: [...pricing.breakdown, held.line] },",
+  },
+  {
+    name: 'hold_taken_at_another_fee',
+    why: 'a hold is recorded on a fee it was not claimed on',
+    file: 'src/validations.js',
+    from: "  if (priced && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0) {",
+    to: "  if (priced && pricing.feeMinor > 0) {",
+  },
+  {
+    name: 'close_strands_hold',
+    why: 'a hold the close cannot take is not given back',
+    file: 'src/validations.js',
+    from: "  const released = await release({ garage, sessionId, at }, options);\n  return {\n    pricing,",
+    to: "  const released = { answer: { outcome: 'not_asked' } };\n  return {\n    pricing,",
+  },
+  {
+    name: 'sweep_never_runs',
+    why: 'the sweep finds nothing to give back',
+    file: 'src/validations.js',
+    from: "  const stale = await withTenant(tenantId, (c) => repo.staleValidationHolds(c, tenantId, cutoff));",
+    to: "  const stale = [];",
+  },
+  {
+    name: 'sweep_ignores_window',
+    why: 'the sweep gives back holds inside the window',
+    file: 'src/validations.js',
+    from: "  const cutoff = new Date(now.getTime() - holdMinutes * 60_000);",
+    to: "  const cutoff = new Date(now.getTime() + 60_000);",
+  },
+  {
+    name: 'sweep_keeps_record_held',
+    why: 'the sweep releases and the stay still says held',
+    file: 'src/validations.js',
+    from: "        await repo.setValidationRecord(client, tenantId, id, {\n          ...row.validation,\n          state: 'released',",
+    to: "        await repo.setValidationRecord(client, tenantId, id, {\n          ...row.validation,\n          state: 'held',",
   },
   {
     name: 'outage_is_no_validation',
     why: 'a door that exits 2 is read as not validated',
     file: 'src/validations.js',
     from: "  if (read.exit_code !== 0 && read.exit_code !== 1) throw unavailable('validation-in-store', read);",
-    to: "  if (read.exit_code !== 0 && read.exit_code !== 1) return { pricing, record: { ...record, applied: false }, refusal: null };",
-  },
-  {
-    name: 'refusal_refuses_close',
-    why: 'a refused claim fails the close',
-    file: 'src/validations.js',
-    from: "  if (claimed.exit_code === 3) {\n",
-    to: "  if (claimed.exit_code === 3) {\n    throw unavailable('claim-in-store', claimed);\n",
+    to: "  if (read.exit_code !== 0 && read.exit_code !== 1) return { outcome: 'not_validated', record: null, refusal: null, asked };",
   },
   {
     name: 'already_claimed_final',
     why: 'an already-claimed read is final',
     file: 'src/validations.js',
     from: "  if (read.exit_code === 1 && readAnswer.reason !== 'already_claimed') {",
-    to: '  if (read.exit_code === 1) {',
+    to: "  if (read.exit_code === 1) {",
+  },
+  {
+    name: 'discount_over_fee_held',
+    why: 'a discount larger than the fee is held',
+    file: 'src/validations.js',
+    from: "  if (claim.discount_minor < 0 || claim.discount_minor > feeMinor) {",
+    to: "  if (claim.discount_minor < 0) {",
   },
   {
     name: 'base_echo_unchecked',
-    why: 'a claim answered for another fee is applied',
+    why: 'a claim answered for another fee is held',
     file: 'src/validations.js',
-    from: '  if (claim.base_minor !== feeMinor || claim.currency !== currency) {',
-    to: '  if (false) {',
+    from: "  if (claim.base_minor !== feeMinor || claim.currency !== currency) {",
+    to: "  if (false) {",
   },
   {
-    name: 'covered_is_asked',
-    why: 'a covered stay asks the door',
-    file: 'src/validations.js',
-    from: "  if (pricing.outcome !== 'transient' || pricing.refusal !== undefined || !Number.isInteger(pricing.feeMinor)) {",
-    to: "  if (pricing.outcome === 'transient' && (pricing.refusal !== undefined || !Number.isInteger(pricing.feeMinor))) {",
+    name: 'replay_asks_door',
+    why: 'a held claim asked again goes to the door',
+    file: 'src/app.js',
+    from: "        if (held && held.base_minor === decision.fee_minor) return { outcome: 'held', record: held, replay: true };",
+    to: "        if (false) return { outcome: 'held', record: held, replay: true };",
   },
   {
-    name: 'zero_fee_is_asked',
-    why: 'a zero fee asks the door',
-    file: 'src/validations.js',
-    from: '  if (pricing.feeMinor === 0) {',
-    to: '  if (pricing.feeMinor === -1) {',
+    name: 'claim_after_close',
+    why: 'a closed stay can be claimed for',
+    file: 'src/repository.js',
+    from: "      WHERE tenant_id = $1 AND garage_id = $2 AND id = $3 AND exit_at IS NULL\n      FOR UPDATE",
+    to: "      WHERE tenant_id = $1 AND garage_id = $2 AND id = $3\n      FOR UPDATE",
+  },
+  {
+    name: 'unconsumable_claimed',
+    why: 'a decision the close would not write is claimed on',
+    file: 'src/app.js',
+    from: "        if (!consumable.consume) throw conflict('decision_not_consumable', consumable.reason);",
+    to: "        if (false) throw conflict('decision_not_consumable', consumable.reason);",
+  },
+  {
+    name: 'unpriced_is_claimed',
+    why: 'a covered or zero decision is claimed on',
+    file: 'src/app.js',
+    from: "      if (decision === null || decision.status !== 'priced' || decision.fee_minor === 0) {",
+    to: "      if (decision === null) {",
   },
   {
     name: 'reconciler_sees_line',
     why: 'the reconciler compares with the fee including the line',
     file: 'src/reconcile.js',
-    from: '  return Number(row.fee_minor) - validationDelta(row.breakdown);',
-    to: '  return Number(row.fee_minor) - 0 * validationDelta(row.breakdown);',
+    from: "  return Number(row.fee_minor) - validationDelta(row.breakdown);",
+    to: "  return Number(row.fee_minor) - 0 * validationDelta(row.breakdown);",
   },
 ];
 
 const SCHEMA_BREAKS = [
   {
-    // Two guards stand here -- this check, and 0002's CHECK (fee_minor >= 0),
-    // which refuses the negative fee an over-large discount makes -- so both
-    // are removed, or the break measures the one that is left.
-    name: 'discount_over_fee_taken',
-    why: 'a discount larger than the fee is applied',
-    edits: [
-      {
-        file: '0002_core_schema.sql',
-        from: '  fee_minor            bigint      CHECK (fee_minor >= 0),',
-        to: '  fee_minor            bigint,',
-      },
-    ],
-    source: {
-      file: 'src/validations.js',
-      from: '  if (claim.discount_minor < 0 || claim.discount_minor > feeMinor) {',
-      to: '  if (claim.discount_minor < 0) {',
-    },
+    name: 'hold_on_closed_stay',
+    why: 'a closed stay may still hold',
+    edits: [{ file: '0019_validations.sql', from: "    OR (validation->>'state' = 'held' AND exit_at IS NULL)", to: "    OR (validation->>'state' = 'held')" }],
   },
   {
-    name: 'record_on_open_stay',
-    why: 'the only-when-closed CHECK never created',
-    edits: [
-      {
-        file: '0019_validations.sql',
-        from: '  ADD CONSTRAINT sessions_validation_only_when_closed CHECK (\n    validation IS NULL OR exit_at IS NOT NULL',
-        to: '  ADD CONSTRAINT sessions_validation_only_when_closed CHECK (\n    true OR validation IS NULL OR exit_at IS NOT NULL',
-      },
-    ],
+    name: 'record_shape_unchecked',
+    why: 'a record with no state is accepted',
+    edits: [{ file: '0019_validations.sql', from: "        AND coalesce(validation->>'state', '') IN ('held', 'recorded', 'released')", to: "        AND true" }],
   },
   {
     name: 'link_shape_unchecked',
     why: 'the link CHECK never created',
-    edits: [
-      {
-        file: '0019_validations.sql',
-        from: '    validations_link IS NULL OR (',
-        to: '    true OR validations_link IS NULL OR (',
-      },
-    ],
+    edits: [{ file: '0019_validations.sql', from: "    validations_link IS NULL OR (", to: "    true OR validations_link IS NULL OR (" }],
   },
 ];
 

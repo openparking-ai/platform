@@ -1,15 +1,16 @@
 /**
- * A validation at the exit (migration 0019), driven through the lane's close
- * against the REAL engine and a STAND-IN for the validations module's door
- * (`test/fixtures/validations-door`): the module is not in this repository,
- * and the stand-in speaks its contract and nothing else -- see its header.
+ * A validation at the exit (migration 0019, amendment A1), driven through the
+ * lane's routes against the REAL engine and a STAND-IN for the validations
+ * module's door (`test/fixtures/validations-door`): the module is not in this
+ * repository, and the stand-in speaks its contract and nothing else.
  *
- * What is held here is this platform's side: the phone reaches the door on
- * stdin and is kept nowhere; a claimed discount becomes ONE line on the
- * ledger and the fee is the running total including it; nothing re-prices;
- * a module that could not decide is not no-validation; a module that refused
- * does not refuse the close; the reconciler compares the engine's number with
- * the fee WITHOUT the validation line.
+ * What is held here is this platform's side: the claim is made AT THE READER,
+ * on the fee the lane priced, and held on the open stay; the close RECORDS it
+ * -- one line on the ledger, the fee its running total, no door asked, nothing
+ * re-priced; a hold no close takes is GIVEN BACK, by the close or by the sweep,
+ * so a driver who entered a phone and did not pay strands nothing; the phone
+ * reaches the door on stdin and is kept nowhere; the reconciler compares the
+ * engine's number with the fee WITHOUT the validation line.
  */
 import test, { before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -22,7 +23,9 @@ import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, 
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
 import { laneDecidedCloses, sweepLaneDecisions } from '../src/reconcile.js';
-import { LINE_CODE, LINK_STATED_EVENT_KIND, REFUSED_EVENT_KIND } from '../src/validations.js';
+import {
+  LINE_CODE, LINK_STATED_EVENT_KIND, REFUSED_EVENT_KIND, RELEASED_EVENT_KIND, RELEASED_BEFORE_CLOSE_EVENT_KIND, releaseStaleHolds,
+} from '../src/validations.js';
 
 const DOOR_DIR = new URL('./fixtures/validations-door/', import.meta.url).pathname;
 const scratch = mkdtempSync(join(tmpdir(), 'openparking-validations-'));
@@ -63,6 +66,24 @@ const open = (token, plate) =>
 const closeRequest = (token, plate, extra = {}) =>
   asDevice(token, { plate, exit_at: '2026-09-10T14:00:00Z', exit_confirmation: 'confirmed', ...extra });
 const close = (token, plate, extra = {}) => fetch(`${base}/api/v1/lane/sessions/close`, closeRequest(token, plate, extra));
+const computedFrom = { rules_refreshed_at: 1, stays_refreshed_at: 1, stays_cursor: '1', day: '2026-09-10', clock: 'America/New_York' };
+/** The lane's priced decision for a stay: two hours at 250 is 500, the engine's own lines. */
+const priced = (sessionId, { feeMinor = 500, entryAt = '2026-09-10T12:00:00+00:00', exitAt = '2026-09-10T14:00:00+00:00' } = {}) => ({
+  status: 'priced', covered_by: [], matched: [], fee_minor: feeMinor, currency: 'USD', plan_version: 'flat-250-USD',
+  breakdown: [{ code: 'increment.first_period', rule_id: 'hourly', text: 'first hour', delta_minor: 250 },
+    { code: 'increment.repeat_periods', rule_id: 'hourly', text: 'more hours', delta_minor: feeMinor - 250 }],
+  entry_at: entryAt, exit_at: exitAt, session_id: sessionId, space_class: 'standard', computed_from: computedFrom,
+});
+const coveredDecision = () => ({
+  status: 'covered', covered_by: ['garage_pass'], matched: [{ module: 'garage_pass', pass: 'pass-x', agreement: null }], computed_from: computedFrom,
+});
+/** The reader's claim: the phone the driver entered, on the decision the reader shows. */
+const claimAt = (token, sessionId, phone, decision) =>
+  fetch(`${base}/api/v1/lane/sessions/${sessionId}/validation`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify({ phone, local_decision: decision }),
+  });
 const plate = (tag) => `${tag}${randomUUID().slice(0, 6).toUpperCase()}`;
 const rowFor = (id) => withTenant(tenant, async (c) => (await c.query('SELECT * FROM sessions WHERE id = $1', [id])).rows[0]);
 const eventsOf = (kind, garageId) =>
@@ -99,6 +120,7 @@ const validation = (over = {}) => ({
   phone: PHONE_DIGITS, validator_name: 'Invented Bistro', discount_type: 'flat', discount_value: 2, discount_minor: 200, claimed_ref: null, ...over,
 });
 
+const heldRef = (g) => readState().garages[`${g.link.tenant_id}/${g.link.garage_id}`][0].claimed_ref;
 /** A garage linked to the stand-in, which holds `list` for it. */
 async function linked(list = [validation()]) {
   const g = await garage();
@@ -159,9 +181,15 @@ after(async () => {
   await pool.end();
 });
 
-beforeEach(() => {
+beforeEach(async () => {
   setState({});
   writeFileSync(LOG, '');
+  // The sweep is per tenant: holds an earlier test left on its open stays --
+  // whose module state is gone with it -- are cleared, so each test's sweep
+  // counts its own.
+  await withTenant(tenant, (c) =>
+    c.query(`UPDATE sessions SET validation = NULL WHERE tenant_id = $1 AND exit_at IS NULL AND validation->>'state' = 'held'`, [tenant]),
+  );
 });
 
 // --- the check first: it can see a number -----------------------------------------------
@@ -171,292 +199,355 @@ test('CONTROL: the phone check finds a planted number, in a stored row, in every
     assert.equal(holdsPhone(JSON.stringify({ planted: written })), true, written);
   }
   assert.equal(holdsPhone(JSON.stringify({ at: '2026-09-10T14:00:00Z', id: randomUUID() })), false);
-  // And through the database: a planted record on a real closed row is found.
+  // And through the database: a planted record on a real stay is found.
   const g = await linked();
   const car = plate('CTRL');
   const id = await opened(g, car);
-  assert.equal((await close(g.exit, car)).status, 200);
   assert.equal(holdsPhone(await storedAbout(g.id)), false, 'the premise: nothing planted yet');
   await withTenant(tenant, (c) =>
-    c.query(`UPDATE sessions SET validation = $2 WHERE id = $1`, [id, JSON.stringify({ consulted: true, planted: PHONE })]),
+    c.query(`UPDATE sessions SET validation = $2 WHERE id = $1`, [id, JSON.stringify({ state: 'held', planted: PHONE })]),
   );
   assert.equal(holdsPhone(await storedAbout(g.id)), true);
 });
 
-// --- the discount is a line --------------------------------------------------------------
+// --- claimed at the reader, recorded at the close ------------------------------------------
 
-test('a phone with a live validation: one line on the ledger, the fee its running total, the phone kept nowhere', async () => {
+test('the phone is claimed when it is entered: the reader is answered the discounted fee, and the claim is held on the open stay', async () => {
   const g = await linked();
-  const car = plate('VALD');
+  const car = plate('RDR');
   const id = await opened(g, car);
-  const res = await close(g.exit, car, { phone: PHONE });
+  const res = await claimAt(g.exit, id, PHONE, priced(id));
   assert.equal(res.status, 200, await res.clone().text());
-  const body = await res.json();
-  const row = await rowFor(id);
-
-  // The engine priced 500; the module answered 200; the ledger says both.
-  assert.equal(row.fee_minor, '300');
-  assert.equal(body.session.fee_minor, 300);
-  const last = row.breakdown.at(-1);
-  assert.deepEqual(last, {
-    code: LINE_CODE, rule_id: null, delta_minor: -200,
-    text: 'Validation from Invented Bistro (2.00 USD off): -2.00 USD',
+  const { validation } = await res.json();
+  assert.deepEqual(validation, {
+    outcome: 'held', replay: false, currency: 'USD', fee_before_minor: 500, discount_minor: 200, fee_minor: 300,
+    line: { code: LINE_CODE, rule_id: null, delta_minor: -200, text: 'Validation from Invented Bistro (2.00 USD off): -2.00 USD' },
+    held_at: validation.held_at,
   });
-  const engineLines = row.breakdown.slice(0, -1);
-  assert.equal(engineLines.some((l) => l.code === LINE_CODE), false);
-  assert.equal(row.breakdown.reduce((sum, l) => sum + l.delta_minor, 0), 300, 'the fee IS the running total');
-  assert.equal(engineLines.reduce((sum, l) => sum + l.delta_minor, 0), 500, 'the engine\'s lines are the engine\'s');
-
-  // The record: what was asked, what was answered, what was done.
-  assert.equal(row.validation.consulted, true);
-  assert.equal(row.validation.applied, true);
-  assert.equal(row.validation.asserted_by, 'validations');
-  assert.deepEqual(
-    [row.validation.discount_minor, row.validation.fee_before_minor, row.validation.fee_after_minor],
-    [200, 500, 300],
-  );
-  assert.deepEqual(row.validation.claimed.argv, [
-    'claim-in-store', '--tenant', g.link.tenant_id, '--garage', g.link.garage_id, '--at', '2026-09-10T14:00:00.000Z',
-    '--consumer', 'openparking', '--ref', id, '--base-minor', '500', '--currency', 'USD',
-  ]);
-
-  // The phone went on stdin, to both verbs, and on no argv.
+  const row = await rowFor(id);
+  assert.equal(row.exit_at, null, 'the stay is still open: nothing has left');
+  assert.equal(row.validation.state, 'held');
+  assert.equal(row.fee_minor, null, 'no fee is written before the close');
+  assert.equal(heldRef(g), id, 'the module holds the claim for this stay');
+  // The phone went on stdin, to both verbs, and on no argv; it is nowhere kept.
   const asked = calls();
   assert.deepEqual(asked.map((c) => c.argv[0]), ['validation-in-store', 'claim-in-store']);
   for (const c of asked) {
     assert.equal(c.stdin, `${PHONE}\n`);
     assert.equal(holdsPhone(JSON.stringify(c.argv)), false);
   }
-  // And it is nowhere this platform keeps anything, nor in what it answered.
+  assert.deepEqual(asked[1].argv.slice(-8), ['--consumer', 'openparking', '--ref', id, '--base-minor', '500', '--currency', 'USD']);
   assert.equal(holdsPhone(await storedAbout(g.id)), false);
-  assert.equal(holdsPhone(JSON.stringify(body)), false);
 });
 
-test('the lane decided the fee: the validation is a line on the lane\'s ledger, and the reconciler still agrees', async () => {
-  // A tenant of its own, so the sweep below sees these closes and no others.
+test('the close records what was claimed: the same line on the ledger, no door asked, nothing re-priced, and the reconciler agrees', async () => {
   const own = await createTenant('validations-lane');
-  const saved = tenant;
+  const saved = { tenant, operatorToken };
   tenant = own;
   try {
     await buildWorld(own);
     const token = generateDeviceToken();
-    await withTenant(own, (c) =>
-      c.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'ops',$2)`, [own, hashToken(token)]),
-    );
-    const savedOp = operatorToken;
+    await withTenant(own, (c) => c.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'ops',$2)`, [own, hashToken(token)]));
     operatorToken = token;
-    try {
-      const g = await linked();
-      const car = plate('LANE');
-      const id = await opened(g, car);
-      const decision = {
-        status: 'priced', covered_by: [], matched: [], fee_minor: 500, currency: 'USD', plan_version: 'flat-250-USD',
-        breakdown: [{ code: 'increment.first_period', rule_id: 'hourly', text: 'first hour', delta_minor: 250 },
-          { code: 'increment.repeat_periods', rule_id: 'hourly', text: 'one more hour', delta_minor: 250 }],
-        entry_at: '2026-09-10T12:00:00+00:00', exit_at: '2026-09-10T14:00:00+00:00', session_id: id, space_class: 'standard',
-        computed_from: { rules_refreshed_at: 1, stays_refreshed_at: 1, stays_cursor: '1', day: '2026-09-10', clock: 'America/New_York' },
-      };
-      const res = await close(g.exit, car, { local_decision: decision, phone: PHONE });
-      assert.equal(res.status, 200, await res.clone().text());
-      const row = await rowFor(id);
-      assert.equal(row.decided_by, 'lane');
-      assert.equal(row.fee_minor, '300');
-      assert.deepEqual(row.breakdown.slice(0, 2), decision.breakdown, 'the lane\'s lines, untouched');
-      assert.equal(row.breakdown[2].delta_minor, -200);
-
-      const report = await withTenant(own, (c) => laneDecidedCloses(c, own, g.id, '2026-09-10T00:00:00Z'));
-      assert.deepEqual([report.checked, report.agreed, report.diverged.length], [1, 1, 0]);
-      await sweepLaneDecisions(own);
-      assert.equal((await rowFor(id)).decision_check.verdict, 'agreed');
-    } finally {
-      operatorToken = savedOp;
-    }
+    const g = await linked();
+    const car = plate('REC');
+    const id = await opened(g, car);
+    const shown = (await (await claimAt(g.exit, id, PHONE, priced(id))).json()).validation;
+    writeFileSync(LOG, '');
+    const res = await close(g.exit, car, { local_decision: priced(id) });
+    assert.equal(res.status, 200, await res.clone().text());
+    const row = await rowFor(id);
+    assert.deepEqual(calls(), [], 'the close asked the door nothing');
+    assert.equal(row.fee_minor, String(shown.fee_minor), 'the row says what the reader said');
+    assert.deepEqual(row.breakdown.at(-1), shown.line);
+    assert.equal(row.breakdown.reduce((sum, l) => sum + l.delta_minor, 0), 300, 'the fee IS the running total');
+    assert.equal(row.validation.state, 'recorded');
+    assert.deepEqual([row.validation.fee_before_minor, row.validation.fee_after_minor], [500, 300]);
+    const report = await withTenant(own, (c) => laneDecidedCloses(c, own, g.id, '2026-09-10T00:00:00Z'));
+    assert.deepEqual([report.checked, report.agreed, report.diverged.length], [1, 1, 0]);
+    await sweepLaneDecisions(own);
+    assert.equal((await rowFor(id)).decision_check.verdict, 'agreed');
+    assert.equal(holdsPhone(await storedAbout(g.id)), false);
   } finally {
-    tenant = saved;
+    ({ tenant, operatorToken } = saved);
   }
 });
 
-// --- nothing to discount, nothing asked --------------------------------------------------
-
-test('no phone: the door is not asked and the record is null', async () => {
+test('a close the platform prices itself at the same fee records the hold too', async () => {
   const g = await linked();
-  const car = plate('NOPH');
+  const car = plate('SELF');
   const id = await opened(g, car);
+  assert.equal((await claimAt(g.exit, id, PHONE, priced(id))).status, 200);
   assert.equal((await close(g.exit, car)).status, 200);
   const row = await rowFor(id);
-  assert.equal(row.fee_minor, '500');
-  assert.equal(row.validation, null);
-  assert.deepEqual(calls(), []);
+  assert.equal(row.decided_by, 'platform');
+  assert.equal(row.fee_minor, '300');
+  assert.equal(row.validation.state, 'recorded');
 });
 
-test('a phone at a garage that links no module: not consulted, said so, the fee as priced', async () => {
-  const g = await garage();
-  const car = plate('NOLK');
+// --- a hold no close takes is given back -------------------------------------------------
+
+test('NOT PAID: the driver entered a phone and did not leave; the sweep gives the claim back and the phone claims again', async () => {
+  const g = await linked();
+  const car = plate('NPAY');
   const id = await opened(g, car);
-  assert.equal((await close(g.exit, car, { phone: PHONE })).status, 200);
+  assert.equal((await claimAt(g.exit, id, PHONE, priced(id))).status, 200);
+  const heldAt = new Date((await rowFor(id)).validation.held_at);
+  assert.equal(heldRef(g), id);
+
+  // Inside the window: the hold stands.
+  let summary = await releaseStaleHolds(tenant, { holdMinutes: 30, now: new Date(heldAt.getTime() + 29 * 60_000) });
+  assert.equal(summary.released, 0);
+  assert.equal((await rowFor(id)).validation.state, 'held');
+
+  // Past it: given back through the door, said on the stay and in an event.
+  summary = await releaseStaleHolds(tenant, { holdMinutes: 30, now: new Date(heldAt.getTime() + 31 * 60_000) });
+  assert.deepEqual([summary.stale, summary.released, summary.failed], [1, 1, 0]);
+  assert.equal(heldRef(g), null, 'the module holds no claim: the validation is unclaimed again');
+  const row = await rowFor(id);
+  assert.equal(row.exit_at, null);
+  assert.equal(row.validation.state, 'released');
+  assert.equal(row.validation.released_by, 'sweep');
+  assert.equal(calls().at(-1).argv[0], 'release-in-store');
+  assert.equal(calls().at(-1).stdin, '\n', 'a release carries no phone');
+  assert.equal((await eventsOf(RELEASED_EVENT_KIND, g.id)).length, 1);
+
+  // The driver comes back to the reader: the phone claims again, for the same stay.
+  const again = await claimAt(g.exit, id, PHONE, priced(id));
+  assert.equal((await again.json()).validation.outcome, 'held');
+  assert.equal(heldRef(g), id);
+  assert.equal(holdsPhone(await storedAbout(g.id)), false);
+});
+
+test('given back while the car was still inside: another stay can use the validation', async () => {
+  const g = await linked();
+  const first = plate('FRST');
+  const second = plate('SCND');
+  const a = await opened(g, first);
+  const b = await opened(g, second);
+  assert.equal((await claimAt(g.exit, a, PHONE, priced(a))).status, 200);
+  const refused = await (await claimAt(g.exit, b, PHONE, priced(b))).json();
+  assert.deepEqual(refused.validation, { outcome: 'not_validated', reason: 'already_claimed' });
+  const heldAt = new Date((await rowFor(a)).validation.held_at);
+  await releaseStaleHolds(tenant, { holdMinutes: 30, now: new Date(heldAt.getTime() + 31 * 60_000) });
+  const taken = await (await claimAt(g.exit, b, PHONE, priced(b))).json();
+  assert.equal(taken.validation.outcome, 'held');
+  assert.equal(heldRef(g), b);
+});
+
+test('the sweep leaves a hold the close already recorded', async () => {
+  const g = await linked();
+  const car = plate('SWPC');
+  const id = await opened(g, car);
+  assert.equal((await claimAt(g.exit, id, PHONE, priced(id))).status, 200);
+  assert.equal((await close(g.exit, car, { local_decision: priced(id) })).status, 200);
+  const summary = await releaseStaleHolds(tenant, { holdMinutes: 30, now: new Date(Date.now() + 24 * 3600_000) });
+  assert.equal(summary.stale, 0);
+  assert.equal((await rowFor(id)).validation.state, 'recorded');
+  assert.equal(heldRef(g), id);
+});
+
+test('a close after the sweep gave the hold back records no discount, and a human is told', async () => {
+  const g = await linked();
+  const car = plate('LATE');
+  const id = await opened(g, car);
+  assert.equal((await claimAt(g.exit, id, PHONE, priced(id))).status, 200);
+  const heldAt = new Date((await rowFor(id)).validation.held_at);
+  await releaseStaleHolds(tenant, { holdMinutes: 30, now: new Date(heldAt.getTime() + 31 * 60_000) });
+  assert.equal((await close(g.exit, car, { local_decision: priced(id) })).status, 200);
   const row = await rowFor(id);
   assert.equal(row.fee_minor, '500');
-  assert.deepEqual(row.validation, { consulted: false, reason: 'not linked: the garage names no garage in a validations module' });
-  assert.deepEqual(calls(), []);
+  assert.equal(row.breakdown.some((l) => l.code === LINE_CODE), false);
+  assert.equal(row.validation.state, 'released');
+  assert.equal((await eventsOf(RELEASED_BEFORE_CLOSE_EVENT_KIND, g.id)).length, 1);
 });
 
-test('a phone that matches nothing: no discount, no error, and the claim is never made', async () => {
+test('a close the hold does not fit gives it back: covered, or another fee', async () => {
+  const g = await linked();
+  const covered = plate('CVRD');
+  const c = await opened(g, covered);
+  assert.equal((await claimAt(g.exit, c, PHONE, priced(c))).status, 200);
+  assert.equal((await close(g.exit, covered, { local_decision: coveredDecision() })).status, 200);
+  let row = await rowFor(c);
+  assert.equal(row.exit_outcome, 'covered');
+  assert.equal(row.validation.state, 'released');
+  assert.equal(row.validation.reason, 'the stay closed covered');
+  assert.equal(heldRef(g), null);
+
+  const other = plate('OTHR');
+  const o = await opened(g, other);
+  assert.equal((await claimAt(g.exit, o, PHONE, priced(o))).status, 200);
+  // The platform prices three hours, not the two the claim was made on.
+  const res = await close(g.exit, other, { exit_at: '2026-09-10T15:00:00Z' });
+  assert.equal(res.status, 200);
+  row = await rowFor(o);
+  assert.equal(row.fee_minor, '750');
+  assert.equal(row.validation.state, 'released');
+  assert.match(row.validation.reason, /750, not the 500/);
+  assert.equal(heldRef(g), null);
+  assert.equal((await eventsOf(RELEASED_EVENT_KIND, g.id)).length, 2);
+});
+
+test('a close that must give a hold back and cannot is a 5xx: the stay stays open, and the retry gives it back', async () => {
+  const g = await linked();
+  const car = plate('RLSD');
+  const id = await opened(g, car);
+  assert.equal((await claimAt(g.exit, id, PHONE, priced(id))).status, 200);
+  setMode('exit2');
+  const request = closeRequest(g.exit, car, { local_decision: coveredDecision() });
+  assert.equal((await fetch(`${base}/api/v1/lane/sessions/close`, request)).status, 500);
+  assert.equal((await rowFor(id)).exit_at, null);
+  setMode('normal');
+  assert.equal((await fetch(`${base}/api/v1/lane/sessions/close`, request)).status, 200);
+  assert.equal((await rowFor(id)).validation.state, 'released');
+});
+
+// --- the claim route's answers ------------------------------------------------------------
+
+test('asked again on the same fee: the held claim, without the door; on another fee: given back and claimed on that one', async () => {
+  const g = await linked();
+  const car = plate('AGIN');
+  const id = await opened(g, car);
+  const first = (await (await claimAt(g.exit, id, PHONE, priced(id))).json()).validation;
+  writeFileSync(LOG, '');
+  const again = (await (await claimAt(g.exit, id, PHONE, priced(id))).json()).validation;
+  assert.equal(again.replay, true);
+  assert.equal(again.fee_minor, first.fee_minor);
+  assert.deepEqual(calls(), []);
+  const later = priced(id, { feeMinor: 750, exitAt: '2026-09-10T15:00:00+00:00' });
+  const moved = (await (await claimAt(g.exit, id, PHONE, later)).json()).validation;
+  assert.deepEqual([moved.outcome, moved.fee_before_minor, moved.fee_minor], ['held', 750, 550]);
+  assert.deepEqual(calls().map((c) => c.argv[0]), ['release-in-store', 'validation-in-store', 'claim-in-store']);
+});
+
+test('a claim the platform failed to hold is asked on: already_claimed is answered with this stay\'s own claim', async () => {
+  const g = await linked();
+  const car = plate('RPLY');
+  const id = await opened(g, car);
+  const state = readState();
+  state.garages[`${g.link.tenant_id}/${g.link.garage_id}`][0].claimed_ref = id;
+  writeFileSync(STATE, JSON.stringify(state));
+  const out = (await (await claimAt(g.exit, id, PHONE, priced(id))).json()).validation;
+  assert.equal(out.outcome, 'held');
+  assert.equal((await rowFor(id)).validation.claimed.answer.replay, true);
+});
+
+test('a phone that matches nothing: not validated, nothing held, no error', async () => {
   const g = await linked();
   const car = plate('UNKN');
   const id = await opened(g, car);
-  const res = await close(g.exit, car, { phone: OTHER_PHONE });
+  const res = await claimAt(g.exit, id, OTHER_PHONE, priced(id));
   assert.equal(res.status, 200);
-  const row = await rowFor(id);
-  assert.equal(row.fee_minor, '500');
-  assert.equal(row.validation.applied, false);
-  assert.equal(row.validation.asked.answer.reason, 'none');
-  assert.equal(row.breakdown.some((l) => l.code === LINE_CODE), false);
+  assert.deepEqual((await res.json()).validation, { outcome: 'not_validated', reason: 'none' });
+  assert.equal((await rowFor(id)).validation, null);
   assert.deepEqual(calls().map((c) => c.argv[0]), ['validation-in-store']);
-  assert.equal(holdsPhone(await storedAbout(g.id), OTHER_PHONE.replace(/\D/g, '')), false);
+  assert.equal((await close(g.exit, car, { local_decision: priced(id) })).status, 200);
+  assert.equal((await rowFor(id)).fee_minor, '500');
 });
 
-test('a validation already used by another stay: the second stay pays in full', async () => {
-  const g = await linked();
-  const first = plate('ONE');
-  const second = plate('TWO');
-  const a = await opened(g, first);
-  const b = await opened(g, second);
-  assert.equal((await close(g.exit, first, { phone: PHONE })).status, 200);
-  assert.equal((await close(g.exit, second, { phone: PHONE })).status, 200);
-  assert.equal((await rowFor(a)).fee_minor, '300');
-  const row = await rowFor(b);
-  assert.equal(row.fee_minor, '500');
-  assert.equal(row.validation.asked.answer.reason, 'already_claimed');
-  // Asked on -- it might have been this stay's -- and it was not.
-  assert.equal(row.validation.claimed.answer.reason, 'already_claimed');
-  assert.equal(row.validation.applied, false);
-});
-
-test('a covered stay and a zero fee have nothing to discount: the door is not asked and the validation is not spent', async () => {
-  const g = await linked();
-  const computedFrom = { rules_refreshed_at: 1, stays_refreshed_at: 1, stays_cursor: '1', day: '2026-09-10', clock: 'America/New_York' };
-  const covered = plate('COVR');
-  const coveredId = await opened(g, covered);
-  const res = await close(g.exit, covered, {
-    phone: PHONE,
-    local_decision: { status: 'covered', covered_by: ['garage_pass'], matched: [{ module: 'garage_pass', pass: 'pass-x', agreement: null }], computed_from: computedFrom },
-  });
-  assert.equal(res.status, 200, await res.clone().text());
-  assert.deepEqual((await rowFor(coveredId)).validation, { consulted: false, reason: 'nothing to discount: the stay is covered' });
-
-  const free = plate('ZERO');
-  const freeId = await opened(g, free);
-  const zero = await close(g.exit, free, {
-    phone: PHONE,
-    local_decision: {
-      status: 'priced', covered_by: [], matched: [], fee_minor: 0, currency: 'USD', plan_version: 'flat-250-USD', breakdown: [],
-      entry_at: '2026-09-10T12:00:00+00:00', exit_at: '2026-09-10T14:00:00+00:00', session_id: freeId, space_class: 'standard', computed_from: computedFrom,
-    },
-  });
-  assert.equal(zero.status, 200, await zero.clone().text());
-  assert.deepEqual((await rowFor(freeId)).validation, { consulted: false, reason: 'nothing to discount: the fee is zero' });
-
+test('a garage that links no module: not_linked, nothing asked', async () => {
+  const g = await garage();
+  const car = plate('NOLK');
+  const id = await opened(g, car);
+  const out = (await (await claimAt(g.exit, id, PHONE, priced(id))).json()).validation;
+  assert.equal(out.outcome, 'not_linked');
   assert.deepEqual(calls(), []);
-  assert.equal(readState().garages[`${g.link.tenant_id}/${g.link.garage_id}`][0].claimed_ref, null, 'still unspent');
 });
 
-// --- a door that could not decide, or refused --------------------------------------------
-
-test('a door that could not decide is not no-validation: 5xx, the stay stays open, and the retry gets the discount', async () => {
+test('a door that could not decide at the reader: 5xx, nothing held; asked again it holds', async () => {
   const g = await linked();
   const car = plate('DOWN');
   const id = await opened(g, car);
   setMode('exit2');
-  const request = closeRequest(g.exit, car, { phone: PHONE });
-  const down = await fetch(`${base}/api/v1/lane/sessions/close`, request);
+  const down = await claimAt(g.exit, id, PHONE, priced(id));
   assert.equal(down.status, 500);
   assert.equal(holdsPhone(await down.text()), false);
-  assert.equal((await rowFor(id)).exit_at, null, 'the stay is still open: nothing was recorded on an outage');
+  assert.equal((await rowFor(id)).validation, null);
   setMode('normal');
-  const back = await fetch(`${base}/api/v1/lane/sessions/close`, request);
-  assert.equal(back.status, 200);
-  assert.equal((await rowFor(id)).fee_minor, '300');
+  assert.equal((await (await claimAt(g.exit, id, PHONE, priced(id))).json()).validation.outcome, 'held');
 });
 
-test('a claim the platform\'s own transaction lost is answered again, not refused: the retry gets the discount', async () => {
-  const g = await linked();
-  const car = plate('RPLY');
-  const id = await opened(g, car);
-  // The module already holds this stay's claim, as it would if the first close
-  // had claimed and then rolled back.
-  const state = readState();
-  state.garages[`${g.link.tenant_id}/${g.link.garage_id}`][0].claimed_ref = id;
-  writeFileSync(STATE, JSON.stringify(state));
-  // The read says already claimed -- it cannot say by whom -- so the claim is
-  // asked, and answers this stay's claim again.
-  assert.equal((await close(g.exit, car, { phone: PHONE })).status, 200);
-  const row = await rowFor(id);
-  assert.equal(row.validation.asked.answer.reason, 'already_claimed');
-  assert.equal(row.validation.claimed.answer.replay, true);
-  assert.equal(row.fee_minor, '300');
-  assert.deepEqual(calls().map((c) => c.argv[0]), ['validation-in-store', 'claim-in-store']);
-});
-
-test('a door that refused the request: the stay closes undiscounted and a human is told', async () => {
+test('a door that refused: nothing held, and a human is told', async () => {
   const g = await linked();
   const car = plate('RFSD');
   const id = await opened(g, car);
   setMode('refuse_claims');
-  const res = await close(g.exit, car, { phone: PHONE });
-  assert.equal(res.status, 200);
-  const row = await rowFor(id);
-  assert.equal(row.fee_minor, '500');
-  assert.equal(row.validation.applied, false);
-  assert.equal(row.validation.refused.refused, 'currency_unsupported');
+  const out = (await (await claimAt(g.exit, id, PHONE, priced(id))).json()).validation;
+  assert.equal(out.outcome, 'refused');
+  assert.equal((await rowFor(id)).validation, null);
   const events = await eventsOf(REFUSED_EVENT_KIND, g.id);
   assert.equal(events.length, 1);
-  assert.equal(events[0].detail.refused.refused, 'currency_unsupported');
   assert.equal(holdsPhone(await storedAbout(g.id)), false);
 });
 
-test('money the module asserts that does not fit the question is not taken: 5xx, the stay stays open', async () => {
-  // A discount larger than the fee, and a claim answered for another fee.
+test('money the module asserts that does not fit the question is not held: 5xx', async () => {
   for (const mode of ['bad_money', 'wrong_base']) {
     const g = await linked();
     const car = plate('MONY');
     const id = await opened(g, car);
     setMode(mode);
-    const res = await close(g.exit, car, { phone: PHONE });
-    assert.equal(res.status, 500, mode);
-    assert.equal((await rowFor(id)).exit_at, null, mode);
+    assert.equal((await claimAt(g.exit, id, PHONE, priced(id))).status, 500, mode);
+    assert.equal((await rowFor(id)).validation, null, mode);
   }
 });
 
-// --- the field and the link --------------------------------------------------------------
+test('a claim is made before the close and on a fee the close would write, or not at all', async () => {
+  const g = await linked();
+  const car = plate('ORDR');
+  const id = await opened(g, car);
+  const code = async (res) => (await res.json()).code;
+  assert.equal(await code(await claimAt(g.exit, id, PHONE, null)), 'nothing_to_discount');
+  assert.equal(await code(await claimAt(g.exit, id, PHONE, coveredDecision())), 'nothing_to_discount');
+  assert.equal(await code(await claimAt(g.exit, id, PHONE, priced(id, { feeMinor: 0 }))), 'nothing_to_discount');
+  assert.equal(await code(await claimAt(g.exit, id, PHONE, priced(randomUUID()))), 'decision_not_consumable');
+  assert.equal(await code(await claimAt(g.exit, id, PHONE, { ...priced(id), currency: 'EUR' })), 'decision_not_consumable');
+  assert.equal(await code(await claimAt(g.entry, id, PHONE, priced(id))), 'wrong_lane_direction');
+  assert.equal((await close(g.exit, car, { local_decision: priced(id) })).status, 200);
+  assert.equal(await code(await claimAt(g.exit, id, PHONE, priced(id))), 'stay_not_open');
+  assert.deepEqual(calls(), []);
+});
 
 test('a phone that is not a phone number is refused 400 by name, and its value is not echoed', async () => {
   const g = await linked();
-  for (const bad of ['call me at 2025550143', ['2025550143'], 2025550143, '---', 'x'.repeat(40)]) {
-    const car = plate('BADP');
-    const id = await opened(g, car);
-    const res = await close(g.exit, car, { phone: bad });
+  const car = plate('BADP');
+  const id = await opened(g, car);
+  for (const bad of ['call me at 2025550143', ['2025550143'], 2025550143, '---', 'x'.repeat(40), null]) {
+    const res = await claimAt(g.exit, id, bad, priced(id));
     assert.equal(res.status, 400, JSON.stringify(bad));
     const text = await res.text();
-    assert.match(text, /phone must be/);
+    assert.match(text, /phone/);
     assert.equal(holdsPhone(text), false);
-    assert.equal((await rowFor(id)).exit_at, null);
   }
   assert.deepEqual(calls(), []);
+});
+
+test('the close no longer takes a phone: one sent there asks nothing and is kept nowhere', async () => {
+  const g = await linked();
+  const car = plate('CLPH');
+  const id = await opened(g, car);
+  assert.equal((await close(g.exit, car, { local_decision: priced(id), phone: PHONE })).status, 200);
+  const row = await rowFor(id);
+  assert.equal(row.fee_minor, '500');
+  assert.equal(row.validation, null);
+  assert.deepEqual(calls(), []);
+  assert.equal(holdsPhone(await storedAbout(g.id)), false);
 });
 
 test('a replayed close answers the stay it closed and asks the door nothing', async () => {
   const g = await linked();
   const car = plate('RPLC');
-  await opened(g, car);
-  const request = closeRequest(g.exit, car, { phone: PHONE });
+  const id = await opened(g, car);
+  assert.equal((await claimAt(g.exit, id, PHONE, priced(id))).status, 200);
+  const request = closeRequest(g.exit, car, { local_decision: priced(id) });
   const first = await (await fetch(`${base}/api/v1/lane/sessions/close`, request)).json();
   writeFileSync(LOG, '');
-  const again = await fetch(`${base}/api/v1/lane/sessions/close`, request);
-  const body = await again.json();
+  const body = await (await fetch(`${base}/api/v1/lane/sessions/close`, request)).json();
   assert.equal(body.replay, true);
   assert.equal(body.session.fee_minor, first.session.fee_minor);
   assert.deepEqual(calls(), []);
 });
+
+// --- the link and the schema ---------------------------------------------------------------
 
 test('a link is probed before it is stored: a garage the module does not know is refused by name', async () => {
   const g = await garage();
@@ -467,7 +558,6 @@ test('a link is probed before it is stored: a garage the module does not know is
   const ok = await op('PUT', `/garages/${g.id}/validations-link`, { validations: { tenant_id: 'vt-1', garage_id: 'known' } });
   assert.equal(ok.status, 200);
   assert.deepEqual((await ok.json()).garage.validations_link, { tenant_id: 'vt-1', garage_id: 'known' });
-  // The probe asked a read, with a stdin that is not a phone number.
   assert.deepEqual(calls().map((c) => [c.argv[0], c.stdin]), [['validation-in-store', 'probe\n'], ['validation-in-store', 'probe\n']]);
   const unlinked = await op('PUT', `/garages/${g.id}/validations-link`, { validations: null });
   assert.equal((await unlinked.json()).garage.validations_link, null);
@@ -478,7 +568,7 @@ test('a link is probed before it is stored: a garage the module does not know is
   assert.equal((await op('PUT', `/garages/${g.id}/validations-link`, { garage_pass: null })).status, 400);
 });
 
-test('the schema holds the shapes: a link is a link, a record is a record and only on a closed stay', async () => {
+test('the schema holds the shapes: a link is a link; a hold only on an open stay, a recorded one only on a closed one', async () => {
   const g = await garage();
   await assert.rejects(
     withTenant(tenant, (c) => c.query(`UPDATE garages SET validations_link = '{"tenant_id":"t"}'::jsonb WHERE id = $1`, [g.id])),
@@ -487,12 +577,19 @@ test('the schema holds the shapes: a link is a link, a record is a record and on
   const car = plate('SHPE');
   const id = await opened(g, car);
   await assert.rejects(
-    withTenant(tenant, (c) => c.query(`UPDATE sessions SET validation = '{"consulted":true}'::jsonb WHERE id = $1`, [id])),
-    (err) => err.constraint === 'sessions_validation_only_when_closed',
+    withTenant(tenant, (c) => c.query(`UPDATE sessions SET validation = '{"state":"recorded"}'::jsonb WHERE id = $1`, [id])),
+    (err) => err.constraint === 'sessions_validation_state_fits_the_stay',
   );
+  await assert.rejects(
+    withTenant(tenant, (c) => c.query(`UPDATE sessions SET validation = '{"consulted":true}'::jsonb WHERE id = $1`, [id])),
+    (err) => err.constraint === 'sessions_validation_is_a_record',
+  );
+  await withTenant(tenant, (c) => c.query(`UPDATE sessions SET validation = '{"state":"held"}'::jsonb WHERE id = $1`, [id]));
+  // A close with no garage link cannot give it back; clear it as a human would, then close.
+  await withTenant(tenant, (c) => c.query(`UPDATE sessions SET validation = NULL WHERE id = $1`, [id]));
   assert.equal((await close(g.exit, car)).status, 200);
   await assert.rejects(
-    withTenant(tenant, (c) => c.query(`UPDATE sessions SET validation = '{"applied":true}'::jsonb WHERE id = $1`, [id])),
-    (err) => err.constraint === 'sessions_validation_is_a_record',
+    withTenant(tenant, (c) => c.query(`UPDATE sessions SET validation = '{"state":"held"}'::jsonb WHERE id = $1`, [id])),
+    (err) => err.constraint === 'sessions_validation_state_fits_the_stay',
   );
 });

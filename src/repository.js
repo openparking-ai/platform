@@ -472,3 +472,59 @@ export async function devicesForGarage(client, tenantId, garageId) {
   );
   return rows;
 }
+
+/**
+ * THE VALIDATION HOLD (0019, amendment A1). An open stay of this garage,
+ * LOCKED, with its record -- the claim route and the close read the hold
+ * under this lock, so a hold is never taken by a close and given back by the
+ * sweep at once. Null when the stay is not open here.
+ */
+export async function lockOpenStay(client, tenantId, garageId, sessionId) {
+  const { rows } = await client.query(
+    `SELECT id, garage_id, validation FROM sessions
+      WHERE tenant_id = $1 AND garage_id = $2 AND id = $3 AND exit_at IS NULL
+      FOR UPDATE`,
+    [tenantId, garageId, sessionId],
+  );
+  return rows[0] ?? null;
+}
+
+/** A stay's validation record, locked, whatever its state. The close's read. */
+export async function lockValidation(client, tenantId, sessionId) {
+  const { rows } = await client.query(
+    'SELECT validation FROM sessions WHERE tenant_id = $1 AND id = $2 FOR UPDATE',
+    [tenantId, sessionId],
+  );
+  return rows[0]?.validation ?? null;
+}
+
+/** An open stay still holding a claim, locked; null once it closed or its hold resolved. */
+export async function lockOpenValidationHold(client, tenantId, sessionId) {
+  const { rows } = await client.query(
+    `SELECT id, garage_id, validation FROM sessions
+      WHERE tenant_id = $1 AND id = $2 AND exit_at IS NULL AND validation->>'state' = 'held'
+      FOR UPDATE`,
+    [tenantId, sessionId],
+  );
+  return rows[0] ?? null;
+}
+
+/** Open stays whose hold was taken before `cutoff`: the release sweep's queue. */
+export async function staleValidationHolds(client, tenantId, cutoff) {
+  const { rows } = await client.query(
+    `SELECT id FROM sessions
+      WHERE tenant_id = $1 AND exit_at IS NULL AND validation->>'state' = 'held'
+        AND (validation->>'held_at')::timestamptz < $2
+      ORDER BY (validation->>'held_at')::timestamptz, id`,
+    [tenantId, cutoff],
+  );
+  return rows;
+}
+
+/** Write a stay's validation record. The record, and nothing else on the row. */
+export async function setValidationRecord(client, tenantId, sessionId, record) {
+  await client.query(
+    'UPDATE sessions SET validation = $3 WHERE tenant_id = $1 AND id = $2',
+    [tenantId, sessionId, record === null ? null : JSON.stringify(record)],
+  );
+}

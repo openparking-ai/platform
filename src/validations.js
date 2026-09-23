@@ -16,6 +16,18 @@
  *       --consumer openparking --ref SESSION --base-minor FEE --currency C  < phone
  *       exit 0 claimed, with the discount in minor units · 1 nothing to claim
  *       · 2 could not decide · 3 refused.
+ *   valet-validations release-in-store --tenant T --garage G --at NOW
+ *       --consumer openparking --ref SESSION
+ *       exit 0 released · 1 not released (none, superseded) · 2 · 3.
+ *
+ * WHEN (amendment A1): the claim is made AT THE READER, the moment the phone
+ * is entered, on the fee the lane priced -- `claimAtReader` -- and HELD on the
+ * open stay, so the amount the driver is shown is already the discounted one.
+ * The close RECORDS the hold (`recordAtClose`) and asks nothing. A hold no
+ * close takes is RELEASED (`release`): by the close when it cannot take it,
+ * by the sweep when the stay is still open a hold window later
+ * (`releaseStaleHolds`) -- a driver who entered a phone and did not pay and
+ * leave strands nothing.
  *
  * THE PHONE NUMBER GOES ON STDIN AND NOWHERE ELSE. Argv is kept on the record,
  * so it carries the tenant, the garage, the instant, the consumer, this
@@ -29,17 +41,17 @@
  * kept verbatim beside the line it produced. It is never recomputed here.
  *
  * COULD-NOT-DECIDE IS NOT NO-VALIDATION. A door that cannot be run, or exits 2,
- * raises `ValidationsUnavailable` and the close falls to a 5xx so the lane
- * retries -- closing without the discount would charge a validated driver on
- * the strength of an outage (0015's rule for the pass holder). The retry is
- * safe: the module answers a claim made again by the same stay with the same
- * claim. A door that REFUSES the request (exit 3: a garage it does not know, a
- * currency it does not take) is not an outage and a retry would not change it,
- * so the stay closes undiscounted with the refusal on the record -- the close
- * is never refused on its account.
+ * raises `ValidationsUnavailable`. At the reader the claim route answers 5xx
+ * and the reader shows the fee undiscounted -- nothing was taken, and asking
+ * again is safe: the module answers a claim made again by the same stay with
+ * the same claim. At the close, a hold the close must give back and cannot
+ * falls to a 5xx and the lane retries. A door that REFUSES the request (exit
+ * 3: a garage it does not know, a currency it does not take) is not an outage:
+ * nothing is held, and a `validation_refused` event tells a human.
  */
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
+import { withTenant } from './db.js';
 import * as repo from './repository.js';
 import { assertMinor, formatMinor } from './money.js';
 
@@ -48,6 +60,8 @@ export const CONSUMER = 'openparking';
 export const LINE_CODE = 'validation';
 export const LINK_STATED_EVENT_KIND = 'validations_link_stated';
 export const REFUSED_EVENT_KIND = 'validation_refused';
+export const RELEASED_EVENT_KIND = 'validation_released';
+export const RELEASED_BEFORE_CLOSE_EVENT_KIND = 'validation_released_before_close';
 
 /** The module could not decide. Not a verdict; the close does not record one. */
 export class ValidationsUnavailable extends Error {
@@ -174,81 +188,182 @@ function checkedClaim(answer, { feeMinor, currency }) {
 }
 
 /**
- * The validation question for one closing stay. `phone` is what the driver
- * entered, or null. `pricing` is the close's pricing as decided -- by the lane
- * or by this platform -- and is returned unchanged unless a validation was
- * claimed, in which case it is returned with the line appended and the fee
- * the running total including it.
+ * THE CLAIM, AT THE READER (amendment A1): the driver has entered `phone` and
+ * the lane holds its priced decision for this open stay, `feeMinor` in
+ * `currency` at `exitAt`. Read, and when a validation is live, claim it for
+ * this stay on that fee -- so the amount the driver is shown next is the
+ * discounted one.
  *
- * Returns `{ pricing, record, refusal }`: `record` is what goes in
- * `sessions.validation` (null when no phone was given), `refusal` the door's
- * refusal when it refused, for an event beside the row.
+ * Returns `{ outcome, record, refusal }`:
+ *   outcome  'held' | 'not_validated' | 'refused' | 'not_linked', for the lane;
+ *   record   what goes on the stay (`sessions.validation`) -- a HOLD, only when
+ *            outcome is 'held'; null otherwise, because nothing was taken;
+ *   refusal  the door's refusal when it refused, for an event.
+ * Throws `ValidationsUnavailable` when the door could not decide.
  */
-export async function atClose({ garage, sessionId, phone, pricing, currency, exitAt }, options = {}) {
-  if (phone === null) return { pricing, record: null, refusal: null };
+export async function claimAtReader({ garage, sessionId, phone, feeMinor, currency, exitAt }, options = {}) {
   const link = garage.validations_link;
-  if (!link) {
-    return { pricing, record: { consulted: false, reason: 'not linked: the garage names no garage in a validations module' }, refusal: null };
-  }
-  if (pricing.outcome !== 'transient' || pricing.refusal !== undefined || !Number.isInteger(pricing.feeMinor)) {
-    const why = pricing.outcome === 'covered' ? 'the stay is covered' : 'the stay has no priced fee';
-    return { pricing, record: { consulted: false, reason: `nothing to discount: ${why}` }, refusal: null };
-  }
-  if (pricing.feeMinor === 0) {
-    return { pricing, record: { consulted: false, reason: 'nothing to discount: the fee is zero' }, refusal: null };
-  }
+  if (!link) return { outcome: 'not_linked', record: null, refusal: null, reason: 'the garage names no garage in a validations module' };
 
   const at = exitAt.toISOString();
   const readArgv = ['validation-in-store', '--tenant', link.tenant_id, '--garage', link.garage_id, '--at', at];
   const read = await door(readArgv, phone, options);
   const readAnswer = parseJson(read.stdout);
   const asked = { argv: readArgv, exit_code: read.exit_code, answer: kept(readAnswer) };
-  const record = { consulted: true, module: 'validations', link, asked };
-  if (read.exit_code === 3) {
-    return { pricing, record: { ...record, applied: false, refused: kept(readAnswer) }, refusal: kept(readAnswer) };
-  }
+  if (read.exit_code === 3) return { outcome: 'refused', record: null, refusal: kept(readAnswer), asked };
   if (read.exit_code !== 0 && read.exit_code !== 1) throw unavailable('validation-in-store', read);
   if (!readAnswer || (readAnswer.outcome !== 'validated' && readAnswer.outcome !== 'not_validated')) {
     throw new ValidationsUnavailable(`validation-in-store exit ${read.exit_code} with an answer this platform does not recognise`);
   }
-  // ALREADY CLAIMED MAY BE THIS STAY'S OWN CLAIM: a close whose transaction
-  // rolled back after the module committed the claim, retried. The read cannot
-  // tell whose claim it was; the claim can -- it answers this stay's claim again,
-  // and answers already_claimed for anyone else's. So that one answer is asked on.
+  // ALREADY CLAIMED MAY BE THIS STAY'S OWN CLAIM: a claim whose hold this
+  // platform failed to store (its transaction rolled back after the module
+  // committed), asked again. The read cannot tell whose claim it was; the claim
+  // can -- it answers this stay's claim again, and already_claimed for anyone
+  // else's. So that one answer is asked on.
   if (read.exit_code === 1 && readAnswer.reason !== 'already_claimed') {
-    return { pricing, record: { ...record, applied: false }, refusal: null };
+    return { outcome: 'not_validated', record: null, refusal: null, reason: readAnswer.reason, asked };
   }
 
   const claimArgv = [
     'claim-in-store', '--tenant', link.tenant_id, '--garage', link.garage_id, '--at', at,
     '--consumer', CONSUMER, '--ref', sessionId,
-    '--base-minor', String(pricing.feeMinor), '--currency', currency,
+    '--base-minor', String(feeMinor), '--currency', currency,
   ];
   const claimed = await door(claimArgv, phone, options);
   const claimAnswer = parseJson(claimed.stdout);
-  record.claimed = { argv: claimArgv, exit_code: claimed.exit_code, answer: kept(claimAnswer) };
-  if (claimed.exit_code === 3) {
-    return { pricing, record: { ...record, applied: false, refused: kept(claimAnswer) }, refusal: kept(claimAnswer) };
+  const claimRecord = { argv: claimArgv, exit_code: claimed.exit_code, answer: kept(claimAnswer) };
+  if (claimed.exit_code === 3) return { outcome: 'refused', record: null, refusal: kept(claimAnswer), asked, claimed: claimRecord };
+  if (claimed.exit_code === 1) {
+    return { outcome: 'not_validated', record: null, refusal: null, reason: claimAnswer?.reason ?? null, asked, claimed: claimRecord };
   }
-  if (claimed.exit_code === 1) return { pricing, record: { ...record, applied: false }, refusal: null };
   if (claimed.exit_code !== 0) throw unavailable('claim-in-store', claimed);
 
-  const claim = checkedClaim(claimAnswer, { feeMinor: pricing.feeMinor, currency });
+  const claim = checkedClaim(claimAnswer, { feeMinor, currency });
   const line = lineFor(claim, currency);
-  const feeMinor = assertMinor(pricing.feeMinor + line.delta_minor, 'fee_minor');
   return {
-    pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, line] },
-    record: {
-      ...record,
-      applied: true,
-      // What the module asserted, and what this platform did with it.
-      asserted_by: 'validations',
-      discount_minor: claim.discount_minor,
-      fee_before_minor: pricing.feeMinor,
-      fee_after_minor: feeMinor,
-    },
+    outcome: 'held',
     refusal: null,
+    record: {
+      consulted: true,
+      state: 'held',
+      module: 'validations',
+      link,
+      asked,
+      claimed: claimRecord,
+      held_at: new Date().toISOString(),
+      // What the module asserted, on which fee, and the line it becomes.
+      asserted_by: 'validations',
+      base_minor: feeMinor,
+      currency,
+      discount_minor: claim.discount_minor,
+      fee_after_minor: assertMinor(feeMinor + line.delta_minor, 'fee_after_minor'),
+      line,
+    },
   };
+}
+
+/**
+ * THE CLOSE RECORDS WHAT WAS CLAIMED. `held` is the stay's validation record
+ * as it stands under the close's lock. A hold whose fee is the close's fee is
+ * taken: its line appended to the ledger, the fee the running total including
+ * it, the record `recorded`. Nothing asks the door and nothing is recomputed.
+ *
+ * A hold the close cannot take -- the stay closed covered, unpriced, or at a
+ * fee other than the one the claim was made on -- is RELEASED through the
+ * door, so the validation is not stranded, and the record says why. A release
+ * the door could not make throws `ValidationsUnavailable`: the close rolls
+ * back and the lane retries, rather than close over a hold nobody gave back.
+ *
+ * Returns `{ pricing, record, released }`.
+ */
+export async function recordAtClose({ garage, sessionId, held, pricing, at }, options = {}) {
+  if (!held || held.state !== 'held') return { pricing, record: held ?? null, released: null };
+  const priced = pricing.outcome === 'transient' && pricing.refusal === undefined && Number.isInteger(pricing.feeMinor);
+  if (priced && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0) {
+    const feeMinor = assertMinor(pricing.feeMinor + held.line.delta_minor, 'fee_minor');
+    return {
+      pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, held.line] },
+      record: { ...held, state: 'recorded', recorded_at: at.toISOString(), fee_before_minor: pricing.feeMinor, fee_after_minor: feeMinor },
+      released: null,
+    };
+  }
+  const reason = pricing.outcome === 'covered' ? 'the stay closed covered'
+    : !priced ? 'the stay closed with no priced fee'
+      : `the stay closed at ${pricing.feeMinor}, not the ${held.base_minor} the claim was made on`;
+  const released = await release({ garage, sessionId, at }, options);
+  return {
+    pricing,
+    record: { ...held, state: 'released', released_at: at.toISOString(), released_by: 'close', reason, release: released },
+    released,
+  };
+}
+
+/**
+ * Give a hold back through the door. Returns the door's answer, kept; throws
+ * `ValidationsUnavailable` when the door could not decide. `not_released` is
+ * an answer, not a failure: `none` means the module holds no claim for this
+ * stay (already given back), `superseded` that the phone has another live
+ * validation for the day, which is the driver's.
+ */
+export async function release({ garage, sessionId, at }, options = {}) {
+  const link = garage.validations_link;
+  if (!link) throw new ValidationsUnavailable('a hold on a garage that no longer links a validations module cannot be released here');
+  const argv = [
+    'release-in-store', '--tenant', link.tenant_id, '--garage', link.garage_id, '--at', at.toISOString(),
+    '--consumer', CONSUMER, '--ref', sessionId,
+  ];
+  const out = await door(argv, '', options);
+  const answer = parseJson(out.stdout);
+  if ((out.exit_code === 0 || out.exit_code === 1) && answer && typeof answer.outcome === 'string') {
+    return { argv, exit_code: out.exit_code, answer: kept(answer) };
+  }
+  throw unavailable('release-in-store', out);
+}
+
+/**
+ * THE SWEEP: every open stay of the tenant holding a claim older than
+ * `holdMinutes` -- the driver entered a phone and did not pay and leave -- is
+ * given back through the door, one stay at a time under its own lock, and the
+ * record says so. A stay that closed meanwhile is not touched: its close
+ * resolved the hold. A release the door could not make leaves the hold for
+ * the next sweep. Returns a summary.
+ */
+export async function releaseStaleHolds(tenantId, { holdMinutes, now = new Date(), options = {} }) {
+  const cutoff = new Date(now.getTime() - holdMinutes * 60_000);
+  const summary = { tenant_id: tenantId, stale: 0, released: 0, not_released: 0, failed: 0 };
+  const stale = await withTenant(tenantId, (c) => repo.staleValidationHolds(c, tenantId, cutoff));
+  summary.stale = stale.length;
+  for (const { id } of stale) {
+    try {
+      await withTenant(tenantId, async (client) => {
+        const row = await repo.lockOpenValidationHold(client, tenantId, id);
+        if (!row || row.validation?.state !== 'held' || new Date(row.validation.held_at) > cutoff) return;
+        const garage = await repo.getGarage(client, tenantId, row.garage_id);
+        const released = await release({ garage, sessionId: id, at: now }, options);
+        await repo.setValidationRecord(client, tenantId, id, {
+          ...row.validation,
+          state: 'released',
+          released_at: now.toISOString(),
+          released_by: 'sweep',
+          reason: `no close took the claim within ${holdMinutes} minutes of it`,
+          release: released,
+        });
+        await repo.appendEvents(client, tenantId, [{
+          garageId: row.garage_id,
+          laneId: null,
+          eventId: `validation_released:${id}:${row.validation.held_at}`,
+          kind: RELEASED_EVENT_KIND,
+          occurredAt: now,
+          detail: { actor: 'platform:sweep', session_id: id, held_at: row.validation.held_at, release: released },
+        }]);
+        summary[released.answer.outcome === 'released' ? 'released' : 'not_released'] += 1;
+      });
+    } catch (err) {
+      summary.failed += 1;
+      console.error(`validation hold release failed for ${id}: ${err.message ?? err}`);
+    }
+  }
+  return summary;
 }
 
 /** The sum of the validation lines on a ledger: what the fee holds that the engine did not price. */

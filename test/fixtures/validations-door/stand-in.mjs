@@ -17,6 +17,8 @@
  *     "garages": { "<tenant>/<garage>": [ { "phone": "2025550143",
  *        "validator_name": "...", "discount_type": "flat",
  *        "discount_value": 5, "discount_minor": 500, "claimed_ref": null } ] } }
+ * `release-in-store` gives a claim back (claimed_ref to null), or answers
+ * none / superseded as the real door does.
  * Every call is appended to VALIDATIONS_STANDIN_LOG as one JSON line
  * {argv, stdin}, so a test can see what arrived where.
  */
@@ -52,6 +54,22 @@ const list = state.garages[`${args['--tenant']}/${args['--garage']}`];
 if (!list) {
   print({ refused: 'unknown_garage', field: '--garage', detail: `garage ${args['--garage']} is not a garage of tenant ${args['--tenant']}` });
   process.exit(3);
+}
+if (verb === 'release-in-store') {
+  // No phone: the reference names the claim.
+  const held = list.find((v) => v.claimed_ref === args['--ref']);
+  if (!held) {
+    print({ outcome: 'not_released', reason: 'none' });
+    process.exit(1);
+  }
+  if (list.some((v) => v !== held && v.phone === held.phone && v.claimed_ref === null)) {
+    print({ outcome: 'not_released', reason: 'superseded' });
+    process.exit(1);
+  }
+  held.claimed_ref = null;
+  writeFileSync(statePath, JSON.stringify(state));
+  print({ outcome: 'released', validation_id: 1, live_again: true });
+  process.exit(0);
 }
 const digits = stdin.split('\n')[0].replace(/\D/g, '');
 const phone = digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;

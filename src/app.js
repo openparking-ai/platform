@@ -309,17 +309,16 @@ function descriptorField(value) {
 const PHONE_MAX = 32;
 
 /**
- * The driver's phone number on a close (0019): OPTIONAL, and it is the one
- * field of the close this platform must never keep. It is read here, handed
- * to the validations door on stdin (`validations.atClose`), and dropped --
- * no column, no event, no log line holds it. So a refusal below names the
- * field and never the value: an error message is the one place a value can
- * leave by accident.
+ * The driver's phone number, entered at the reader (0019, amendment A1): the
+ * one value on any lane request this platform must never keep. It is read
+ * here, handed to the validations door on stdin (`validations.claimAtReader`),
+ * and dropped -- no column, no event, no log line holds it. So a refusal below
+ * names the field and never the value: an error message is the one place a
+ * value can leave by accident.
  *
- * Absent or null is "the driver skipped it". Present, it must be a string of
- * digits and the punctuation people type in a number; whether it IS a number
- * the module can match is the module's question, and a number it cannot read
- * is a not-validated answer, not a refused close.
+ * It must be a string of digits and the punctuation people type in a number;
+ * whether it IS a number the module can match is the module's question, and a
+ * number it cannot read is a not-validated answer, not a refusal.
  */
 function phoneField(value) {
   if (value === undefined || value === null) return null;
@@ -1355,6 +1354,86 @@ export function createApp() {
   });
 
   /**
+   * THE VALIDATION CLAIM, AT THE READER (0019, amendment A1). The driver has
+   * entered a phone on the reader's screen, which shows the fee the lane
+   * priced; this claims a live validation for the stay ON THAT FEE, before
+   * anything is paid, and holds it on the open stay -- so the next amount the
+   * driver is shown is the discounted one, and the close records the hold.
+   *
+   * The body is `{phone, local_decision}`: the decision the reader is showing,
+   * which must be a priced one this platform would consume at the close for
+   * this very stay (`consumableDecision`) -- the claim is made on the fee the
+   * close will write, or not at all. A stay already holding a claim on that
+   * fee answers it again (`replay`), without the door: one validation per
+   * stay. A hold on another fee is given back first. A stay that is not open
+   * is refused: a claim is made before the close, never after.
+   *
+   * 200 with `validation.outcome`: held (with the line, the fee before and
+   * after), not_validated (with the module's reason), refused, not_linked. A
+   * door that could not decide is a 5xx: nothing was held, and the reader
+   * shows the fee as priced.
+   */
+  lane.post('/sessions/:sessionId/validation', async (req, res, next) => {
+    try {
+      const { tenantId, garageId, laneId, direction } = req.device;
+      if (direction !== 'exit') {
+        throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
+      }
+      const phone = phoneField(req.body?.phone);
+      if (phone === null) throw bad('phone is required: the number the driver entered');
+      const decision = localDecisionField(req.body?.local_decision);
+      if (decision === null || decision.status !== 'priced' || decision.fee_minor === 0) {
+        throw conflict('nothing_to_discount', 'a validation is claimed on a priced fee above zero; this request carries none');
+      }
+      const sessionId = req.params.sessionId;
+      const out = await withTenant(tenantId, async (client) => {
+        const stay = await repo.lockOpenStay(client, tenantId, garageId, sessionId);
+        if (!stay) {
+          throw conflict('stay_not_open', 'the stay is not open in this garage: a validation is claimed before the close, never after');
+        }
+        const garage = await repo.getGarage(client, tenantId, garageId);
+        const open = await repo.findOpenSessionById(client, tenantId, garageId, sessionId);
+        const plans = ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, garageId));
+        const consumable = consumableDecision(decision, { open, garage, planVersions: plans.map((p) => p.plan_version) });
+        if (!consumable.consume) throw conflict('decision_not_consumable', consumable.reason);
+        const held = stay.validation?.state === 'held' ? stay.validation : null;
+        if (held && held.base_minor === decision.fee_minor) return { outcome: 'held', record: held, replay: true };
+        if (held) {
+          // Held on another fee: the claim was made on a number the close will
+          // not write. Given back, then asked again on this one.
+          const released = await validations.release({ garage, sessionId, at: new Date() });
+          await repo.setValidationRecord(client, tenantId, sessionId, {
+            ...held, state: 'released', released_at: new Date().toISOString(), released_by: 'reclaim',
+            reason: `claimed again on ${decision.fee_minor}, not ${held.base_minor}`, release: released,
+          });
+        }
+        const claimed = await validations.claimAtReader({
+          garage, sessionId, phone, feeMinor: decision.fee_minor, currency: decision.currency, exitAt: new Date(decision.exit_at),
+        });
+        if (claimed.record) await repo.setValidationRecord(client, tenantId, sessionId, claimed.record);
+        if (claimed.refusal) {
+          // The module refused the request: nothing is held, and a human is
+          // told why. The module's words, without the phone.
+          await repo.appendEvents(client, tenantId, [
+            {
+              garageId,
+              laneId,
+              eventId: `validation_refused:${sessionId}:${Date.now()}`,
+              kind: validations.REFUSED_EVENT_KIND,
+              occurredAt: new Date(),
+              detail: { actor: 'platform:reader', session_id: sessionId, link: garage.validations_link, refused: claimed.refusal },
+            },
+          ]);
+        }
+        return { ...claimed, replay: false };
+      });
+      res.status(200).json({ validation: presentClaim(out) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
    * Exit. Computes the fee and freezes it, along with the rate that produced it.
    * Idempotent: closing an already-closed session returns it unchanged.
    */
@@ -1374,8 +1453,6 @@ export function createApp() {
       // carries none -- a lane built before it existed, or one that was
       // offline at the exit and closes from its outbox.
       const localDecision = localDecisionField(req.body?.local_decision);
-      // The driver's phone, entered at the reader (0019), or null: see phoneField.
-      const phone = phoneField(req.body?.phone);
       // The same rule at the other end of the stay. Without it a stay opened on
       // a ticket could never be closed: the close would upsert a vehicle from a
       // plate it does not have, find no open session, and 404 — a car that got
@@ -1537,17 +1614,22 @@ export function createApp() {
           }
         }
 
-        // THE VALIDATION (0019), after the fee is decided -- by the lane or by
-        // this platform, the same either way -- and before it is written. A
-        // phone and a priced fee above zero ask the linked module; a claim it
-        // answers becomes ONE MORE LINE on the ledger and the fee is the
-        // running total including it. Nothing is re-priced. The phone goes to
-        // the door on stdin and is not kept. A module that could not decide
-        // falls through as a 5xx, like the entitlement doors: the lane
-        // retries, and the module answers the same stay's claim again with
-        // the same claim.
-        const validated = await validations.atClose({
-          garage, sessionId: open.id, phone, pricing, currency: open.currency, exitAt,
+        // THE VALIDATION (0019, amendment A1), after the fee is decided -- by
+        // the lane or by this platform, the same either way -- and before it
+        // is written. The claim was made AT THE READER and held on this stay;
+        // the close RECORDS it: the held line appended to the ledger, the fee
+        // the running total including it. No door is asked for a claim and
+        // nothing is re-priced. A hold the close cannot take -- covered,
+        // unpriced, another fee -- is given back through the door, so the
+        // validation is not stranded; a release the door cannot make falls
+        // through as a 5xx and the lane retries. Read under the row's lock, so
+        // the release sweep and this close never both act on one hold.
+        const validated = await validations.recordAtClose({
+          garage,
+          sessionId: open.id,
+          held: await repo.lockValidation(client, tenantId, open.id),
+          pricing,
+          at: new Date(),
         });
         pricing = validated.pricing;
 
@@ -1578,23 +1660,25 @@ export function createApp() {
           decisionInputs,
           validation: validated.record,
         });
-        if (validated.refusal) {
-          // The module refused the request (a garage it does not know, a
-          // currency it does not take): the stay closed undiscounted, and a
-          // human is told why. The module's words, without the phone.
+        if (validated.released || validated.record?.released_by === 'sweep') {
+          // A claim this stay made and did not record: given back now by the
+          // close, or already given back by the sweep before this close came
+          // -- a driver the reader may have shown a discount to, closing
+          // without it. Either way a human is told.
           await repo.appendEvents(client, tenantId, [
             {
               garageId,
               laneId,
-              eventId: `validation_refused:${closed.id}`,
-              kind: validations.REFUSED_EVENT_KIND,
+              eventId: `validation_unrecorded:${closed.id}`,
+              kind: validated.released ? validations.RELEASED_EVENT_KIND : validations.RELEASED_BEFORE_CLOSE_EVENT_KIND,
               occurredAt: exitAt,
               detail: {
                 actor: 'platform:close',
                 session_id: closed.id,
                 close_event_id: String(closeEventId),
-                link: garage.validations_link,
-                refused: validated.refusal,
+                reason: validated.record.reason,
+                released_by: validated.record.released_by,
+                release: validated.record.release,
               },
             },
           ]);
@@ -1686,6 +1770,24 @@ export function createApp() {
   });
 
   return app;
+}
+
+/** A claim as the reader is told it: what to show, never the phone. */
+function presentClaim(out) {
+  if (out.outcome !== 'held') {
+    return { outcome: out.outcome, ...(out.reason !== undefined ? { reason: out.reason } : {}) };
+  }
+  const r = out.record;
+  return {
+    outcome: 'held',
+    replay: out.replay,
+    currency: r.currency,
+    fee_before_minor: r.base_minor,
+    discount_minor: r.discount_minor,
+    fee_minor: r.fee_after_minor,
+    line: r.line,
+    held_at: r.held_at,
+  };
 }
 
 /** Money leaves the database as a string; it leaves the API as a number. */

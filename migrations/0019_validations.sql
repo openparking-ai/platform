@@ -7,14 +7,16 @@
 -- tenants, asked the way garage-pass and monthly-billing are asked (0015):
 -- a command line, run as a subprocess with the environment the operator gave
 -- this platform, its DSN never read here. THIS REPOSITORY GETS THE ABILITY TO
--- ASK, NEVER THE MODULE: an operator without one links nothing, and a close
--- with a phone at a garage that links none says so and discounts nothing.
+-- ASK, NEVER THE MODULE: an operator without one links nothing, and a
+-- phone entered at a garage that links none discounts nothing.
 --
 --   <door> validation-in-store --tenant T --garage G --at EXIT        < phone
 --   <door> claim-in-store --tenant T --garage G --at EXIT
 --          --consumer openparking --ref SESSION --base-minor FEE --currency C < phone
+--   <door> release-in-store --tenant T --garage G --at NOW
+--          --consumer openparking --ref SESSION
 --
--- THE PHONE NUMBER IS NEVER STORED. It arrives on the close body, goes to the
+-- THE PHONE NUMBER IS NEVER STORED. It arrives from the reader, goes to the
 -- door on STDIN -- never argv, because argv is kept on the record -- and is not
 -- written to any column, any event or any log line. The door's answers carry
 -- the number's last four digits for a human reading them at a terminal; this
@@ -40,10 +42,35 @@
 -- claim would consume the driver's validation for nothing: the door is not
 -- asked, and the record says why.
 --
--- `sessions.validation` is the record: null when the close carried no phone;
--- otherwise an object saying whether the module was consulted and what it
--- said. It holds no vehicle identity and no phone, so the retention purge has
--- nothing in it to reach.
+-- WHEN THE CLAIM IS MADE (amendment A1). Not at the close: the close comes
+-- after the barrier opens, and the driver has to see the discounted amount
+-- BEFORE they pay. So the phone is claimed THE MOMENT IT IS ENTERED at the
+-- reader -- `POST /lane/sessions/:id/validation`, on the fee the lane's own
+-- decision priced -- and the claim is HELD on the open stay. The close RECORDS
+-- the held claim: the same line, now on the ledger, with no door asked and
+-- nothing recomputed. The door, the discount and the line are as above; only
+-- their moment moved.
+--
+-- A HOLD THAT IS NEVER RECORDED IS GIVEN BACK. A driver who enters a phone and
+-- then does not pay and leave has claimed something their stay will not
+-- record. The claim is released through the module's own door
+-- (`release-in-store`), and the validation is unclaimed again -- live if its
+-- garage-day has not ended:
+--   * by the sweep (`npm run release-validation-holds`), for a stay still OPEN
+--     a hold window after the claim (VALIDATION_HOLD_MINUTES, default 30);
+--   * by the close, when the stay closes with no fee to take it (covered,
+--     unpriced) or at a fee other than the one it was claimed on.
+-- A driver who comes back to the reader after a release enters the phone
+-- again and claims again.
+--
+-- `sessions.validation` is the record: null when no phone was claimed for the
+-- stay; otherwise an object whose `state` is
+--   held      claimed at the reader, on an OPEN stay, not yet recorded;
+--   recorded  taken by the close: its line is on the ledger;
+--   released  given back, by the sweep or by the close, with the reason.
+-- A closed stay never holds, and an open one never has recorded. It holds no
+-- vehicle identity and no phone, so the retention purge has nothing in it to
+-- reach.
 --
 -- Run as the database OWNER.
 
@@ -68,12 +95,19 @@ ALTER TABLE sessions
     CONSTRAINT sessions_validation_is_a_record CHECK (
       validation IS NULL OR (
         jsonb_typeof(validation) = 'object'
-        AND coalesce(jsonb_typeof(validation->'consulted'), '') = 'boolean'
+        AND coalesce(validation->>'state', '') IN ('held', 'recorded', 'released')
       )
     ),
-  -- A record only on a closed stay: an open stay has no exit to ask about.
-  ADD CONSTRAINT sessions_validation_only_when_closed CHECK (
-    validation IS NULL OR exit_at IS NOT NULL
+  -- A hold lives on an open stay; the close resolves it, recorded or released.
+  ADD CONSTRAINT sessions_validation_state_fits_the_stay CHECK (
+    validation IS NULL
+    OR (validation->>'state' = 'held' AND exit_at IS NULL)
+    OR (validation->>'state' = 'recorded' AND exit_at IS NOT NULL)
+    OR validation->>'state' = 'released'
   );
+
+-- The sweep's queue: open stays holding a claim.
+CREATE INDEX sessions_validation_held_idx ON sessions (tenant_id, garage_id)
+  WHERE exit_at IS NULL AND validation->>'state' = 'held';
 
 COMMIT;
