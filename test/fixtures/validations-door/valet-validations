@@ -1,0 +1,3 @@
+#!/bin/sh
+# The validations door's stand-in, for this repository's tests. See stand-in.mjs.
+exec node "$(dirname "$0")/stand-in.mjs" "$@"

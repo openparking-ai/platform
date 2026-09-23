@@ -622,6 +622,85 @@ close pricing again, the inputs not stored, a mismatch consumed, a covered
 decision asking the doors, a blind reconciler, a correcting one, and the
 attribution constraint never created.
 
+### A validation at the exit: a linked module, and one more line on the ledger
+
+A **validation** is a discount a merchant gives a driver ahead of the exit,
+carried by the driver's phone number. The module that holds validations is its
+own system, asked through its own door as garage-pass and monthly-billing are,
+and **this repository gets the ability to ask, never the module** (migration
+0019). A garage states which garage of a validations module it is —
+`PUT /api/v1/garages/<id>/validations-link` with `{validations: {tenant_id,
+garage_id}}` or `null` — and the link is probed before it is stored.
+
+**The claim is made when the phone is entered, not at the close** (amendment
+A1): the close comes after the barrier opens, and the driver has to see the
+discounted amount before paying. The reader shows the fee the lane priced with
+an optional phone number; the lane sends what was entered to
+`POST /api/v1/lane/sessions/<id>/validation` with the decision on screen, and
+this platform reads and, when a validation is live, **claims it for the stay on
+that fee** and holds it on the open stay. The answer — the line, the fee before
+and after — is what the reader shows next. The claim is made only on a priced
+decision above zero that the close would consume for this very stay; asked
+again on the same fee it answers the held claim, without the door.
+
+The discount is **the module's assertion**, checked for shape — whole minor
+units, not more than the fee, the fee and currency echoed back — and it becomes
+**one more line on the ledger**, `code: 'validation'`, after the engine's lines.
+**The close records the held claim — when the reader showed it** (amendment
+A2): the close carries `reader_shown`, `{fee_minor, currency}`, what the reader
+actually put up, and the line is appended, the fee the running total including
+it, only when that is the discounted fee. A reader that gave up waiting and
+showed the fee as priced, or a close that says nothing about the reader, gives
+the hold back: the row says what the driver saw. No door asked, nothing
+re-priced.
+
+**No door call is the last word.** The door commits in its own database before
+this platform does, so every call that changes the module is preceded by a
+record committed here — `claiming` before a claim, `releasing` before a release
+— and neither is ever recorded as a discount. A rollback after the door
+answered leaves one of them, and the close or the sweep gives it back:
+releasing a claim that never landed is harmless, the door answers `none`.
+
+**A release names the claim it gives back.** Those door calls happen outside
+any lock here, so a release can reach the module after the same stay has
+claimed again. Every claim is named by the attempt that made it (`--claim`),
+a record keeps the names of the claims it may still hold, and a release names
+those and nothing else; the module refuses to release a claim it no longer
+holds (`already_superseded`). A late release cannot undo a newer claim.
+
+**A hold no close takes is given back** through the module's door
+(`release-in-store`), so a driver who entered a phone and then did not pay and
+leave strands nothing: the validation is unclaimed again, live if its day has
+not ended. The close gives back a hold it cannot take (the stay closed covered,
+unpriced, at another fee, or the reader did not show it) — after it commits, so
+a door that cannot answer leaves `releasing` for the sweep and never refuses a
+close. `npm run release-validation-holds`, on a
+schedule, gives back every hold still on an OPEN stay a hold window after the
+claim (`VALIDATION_HOLD_MINUTES`, default 30), gives back a claim whose hold was
+never stored, and finishes every release begun; the driver who comes back to the
+reader enters the phone and claims again. A close that arrives after its hold
+was given back records no discount, with a `validation_released_before_close`
+event for a human.
+
+**The phone number is never kept.** It goes to the door on stdin — never argv,
+because argv is kept on the record — and into no column, event or log line;
+the door's `phone_last4` is dropped from every answer before it is stored, and
+a refused `phone` field names the field, not the value. The close takes no
+phone at all.
+
+A door that **could not decide** at the reader answers 5xx and nothing is held
+(the record says `claiming`, and is given back);
+a read that says `already_claimed` is asked on, because the claim it names may
+be this stay's own from a claim whose hold was not stored — the module answers
+that claim again. A door that **refused** holds nothing, with a
+`validation_refused` event. The reconciler compares the engine's number with
+the fee **without** the validation line.
+
+`test/validations.test.js` runs against the real engine and a stand-in for the
+door (`test/fixtures/validations-door`) that speaks the door's contract and
+computes nothing; `npm run validations-fail-control` breaks each property in
+turn.
+
 ## Vehicle identity and retention
 
 The database stores real vehicle identity — plate, make, model, colour — because

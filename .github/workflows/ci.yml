@@ -249,3 +249,14 @@ jobs:
         # corrects nothing. Each property is broken in turn, plus the verdict
         # constraint never created, and the suite must go red.
         run: npm run lane-decision-sweep-fail-control
+
+      - name: Validations fail-control
+        # A validation at the exit (0019, amendment A1): the claim made at the
+        # reader on the fee the close will write and held on the open stay;
+        # the close recording it as one ledger line with no door asked; a hold
+        # no close takes given back, by the close or by the sweep; the phone on
+        # stdin and kept nowhere; the money checked against the question; the
+        # reconciler comparing the engine's number without the line. Each
+        # property is broken in turn, plus three schema statements never
+        # created, and the suite must go red.
+        run: npm run validations-fail-control
