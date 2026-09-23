@@ -65,10 +65,18 @@
 --
 -- `sessions.validation` is the record: null when no phone was claimed for the
 -- stay; otherwise an object whose `state` is
+--   claiming  a claim about to be asked for, COMMITTED before the door is
+--             asked (amendment A2.3), on an OPEN stay: never a discount;
 --   held      claimed at the reader, on an OPEN stay, not yet recorded;
---   recorded  taken by the close: its line is on the ledger;
+--   recorded  taken by the close: its line is on the ledger -- only when the
+--             close says the reader showed the discounted fee (A2.2);
+--   releasing a release about to be asked for, COMMITTED before the door is
+--             asked (A2.3): never a discount, whatever the door did;
 --   released  given back, by the sweep or by the close, with the reason.
--- A closed stay never holds, and an open one never has recorded. It holds no
+-- A closed stay never holds or claims, and an open one never has recorded.
+-- The door commits in its own database first, so the state written BEFORE a
+-- door call is what a rollback after it leaves behind -- and both are states
+-- the sweep finishes and no close records. It holds no
 -- vehicle identity and no phone, so the retention purge has nothing in it to
 -- reach.
 --
@@ -95,19 +103,19 @@ ALTER TABLE sessions
     CONSTRAINT sessions_validation_is_a_record CHECK (
       validation IS NULL OR (
         jsonb_typeof(validation) = 'object'
-        AND coalesce(validation->>'state', '') IN ('held', 'recorded', 'released')
+        AND coalesce(validation->>'state', '') IN ('claiming', 'held', 'recorded', 'releasing', 'released')
       )
     ),
   -- A hold lives on an open stay; the close resolves it, recorded or released.
   ADD CONSTRAINT sessions_validation_state_fits_the_stay CHECK (
     validation IS NULL
-    OR (validation->>'state' = 'held' AND exit_at IS NULL)
+    OR (validation->>'state' IN ('claiming', 'held') AND exit_at IS NULL)
     OR (validation->>'state' = 'recorded' AND exit_at IS NOT NULL)
-    OR validation->>'state' = 'released'
+    OR validation->>'state' IN ('releasing', 'released')
   );
 
--- The sweep's queue: open stays holding a claim.
-CREATE INDEX sessions_validation_held_idx ON sessions (tenant_id, garage_id)
-  WHERE exit_at IS NULL AND validation->>'state' = 'held';
+-- The sweep's queues: open stays holding or claiming, and any stay releasing.
+CREATE INDEX sessions_validation_unresolved_idx ON sessions (tenant_id)
+  WHERE validation->>'state' IN ('claiming', 'held', 'releasing');
 
 COMMIT;

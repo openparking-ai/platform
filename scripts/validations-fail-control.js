@@ -33,10 +33,16 @@
  *   unconsumable_claimed       a decision the close would not write is claimed on.
  *   unpriced_is_claimed        a covered or zero decision is claimed on.
  *   reconciler_sees_line       the reconciler compares with the fee including the line.
+ *   shown_not_checked          a hold is recorded whatever the reader showed (A2.2).
+ *   claiming_left_by_close     the close takes no notice of a claim never held (A2.3).
+ *   claiming_left_by_sweep     the sweep never gives back a claim never held (A2.3).
+ *   releasing_recorded         a stay whose release began records the discount (A2.3).
+ *   release_never_finished     the close never asks the door after it commits (A2.3).
+ *   unfinished_left            the sweep never finishes a release begun (A2.3).
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0019, so the property genuinely never existed:
- *   hold_on_closed_stay        a closed stay may still hold.
+ *   hold_on_closed_stay        a closed stay may still hold or claim.
  *   record_shape_unchecked     a record with no state is accepted.
  *   link_shape_unchecked       the link CHECK never created.
  *
@@ -79,8 +85,8 @@ const SOURCE_BREAKS = [
     name: 'close_ignores_hold',
     why: 'the close does not read the hold',
     file: 'src/app.js',
-    from: "          held: await repo.lockValidation(client, tenantId, open.id),",
-    to: "          held: null,",
+    from: "        const heldAtClose = await repo.lockValidation(client, tenantId, open.id);",
+    to: "        const heldAtClose = null;",
   },
   {
     name: 'line_not_on_ledger',
@@ -100,22 +106,22 @@ const SOURCE_BREAKS = [
     name: 'hold_taken_at_another_fee',
     why: 'a hold is recorded on a fee it was not claimed on',
     file: 'src/validations.js',
-    from: "  if (priced && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0) {",
-    to: "  if (priced && pricing.feeMinor > 0) {",
+    from: "  if (held.state === 'held' && priced && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0 && shownDiscounted) {",
+    to: "  if (held.state === 'held' && priced && pricing.feeMinor > 0 && shownDiscounted) {",
   },
   {
     name: 'close_strands_hold',
     why: 'a hold the close cannot take is not given back',
     file: 'src/validations.js',
-    from: "  const released = await release({ garage, sessionId, at }, options);\n  return {\n    pricing,",
-    to: "  const released = { answer: { outcome: 'not_asked' } };\n  return {\n    pricing,",
+    from: "  return {\n    pricing,\n    record: {\n      ...held, state: 'releasing',",
+    to: "  return {\n    pricing,\n    record: {\n      ...held, state: held.state === 'claiming' ? 'released' : 'recorded',",
   },
   {
     name: 'sweep_never_runs',
     why: 'the sweep finds nothing to give back',
     file: 'src/validations.js',
-    from: "  const stale = await withTenant(tenantId, (c) => repo.staleValidationHolds(c, tenantId, cutoff));",
-    to: "  const stale = [];",
+    from: "    stale: await repo.staleValidationHolds(c, tenantId, cutoff),",
+    to: "    stale: [],",
   },
   {
     name: 'sweep_ignores_window',
@@ -128,8 +134,8 @@ const SOURCE_BREAKS = [
     name: 'sweep_keeps_record_held',
     why: 'the sweep releases and the stay still says held',
     file: 'src/validations.js',
-    from: "        await repo.setValidationRecord(client, tenantId, id, {\n          ...row.validation,\n          state: 'released',",
-    to: "        await repo.setValidationRecord(client, tenantId, id, {\n          ...row.validation,\n          state: 'held',",
+    from: "      ...row.validation, state: 'released', released_at: now.toISOString(), release: released,",
+    to: "      ...row.validation, state: row.exit_at === null ? 'held' : 'released', released_at: now.toISOString(), release: released,",
   },
   {
     name: 'outage_is_no_validation',
@@ -163,8 +169,8 @@ const SOURCE_BREAKS = [
     name: 'replay_asks_door',
     why: 'a held claim asked again goes to the door',
     file: 'src/app.js',
-    from: "        if (held && held.base_minor === decision.fee_minor) return { outcome: 'held', record: held, replay: true };",
-    to: "        if (false) return { outcome: 'held', record: held, replay: true };",
+    from: "        if (current?.state === 'held' && current.base_minor === decision.fee_minor) {",
+    to: "        if (false) {",
   },
   {
     name: 'claim_after_close',
@@ -194,18 +200,60 @@ const SOURCE_BREAKS = [
     from: "  return Number(row.fee_minor) - validationDelta(row.breakdown);",
     to: "  return Number(row.fee_minor) - 0 * validationDelta(row.breakdown);",
   },
+  {
+    name: 'shown_not_checked',
+    why: 'a hold is recorded whatever the reader showed',
+    file: 'src/validations.js',
+    from: "  const shownDiscounted = readerShown !== null && readerShown !== undefined",
+    to: "  const shownDiscounted = true || readerShown !== null && readerShown !== undefined",
+  },
+  {
+    name: 'claiming_left_by_close',
+    why: 'the close takes no notice of a claim never held',
+    file: 'src/validations.js',
+    from: "  if (!held || !UNRESOLVED.has(held.state)) return { pricing, record: held ?? null, releaseAfter: false };",
+    to: "  if (!held || !UNRESOLVED.has(held.state) || held.state === 'claiming') return { pricing, record: held ?? null, releaseAfter: false };",
+  },
+  {
+    name: 'claiming_left_by_sweep',
+    why: 'the sweep never gives back a claim never held',
+    file: 'src/validations.js',
+    from: "    claiming: await repo.staleClaimingRecords(c, tenantId, claimingCutoff),",
+    to: "    claiming: [],",
+  },
+  {
+    name: 'releasing_recorded',
+    why: 'a stay whose release began records the discount',
+    file: 'src/validations.js',
+    from: "  if (held.state === 'held' && priced && pricing.feeMinor === held.base_minor",
+    to: "  if ((held.state === 'held' || held.state === 'releasing') && priced && pricing.feeMinor === held.base_minor",
+  },
+  {
+    name: 'release_never_finished',
+    why: 'the close never asks the door after it commits',
+    file: 'src/app.js',
+    from: "      if (out.releaseAfter) {",
+    to: "      if (false) {",
+  },
+  {
+    name: 'unfinished_left',
+    why: 'the sweep never finishes a release begun',
+    file: 'src/validations.js',
+    from: "    unfinished: await repo.releasingRecords(c, tenantId),",
+    to: "    unfinished: [],",
+  },
 ];
 
 const SCHEMA_BREAKS = [
   {
     name: 'hold_on_closed_stay',
-    why: 'a closed stay may still hold',
-    edits: [{ file: '0019_validations.sql', from: "    OR (validation->>'state' = 'held' AND exit_at IS NULL)", to: "    OR (validation->>'state' = 'held')" }],
+    why: 'a closed stay may still hold or claim',
+    edits: [{ file: '0019_validations.sql', from: "    OR (validation->>'state' IN ('claiming', 'held') AND exit_at IS NULL)", to: "    OR (validation->>'state' IN ('claiming', 'held'))" }],
   },
   {
     name: 'record_shape_unchecked',
     why: 'a record with no state is accepted',
-    edits: [{ file: '0019_validations.sql', from: "        AND coalesce(validation->>'state', '') IN ('held', 'recorded', 'released')", to: "        AND true" }],
+    edits: [{ file: '0019_validations.sql', from: "        AND coalesce(validation->>'state', '') IN ('claiming', 'held', 'recorded', 'releasing', 'released')", to: "        AND true" }],
   },
   {
     name: 'link_shape_unchecked',

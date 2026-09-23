@@ -29,6 +29,26 @@
  * (`releaseStaleHolds`) -- a driver who entered a phone and did not pay and
  * leave strands nothing.
  *
+ * SHOWN IS RECORDED (amendment A2.2). The close carries what the reader
+ * actually showed (`reader_shown`), and the hold is recorded only when the
+ * reader showed its discounted fee. A reader that gave up before the claim
+ * answered -- it showed the fee as priced -- or a close that says nothing about
+ * the reader, gives the hold back: the row says what the driver saw.
+ *
+ * NO DOOR CALL IS EVER THE LAST WORD (amendment A2.3). The door commits in its
+ * own database before this platform's transaction does, so a rollback here
+ * after the door answered would leave the two systems disagreeing. So every
+ * door call that changes the module is preceded by a record COMMITTED here:
+ *   claiming   written before a claim is asked for; only `held`, written after
+ *              the door answered, is ever recorded as a discount, so a claim
+ *              whose hold was never stored is still named and given back;
+ *   releasing  written before a release is asked for; a stay in it never
+ *              records a discount, whatever the door did, so a release whose
+ *              own bookkeeping rolled back cannot come back as a discount.
+ * `finishRelease` asks the door and writes `released`; the close and the sweep
+ * finish anything left in either state. Releasing a claim that never landed is
+ * harmless: the door answers `none`.
+ *
  * THE PHONE NUMBER GOES ON STDIN AND NOWHERE ELSE. Argv is kept on the record,
  * so it carries the tenant, the garage, the instant, the consumer, this
  * stay's id and the fee -- never the number. The door's answers carry the last
@@ -262,40 +282,96 @@ export async function claimAtReader({ garage, sessionId, phone, feeMinor, curren
   };
 }
 
+/** What a claim is before the door is asked (A2.3): committed first, never a discount. */
+export function claimingRecord({ attempt, link, feeMinor, currency, prior, at = new Date() }) {
+  return {
+    consulted: true,
+    state: 'claiming',
+    module: 'validations',
+    link,
+    attempt,
+    claiming_at: at.toISOString(),
+    base_minor: feeMinor,
+    currency,
+    ...(prior ? { prior_state: prior.state } : {}),
+  };
+}
+
+/** The states in which the module may hold a claim for this stay that no close will record. */
+export const UNRESOLVED = new Set(['held', 'claiming', 'releasing']);
+
 /**
- * THE CLOSE RECORDS WHAT WAS CLAIMED. `held` is the stay's validation record
- * as it stands under the close's lock. A hold whose fee is the close's fee is
- * taken: its line appended to the ledger, the fee the running total including
- * it, the record `recorded`. Nothing asks the door and nothing is recomputed.
+ * THE CLOSE RECORDS WHAT WAS CLAIMED AND SHOWN. `held` is the stay's validation
+ * record as it stands under the close's lock; `readerShown` is what the close
+ * says the reader showed (`{fee_minor, currency}`), or null. A hold is taken
+ * -- its line appended to the ledger, the fee the running total including it,
+ * the record `recorded` -- only when the close's fee is the fee the claim was
+ * made on AND the reader showed the discounted fee. Nothing asks the door and
+ * nothing is recomputed.
  *
- * A hold the close cannot take -- the stay closed covered, unpriced, or at a
- * fee other than the one the claim was made on -- is RELEASED through the
- * door, so the validation is not stranded, and the record says why. A release
- * the door could not make throws `ValidationsUnavailable`: the close rolls
- * back and the lane retries, rather than close over a hold nobody gave back.
+ * Anything else still unresolved -- a hold the close cannot take (covered,
+ * unpriced, another fee, a reader that showed the fee as priced or said
+ * nothing), a claim never held, a release never finished -- becomes
+ * `releasing` on this row, in this transaction. The door is asked AFTER the
+ * close commits (`finishRelease`), so no rollback here can undo a release the
+ * module already made. Pure: no door, no database.
  *
- * Returns `{ pricing, record, released }`.
+ * Returns `{ pricing, record, releaseAfter }`.
  */
-export async function recordAtClose({ garage, sessionId, held, pricing, at }, options = {}) {
-  if (!held || held.state !== 'held') return { pricing, record: held ?? null, released: null };
+export function recordAtClose({ held, pricing, readerShown, at }) {
+  if (!held || !UNRESOLVED.has(held.state)) return { pricing, record: held ?? null, releaseAfter: false };
   const priced = pricing.outcome === 'transient' && pricing.refusal === undefined && Number.isInteger(pricing.feeMinor);
-  if (priced && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0) {
+  const shownDiscounted = readerShown !== null && readerShown !== undefined
+    && readerShown.fee_minor === held.fee_after_minor && readerShown.currency === held.currency;
+  if (held.state === 'held' && priced && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0 && shownDiscounted) {
     const feeMinor = assertMinor(pricing.feeMinor + held.line.delta_minor, 'fee_minor');
     return {
       pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, held.line] },
-      record: { ...held, state: 'recorded', recorded_at: at.toISOString(), fee_before_minor: pricing.feeMinor, fee_after_minor: feeMinor },
-      released: null,
+      record: {
+        ...held, state: 'recorded', recorded_at: at.toISOString(), fee_before_minor: pricing.feeMinor, fee_after_minor: feeMinor,
+        reader_shown: readerShown,
+      },
+      releaseAfter: false,
     };
   }
-  const reason = pricing.outcome === 'covered' ? 'the stay closed covered'
-    : !priced ? 'the stay closed with no priced fee'
-      : `the stay closed at ${pricing.feeMinor}, not the ${held.base_minor} the claim was made on`;
-  const released = await release({ garage, sessionId, at }, options);
+  if (held.state === 'releasing') return { pricing, record: held, releaseAfter: true };
+  const reason = held.state === 'claiming' ? 'a claim that was never held'
+    : pricing.outcome === 'covered' ? 'the stay closed covered'
+      : !priced ? 'the stay closed with no priced fee'
+        : pricing.feeMinor !== held.base_minor ? `the stay closed at ${pricing.feeMinor}, not the ${held.base_minor} the claim was made on`
+          : readerShown === null || readerShown === undefined ? 'the close does not say the reader showed the discounted fee'
+            : `the reader showed ${readerShown.fee_minor} ${readerShown.currency}, not the discounted ${held.fee_after_minor} ${held.currency}`;
   return {
     pricing,
-    record: { ...held, state: 'released', released_at: at.toISOString(), released_by: 'close', reason, release: released },
-    released,
+    record: {
+      ...held, state: 'releasing', releasing_at: at.toISOString(), released_by: 'close', reason,
+      ...(readerShown ? { reader_shown: readerShown } : {}),
+    },
+    releaseAfter: true,
   };
+}
+
+/**
+ * FINISH A RELEASE (A2.3): the stay's record is `releasing`, committed. Ask the
+ * door -- outside any transaction here -- then write `released`, under the
+ * row's lock, only if the record is still the one that was released. A door
+ * that could not decide, or a write that fails, leaves `releasing` for the
+ * next sweep; asking again is harmless. Returns the door's answer, or null
+ * when there was nothing to finish.
+ */
+export async function finishRelease(tenantId, sessionId, { now = new Date(), options = {} } = {}) {
+  const before = await withTenant(tenantId, (c) => repo.validationRow(c, tenantId, sessionId));
+  if (!before || before.validation?.state !== 'releasing') return null;
+  const garage = await withTenant(tenantId, (c) => repo.getGarage(c, tenantId, before.garage_id));
+  const released = await release({ garage, sessionId, at: now }, options);
+  await withTenant(tenantId, async (client) => {
+    const row = await repo.lockValidationRow(client, tenantId, sessionId);
+    if (row?.validation?.state !== 'releasing' || row.validation.releasing_at !== before.validation.releasing_at) return;
+    await repo.setValidationRecord(client, tenantId, sessionId, {
+      ...row.validation, state: 'released', released_at: now.toISOString(), release: released,
+    });
+  });
+  return released;
 }
 
 /**
@@ -321,48 +397,79 @@ export async function release({ garage, sessionId, at }, options = {}) {
 }
 
 /**
- * THE SWEEP: every open stay of the tenant holding a claim older than
- * `holdMinutes` -- the driver entered a phone and did not pay and leave -- is
- * given back through the door, one stay at a time under its own lock, and the
- * record says so. A stay that closed meanwhile is not touched: its close
- * resolved the hold. A release the door could not make leaves the hold for
- * the next sweep. Returns a summary.
+ * THE SWEEP. Three queues, each moved to `releasing` under the row's own lock
+ * and COMMITTED before the door is asked (A2.3), then finished:
+ *   * a hold on a still-OPEN stay older than `holdMinutes` -- the driver
+ *     entered a phone and did not pay and leave;
+ *   * a `claiming` record on an open stay older than `claimingGraceSeconds`
+ *     -- a claim whose hold was never stored (the transaction after the door
+ *     rolled back); the grace keeps a claim in flight from being raced;
+ *   * every `releasing` record, open or closed -- a release begun and not
+ *     finished.
+ * A release the door could not make is left `releasing` for the next run.
+ * Returns a summary.
  */
-export async function releaseStaleHolds(tenantId, { holdMinutes, now = new Date(), options = {} }) {
+export async function releaseStaleHolds(tenantId, { holdMinutes, claimingGraceSeconds = 60, now = new Date(), options = {} }) {
   const cutoff = new Date(now.getTime() - holdMinutes * 60_000);
-  const summary = { tenant_id: tenantId, stale: 0, released: 0, not_released: 0, failed: 0 };
-  const stale = await withTenant(tenantId, (c) => repo.staleValidationHolds(c, tenantId, cutoff));
-  summary.stale = stale.length;
-  for (const { id } of stale) {
-    try {
-      await withTenant(tenantId, async (client) => {
-        const row = await repo.lockOpenValidationHold(client, tenantId, id);
-        if (!row || row.validation?.state !== 'held' || new Date(row.validation.held_at) > cutoff) return;
-        const garage = await repo.getGarage(client, tenantId, row.garage_id);
-        const released = await release({ garage, sessionId: id, at: now }, options);
-        await repo.setValidationRecord(client, tenantId, id, {
-          ...row.validation,
-          state: 'released',
-          released_at: now.toISOString(),
-          released_by: 'sweep',
-          reason: `no close took the claim within ${holdMinutes} minutes of it`,
-          release: released,
-        });
-        await repo.appendEvents(client, tenantId, [{
-          garageId: row.garage_id,
-          laneId: null,
-          eventId: `validation_released:${id}:${row.validation.held_at}`,
-          kind: RELEASED_EVENT_KIND,
-          occurredAt: now,
-          detail: { actor: 'platform:sweep', session_id: id, held_at: row.validation.held_at, release: released },
-        }]);
-        summary[released.answer.outcome === 'released' ? 'released' : 'not_released'] += 1;
+  const claimingCutoff = new Date(now.getTime() - claimingGraceSeconds * 1000);
+  const summary = { tenant_id: tenantId, stale: 0, claiming: 0, unfinished: 0, released: 0, not_released: 0, failed: 0 };
+  const queues = await withTenant(tenantId, async (c) => ({
+    stale: await repo.staleValidationHolds(c, tenantId, cutoff),
+    claiming: await repo.staleClaimingRecords(c, tenantId, claimingCutoff),
+    unfinished: await repo.releasingRecords(c, tenantId),
+  }));
+  for (const key of ['stale', 'claiming', 'unfinished']) summary[key] = queues[key].length;
+
+  const begin = async (id, fits, reason) => {
+    await withTenant(tenantId, async (client) => {
+      const row = await repo.lockValidationRow(client, tenantId, id);
+      if (!row || row.exit_at !== null || !fits(row.validation)) return;
+      await repo.setValidationRecord(client, tenantId, id, {
+        ...row.validation, state: 'releasing', releasing_at: now.toISOString(), released_by: 'sweep', reason,
       });
+      await repo.appendEvents(client, tenantId, [{
+        garageId: row.garage_id,
+        laneId: null,
+        eventId: `validation_released:${id}:${row.validation.held_at ?? row.validation.claiming_at}`,
+        kind: RELEASED_EVENT_KIND,
+        occurredAt: now,
+        detail: { actor: 'platform:sweep', session_id: id, held_at: row.validation.held_at ?? null, reason },
+      }]);
+    });
+  };
+  const finish = async (id) => {
+    try {
+      const released = await finishRelease(tenantId, id, { now, options });
+      if (released) summary[released.answer.outcome === 'released' ? 'released' : 'not_released'] += 1;
     } catch (err) {
       summary.failed += 1;
       console.error(`validation hold release failed for ${id}: ${err.message ?? err}`);
     }
+  };
+
+  for (const { id } of queues.stale) {
+    try {
+      await begin(id, (v) => v?.state === 'held' && new Date(v.held_at) <= cutoff,
+        `no close took the claim within ${holdMinutes} minutes of it`);
+    } catch (err) {
+      summary.failed += 1;
+      console.error(`validation hold release failed for ${id}: ${err.message ?? err}`);
+      continue;
+    }
+    await finish(id);
   }
+  for (const { id } of queues.claiming) {
+    try {
+      await begin(id, (v) => v?.state === 'claiming' && new Date(v.claiming_at) <= claimingCutoff,
+        'a claim whose hold was never stored');
+    } catch (err) {
+      summary.failed += 1;
+      console.error(`validation hold release failed for ${id}: ${err.message ?? err}`);
+      continue;
+    }
+    await finish(id);
+  }
+  for (const { id } of queues.unfinished) await finish(id);
   return summary;
 }
 

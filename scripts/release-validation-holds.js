@@ -14,6 +14,10 @@
  * module's own door: the validation is unclaimed again, live if its
  * garage-day has not ended, and the stay's record and an event say so. A
  * driver who comes back to the reader later enters the phone and claims again.
+ * It also gives back a claim whose hold was never stored (`claiming`), and
+ * finishes every release begun and not finished (`releasing`) -- amendment
+ * A2.3: the state committed before a door call is what a rollback after it
+ * leaves, and this is what clears it.
  *
  *   VALIDATION_HOLD_MINUTES=30   the hold window (default 30)
  *   VERBOSE=1                    a line per tenant even when there was nothing
@@ -33,19 +37,21 @@ if (!Number.isFinite(holdMinutes) || holdMinutes <= 0) {
 }
 
 const tenants = await listTenantIds(pool);
-const total = { stale: 0, released: 0, not_released: 0, failed: 0 };
+const total = { stale: 0, claiming: 0, unfinished: 0, released: 0, not_released: 0, failed: 0 };
 for (const tenantId of tenants) {
   const summary = await releaseStaleHolds(tenantId, { holdMinutes });
   for (const key of Object.keys(total)) total[key] += summary[key];
-  if (summary.stale > 0 || process.env.VERBOSE) {
+  if (summary.stale + summary.claiming + summary.unfinished > 0 || process.env.VERBOSE) {
     console.log(
-      `${tenantId.slice(0, 8)}  stale=${summary.stale}  released=${summary.released}  ` +
+      `${tenantId.slice(0, 8)}  stale=${summary.stale}  claiming=${summary.claiming}  unfinished=${summary.unfinished}  ` +
+        `released=${summary.released}  ` +
         `not_released=${summary.not_released}  failed=${summary.failed}`,
     );
   }
 }
 console.log(
-  `${tenants.length} tenant(s); ${total.stale} hold(s) older than ${holdMinutes} min on open stays: ` +
+  `${tenants.length} tenant(s); ${total.stale} hold(s) older than ${holdMinutes} min on open stays, ` +
+    `${total.claiming} claim(s) never held, ${total.unfinished} release(s) unfinished: ` +
     `${total.released} released, ${total.not_released} not released (already given back, or superseded), ` +
     `${total.failed} left for the next run.`,
 );

@@ -646,16 +646,31 @@ again on the same fee it answers the held claim, without the door.
 The discount is **the module's assertion**, checked for shape — whole minor
 units, not more than the fee, the fee and currency echoed back — and it becomes
 **one more line on the ledger**, `code: 'validation'`, after the engine's lines.
-**The close records the held claim**: the line appended, the fee the running
-total including it, no door asked, nothing re-priced.
+**The close records the held claim — when the reader showed it** (amendment
+A2): the close carries `reader_shown`, `{fee_minor, currency}`, what the reader
+actually put up, and the line is appended, the fee the running total including
+it, only when that is the discounted fee. A reader that gave up waiting and
+showed the fee as priced, or a close that says nothing about the reader, gives
+the hold back: the row says what the driver saw. No door asked, nothing
+re-priced.
+
+**No door call is the last word.** The door commits in its own database before
+this platform does, so every call that changes the module is preceded by a
+record committed here — `claiming` before a claim, `releasing` before a release
+— and neither is ever recorded as a discount. A rollback after the door
+answered leaves one of them, and the close or the sweep gives it back:
+releasing a claim that never landed is harmless, the door answers `none`.
 
 **A hold no close takes is given back** through the module's door
 (`release-in-store`), so a driver who entered a phone and then did not pay and
 leave strands nothing: the validation is unclaimed again, live if its day has
 not ended. The close gives back a hold it cannot take (the stay closed covered,
-unpriced, or at another fee). `npm run release-validation-holds`, on a
+unpriced, at another fee, or the reader did not show it) — after it commits, so
+a door that cannot answer leaves `releasing` for the sweep and never refuses a
+close. `npm run release-validation-holds`, on a
 schedule, gives back every hold still on an OPEN stay a hold window after the
-claim (`VALIDATION_HOLD_MINUTES`, default 30); the driver who comes back to the
+claim (`VALIDATION_HOLD_MINUTES`, default 30), gives back a claim whose hold was
+never stored, and finishes every release begun; the driver who comes back to the
 reader enters the phone and claims again. A close that arrives after its hold
 was given back records no discount, with a `validation_released_before_close`
 event for a human.
@@ -666,7 +681,8 @@ the door's `phone_last4` is dropped from every answer before it is stored, and
 a refused `phone` field names the field, not the value. The close takes no
 phone at all.
 
-A door that **could not decide** at the reader answers 5xx and nothing is held;
+A door that **could not decide** at the reader answers 5xx and nothing is held
+(the record says `claiming`, and is given back);
 a read that says `already_claimed` is asked on, because the claim it names may
 be this stay's own from a claim whose hold was not stored — the module answers
 that claim again. A door that **refused** holds nothing, with a

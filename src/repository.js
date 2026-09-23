@@ -521,6 +521,46 @@ export async function staleValidationHolds(client, tenantId, cutoff) {
   return rows;
 }
 
+/** A stay's validation record with its garage and whether it closed; no lock. */
+export async function validationRow(client, tenantId, sessionId) {
+  const { rows } = await client.query(
+    'SELECT id, garage_id, exit_at, validation FROM sessions WHERE tenant_id = $1 AND id = $2',
+    [tenantId, sessionId],
+  );
+  return rows[0] ?? null;
+}
+
+/** The same, LOCKED: the sweep's and `finishRelease`'s read before they write the record. */
+export async function lockValidationRow(client, tenantId, sessionId) {
+  const { rows } = await client.query(
+    'SELECT id, garage_id, exit_at, validation FROM sessions WHERE tenant_id = $1 AND id = $2 FOR UPDATE',
+    [tenantId, sessionId],
+  );
+  return rows[0] ?? null;
+}
+
+/** Open stays whose claim was begun before `cutoff` and never held (A2.3). */
+export async function staleClaimingRecords(client, tenantId, cutoff) {
+  const { rows } = await client.query(
+    `SELECT id FROM sessions
+      WHERE tenant_id = $1 AND exit_at IS NULL AND validation->>'state' = 'claiming'
+        AND (validation->>'claiming_at')::timestamptz <= $2
+      ORDER BY (validation->>'claiming_at')::timestamptz, id`,
+    [tenantId, cutoff],
+  );
+  return rows;
+}
+
+/** Every stay, open or closed, whose release was begun and not finished (A2.3). */
+export async function releasingRecords(client, tenantId) {
+  const { rows } = await client.query(
+    `SELECT id FROM sessions WHERE tenant_id = $1 AND validation->>'state' = 'releasing'
+      ORDER BY (validation->>'releasing_at')::timestamptz, id`,
+    [tenantId],
+  );
+  return rows;
+}
+
 /** Write a stay's validation record. The record, and nothing else on the row. */
 export async function setValidationRecord(client, tenantId, sessionId, record) {
   await client.query(
