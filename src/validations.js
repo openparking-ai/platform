@@ -186,10 +186,11 @@ function lineFor(claim, currency) {
       : claim.discount_type === 'percent' ? `${claim.discount_value}% off`
         : claim.discount_type === 'flat' ? `${formatMinor(Math.round(claim.discount_value * 100), currency)} off`
           : claim.discount_type;
+  const from = claim.validator_name ?? null;
   return {
     code: LINE_CODE,
     rule_id: null,
-    text: `Validation from ${claim.validator_name ?? 'a merchant'} (${rule}): ${formatMinor(-claim.discount_minor, currency)}`,
+    text: `${from === null ? 'Validation' : `Validation from ${from}`} (${rule}): ${formatMinor(-claim.discount_minor, currency)}`,
     delta_minor: -claim.discount_minor,
   };
 }
