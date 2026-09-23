@@ -1,14 +1,15 @@
 -- 0019 — a validation at the exit: a linked module asked through its own door,
 -- and the discount it answers written as one more line on the stay's ledger.
 --
--- A VALIDATION is a discount a merchant (a restaurant, a shop) gives a driver
--- ahead of the exit, carried by the driver's phone number. The module that
--- holds validations is ITS OWN SYSTEM with its own database and its own
+-- This platform does not know what a validation IS. It asks a linked module a
+-- question about an opaque key the driver enters at the reader (the lane's
+-- `phone` field), and the module answers with a discount or with none. The
+-- module is ITS OWN SYSTEM with its own database and its own
 -- tenants, asked the way garage-pass and monthly-billing are asked (0015):
 -- a command line, run as a subprocess with the environment the operator gave
 -- this platform, its DSN never read here. THIS REPOSITORY GETS THE ABILITY TO
 -- ASK, NEVER THE MODULE: an operator without one links nothing, and a
--- phone entered at a garage that links none discounts nothing.
+-- key entered at a garage that links none discounts nothing.
 --
 --   <door> validation-in-store --tenant T --garage G --at EXIT        < phone
 --   <door> claim-in-store --tenant T --garage G --at EXIT
@@ -39,8 +40,8 @@
 --
 -- ONLY A PRICED FEE ABOVE ZERO IS DISCOUNTED. A covered stay, a stay the
 -- engine refused, and a zero fee have nothing to take a discount from, and a
--- claim would consume the driver's validation for nothing: the door is not
--- asked, and the record says why.
+-- claim would use up what the module holds for the key, for nothing: the door
+-- is not asked, and the record says why.
 --
 -- WHEN THE CLAIM IS MADE (amendment A1). Not at the close: the close comes
 -- after the barrier opens, and the driver has to see the discounted amount

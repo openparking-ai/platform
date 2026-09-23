@@ -405,8 +405,8 @@ export async function finishRelease(tenantId, sessionId, { now = new Date(), opt
  * Give a hold back through the door, NAMING THE CLAIMS it means (`claimIds`,
  * from `claimIdsOf`; A3). The module holds at most one claim for this stay, so
  * the ids are asked in turn until one is answered for: `released`, `none` (it
- * holds no claim for this stay: already given back) or `superseded` (the phone
- * has another live validation for the day, which is the driver's). An id
+ * holds no claim for this stay: already given back) or `superseded` (the key
+ * has another live validation for the day, not this stay's). An id
  * answered `already_superseded` is a claim the module no longer holds -- this
  * stay has claimed again since, and that newer claim is not this release's to
  * undo -- and the next id is asked. Returns the last answer, kept; throws

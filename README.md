@@ -624,11 +624,13 @@ attribution constraint never created.
 
 ### A validation at the exit: a linked module, and one more line on the ledger
 
-A **validation** is a discount a merchant gives a driver ahead of the exit,
-carried by the driver's phone number. The module that holds validations is its
-own system, asked through its own door as garage-pass and monthly-billing are,
-and **this repository gets the ability to ask, never the module** (migration
-0019). A garage states which garage of a validations module it is —
+This platform does not know what a validation *is*. It asks a linked module a
+question about an opaque key the driver enters at the reader (the lane's
+`phone` field), and the module answers with a discount or with none. The
+module is its own system, asked through its own door as garage-pass and
+monthly-billing are, and **this repository gets the ability to ask, never the
+module** (migration 0019). A garage states which garage of a validations
+module it is —
 `PUT /api/v1/garages/<id>/validations-link` with `{validations: {tenant_id,
 garage_id}}` or `null` — and the link is probed before it is stored.
 
