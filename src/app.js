@@ -11,6 +11,7 @@ import * as entitlement from './entitlement.js';
 import * as validations from './validations.js';
 import { reconcile } from './reconcile.js';
 import * as stripeAccount from './stripeAccount.js';
+import * as terminal from './terminal.js';
 
 class HttpError extends Error {
   constructor(status, message, code = null) {
@@ -839,6 +840,39 @@ export function createApp() {
       actor: `operator_token:${req.operatorTokenId}`,
     });
     res.json({ stripe_account: stripeAccount.presentAccount(row) });
+  }));
+
+  /**
+   * The garage's Location, on its own account: where its readers are grouped.
+   * Refused while the account cannot take a card.
+   */
+  operator.post('/garages/:garageId/stripe-account/location', connectRoute(async (req, res) => {
+    const { location, created } = await terminal.createLocation(req.tenantId, req.params.garageId, req.body ?? {}, {
+      actor: `operator_token:${req.operatorTokenId}`,
+    });
+    res.status(created ? 201 : 200).json({ location: terminal.presentLocation(location) });
+  }));
+
+  /** Every reader binding the garage's lanes have had, current ones first. */
+  operator.get('/garages/:garageId/readers', connectRoute(async (req, res) => {
+    const rows = await terminal.listReaders(req.tenantId, req.params.garageId);
+    res.json({ readers: rows.map(terminal.presentReader) });
+  }));
+
+  /** Register a reader on the garage's account and bind it to this lane. */
+  operator.post('/lanes/:laneId/reader', connectRoute(async (req, res) => {
+    const row = await terminal.bindReader(req.tenantId, req.params.laneId, req.body ?? {}, {
+      actor: `operator_token:${req.operatorTokenId}`,
+    });
+    res.status(201).json({ reader: terminal.presentReader(row) });
+  }));
+
+  /** End the lane's binding. Recorded; the binding's row stays. */
+  operator.post('/lanes/:laneId/reader/unbind', connectRoute(async (req, res) => {
+    const row = await terminal.unbindReader(req.tenantId, req.params.laneId, {
+      actor: `operator_token:${req.operatorTokenId}`,
+    });
+    res.json({ reader: terminal.presentReader(row) });
   }));
 
   operator.post('/garages/:garageId/lanes', async (req, res, next) => {

@@ -294,3 +294,13 @@ jobs:
         # asked. Each property is broken in turn, plus three schema statements
         # never created, and the suite must go red.
         run: npm run stripe-account-fail-control
+
+      - name: Lane-reader fail-control
+        # A garage's Location and each reader (0021) are registered ON the
+        # garage's own account, refused while Stripe -- asked now, not an old
+        # read -- says it cannot take a card; a lane holds one reader and a
+        # reader one lane, at the route and at the table; ending a binding is
+        # recorded, never deleted, and the history is listed. Each property
+        # is broken in turn, plus three schema statements never created, and
+        # the suite must go red.
+        run: npm run lane-reader-fail-control

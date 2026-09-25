@@ -44,7 +44,7 @@ export class ConnectRefusal extends Error {
   }
 }
 
-function requireConnect() {
+export function requireConnect() {
   const config = connectConfig();
   if (!config.configured) throw new ConnectRefusal(409, 'connect_not_configured', NO_CONNECT_CONFIGURED);
   return config;
