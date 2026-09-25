@@ -21,8 +21,12 @@
 -- recorded on the reservation (`create_refused_at`, and why), and the next
 -- create RE-ARMS it: a new key, a new time, the refusal cleared. The trigger
 -- allows that rewrite of the reservation and no other. A request whose outcome
--- is UNKNOWN (Stripe unreachable, or a 5xx) is not a refusal: its reservation
--- and key stand, because Stripe may have created the account.
+-- is UNKNOWN (Stripe unreachable, or a 5xx) is not a refusal: inside Stripe's
+-- 24-hour idempotency window its reservation and key stand, because Stripe may
+-- have created the account and the same key answers with it. Past the window
+-- the create reads Stripe's account list for one naming this garage: found, it
+-- is attached; none, the lost request made nothing, which is recorded here the
+-- same way (`create_refused_reason` says so) and the reservation re-armed.
 --
 -- PULL, NOT PUSH. There is no webhook here. The state columns are what Stripe
 -- answered the last time the platform asked, each with WHEN it was asked, and

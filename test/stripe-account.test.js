@@ -13,6 +13,7 @@
  * route answers one sentence saying so, and asks Stripe nothing.
  */
 import test, { before, after } from 'node:test';
+import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { pool, withTenant, createTenant } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
@@ -303,22 +304,116 @@ test('a reservation is re-armed only after a recorded refusal, at the table', as
               WHERE garage_id = $1`, [garage]));
 });
 
-test('a reservation older than Stripe keeps its key is refused by name, not asked again', async () => {
-  configure();
-  const garage = await newGarage();
+// --- an unknown outcome older than the key window asks Stripe (the re-gate's F2) --------------
+
+const lists = () => stub.requests.filter((r) => r.method === 'GET' && r.path.startsWith('/v1/accounts?'));
+const AGES = [['24 hours', '24 hours'], ['48 hours', '48 hours'], ['30 days', '30 days']];
+
+/** A reservation whose create's outcome was never learned (Stripe unreachable), aged. */
+async function staleReservation(garage, age) {
+  const key = `openparking-account-lost-${randomUUID()}`;
   await withTenant(tenant, (c) =>
     c.query(
       `INSERT INTO garage_stripe_accounts (tenant_id, garage_id, create_idempotency_key, create_requested_by, create_requested_at)
-       VALUES ($1, $2, 'openparking-account-old-' || gen_random_uuid(), 'test', now() - interval '25 hours')`,
-      [tenant, garage],
+       VALUES ($1, $2, $3, 'test', now() - $4::interval)`,
+      [tenant, garage, key, age],
     ));
+  return key;
+}
+
+for (const [label, age] of AGES) {
+  test(`unknown outcome ${label} old, and Stripe has no account: the retry starts over with a new key`, async () => {
+    configure();
+    const garage = await newGarage();
+    const lostKey = await staleReservation(garage, age);
+    const n = creates().length;
+    const res = await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' });
+    assert.equal(res.status, 201, `a garage whose create was lost ${label} ago is locked out`);
+    const { stripe_account: account } = await res.json();
+    assert.ok(account.account_id);
+    assert.equal(creates().length, n + 1, 'Stripe was not asked exactly once');
+    assert.notEqual(creates().at(-1).headers['idempotency-key'], lostKey, 'the lost key was reused past its window');
+    // And a retry after that answers the same account, asking Stripe nothing more.
+    const again = await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' });
+    assert.equal(again.status, 200);
+    assert.equal((await again.json()).stripe_account.account_id, account.account_id);
+    assert.equal(creates().length, n + 1);
+  });
+
+  test(`unknown outcome ${label} old, and Stripe made the account: it is attached, never made twice`, async () => {
+    configure();
+    const garage = await newGarage();
+    await staleReservation(garage, age);
+    const made = stub.plantAccount({ openparking_tenant_id: tenant, openparking_garage_id: garage });
+    const n = creates().length;
+    const res = await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' });
+    assert.equal(res.status, 200, `a garage whose account Stripe made ${label} ago is locked out`);
+    assert.equal((await res.json()).stripe_account.account_id, made);
+    assert.equal(creates().length, n, 'Stripe was asked to make a second account');
+    assert.equal((await rowOf(garage)).account_id, made);
+    const again = await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' });
+    assert.equal(again.status, 200);
+    assert.equal((await again.json()).stripe_account.account_id, made);
+  });
+}
+
+test('the lookup reads every page and matches this garage only', async () => {
+  configure();
+  const garage = await newGarage();
+  await staleReservation(garage, '48 hours');
+  // Planted FIRST, so it is the oldest -- the last page of a newest-first list.
+  const made = stub.plantAccount({ openparking_tenant_id: tenant, openparking_garage_id: garage });
+  for (let i = 0; i < 150; i += 1) {
+    stub.plantAccount({ openparking_tenant_id: tenant, openparking_garage_id: randomUUID() });
+  }
+  const before = lists().length;
+  const res = await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).stripe_account.account_id, made);
+  assert.ok(lists().length - before >= 2, 'the lookup read one page');
+});
+
+test('two accounts naming one garage are refused by name, and none is attached or made', async () => {
+  configure();
+  const garage = await newGarage();
+  const lostKey = await staleReservation(garage, '30 days');
+  const a = stub.plantAccount({ openparking_tenant_id: tenant, openparking_garage_id: garage });
+  const b = stub.plantAccount({ openparking_tenant_id: tenant, openparking_garage_id: garage });
   const n = creates().length;
   const res = await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' });
   assert.equal(res.status, 409);
   const body = await res.json();
-  assert.equal(body.code, 'stripe_account_create_unresolved');
-  assert.ok(body.error.includes(garage));
-  assert.equal(creates().length, n, 'Stripe was asked again');
+  assert.equal(body.code, 'stripe_account_ambiguous');
+  assert.ok(body.error.includes(a) && body.error.includes(b));
+  assert.equal(creates().length, n);
+  const row = await rowOf(garage);
+  assert.equal(row.account_id, null);
+  assert.equal(row.create_idempotency_key, lostKey);
+});
+
+test('Stripe unreachable during the lookup changes nothing, and a later retry recovers', async () => {
+  configure();
+  const garage = await newGarage();
+  const lostKey = await staleReservation(garage, '30 days');
+  process.env.STRIPE_API_BASE = 'http://127.0.0.1:9';
+  const res = await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' });
+  assert.equal(res.status, 503);
+  assert.equal((await res.json()).code, 'stripe_unreachable');
+  const row = await rowOf(garage);
+  assert.equal(row.create_idempotency_key, lostKey);
+  assert.equal(row.create_refused_at, null);
+  configure();
+  assert.equal((await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' })).status, 201);
+});
+
+test('inside the key window an unknown outcome is re-asked with its own key, and Stripe is not searched', async () => {
+  configure();
+  const garage = await newGarage();
+  const key = await staleReservation(garage, '1 hour');
+  const before = lists().length;
+  assert.equal((await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' })).status, 201);
+  assert.equal(creates().at(-1).headers['idempotency-key'], key);
+  assert.equal(lists().length, before);
 });
 
 test('another tenant cannot see or create this garage\'s account', async () => {
