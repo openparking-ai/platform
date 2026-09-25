@@ -1,47 +1,41 @@
 #!/usr/bin/env node
 /**
- * The control for the activation gate.
+ * The control for a garage's own Stripe account (0020).
  *
- * A garage is not usable until its rate setup is complete and its transient
- * mode is stated, the refusal at the lane is named and recorded, and
- * activation carries no payment-processor condition. Every property is
- * broken below, one at a time, and the suite is REQUIRED to go red. A pass
- * is the failure.
+ * Every property is broken below, one at a time, and the suite is REQUIRED to
+ * go red. A pass is the failure.
  *
  * SOURCE breaks, applied to a COPY of the tree; no tracked file is edited.
  *
- *   gate_off_at_the_lane       the lane routes treat every garage as active.
- *                              An unready garage opens stays again.
- *   refusal_not_recorded       the inactive refusal answers 409 and writes
- *                              nothing. The lane drops it; nobody knows.
- *   no_plan_counts_as_setup    the route's readout calls the rate setup
- *                              complete with no plan stored.
- *   stored_counts_as_in_force  a plan stored for next month satisfies the
- *                              route: set up, but nothing prices today.
- *   unstated_counts_as_stated  an unstated transient mode satisfies the
- *                              route -- the guessed default the three-state
- *                              field exists to forbid.
- *   null_is_a_statement        the request boundary accepts
- *                              `transient_available: null` as a value.
- *   processor_surface          the processor's name appears in
- *                              activation's own source. A garage's Stripe
- *                              account exists elsewhere (0020); activation
- *                              must never be conditioned on it.
- *   rules_say_active           /lane/rules tells every lane its garage is
- *                              active.
+ *   losses_on_the_platform   the account is created with the deployment
+ *                            responsible for its losses.
+ *   fees_on_the_platform     ... with the deployment collecting its fees.
+ *   dashboard_given          ... with a Stripe dashboard: the full signup the
+ *                            garage must never be sent through.
+ *   country_unchecked        a create with no country goes to Stripe.
+ *   no_card_payments         ... without asking for card_payments.
+ *   no_idempotency_key       the create is sent without the reservation's
+ *                            key: a retry can make a second account.
+ *   asks_again               a garage that has an account asks Stripe again.
+ *   stale_key_reused         a reservation older than Stripe keeps its key is
+ *                            asked again instead of refused.
+ *   connect_assumed          the routes act with no Connect configured.
+ *   urls_not_sent            the onboarding link is asked for without the
+ *                            deployment's return URL.
+ *   read_not_stored          a read answers Stripe's facts and keeps none.
+ *   form_arrays_unindexed    the form encoder writes an array without its
+ *                            index.
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
- * statement edited out of 0014, so the property genuinely never existed.
+ * statement edited out of 0020, so the property genuinely never existed.
  *
- *   no_trigger                 the gate trigger never created: a direct
- *                              UPDATE activates anything, a garage can be
- *                              created active, a mode can be un-stated,
- *                              activation can be undone.
- *   trigger_ignores_in_force   the trigger counts stored plans, not plans in
- *                              force.
+ *   account_not_frozen       the guard trigger never created: a recorded
+ *                            account can be swapped for another.
+ *   two_per_garage           the one-per-garage constraint never created.
+ *   fact_without_read_time   a fact can be stored with no read time.
  *
  * Needs the same environment as the suite, plus the engine
- * (RATE_ENGINE_PYTHON). The suite starts and stops the engine itself.
+ * (RATE_ENGINE_PYTHON) for the activation test beside it.
  */
 import { spawnSync } from 'node:child_process';
 import {
@@ -52,98 +46,140 @@ import { join, resolve } from 'node:path';
 import pg from 'pg';
 
 const ROOT = resolve(import.meta.dirname, '..');
-const SCRATCH = process.env.ACTIVATION_SCRATCH_DB || 'openparking_activation_control';
+const SCRATCH = process.env.STRIPE_ACCOUNT_SCRATCH_DB || 'openparking_stripe_account_control';
 
 const SOURCE_BREAKS = [
   {
-    name: 'gate_off_at_the_lane',
-    why: 'the lane routes treat every garage as active',
-    file: 'src/app.js',
-    from: '  if (garage.activated_at !== null) return garage;',
-    to: '  if (true) return garage;',
+    name: 'losses_on_the_platform',
+    why: 'the deployment is made responsible for the account\'s losses',
+    file: 'src/stripeAccount.js',
+    from: "      losses: { payments: 'stripe' },",
+    to: "      losses: { payments: 'application' },",
   },
   {
-    name: 'refusal_not_recorded',
-    why: 'the inactive refusal writes nothing before answering',
-    file: 'src/app.js',
-    from: '  await withTenant(tenantId, (client) =>\n    activation.recordInactiveRefusal(',
-    to: '  if (false) await withTenant(tenantId, (client) =>\n    activation.recordInactiveRefusal(',
+    name: 'fees_on_the_platform',
+    why: 'the deployment collects the account\'s fees',
+    file: 'src/stripeAccount.js',
+    from: "      fees: { payer: 'account' },",
+    to: "      fees: { payer: 'application' },",
   },
   {
-    name: 'no_plan_counts_as_setup',
-    why: 'the readout calls the rate setup complete with no plan',
-    file: 'src/activation.js',
-    from: "      condition: 'rate_setup_complete',\n      met: plans.in_force > 0,",
-    to: "      condition: 'rate_setup_complete',\n      met: true,",
+    name: 'dashboard_given',
+    why: 'the account is given a Stripe dashboard',
+    file: 'src/stripeAccount.js',
+    from: "      stripe_dashboard: { type: 'none' },",
+    to: "      stripe_dashboard: { type: 'full' },",
   },
   {
-    name: 'stored_counts_as_in_force',
-    why: 'a plan not yet in force satisfies the readout',
-    file: 'src/activation.js',
-    from: "      condition: 'rate_setup_complete',\n      met: plans.in_force > 0,",
-    to: "      condition: 'rate_setup_complete',\n      met: plans.stored > 0,",
+    name: 'country_unchecked',
+    why: 'a create with no country is sent to Stripe',
+    file: 'src/stripeAccount.js',
+    from: '  const country = countryField(rawCountry);',
+    to: '  const country = rawCountry;',
   },
   {
-    name: 'unstated_counts_as_stated',
-    why: 'an unstated transient mode satisfies the readout',
-    file: 'src/activation.js',
-    from: "      condition: 'transient_mode_stated',\n      met: garage.transient_available !== null && garage.transient_available !== undefined,",
-    to: "      condition: 'transient_mode_stated',\n      met: true,",
+    name: 'no_card_payments',
+    why: 'card_payments is not asked for',
+    file: 'src/stripeAccount.js',
+    from: '    capabilities: { card_payments: { requested: true }, transfers: { requested: true } },',
+    to: '    capabilities: { transfers: { requested: true } },',
   },
   {
-    name: 'null_is_a_statement',
-    why: 'the request boundary accepts null as a transient mode',
-    file: 'src/activation.js',
-    from: '  if (raw !== true && raw !== false) {',
-    to: '  if (raw === null) return null;\n  if (raw !== true && raw !== false) {',
+    name: 'no_idempotency_key',
+    why: 'the create goes without the reservation\'s key',
+    file: 'src/stripeAccount.js',
+    from: '      idempotencyKey: reserved.row.create_idempotency_key,',
+    to: '',
   },
   {
-    name: 'processor_surface',
-    why: "the processor's name appears in activation's source",
-    file: 'src/activation.js',
-    from: "export const GARAGE_ACTIVATED_EVENT_KIND = 'garage_activated';",
-    to: "export const GARAGE_ACTIVATED_EVENT_KIND = 'garage_activated';\nexport const STRIPE_ACCOUNT_FIELD = 'stripe_account_id';",
+    name: 'asks_again',
+    why: 'a garage with an account asks Stripe again',
+    file: 'src/stripeAccount.js',
+    from: '  if (reserved.row.account_id) return { account: reserved.row, created: false };',
+    to: '',
   },
   {
-    name: 'rules_say_active',
-    why: '/lane/rules tells every lane its garage is active',
-    file: 'src/app.js',
-    from: '        active: payload.garage.activated_at !== null,',
-    to: '        active: true,',
+    name: 'stale_key_reused',
+    why: 'a reservation past the key window is asked again',
+    file: 'src/stripeAccount.js',
+    from: '  if (ageHours > IDEMPOTENCY_WINDOW_HOURS) {',
+    to: '  if (ageHours > IDEMPOTENCY_WINDOW_HOURS && false) {',
+  },
+  {
+    name: 'connect_assumed',
+    why: 'the routes act with no Connect configured',
+    file: 'src/stripeAccount.js',
+    from: '  if (!config.configured) throw new ConnectRefusal(',
+    to: '  if (!config.key) throw new ConnectRefusal(',
+  },
+  {
+    name: 'urls_not_sent',
+    why: 'the onboarding link goes without the return URL',
+    file: 'src/stripeAccount.js',
+    from: '        return_url: config.returnUrl,',
+    to: '',
+  },
+  {
+    name: 'read_not_stored',
+    why: 'a read keeps nothing of what Stripe said',
+    file: 'src/stripeAccount.js',
+    from: '      [tenantId, garageId, facts.card_payments, facts.charges_enabled, facts.details_submitted],',
+    to: "      [tenantId, garageId, 'inactive', false, false],",
+  },
+  {
+    name: 'form_arrays_unindexed',
+    why: 'the form encoder drops an array\'s index',
+    file: 'src/form.js',
+    from: '      value.forEach((item, i) => walk(`${prefix}[${i}]`, item));',
+    to: '      value.forEach((item) => walk(`${prefix}[]`, item));',
   },
 ];
 
 const SCHEMA_BREAKS = [
   {
-    name: 'no_trigger',
-    why: 'the gate trigger never created',
+    name: 'account_not_frozen',
+    why: 'the guard trigger never created',
     edits: [
       {
-        file: '0014_activation_gate.sql',
-        from: `CREATE TRIGGER garages_activation_gate
-  BEFORE INSERT OR UPDATE OF transient_available, activated_at ON garages
-  FOR EACH ROW EXECUTE FUNCTION garages_activation_gate();`,
+        file: '0020_garage_stripe_accounts.sql',
+        from: `CREATE TRIGGER garage_stripe_accounts_guard
+  BEFORE INSERT OR UPDATE ON garage_stripe_accounts
+  FOR EACH ROW EXECUTE FUNCTION garage_stripe_accounts_guard();`,
         to: '',
       },
     ],
   },
   {
-    name: 'trigger_ignores_in_force',
-    why: 'the trigger counts stored plans, not plans in force',
+    name: 'two_per_garage',
+    why: 'the one-per-garage constraint never created',
     edits: [
       {
-        file: '0014_activation_gate.sql',
-        from: '    SELECT count(*), count(*) FILTER (WHERE effective_from <= now())',
-        to: '    SELECT count(*), count(*)',
+        file: '0020_garage_stripe_accounts.sql',
+        from: '  CONSTRAINT garage_stripe_accounts_one_per_garage UNIQUE (garage_id),\n',
+        to: '',
+      },
+    ],
+  },
+  {
+    name: 'fact_without_read_time',
+    why: 'a fact can be stored without its read time',
+    edits: [
+      {
+        file: '0020_garage_stripe_accounts.sql',
+        from: `  CONSTRAINT garage_stripe_accounts_card_payments_read CHECK (
+    (card_payments IS NULL) = (card_payments_read_at IS NULL)
+  ),
+`,
+        to: '',
       },
     ],
   },
 ];
 
-const SUITE = ['--test', 'test/activation.test.js'];
+const SUITE = ['--test', 'test/stripe-account.test.js', 'test/form.test.js', 'test/activation.test.js'];
 
 function stage() {
-  const dir = mkdtempSync(join(tmpdir(), 'openparking-activation-control-'));
+  const dir = mkdtempSync(join(tmpdir(), 'openparking-stripe-account-control-'));
   for (const entry of ['src', 'test', 'scripts', 'migrations', 'package.json']) {
     cpSync(join(ROOT, entry), join(dir, entry), { recursive: true });
   }
@@ -210,7 +246,7 @@ async function buildScratch(dir, brk) {
     await c.query(`CREATE DATABASE ${pg.escapeIdentifier(SCRATCH)}`);
   });
 
-  const partial = mkdtempSync(join(tmpdir(), 'openparking-activation-migrations-'));
+  const partial = mkdtempSync(join(tmpdir(), 'openparking-stripe-account-migrations-'));
   for (const file of readdirSync(join(ROOT, 'migrations')).filter((f) => f.endsWith('.sql'))) {
     copyFileSync(join(ROOT, 'migrations', file), join(partial, file));
   }
@@ -335,4 +371,4 @@ if (failures) {
   console.error(`\n${failures} control(s) failed. Do not trust this round's platform tests.`);
   process.exit(1);
 }
-console.log('\nall controls OK — the suite fails on every property the activation gate rests on.');
+console.log("\nall controls OK — the suite fails on every property a garage's own Stripe account rests on.");

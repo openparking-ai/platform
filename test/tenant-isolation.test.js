@@ -51,7 +51,7 @@ if (only && tables.length === 0) {
 }
 
 for (const spec of tables) {
-  const { table, insert, appendOnly, singleton } = spec;
+  const { table, insert, appendOnly, noDelete, singleton } = spec;
 
   // A singleton table holds one row per tenant by construction (tenant_settings
   // is keyed on tenant_id), so its "second row" is another tenant's, and the
@@ -107,14 +107,27 @@ for (const spec of tables) {
       assert.equal(count, 0, `${table} let tenant A update tenant B's row`);
     });
 
-    test(`${table}: a tenant cannot delete another tenant's row`, async () => {
-      const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
-      const count = await withTenant(A, async (c) => {
-        const res = await c.query(`DELETE FROM ${table} WHERE ${key} = $1`, [idB]);
-        return res.rowCount;
+    if (noDelete) {
+      // Updatable but never deletable: the app role has no DELETE grant, so
+      // there is no policy to measure -- the grant itself is the property.
+      test(`${table}: the application role cannot delete at all`, async () => {
+        const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
+        await assert.rejects(
+          withTenant(B, (c) => c.query(`DELETE FROM ${table} WHERE ${key} = $1`, [idB])),
+          /permission denied/i,
+          `${table} let the application role delete a row`,
+        );
       });
-      assert.equal(count, 0, `${table} let tenant A delete tenant B's row`);
-    });
+    } else {
+      test(`${table}: a tenant cannot delete another tenant's row`, async () => {
+        const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
+        const count = await withTenant(A, async (c) => {
+          const res = await c.query(`DELETE FROM ${table} WHERE ${key} = $1`, [idB]);
+          return res.rowCount;
+        });
+        assert.equal(count, 0, `${table} let tenant A delete tenant B's row`);
+      });
+    }
   }
 
   test(`${table}: a connection with no tenant context reads nothing`, async () => {
