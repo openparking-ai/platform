@@ -223,6 +223,86 @@ test('a create Stripe refused is retried with the SAME key, and is said by name'
   assert.equal(lastTwo[1], reservation.create_idempotency_key);
 });
 
+// --- a refused create never locks a garage out (the gate's F1) ------------------------------
+
+test('a create refused for its country leaves nothing behind', async () => {
+  configure();
+  const garage = await newGarage();
+  const res = await op('POST', `/garages/${garage}/stripe-account`, { country: 'us' });
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).code, 'bad_country');
+  assert.equal(await rowOf(garage), null, 'a reservation was written for a create that was never asked');
+  // CONTROL: the same garage with a country creates.
+  assert.equal((await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' })).status, 201);
+});
+
+test('a create Stripe definitely refused is released: the retry asks with a NEW key and succeeds', async () => {
+  configure();
+  const garage = await newGarage();
+  stub.behaviour.failNext = { status: 400, code: 'parameter_invalid', message: 'Stripe said no' };
+  const refused = await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' });
+  assert.equal(refused.status, 502);
+  assert.equal((await refused.json()).code, 'stripe_refused');
+  const row = await rowOf(garage);
+  assert.equal(row.account_id, null);
+  assert.ok(row.create_refused_at, 'the refusal was not recorded on the reservation');
+  const refusedKey = row.create_idempotency_key;
+
+  const retried = await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' });
+  assert.equal(retried.status, 201);
+  const retryKey = creates().at(-1).headers['idempotency-key'];
+  assert.notEqual(retryKey, refusedKey, 'the retry reused the key of a request Stripe refused');
+  const after = await rowOf(garage);
+  assert.equal(after.create_refused_at, null);
+  assert.equal(after.create_idempotency_key, retryKey);
+});
+
+test('a refusal a day old still does not lock the garage out', async () => {
+  configure();
+  const garage = await newGarage();
+  await withTenant(tenant, (c) =>
+    c.query(
+      `INSERT INTO garage_stripe_accounts (tenant_id, garage_id, create_idempotency_key, create_requested_by,
+                                           create_requested_at, create_refused_at, create_refused_reason)
+       VALUES ($1, $2, 'openparking-account-refused-' || gen_random_uuid(), 'test',
+               now() - interval '25 hours', now() - interval '25 hours', 'stripe 400 parameter_invalid')`,
+      [tenant, garage],
+    ));
+  const res = await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' });
+  assert.equal(res.status, 201, 'a garage whose create was refused a day ago is locked out');
+});
+
+test('an idempotency conflict is not a refusal: the reservation and its key are kept', async () => {
+  configure();
+  const garage = await newGarage();
+  stub.behaviour.failNext = { status: 400, type: 'idempotency_error', message: 'Keys for idempotent requests can only be used with the same parameters' };
+  assert.equal((await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' })).status, 502);
+  const row = await rowOf(garage);
+  assert.equal(row.create_refused_at, null, 'an idempotency conflict was treated as a refusal');
+  assert.equal((await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' })).status, 201);
+  assert.equal(creates().at(-1).headers['idempotency-key'], row.create_idempotency_key);
+});
+
+test('a reservation is re-armed only after a recorded refusal, at the table', async () => {
+  const garage = await newGarage();
+  await withTenant(tenant, (c) =>
+    c.query(`INSERT INTO garage_stripe_accounts (tenant_id, garage_id, create_idempotency_key, create_requested_by)
+             VALUES ($1,$2,'k-arm-' || gen_random_uuid(),'t')`, [tenant, garage]));
+  await assert.rejects(
+    withTenant(tenant, (c) =>
+      c.query(`UPDATE garage_stripe_accounts SET create_idempotency_key = 'k-other-' || gen_random_uuid() WHERE garage_id = $1`, [garage])),
+    /reservation is never rewritten/,
+  );
+  await withTenant(tenant, (c) =>
+    c.query(`UPDATE garage_stripe_accounts SET create_refused_at = now(), create_refused_reason = 'test' WHERE garage_id = $1`, [garage]));
+  // CONTROL: after a recorded refusal, re-arming lands.
+  await withTenant(tenant, (c) =>
+    c.query(`UPDATE garage_stripe_accounts
+                SET create_idempotency_key = 'k-rearmed-' || gen_random_uuid(), create_requested_at = now(),
+                    create_requested_by = 't2', create_refused_at = NULL, create_refused_reason = NULL
+              WHERE garage_id = $1`, [garage]));
+});
+
 test('a reservation older than Stripe keeps its key is refused by name, not asked again', async () => {
   configure();
   const garage = await newGarage();

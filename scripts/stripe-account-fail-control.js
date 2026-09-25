@@ -13,6 +13,17 @@
  *   dashboard_given          ... with a Stripe dashboard: the full signup the
  *                            garage must never be sent through.
  *   country_unchecked        a create with no country goes to Stripe.
+ *   validate_after_reserve   the country is checked only after the
+ *                            reservation is written: a bad country leaves
+ *                            a reservation behind (the gate's F1).
+ *   refusal_not_released     a create Stripe definitely refused is not
+ *                            recorded: the next create re-asks with the
+ *                            dead key, and after a day is locked out.
+ *   unknown_released         a 5xx -- an outcome Stripe may have acted on --
+ *                            is treated as a refusal and re-armed.
+ *   idempotency_conflict_released
+ *                            an idempotency conflict (the key already ran)
+ *                            is treated as a refusal and re-armed.
  *   no_card_payments         ... without asking for card_payments.
  *   no_idempotency_key       the create is sent without the reservation's
  *                            key: a retry can make a second account.
@@ -33,6 +44,8 @@
  *                            account can be swapped for another.
  *   two_per_garage           the one-per-garage constraint never created.
  *   fact_without_read_time   a fact can be stored with no read time.
+ *   rearm_unguarded          the trigger lets any reservation's key be
+ *                            rewritten, refused or not.
  *
  * Needs the same environment as the suite, plus the engine
  * (RATE_ENGINE_PYTHON) for the activation test beside it.
@@ -71,11 +84,40 @@ const SOURCE_BREAKS = [
     to: "      stripe_dashboard: { type: 'full' },",
   },
   {
+    name: 'validate_after_reserve',
+    why: 'the country is checked after the reservation is written',
+    edits: [
+      { file: 'src/stripeAccount.js', from: '    const country = countryField(rawCountry);', to: '    const country = rawCountry;' },
+      { file: 'src/stripeAccount.js', from: '  const { country } = reserved;', to: '  const country = countryField(reserved.country);' },
+    ],
+  },
+  {
+    name: 'refusal_not_released',
+    why: 'a definite Stripe refusal is not recorded',
+    file: 'src/stripeAccount.js',
+    from: '    if (definiteRefusal(err)) {',
+    to: '    if (false) {',
+  },
+  {
+    name: 'unknown_released',
+    why: 'a 5xx is treated as a refusal',
+    file: 'src/stripeAccount.js',
+    from: '    && err.status >= 400 && err.status < 500',
+    to: '    && err.status >= 400',
+  },
+  {
+    name: 'idempotency_conflict_released',
+    why: 'an idempotency conflict is treated as a refusal',
+    file: 'src/stripeAccount.js',
+    from: "    && err.status !== 409\n    && err.type !== 'idempotency_error';",
+    to: '    && err.status !== 409;',
+  },
+  {
     name: 'country_unchecked',
     why: 'a create with no country is sent to Stripe',
     file: 'src/stripeAccount.js',
-    from: '  const country = countryField(rawCountry);',
-    to: '  const country = rawCountry;',
+    from: '    const country = countryField(rawCountry);',
+    to: '    const country = rawCountry;',
   },
   {
     name: 'no_card_payments',
@@ -136,6 +178,17 @@ const SOURCE_BREAKS = [
 ];
 
 const SCHEMA_BREAKS = [
+  {
+    name: 'rearm_unguarded',
+    why: 'the trigger lets any reservation be rewritten',
+    edits: [
+      {
+        file: '0020_garage_stripe_accounts.sql',
+        from: '     AND NOT (OLD.account_id IS NULL AND OLD.create_refused_at IS NOT NULL AND NEW.create_refused_at IS NULL) THEN',
+        to: '     AND false THEN',
+      },
+    ],
+  },
   {
     name: 'account_not_frozen',
     why: 'the guard trigger never created',
@@ -278,11 +331,14 @@ async function buildScratch(dir, brk) {
   return { ok: true };
 }
 
-function plant(dir, edit) {
-  const path = join(dir, edit.file);
-  const source = readFileSync(path, 'utf8');
-  if (!source.includes(edit.from)) return false;
-  writeFileSync(path, source.replace(edit.from, edit.to));
+function plant(dir, brk) {
+  // A break is one edit, or several (`edits`) that together remove one property.
+  for (const edit of brk.edits ?? [brk]) {
+    const path = join(dir, edit.file);
+    const source = readFileSync(path, 'utf8');
+    if (!source.includes(edit.from)) return false;
+    writeFileSync(path, source.replace(edit.from, edit.to));
+  }
   return true;
 }
 
@@ -311,7 +367,7 @@ for (const brk of SOURCE_BREAKS) {
     if (!plant(dir, brk)) {
       // A break whose anchor has moved applies nothing, and the run then
       // reports a passing suite as a failed control for the wrong reason.
-      console.error(`  ${brk.name.padEnd(26)} *** ANCHOR NOT FOUND in ${brk.file} ***`);
+      console.error(`  ${brk.name.padEnd(26)} *** ANCHOR NOT FOUND in ${brk.file ?? brk.edits.map((e) => e.file).join(', ')} ***`);
       failures += 1;
       continue;
     }

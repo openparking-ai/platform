@@ -34,7 +34,7 @@ export async function startStripeStub() {
       if (behaviour.failNext) {
         const f = behaviour.failNext;
         behaviour.failNext = null;
-        return send(f.status, { error: { type: 'invalid_request_error', code: f.code, message: f.message } });
+        return send(f.status, { error: { type: f.type ?? 'invalid_request_error', code: f.code, message: f.message } });
       }
       if (!/^Bearer .+/.test(req.headers.authorization ?? '')) {
         return send(401, { error: { type: 'invalid_request_error', message: 'no key' } });

@@ -717,7 +717,12 @@ garage's details itself.
   letters, e.g. `"US"`; Stripe requires it) creates the account, or answers
   the one the garage has. A retry, a double click or two requests at once make
   **one** account: the create is reserved in the database before Stripe is
-  asked, and Stripe is asked with the reservation's idempotency key.
+  asked, and Stripe is asked with the reservation's idempotency key. **A
+  refused create never locks the garage out:** a bad country is refused before
+  anything is written, and a create Stripe definitely refused (a 4xx, nothing
+  made) is recorded so the next create asks again with a new key. Only an
+  unknown outcome -- Stripe unreachable, or a 5xx -- keeps its key, because
+  Stripe may have made the account.
 - `POST /api/v1/garages/<id>/stripe-account/onboarding-link` answers Stripe's
   onboarding link for the operator to open.
 - `POST /api/v1/garages/<id>/stripe-account/refresh` asks Stripe now and keeps

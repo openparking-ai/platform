@@ -19,6 +19,11 @@
  * ONE ACCOUNT, EVEN ON A RETRY. See 0020: the create is reserved in its own
  * committed transaction before Stripe is asked, and Stripe is asked with the
  * reservation's idempotency key.
+ *
+ * AND A REFUSED CREATE NEVER LOCKS THE GARAGE OUT. The country is checked
+ * before anything is reserved. A create Stripe definitely refused is recorded
+ * on the reservation, and the next create re-arms it with a new key. Only an
+ * UNKNOWN outcome keeps the key -- Stripe may have made the account.
  */
 import { withTenant } from './db.js';
 import { connectConfig, stripeCall, StripeError, StripeUnreachable, NO_CONNECT_CONFIGURED } from './stripe.js';
@@ -115,6 +120,19 @@ export function countryField(raw) {
   return raw;
 }
 
+/**
+ * Stripe answered, and what it answered means nothing was created: a 4xx other
+ * than a conflict. `409` (a lock, a key in use) and `idempotency_error` (this
+ * key was already used for a request that RAN) are not refusals: the first
+ * request may have created the account.
+ */
+export function definiteRefusal(err) {
+  return err instanceof StripeError
+    && err.status >= 400 && err.status < 500
+    && err.status !== 409
+    && err.type !== 'idempotency_error';
+}
+
 export async function createAccount(tenantId, garageId, { actor, country: rawCountry }) {
   const config = requireConnect();
 
@@ -122,7 +140,22 @@ export async function createAccount(tenantId, garageId, { actor, country: rawCou
   const reserved = await withTenant(tenantId, async (client) => {
     const garage = await garageOr404(client, tenantId, garageId);
     const existing = await readRow(client, tenantId, garageId);
-    if (existing) return { garage, row: existing };
+    if (existing?.account_id) return { garage, row: existing };
+    // Checked before anything is written: a create refused here leaves nothing.
+    const country = countryField(rawCountry);
+    if (existing?.create_refused_at) {
+      // Stripe definitely refused the last ask and made nothing: re-arm.
+      const { rows } = await client.query(
+        `UPDATE garage_stripe_accounts
+            SET create_idempotency_key = $3, create_requested_at = now(), create_requested_by = $4,
+                create_refused_at = NULL, create_refused_reason = NULL
+          WHERE tenant_id = $1 AND garage_id = $2 AND account_id IS NULL AND create_refused_at IS NOT NULL
+          RETURNING *`,
+        [tenantId, garageId, `openparking-account-${randomUUID()}`, actor],
+      );
+      return { garage, country, row: rows[0] ?? (await readRow(client, tenantId, garageId)) };
+    }
+    if (existing) return { garage, country, row: existing };
     const { rows } = await client.query(
       `INSERT INTO garage_stripe_accounts (tenant_id, garage_id, create_idempotency_key, create_requested_by)
        VALUES ($1, $2, $3, $4)
@@ -131,11 +164,10 @@ export async function createAccount(tenantId, garageId, { actor, country: rawCou
       [tenantId, garageId, `openparking-account-${randomUUID()}`, actor],
     );
     // Lost the race to a concurrent request: its reservation is the one.
-    return { garage, row: rows[0] ?? (await readRow(client, tenantId, garageId)) };
+    return { garage, country, row: rows[0] ?? (await readRow(client, tenantId, garageId)) };
   });
   if (reserved.row.account_id) return { account: reserved.row, created: false };
-  // Checked before Stripe is asked. Asked only when there is an account to make.
-  const country = countryField(rawCountry);
+  const { country } = reserved;
 
   const ageHours = (Date.now() - new Date(reserved.row.create_requested_at).getTime()) / 3_600_000;
   if (ageHours > IDEMPOTENCY_WINDOW_HOURS) {
@@ -149,15 +181,32 @@ export async function createAccount(tenantId, garageId, { actor, country: rawCou
   }
 
   // 2. Ask Stripe, outside any transaction, with the reservation's key.
-  const account = await stripeCall(
-    {
-      method: 'POST',
-      path: '/v1/accounts',
-      form: accountCreateBody({ tenantId, garage: reserved.garage, country }),
-      idempotencyKey: reserved.row.create_idempotency_key,
-    },
-    config,
-  );
+  let account;
+  try {
+    account = await stripeCall(
+      {
+        method: 'POST',
+        path: '/v1/accounts',
+        form: accountCreateBody({ tenantId, garage: reserved.garage, country }),
+        idempotencyKey: reserved.row.create_idempotency_key,
+      },
+      config,
+    );
+  } catch (err) {
+    if (definiteRefusal(err)) {
+      // Nothing was created: record it, so the next create re-arms instead of
+      // waiting out a key that can never produce an account.
+      await withTenant(tenantId, (client) =>
+        client.query(
+          `UPDATE garage_stripe_accounts
+              SET create_refused_at = now(), create_refused_reason = $4
+            WHERE tenant_id = $1 AND garage_id = $2 AND account_id IS NULL AND create_idempotency_key = $3`,
+          [tenantId, garageId, reserved.row.create_idempotency_key,
+            `stripe ${err.status}${err.code ? ` ${err.code}` : ''}`],
+        ));
+    }
+    throw err;
+  }
   if (typeof account?.id !== 'string') throw new StripeUnreachable('Stripe answered a create with no account id');
 
   // 3. Record it. A concurrent request that got here first recorded the same

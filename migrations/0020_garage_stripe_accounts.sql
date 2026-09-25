@@ -15,6 +15,15 @@
 -- with the same key and get the same account back. Once the account id is
 -- recorded it never changes: the trigger below refuses it.
 --
+-- A REFUSED CREATE NEVER LOCKS THE GARAGE OUT. A request refused before
+-- Stripe is asked (a bad country) writes no reservation at all. A request
+-- Stripe DEFINITELY refused -- it answered, and nothing was created -- is
+-- recorded on the reservation (`create_refused_at`, and why), and the next
+-- create RE-ARMS it: a new key, a new time, the refusal cleared. The trigger
+-- allows that rewrite of the reservation and no other. A request whose outcome
+-- is UNKNOWN (Stripe unreachable, or a 5xx) is not a refusal: its reservation
+-- and key stand, because Stripe may have created the account.
+--
 -- PULL, NOT PUSH. There is no webhook here. The state columns are what Stripe
 -- answered the last time the platform asked, each with WHEN it was asked, and
 -- the operator asks again on demand. A value with no read time is a value
@@ -49,6 +58,10 @@ CREATE TABLE garage_stripe_accounts (
   create_idempotency_key    text        NOT NULL,
   create_requested_at       timestamptz NOT NULL DEFAULT now(),
   create_requested_by       text        NOT NULL,
+  -- Stripe definitely refused the create asked with this key; nothing was
+  -- created. Cleared when the reservation is re-armed.
+  create_refused_at         timestamptz,
+  create_refused_reason     text,
 
   -- Stripe's answer. NULL between the reservation and the answer.
   account_id                text,
@@ -70,6 +83,13 @@ CREATE TABLE garage_stripe_accounts (
   ),
   CONSTRAINT garage_stripe_accounts_recorded_together CHECK (
     (account_id IS NULL) = (account_recorded_at IS NULL)
+  ),
+  CONSTRAINT garage_stripe_accounts_refusal_together CHECK (
+    (create_refused_at IS NULL) = (create_refused_reason IS NULL)
+  ),
+  -- A refusal is of a create that made nothing.
+  CONSTRAINT garage_stripe_accounts_refused_has_no_account CHECK (
+    create_refused_at IS NULL OR account_id IS NULL
   ),
   CONSTRAINT garage_stripe_accounts_card_payments_shape CHECK (
     card_payments IS NULL OR card_payments ~ '^[a-z_]+$'
@@ -107,11 +127,18 @@ BEGIN
     RETURN NEW;
   END IF;
   IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id
-     OR NEW.garage_id IS DISTINCT FROM OLD.garage_id
-     OR NEW.create_idempotency_key IS DISTINCT FROM OLD.create_idempotency_key
-     OR NEW.create_requested_at IS DISTINCT FROM OLD.create_requested_at
-     OR NEW.create_requested_by IS DISTINCT FROM OLD.create_requested_by THEN
+     OR NEW.garage_id IS DISTINCT FROM OLD.garage_id THEN
     RAISE EXCEPTION 'garage_stripe_accounts: the reservation is never rewritten'
+      USING ERRCODE = 'check_violation', CONSTRAINT = 'garage_stripe_accounts_reservation_frozen';
+  END IF;
+  -- The reservation's key, time and author change only to RE-ARM a create
+  -- Stripe definitely refused: no account, a refusal on record, and the
+  -- refusal cleared by the same update.
+  IF (NEW.create_idempotency_key IS DISTINCT FROM OLD.create_idempotency_key
+      OR NEW.create_requested_at IS DISTINCT FROM OLD.create_requested_at
+      OR NEW.create_requested_by IS DISTINCT FROM OLD.create_requested_by)
+     AND NOT (OLD.account_id IS NULL AND OLD.create_refused_at IS NOT NULL AND NEW.create_refused_at IS NULL) THEN
+    RAISE EXCEPTION 'garage_stripe_accounts: the reservation is never rewritten, except to re-arm a refused create'
       USING ERRCODE = 'check_violation', CONSTRAINT = 'garage_stripe_accounts_reservation_frozen';
   END IF;
   IF OLD.account_id IS NOT NULL AND (
