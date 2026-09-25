@@ -61,13 +61,13 @@ import { createHash } from 'node:crypto';
  * establish about them.
  */
 const FORBIDDEN_DIGESTS = new Map([
-  // (none yet)
+  ['4a71880669cd527ecd1b15b99a8eac3e34d07d0d70cc0a9c43bd58d85e27602a', 'the platform account id of a deployment'],
 ]);
 
 //: The number of values the private source held when this block was
 //: generated. A digest deleted by hand -- the one edit nothing else here could
 //: notice, because every digest is opaque -- is caught by this.
-const EXPECTED_DIGEST_COUNT = 0;
+const EXPECTED_DIGEST_COUNT = 1;
 
 /** Processor object ids and keys, by shape. Prefix, then the value. */
 const SHAPES = [
