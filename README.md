@@ -742,6 +742,29 @@ the three missing, each route above answers `409 connect_not_configured`,
 *"This deployment has no Stripe Connect configured."*, asks Stripe nothing,
 and every other route behaves exactly as without it.
 
+### A garage's card reader, bound to a lane
+
+Under direct charges the reader belongs to the garage's own Stripe account,
+not to the deployment. So its **Location** and each **Reader** are registered
+on that account (the `Stripe-Account` header). Stripe reaches the reader over
+the internet; nothing here talks to the device.
+
+- `POST /api/v1/garages/<id>/stripe-account/location` with
+  `{display_name, address: {line1, city, state, postal_code, country}}`
+  registers the garage's one Location, or answers the one it has.
+- `POST /api/v1/lanes/<id>/reader` with `{registration_code, label}` registers
+  the reader showing that code, at the garage's Location, and binds it to the
+  lane. The code is sent to Stripe and kept nowhere here.
+- `POST /api/v1/lanes/<id>/reader/unbind` ends the lane's binding. **The
+  binding is recorded as ended, never deleted**: which reader served which
+  lane, and when, stays on the record.
+- `GET /api/v1/garages/<id>/readers` lists every binding, current ones first.
+
+Each create is **refused while the account cannot take a card**. Stripe is
+asked for `card_payments` at the moment of the request, and the read is kept
+like any other. A lane holds one reader at a time, and a reader serves one
+lane at a time, at the route and at the table.
+
 ## Vehicle identity and retention
 
 The database stores real vehicle identity — plate, make, model, colour — because
