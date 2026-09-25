@@ -231,7 +231,7 @@ jobs:
         # nothing, by name and on the record. Each property is broken in
         # turn -- the gate off at the lane, the refusal unrecorded, each
         # condition satisfied by nothing, null accepted as a statement, a
-        # processor surface planted, the rules lying, the trigger never
+        # processor surface planted in activation, the rules lying, the trigger never
         # created, the trigger counting stored instead of in force -- and the
         # suite must go red.
         run: npm run activation-fail-control
@@ -282,3 +282,17 @@ jobs:
         # property is broken in turn, plus three schema statements never
         # created, and the suite must go red.
         run: npm run validations-fail-control
+
+      - name: Stripe-account fail-control
+        # A garage's own Stripe account (0020): created only on the operator's
+        # request, as the garage's -- no Stripe dashboard, its own Stripe
+        # fees, Stripe responsible for its losses, card_payments asked for,
+        # its country checked before anything is reserved -- never twice (a reservation and its
+        # idempotency key, and a stale key refused rather than reused), and a
+        # refused create never locking the garage out (a definite refusal re-arms
+        # with a new key; an unknown outcome keeps its key),
+        # onboarded with the deployment's URLs, read back with each fact's
+        # read time; and with no Connect configured, one sentence and nothing
+        # asked. Each property is broken in turn, plus three schema statements
+        # never created, and the suite must go red.
+        run: npm run stripe-account-fail-control

@@ -703,6 +703,48 @@ door (`test/fixtures/validations-door`) that speaks the door's contract and
 computes nothing; `npm run validations-fail-control` breaks each property in
 turn.
 
+### A garage's own Stripe account
+
+A garage that takes cards takes them into **its own** Stripe account. The
+garage pays its own Stripe fees, and Stripe -- not the deployment -- is
+responsible for the account's losses. The account has no Stripe dashboard of
+its own, so Stripe's onboarding asks the garage about the garage. A deployment that runs
+Stripe Connect creates that account when the operator asks, never implicitly,
+and hands the operator Stripe's own onboarding link; Stripe collects the
+garage's details itself.
+
+- `POST /api/v1/garages/<id>/stripe-account` with `{country}` (two capital
+  letters, e.g. `"US"`; Stripe requires it) creates the account, or answers
+  the one the garage has. A retry, a double click or two requests at once make
+  **one** account: the create is reserved in the database before Stripe is
+  asked, and Stripe is asked with the reservation's idempotency key. **A
+  refused create never locks the garage out:** a bad country is refused before
+  anything is written, and a create Stripe definitely refused (a 4xx, nothing
+  made) is recorded so the next create asks again with a new key. An unknown
+  outcome -- Stripe unreachable, or a 5xx -- keeps its key for Stripe's 24-hour
+  idempotency window, because Stripe may have made the account; after that the
+  create reads Stripe's account list for the one naming this garage, attaches
+  it if it exists, and starts over with a new key if it does not. Two accounts
+  naming one garage are refused by name.
+- `POST /api/v1/garages/<id>/stripe-account/onboarding-link` answers Stripe's
+  onboarding link for the operator to open.
+- `POST /api/v1/garages/<id>/stripe-account/refresh` asks Stripe now and keeps
+  `card_payments`, `charges_enabled` and `details_submitted`, **each with when
+  it was read**. There is no webhook: the platform pulls.
+- `GET /api/v1/garages/<id>/stripe-account` answers what was last read,
+  without asking Stripe.
+
+The account is created with Stripe's Accounts API and its controller
+properties: `stripe_dashboard.type: none`, `fees.payer: account`,
+`losses.payments: stripe`, `requirement_collection: stripe`, with
+`card_payments` requested (and `transfers`, which Stripe requires beside it). None of this is an activation condition.
+
+**Configuration, all of it the deployment's own** (see `.env.example`):
+`STRIPE_API_KEY`, `CONNECT_RETURN_URL` and `CONNECT_REFRESH_URL`. With any of
+the three missing, each route above answers `409 connect_not_configured`,
+*"This deployment has no Stripe Connect configured."*, asks Stripe nothing,
+and every other route behaves exactly as without it.
+
 ## Vehicle identity and retention
 
 The database stores real vehicle identity — plate, make, model, colour — because

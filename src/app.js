@@ -10,6 +10,7 @@ import * as activation from './activation.js';
 import * as entitlement from './entitlement.js';
 import * as validations from './validations.js';
 import { reconcile } from './reconcile.js';
+import * as stripeAccount from './stripeAccount.js';
 
 class HttpError extends Error {
   constructor(status, message, code = null) {
@@ -796,6 +797,49 @@ export function createApp() {
       next(err);
     }
   });
+
+  // -------------------------------------------------------------------------
+  // The garage's own Stripe account (0020). Four routes, each only on the
+  // operator's request. A deployment with no Connect configured answers each
+  // with one sentence saying so, and every other route is unaffected.
+  // -------------------------------------------------------------------------
+  const connectRoute = (fn) => async (req, res, next) => {
+    try {
+      await fn(req, res);
+    } catch (err) {
+      const refusal = stripeAccount.stripeRefusal(err);
+      next(refusal ? new HttpError(refusal.status, refusal.message, refusal.code) : err);
+    }
+  };
+
+  /** Create the garage's account, or answer the one it has. Never a second. Body: {country}. */
+  operator.post('/garages/:garageId/stripe-account', connectRoute(async (req, res) => {
+    const { account, created } = await stripeAccount.createAccount(req.tenantId, req.params.garageId, {
+      actor: `operator_token:${req.operatorTokenId}`,
+      country: req.body?.country,
+    });
+    res.status(created ? 201 : 200).json({ stripe_account: stripeAccount.presentAccount(account) });
+  }));
+
+  /** What this platform last read, without asking Stripe. */
+  operator.get('/garages/:garageId/stripe-account', connectRoute(async (req, res) => {
+    const row = await stripeAccount.getAccount(req.tenantId, req.params.garageId);
+    res.json({ stripe_account: stripeAccount.presentAccount(row) });
+  }));
+
+  /** Stripe's onboarding link, for the operator to open. */
+  operator.post('/garages/:garageId/stripe-account/onboarding-link', connectRoute(async (req, res) => {
+    const link = await stripeAccount.onboardingLink(req.tenantId, req.params.garageId);
+    res.status(201).json({ onboarding_link: link });
+  }));
+
+  /** Ask Stripe now, and keep the answer with when it was read. */
+  operator.post('/garages/:garageId/stripe-account/refresh', connectRoute(async (req, res) => {
+    const row = await stripeAccount.refreshAccount(req.tenantId, req.params.garageId, {
+      actor: `operator_token:${req.operatorTokenId}`,
+    });
+    res.json({ stripe_account: stripeAccount.presentAccount(row) });
+  }));
 
   operator.post('/garages/:garageId/lanes', async (req, res, next) => {
     try {
@@ -1824,8 +1868,12 @@ export function createApp() {
 
   app.use((err, _req, res, _next) => {
     const status = err.status ?? 500;
-    if (status >= 500) console.error('[api]', err);
-    if (status >= 500) return res.status(status).json({ error: 'internal error' });
+    // A NAMED 5xx is ours and says what failed upstream -- Stripe refused, or
+    // could not be reached -- and the operator needs that sentence. Anything
+    // else at 5xx is an internal error and says nothing.
+    const namedUpstream = err instanceof HttpError && err.code && status >= 500;
+    if (status >= 500 && !namedUpstream) console.error('[api]', err);
+    if (status >= 500 && !namedUpstream) return res.status(status).json({ error: 'internal error' });
     // `code` is published only for an error THIS FILE raised. A driver error
     // carries a `code` of its own -- a Postgres SQLSTATE -- and it has no
     // `status`, so it becomes a 500 above and never reaches here. The instance

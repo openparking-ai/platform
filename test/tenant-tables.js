@@ -137,6 +137,23 @@ export const TENANT_TABLES = [
       ),
   },
   {
+    table: 'garage_stripe_accounts',
+    // One per garage (0020), so each row gets a garage of its own.
+    insert: (c, t) =>
+      c.query(
+        `WITH g AS (
+           INSERT INTO garages (tenant_id, name, timezone, currency)
+           VALUES ($1, 'Row', 'UTC', 'USD') RETURNING id
+         )
+         INSERT INTO garage_stripe_accounts (tenant_id, garage_id, create_idempotency_key, create_requested_by)
+         SELECT $1, g.id, 'row-' || gen_random_uuid(), 'test' FROM g
+         RETURNING id`,
+        [t],
+      ),
+    // Updated as Stripe is re-read; never deleted -- the grant has no DELETE.
+    noDelete: true,
+  },
+  {
     table: 'lane_devices',
     insert: (c, t, w) =>
       c.query(

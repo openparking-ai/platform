@@ -27,6 +27,7 @@
     "lane-decided-close-fail-control": "node scripts/lane-decided-close-fail-control.js",
     "lane-decision-sweep-fail-control": "node scripts/lane-decision-sweep-fail-control.js",
     "validations-fail-control": "node scripts/validations-fail-control.js",
+    "stripe-account-fail-control": "node scripts/stripe-account-fail-control.js",
     "reconcile-lane-decisions": "node scripts/reconcile-lane-decisions.js",
     "release-validation-holds": "node scripts/release-validation-holds.js",
     "demo": "node scripts/demo.js",

@@ -7,13 +7,13 @@
  * gate is measured at both of its layers: the operator route, and the
  * database trigger a direct UPDATE cannot go around.
  *
- * There is no Stripe condition and no Stripe word in this round's sources;
- * the last test sweeps for one, with a control that the sweep can see.
+ * There is no Stripe condition in activation; the last test sweeps
+ * activation's own sources for one, with a control that the sweep can see.
  */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { readdir, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { createApp } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
@@ -338,20 +338,31 @@ test('an active garage with both conditions met operates as before: open, close,
   assert.deepEqual(await eventsOf(GARAGE_INACTIVE_REFUSAL_EVENT_KIND, g.id), [], 'and nothing was refused');
 });
 
-// --- no Stripe, anywhere ---------------------------------------------------------------
+// --- no Stripe condition in activation ------------------------------------------------
 
-test('no Stripe surface exists in the sources or the migrations, and the sweep can see one', async () => {
+// NARROWED, NOT REMOVED. This used to sweep every source and migration for any
+// Stripe word, because the round that wrote it had none anywhere. A garage's
+// own Stripe account now exists (0020, src/stripeAccount.js), so a sweep of the
+// whole tree would fail on code that has nothing to do with activation. What
+// this test protects was never "the repository has no Stripe"; it is
+// "ACTIVATION HAS NO STRIPE CONDITION" -- the owner's correction of 2026-09-20.
+// So it sweeps activation's own sources: the module the route and the lane
+// consult, and the migration whose trigger enforces the gate. The planted
+// control stays, and scripts/activation-fail-control.js still plants a Stripe
+// field into src/activation.js and requires this to go red.
+test('activation has no Stripe condition, and the sweep can see one', async () => {
   const stripe = /stripe|connect_account|application_fee|payment_method/i;
+  const ACTIVATION_SOURCES = ['src/activation.js', 'migrations/0014_activation_gate.sql'];
   const hits = [];
-  for (const dir of ['src', 'migrations']) {
-    for (const f of await readdir(new URL(`../${dir}`, import.meta.url))) {
-      const text = await readFile(new URL(`../${dir}/${f}`, import.meta.url), 'utf8');
-      if (stripe.test(text)) hits.push(`${dir}/${f}`);
-    }
+  for (const path of ACTIVATION_SOURCES) {
+    const text = await readFile(new URL(`../${path}`, import.meta.url), 'utf8');
+    if (stripe.test(text)) hits.push(path);
   }
-  assert.deepEqual(hits, [], 'a Stripe surface appeared');
+  assert.deepEqual(hits, [], 'a Stripe surface appeared in activation');
   // CONTROL: the pattern finds what it is for, and the files were read.
   assert.ok(stripe.test('const stripe = require("stripe")'));
   const gate = await readFile(new URL('../migrations/0014_activation_gate.sql', import.meta.url), 'utf8');
   assert.ok(gate.includes('garages_activation_gate'));
+  const module = await readFile(new URL('../src/activation.js', import.meta.url), 'utf8');
+  assert.ok(module.includes('GARAGE_ACTIVATED_EVENT_KIND'));
 });

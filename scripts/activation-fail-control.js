@@ -3,8 +3,8 @@
  * The control for the activation gate.
  *
  * A garage is not usable until its rate setup is complete and its transient
- * mode is stated, the refusal at the lane is named and recorded, and no
- * payment-processor surface exists in this round at all. Every property is
+ * mode is stated, the refusal at the lane is named and recorded, and
+ * activation carries no payment-processor condition. Every property is
  * broken below, one at a time, and the suite is REQUIRED to go red. A pass
  * is the failure.
  *
@@ -23,9 +23,10 @@
  *                              field exists to forbid.
  *   null_is_a_statement        the request boundary accepts
  *                              `transient_available: null` as a value.
- *   processor_surface          the processor's name appears in a source
- *                              file. The brief: any such surface in this
- *                              round's diff at all breaks the build.
+ *   processor_surface          the processor's name appears in
+ *                              activation's own source. A garage's Stripe
+ *                              account exists elsewhere (0020); activation
+ *                              must never be conditioned on it.
  *   rules_say_active           /lane/rules tells every lane its garage is
  *                              active.
  *
@@ -98,7 +99,7 @@ const SOURCE_BREAKS = [
   },
   {
     name: 'processor_surface',
-    why: "the processor's name appears in a source file",
+    why: "the processor's name appears in activation's source",
     file: 'src/activation.js',
     from: "export const GARAGE_ACTIVATED_EVENT_KIND = 'garage_activated';",
     to: "export const GARAGE_ACTIVATED_EVENT_KIND = 'garage_activated';\nexport const STRIPE_ACCOUNT_FIELD = 'stripe_account_id';",
