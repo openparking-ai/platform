@@ -22,8 +22,11 @@
  *
  * AND A REFUSED CREATE NEVER LOCKS THE GARAGE OUT. The country is checked
  * before anything is reserved. A create Stripe definitely refused is recorded
- * on the reservation, and the next create re-arms it with a new key. Only an
- * UNKNOWN outcome keeps the key -- Stripe may have made the account.
+ * on the reservation, and the next create re-arms it with a new key. An
+ * UNKNOWN outcome keeps its key inside Stripe's 24-hour window -- Stripe may
+ * have made the account, and the same key answers with it. Past the window,
+ * Stripe is ASKED: the account it made is attached, or none was made and the
+ * reservation starts over. No garage is left unable to get an account.
  */
 import { withTenant } from './db.js';
 import { connectConfig, stripeCall, StripeError, StripeUnreachable, NO_CONNECT_CONFIGURED } from './stripe.js';
@@ -33,12 +36,18 @@ import { randomUUID } from 'node:crypto';
 export const STRIPE_ACCOUNT_CREATED_EVENT_KIND = 'stripe_account_created';
 export const STRIPE_ACCOUNT_READ_EVENT_KIND = 'stripe_account_read';
 
-//: Stripe keeps an idempotency key for 24 hours. A reservation older than
-//: this with no account recorded may have created one Stripe answered and
-//: this platform never heard, and asking again with the same key could then
-//: make a second. So it is not asked again; it is refused by name and a human
-//: looks (the account carries the garage's id in its metadata).
+//: Stripe keeps an idempotency key for 24 hours. Inside that window an
+//: unknown outcome is re-asked with the SAME key, and Stripe answers with the
+//: account it made, if it made one. Past it the key no longer protects
+//: anything, so the create ASKS STRIPE instead: every account carries its
+//: tenant and garage in its metadata, and the full account list is read. One
+//: match is attached; none means the lost request made nothing, and the
+//: reservation starts over with a new key; two or more is refused by name.
 export const IDEMPOTENCY_WINDOW_HOURS = 23;
+
+//: A ceiling on the account list, so a lookup that cannot finish says so
+//: rather than looping. 1,000 pages of 100 is 100,000 connected accounts.
+export const ACCOUNT_LIST_MAX_PAGES = 1000;
 
 /** The operator asked for something this deployment cannot do. Named, not a 500. */
 export class ConnectRefusal extends Error {
@@ -133,6 +142,79 @@ export function definiteRefusal(err) {
     && err.type !== 'idempotency_error';
 }
 
+/** Every account at Stripe whose metadata names this tenant's garage. Reads all pages. */
+export async function accountsNamingGarage(tenantId, garageId, config) {
+  const found = [];
+  let after = null;
+  for (let page = 0; page < ACCOUNT_LIST_MAX_PAGES; page += 1) {
+    const list = await stripeCall(
+      { method: 'GET', path: `/v1/accounts?limit=100${after ? `&starting_after=${encodeURIComponent(after)}` : ''}` },
+      config,
+    );
+    if (!Array.isArray(list?.data)) throw new StripeUnreachable('Stripe answered the account list with no data');
+    for (const a of list.data) {
+      if (a?.metadata?.openparking_garage_id === garageId && a?.metadata?.openparking_tenant_id === tenantId) {
+        found.push(a.id);
+      }
+    }
+    if (!list.has_more) return found;
+    after = list.data.at(-1)?.id;
+    if (!after) throw new StripeUnreachable('Stripe said the account list has more, and gave no cursor');
+  }
+  throw new StripeUnreachable(`the account list did not end within ${ACCOUNT_LIST_MAX_PAGES} pages`);
+}
+
+/** Record an account found at Stripe for a reservation that never heard its answer. */
+async function attachFound(tenantId, garageId, accountId, { actor }) {
+  return withTenant(tenantId, async (client) => {
+    const { rows } = await client.query(
+      `UPDATE garage_stripe_accounts
+          SET account_id = $3, account_recorded_at = now()
+        WHERE tenant_id = $1 AND garage_id = $2 AND account_id IS NULL
+        RETURNING *`,
+      [tenantId, garageId, accountId],
+    );
+    if (rows[0]) {
+      await appendEvents(client, tenantId, [{
+        garageId,
+        laneId: null,
+        eventId: `stripe-account-created:${garageId}`,
+        kind: STRIPE_ACCOUNT_CREATED_EVENT_KIND,
+        occurredAt: new Date().toISOString(),
+        detail: { account_id: accountId, actor, found_at_stripe: true },
+      }]);
+    }
+    return rows[0] ?? (await readRow(client, tenantId, garageId));
+  });
+}
+
+/**
+ * Stripe holds no account for this garage: the lost request made nothing.
+ * Recorded as such, and the reservation re-armed with a new key, in one
+ * transaction. A concurrent request that re-armed first wins; its key is used.
+ */
+async function startOver(tenantId, garageId, staleKey, { actor, hours }) {
+  return withTenant(tenantId, async (client) => {
+    await client.query(
+      `UPDATE garage_stripe_accounts
+          SET create_refused_at = now(), create_refused_reason = $4
+        WHERE tenant_id = $1 AND garage_id = $2 AND account_id IS NULL
+          AND create_idempotency_key = $3 AND create_refused_at IS NULL`,
+      [tenantId, garageId, staleKey, `no account at stripe ${hours} h after the lost create`],
+    );
+    const { rows } = await client.query(
+      `UPDATE garage_stripe_accounts
+          SET create_idempotency_key = $4, create_requested_at = now(), create_requested_by = $5,
+              create_refused_at = NULL, create_refused_reason = NULL
+        WHERE tenant_id = $1 AND garage_id = $2 AND account_id IS NULL
+          AND create_idempotency_key = $3 AND create_refused_at IS NOT NULL
+        RETURNING *`,
+      [tenantId, garageId, staleKey, `openparking-account-${randomUUID()}`, actor],
+    );
+    return rows[0] ?? (await readRow(client, tenantId, garageId));
+  });
+}
+
 export async function createAccount(tenantId, garageId, { actor, country: rawCountry }) {
   const config = requireConnect();
 
@@ -171,13 +253,24 @@ export async function createAccount(tenantId, garageId, { actor, country: rawCou
 
   const ageHours = (Date.now() - new Date(reserved.row.create_requested_at).getTime()) / 3_600_000;
   if (ageHours > IDEMPOTENCY_WINDOW_HOURS) {
-    throw new ConnectRefusal(
-      409,
-      'stripe_account_create_unresolved',
-      `an account was requested for this garage at ${new Date(reserved.row.create_requested_at).toISOString()} ` +
-        'and Stripe\'s answer was never recorded; asking again now could create a second account. Look in ' +
-        `Stripe for an account whose metadata names garage ${garageId}.`,
-    );
+    // The key no longer protects anything: ask Stripe what the lost request did.
+    const found = await accountsNamingGarage(tenantId, garageId, config);
+    if (found.length > 1) {
+      throw new ConnectRefusal(
+        409,
+        'stripe_account_ambiguous',
+        `Stripe holds ${found.length} accounts naming this garage (${found.join(', ')}); ` +
+          'one garage has one account, so none is attached and none is made. A person decides which is the garage\'s.',
+      );
+    }
+    if (found.length === 1) {
+      return { account: await attachFound(tenantId, garageId, found[0], { actor }), created: false };
+    }
+    const fresh = await startOver(tenantId, garageId, reserved.row.create_idempotency_key, {
+      actor, hours: Math.floor(ageHours),
+    });
+    if (fresh.account_id) return { account: fresh, created: false };
+    reserved.row = fresh;
   }
 
   // 2. Ask Stripe, outside any transaction, with the reservation's key.

@@ -24,6 +24,17 @@
  *   idempotency_conflict_released
  *                            an idempotency conflict (the key already ran)
  *                            is treated as a refusal and re-armed.
+ *   stale_locks_out          an unknown outcome past the key window is
+ *                            refused by name instead of asking Stripe: the
+ *                            garage is locked out for good (the re-gate's F2).
+ *   lookup_ignores_garage    the lookup matches the tenant only, not the
+ *                            garage its metadata names.
+ *   lookup_first_page_only   the lookup stops at the first page.
+ *   ambiguous_not_refused    two accounts naming one garage are not refused.
+ *   absent_reuses_stale_key  Stripe holds none, and the create re-asks with
+ *                            the key whose window has passed.
+ *   lookup_inside_window     Stripe is searched even inside the key window,
+ *                            where the key itself answers.
  *   no_card_payments         ... without asking for card_payments.
  *   no_idempotency_key       the create is sent without the reservation's
  *                            key: a retry can make a second account.
@@ -113,6 +124,48 @@ const SOURCE_BREAKS = [
     to: '    && err.status !== 409;',
   },
   {
+    name: 'stale_locks_out',
+    why: 'an unknown outcome past the window is refused instead of asking Stripe',
+    file: 'src/stripeAccount.js',
+    from: '    const found = await accountsNamingGarage(tenantId, garageId, config);',
+    to: "    const found = []; throw new ConnectRefusal(409, 'stripe_account_create_unresolved', 'look in Stripe');",
+  },
+  {
+    name: 'lookup_ignores_garage',
+    why: 'the lookup matches the tenant only',
+    file: 'src/stripeAccount.js',
+    from: '      if (a?.metadata?.openparking_garage_id === garageId && a?.metadata?.openparking_tenant_id === tenantId) {',
+    to: '      if (a?.metadata?.openparking_tenant_id === tenantId) {',
+  },
+  {
+    name: 'lookup_first_page_only',
+    why: 'the lookup reads one page',
+    file: 'src/stripeAccount.js',
+    from: '    if (!list.has_more) return found;',
+    to: '    return found;',
+  },
+  {
+    name: 'ambiguous_not_refused',
+    why: 'two accounts naming one garage are not refused',
+    file: 'src/stripeAccount.js',
+    from: '    if (found.length > 1) {',
+    to: '    if (found.length > 1 && false) {',
+  },
+  {
+    name: 'absent_reuses_stale_key',
+    why: 'with no account at Stripe the create re-asks with the stale key',
+    file: 'src/stripeAccount.js',
+    from: '    reserved.row = fresh;',
+    to: '    void fresh;',
+  },
+  {
+    name: 'lookup_inside_window',
+    why: 'Stripe is searched inside the key window',
+    file: 'src/stripeAccount.js',
+    from: '  if (ageHours > IDEMPOTENCY_WINDOW_HOURS) {',
+    to: '  if (ageHours > IDEMPOTENCY_WINDOW_HOURS || true) {',
+  },
+  {
     name: 'country_unchecked',
     why: 'a create with no country is sent to Stripe',
     file: 'src/stripeAccount.js',
@@ -142,7 +195,7 @@ const SOURCE_BREAKS = [
   },
   {
     name: 'stale_key_reused',
-    why: 'a reservation past the key window is asked again',
+    why: 'a reservation past the key window is re-asked with its stale key, Stripe never searched',
     file: 'src/stripeAccount.js',
     from: '  if (ageHours > IDEMPOTENCY_WINDOW_HOURS) {',
     to: '  if (ageHours > IDEMPOTENCY_WINDOW_HOURS && false) {',
