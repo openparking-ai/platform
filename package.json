@@ -29,6 +29,7 @@
     "validations-fail-control": "node scripts/validations-fail-control.js",
     "stripe-account-fail-control": "node scripts/stripe-account-fail-control.js",
     "lane-reader-fail-control": "node scripts/lane-reader-fail-control.js",
+    "standalone-arm-fail-control": "node scripts/standalone-arm-fail-control.js",
     "reconcile-lane-decisions": "node scripts/reconcile-lane-decisions.js",
     "release-validation-holds": "node scripts/release-validation-holds.js",
     "demo": "node scripts/demo.js",
