@@ -127,6 +127,18 @@ jobs:
         # assertion in it meaningless.
         run: npm run ensure-app-role
 
+      - name: The suite runs with no Stripe Connect configured
+        # The standalone arm: a self-hoster with no Connect -- or no Stripe --
+        # gets a platform that behaves exactly as it did before Connect code
+        # existed. Every test below runs in this environment, so this is
+        # asserted rather than assumed; test/standalone-arm.test.js boots the
+        # real entrypoint the same way.
+        run: |
+          for v in STRIPE_API_KEY STRIPE_API_BASE CONNECT_RETURN_URL CONNECT_REFRESH_URL; do
+            if [ -n "$(printenv "$v")" ]; then echo "$v is set; the suite must run without Connect"; exit 1; fi
+          done
+          echo "no Connect setting present"
+
       - name: Tests
         run: npm test
 
@@ -304,3 +316,10 @@ jobs:
         # is broken in turn, plus three schema statements never created, and
         # the suite must go red.
         run: npm run lane-reader-fail-control
+
+      - name: Standalone-arm fail-control
+        # With no Connect configured the real entrypoint starts, ordinary
+        # routes behave as before, and each Connect route answers one
+        # sentence. Each property is broken in turn -- a key demanded at boot,
+        # Connect assumed, the sentence reworded -- and the suite must go red.
+        run: npm run standalone-arm-fail-control
