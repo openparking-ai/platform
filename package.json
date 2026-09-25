@@ -34,7 +34,8 @@
     "shadow-search": "node scripts/shadow-search.js",
     "shadow-report": "node scripts/shadow-report.js",
     "issue-operator-token": "node scripts/issue-operator-token.js",
-    "check-no-real-data": "node .github/scripts/check-no-real-data.js"
+    "check-no-real-data": "node .github/scripts/check-no-real-data.js",
+    "check-no-commercial-values": "node .github/scripts/check-no-commercial-values.js"
   },
   "dependencies": {
     "express": "^4.21.2",
