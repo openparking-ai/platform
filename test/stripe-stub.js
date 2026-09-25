@@ -106,6 +106,18 @@ export async function startStripeStub() {
         terminal.push(object);
         return send(200, object);
       }
+      const read = url.pathname.match(/^\/v1\/accounts\/([^/]+)$/);
+      if (req.method === 'GET' && read) {
+        const a = accounts.get(decodeURIComponent(read[1]));
+        if (!a) return send(404, { error: { code: 'resource_missing', message: 'no such account' } });
+        return send(200, {
+          id: a.id,
+          object: 'account',
+          capabilities: { card_payments: a.v1.card_payments },
+          charges_enabled: a.v1.charges_enabled,
+          details_submitted: a.v1.details_submitted,
+        });
+      }
       // The account list, newest first, paged the way Stripe pages it.
       if (req.method === 'GET' && url.pathname === '/v1/accounts') {
         const limit = Math.min(Number(url.searchParams.get('limit') ?? 10), 100);
@@ -117,18 +129,6 @@ export async function startStripeStub() {
           object: 'list',
           data: page.map((a) => ({ id: a.id, object: 'account', metadata: a.metadata })),
           has_more: start + limit < all.length,
-        });
-      }
-      const read = url.pathname.match(/^\/v1\/accounts\/([^/]+)$/);
-      if (req.method === 'GET' && read) {
-        const a = accounts.get(decodeURIComponent(read[1]));
-        if (!a) return send(404, { error: { code: 'resource_missing', message: 'no such account' } });
-        return send(200, {
-          id: a.id,
-          object: 'account',
-          capabilities: { card_payments: a.v1.card_payments },
-          charges_enabled: a.v1.charges_enabled,
-          details_submitted: a.v1.details_submitted,
         });
       }
       return send(404, { error: { code: 'resource_missing', message: `stub has no ${req.method} ${url.pathname}` } });
