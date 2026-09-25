@@ -14,6 +14,16 @@
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 
+/** `metadata[k]=v` form keys, as the object Stripe returns. */
+function metadataOf(form) {
+  const out = {};
+  for (const [k, v] of Object.entries(form)) {
+    const m = k.match(/^metadata\[(.+)\]$/);
+    if (m) out[m[1]] = v;
+  }
+  return out;
+}
+
 export async function startStripeStub() {
   const requests = [];
   const accounts = new Map(); // id -> account
@@ -53,6 +63,8 @@ export async function startStripeStub() {
         const account = {
           id,
           form,
+          seq,
+          metadata: metadataOf(form),
           garage: form['metadata[openparking_garage_id]'],
           created: { id, object: 'account' },
           // What a read reports, kept here so the test can move it.
@@ -94,6 +106,19 @@ export async function startStripeStub() {
         terminal.push(object);
         return send(200, object);
       }
+      // The account list, newest first, paged the way Stripe pages it.
+      if (req.method === 'GET' && url.pathname === '/v1/accounts') {
+        const limit = Math.min(Number(url.searchParams.get('limit') ?? 10), 100);
+        const after = url.searchParams.get('starting_after');
+        const all = [...accounts.values()].sort((a, b) => b.seq - a.seq);
+        const start = after ? all.findIndex((a) => a.id === after) + 1 : 0;
+        const page = all.slice(start, start + limit);
+        return send(200, {
+          object: 'list',
+          data: page.map((a) => ({ id: a.id, object: 'account', metadata: a.metadata })),
+          has_more: start + limit < all.length,
+        });
+      }
       const read = url.pathname.match(/^\/v1\/accounts\/([^/]+)$/);
       if (req.method === 'GET' && read) {
         const a = accounts.get(decodeURIComponent(read[1]));
@@ -117,6 +142,21 @@ export async function startStripeStub() {
     accounts,
     terminal,
     behaviour,
+    /**
+     * An account Stripe made on a request whose answer never came back: it
+     * exists at Stripe, names its garage in its metadata, and no reservation
+     * recorded it.
+     */
+    plantAccount(metadata) {
+      seq += 1;
+      const id = `acct_stub${randomBytes(6).toString('hex')}${seq}`;
+      accounts.set(id, {
+        id, seq, metadata, garage: metadata.openparking_garage_id, form: {},
+        created: { id, object: 'account' },
+        v1: { card_payments: 'inactive', charges_enabled: false, details_submitted: false },
+      });
+      return id;
+    },
     /** Stripe's side moves: onboarding done, capability granted. */
     setState(id, v1) {
       Object.assign(accounts.get(id).v1, v1);

@@ -720,9 +720,12 @@ garage's details itself.
   asked, and Stripe is asked with the reservation's idempotency key. **A
   refused create never locks the garage out:** a bad country is refused before
   anything is written, and a create Stripe definitely refused (a 4xx, nothing
-  made) is recorded so the next create asks again with a new key. Only an
-  unknown outcome -- Stripe unreachable, or a 5xx -- keeps its key, because
-  Stripe may have made the account.
+  made) is recorded so the next create asks again with a new key. An unknown
+  outcome -- Stripe unreachable, or a 5xx -- keeps its key for Stripe's 24-hour
+  idempotency window, because Stripe may have made the account; after that the
+  create reads Stripe's account list for the one naming this garage, attaches
+  it if it exists, and starts over with a new key if it does not. Two accounts
+  naming one garage are refused by name.
 - `POST /api/v1/garages/<id>/stripe-account/onboarding-link` answers Stripe's
   onboarding link for the operator to open.
 - `POST /api/v1/garages/<id>/stripe-account/refresh` asks Stripe now and keeps
