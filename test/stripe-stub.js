@@ -28,6 +28,8 @@ export async function startStripeStub() {
   const requests = [];
   const accounts = new Map(); // id -> account
   const byIdempotencyKey = new Map(); // key -> account id
+  const terminal = []; // locations and readers, as created
+  const terminalByKey = new Map();
   let seq = 0;
   const behaviour = { failNext: null };
 
@@ -82,6 +84,28 @@ export async function startStripeStub() {
           expires_at: 1767225900,
         });
       }
+      // Terminal, on a connected account: the Stripe-Account header names it.
+      if (req.method === 'POST' && (url.pathname === '/v1/terminal/locations' || url.pathname === '/v1/terminal/readers')) {
+        const on = req.headers['stripe-account'];
+        if (!on || !accounts.has(on)) {
+          return send(400, { error: { type: 'invalid_request_error', code: 'account_invalid', message: 'no such connected account' } });
+        }
+        const key = req.headers['idempotency-key'];
+        if (key && terminalByKey.has(key)) return send(200, terminalByKey.get(key));
+        const form = Object.fromEntries(new URLSearchParams(raw));
+        let object;
+        if (url.pathname === '/v1/terminal/locations') {
+          object = { id: `tml_stub${randomBytes(6).toString('hex')}`, object: 'terminal.location', display_name: form.display_name, form, on };
+        } else {
+          if (!String(form.registration_code).startsWith('simulated')) {
+            return send(400, { error: { type: 'invalid_request_error', code: 'resource_missing', message: 'registration code is not valid' } });
+          }
+          object = { id: `tmr_stub${randomBytes(6).toString('hex')}`, object: 'terminal.reader', label: form.label, location: form.location, form, on };
+        }
+        if (key) terminalByKey.set(key, object);
+        terminal.push(object);
+        return send(200, object);
+      }
       const read = url.pathname.match(/^\/v1\/accounts\/([^/]+)$/);
       if (req.method === 'GET' && read) {
         const a = accounts.get(decodeURIComponent(read[1]));
@@ -116,6 +140,7 @@ export async function startStripeStub() {
     base,
     requests,
     accounts,
+    terminal,
     behaviour,
     /**
      * An account Stripe made on a request whose answer never came back: it

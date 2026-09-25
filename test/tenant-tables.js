@@ -154,6 +154,40 @@ export const TENANT_TABLES = [
     noDelete: true,
   },
   {
+    table: 'garage_terminal_locations',
+    // One per garage (0021), so each row gets a garage of its own.
+    insert: (c, t) =>
+      c.query(
+        `WITH g AS (
+           INSERT INTO garages (tenant_id, name, timezone, currency)
+           VALUES ($1, 'Row', 'UTC', 'USD') RETURNING id
+         )
+         INSERT INTO garage_terminal_locations (tenant_id, garage_id, account_id, location_id, display_name, created_by)
+         SELECT $1, g.id, 'acct_stubRow', 'tml_stub' || replace(gen_random_uuid()::text, '-', ''), 'Row', 'test' FROM g
+         RETURNING id`,
+        [t],
+      ),
+    // Insert-only: the grant has no UPDATE or DELETE.
+    appendOnly: true,
+  },
+  {
+    table: 'lane_readers',
+    // One reader per lane at a time, so each row binds on a lane of its own.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH l AS (
+           INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1, $2, 'Row', 'exit') RETURNING id, garage_id
+         )
+         INSERT INTO lane_readers (tenant_id, garage_id, lane_id, account_id, location_id, reader_id, label, bound_by)
+         SELECT $1, l.garage_id, l.id, 'acct_stubRow', 'tml_stubRow', 'tmr_stub' || replace(gen_random_uuid()::text, '-', ''), 'Row', 'test'
+           FROM l
+         RETURNING id`,
+        [t, w.garage],
+      ),
+    // Ending a binding is the one UPDATE there is; there is no DELETE.
+    noDelete: true,
+  },
+  {
     table: 'lane_devices',
     insert: (c, t, w) =>
       c.query(
