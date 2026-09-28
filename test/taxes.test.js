@@ -3,8 +3,9 @@
  * back whole -- and nothing computed.
  *
  * Every refusal here is paired with the call that succeeds, so "cannot" is
- * measured against "can". The store is measured at both of its layers: the
- * operator route, and the table a direct INSERT cannot go around. The
+ * measured against "can". A set is judged by the REAL engine -- the pinned
+ * `rate-engine`, started here -- and by nothing in this platform: a stand-in
+ * would be this platform's opinion of the engine, tested against itself. The
  * activation condition is test/activation.test.js.
  */
 import test, { before, after } from 'node:test';
@@ -15,6 +16,7 @@ import { createApp } from '../src/app.js';
 import { pool, withTenant, createTenant, stateTaxes } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { TAX_SET_STATED_EVENT_KIND } from '../src/taxes.js';
+import { startRateEngine } from './rate-engine.js';
 
 let server;
 let base;
@@ -23,6 +25,7 @@ let other;
 let operatorToken;
 let operatorTokenId;
 let otherToken;
+let engine;
 
 async function issueOperatorToken(tenantId) {
   const token = generateDeviceToken();
@@ -56,7 +59,21 @@ const CITY = { id: 'city', label: 'City parking tax', percent_bp: 1850, rounding
 const STATE = { id: 'state', label: 'State sales tax', percent_bp: 625, rounding: 'up', sequence: 2 };
 const FEE = { id: 'fee', label: 'Stadium district fee', percent_bp: 1, rounding: 'down', sequence: 0 };
 
+/** The engine's own answer to a garage's whole list: what a load of it says. */
+async function load(taxSets) {
+  const res = await fetch(`${engine.url}/v1/validate-tax-sets`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ tax_sets: taxSets.map((s) => ({ effective_from: s.effective_from, rules: s.rules })) }),
+  });
+  return { status: res.status, body: await res.json() };
+}
+
+const REFUSED = /^the rate engine refused the tax set: request\.tax_sets\[0\]/;
+
 before(async () => {
+  engine = await startRateEngine();
+  process.env.RATE_ENGINE_URL = engine.url;
   tenant = await createTenant('taxes');
   other = await createTenant('taxes-other');
   ({ token: operatorToken, id: operatorTokenId } = await issueOperatorToken(tenant));
@@ -68,7 +85,10 @@ before(async () => {
 });
 
 after(async () => {
-  await new Promise((r) => server.close(r));
+  // Guarded: a `before` that threw leaves these unset, and an unguarded close
+  // would hang the file with the engine child still running.
+  if (server) await new Promise((r) => server.close(r));
+  if (engine) await engine.stop();
   await pool.end();
 });
 
@@ -82,7 +102,7 @@ test('a set stores and reads back exactly: every rule, all five fields, in state
   const { tax_set: stored } = await res.json();
   const [back] = await read(g.id);
   assert.deepEqual(back, stored, 'the read is the stored answer');
-  assert.equal(back.effective_from, '2026-01-01T05:00:00.000Z', 'the same instant, said in UTC');
+  assert.equal(back.effective_from, '2026-01-01T05:00:00.000000Z', 'the same instant, said in UTC, to the microsecond');
   assert.equal(back.rule_count, 3);
   assert.deepEqual(back.rules, [FEE, CITY, STATE], 'exactly the rules given, in the garage\'s stated sequence');
   for (const rule of back.rules) {
@@ -119,74 +139,268 @@ test('a rule with a base is impossible: the table has no column for it, and the 
   const res = await state(g.id, { effective_from: '2026-01-01T00:00:00Z', rules: [{ ...CITY, base: 'subtotal' }] });
   assert.equal(res.status, 400);
   const body = await res.json();
-  assert.match(body.error, /tax_set\.rules\[0\]: unknown base/);
-  assert.match(body.error, /there is no base/);
+  assert.match(body.error, REFUSED);
+  assert.match(body.error, /rules\[0\] carries key\(s\) this version does not understand: base/);
   assert.deepEqual(await read(g.id), [], 'nothing stored');
   // CONTROL: the same rule without it stores.
   assert.equal((await state(g.id, { effective_from: '2026-01-01T00:00:00Z', rules: [CITY] })).status, 201);
 });
 
-test('every field the engine requires is required, and every shape it refuses is refused by name', async () => {
+test('every shape the engine refuses is refused at save, in the engine\'s own sentence, and nothing is stored', async () => {
   const g = await newGarage();
   const at = '2026-02-01T00:00:00Z';
   const cases = [
-    [undefined, /tax_set is required/],
-    [{ rules: [] }, /tax_set: missing effective_from/],
-    [{ effective_from: at }, /tax_set: missing rules/],
-    [{ effective_from: at, rules: [], garage: 'x' }, /tax_set: unknown garage/],
-    [{ effective_from: '2026-02-01T00:00:00', rules: [] }, /UTC offset/],
-    [{ effective_from: 'soon', rules: [] }, /UTC offset/],
-    [{ effective_from: at, rules: {} }, /must be a list/],
-    [{ effective_from: at, rules: [{ ...CITY, id: undefined }] }, /rules\[0\]: missing id/],
-    [{ effective_from: at, rules: [{ label: 'x', percent_bp: 1, rounding: 'up', sequence: 0, id: 'a', fixed_minor: 5 }] }, /unknown fixed_minor/],
+    [undefined, /request\.tax_sets\[0\] must be an object/],
+    [{ rules: [] }, /missing required field\(s\): effective_from/],
+    [{ effective_from: at }, /missing required field\(s\): rules/],
+    [{ effective_from: at, rules: [], garage: 'x' }, /does not understand: garage/],
+    [{ effective_from: '2026-02-01T00:00:00', rules: [] }, /has no UTC offset/],
+    [{ effective_from: 'soon', rules: [] }, /is not ISO 8601: 'soon'/],
+    [{ effective_from: at, rules: {} }, /rules must be a list/],
+    [{ effective_from: at, rules: [{ ...CITY, id: undefined }] }, /rules\[0\] is missing required field\(s\): id/],
+    [{ effective_from: at, rules: [{ label: 'x', percent_bp: 1, rounding: 'up', sequence: 0, id: 'a', fixed_minor: 5 }] }, /does not understand: fixed_minor/],
     [{ effective_from: at, rules: [{ ...CITY, id: ' ' }] }, /rules\[0\]\.id must be a non-empty string/],
     [{ effective_from: at, rules: [{ ...CITY, label: '' }] }, /rules\[0\]\.label must be a non-empty string/],
-    [{ effective_from: at, rules: [{ ...CITY, percent_bp: 0 }] }, /percent_bp must be a whole number from 1/],
-    [{ effective_from: at, rules: [{ ...CITY, percent_bp: 18.5 }] }, /percent_bp must be a whole number/],
-    [{ effective_from: at, rules: [{ ...CITY, percent_bp: '1850' }] }, /percent_bp must be a whole number/],
-    [{ effective_from: at, rules: [{ ...CITY, percent_bp: true }] }, /percent_bp must be a whole number/],
-    [{ effective_from: at, rules: [{ ...CITY, percent_bp: 2 ** 31 }] }, /percent_bp must be a whole number from 1 to 2147483647/],
-    [{ effective_from: at, rules: [{ ...CITY, rounding: 'half_even' }] }, /rounding is "half_even"; expected one of up, down, nearest\. There is no default/],
-    [{ effective_from: at, rules: [{ ...CITY, rounding: null }] }, /rounding is null/],
-    [{ effective_from: at, rules: [{ ...CITY, sequence: -1 }] }, /sequence must be a whole number from 0/],
-    [{ effective_from: at, rules: [CITY, { ...STATE, id: 'city' }] }, /two rules with id "city"/],
-    [{ effective_from: at, rules: [CITY, { ...STATE, sequence: 1 }] }, /"city" and "state" both state sequence 1/],
+    [{ effective_from: at, rules: [{ ...CITY, percent_bp: 0 }] }, /percent_bp must be a positive whole number, got 0/],
+    [{ effective_from: at, rules: [{ ...CITY, percent_bp: 18.5 }] }, /percent_bp is a float/],
+    [{ effective_from: at, rules: [{ ...CITY, percent_bp: '1850' }] }, /percent_bp must be a positive whole number/],
+    [{ effective_from: at, rules: [{ ...CITY, percent_bp: true }] }, /percent_bp is a boolean/],
+    [{ effective_from: at, rules: [{ ...CITY, rounding: 'half_even' }] }, /rounding is 'half_even'; expected one of up, down, nearest\. There is no default/],
+    [{ effective_from: at, rules: [{ ...CITY, rounding: null }] }, /rounding is None/],
+    [{ effective_from: at, rules: [{ ...CITY, sequence: -1 }] }, /sequence must be a whole number, got -1/],
+    [{ effective_from: at, rules: [CITY, { ...STATE, id: 'city' }] }, /two rules with id 'city'/],
+    [{ effective_from: at, rules: [CITY, { ...STATE, sequence: 1 }] }, /'city' and 'state' both state sequence 1/],
   ];
   for (const [body, message] of cases) {
     const res = await op('POST', `/garages/${g.id}/tax-sets`, body === undefined ? {} : { tax_set: body });
     assert.equal(res.status, 400, JSON.stringify(body));
-    assert.match((await res.json()).error, message, JSON.stringify(body));
+    const { error } = await res.json();
+    assert.match(error, REFUSED, JSON.stringify(body));
+    assert.match(error, message, JSON.stringify(body));
   }
   assert.deepEqual(await read(g.id), [], 'nothing was stored by any of them');
   // CONTROL: sequence 0 is a sequence, and a whole set of edges stores.
   assert.equal((await state(g.id, { effective_from: at, rules: [FEE, { ...CITY, percent_bp: 2 ** 31 - 1 }] })).status, 201);
 });
 
-test('the table holds the engine\'s rules against a direct INSERT', async () => {
+// --- the engine judges; the platform does not ------------------------------------------
+
+/** The ten the gate found: an id or a label made only of what JavaScript's trim() keeps and Python's strip() removes. */
+const BLANKS = ['\u001c', '\u001d', '\u001e', '\u001f', '\u0085'];
+
+test('the ten blank-text cases are refused at save, by the engine\'s refusal, and nothing is stored', async () => {
   const g = await newGarage();
-  const insertRule = (overrides) =>
-    withTenant(tenant, async (c) => {
-      const set = await c.query(
-        `INSERT INTO garage_tax_sets (tenant_id, garage_id, effective_from, rule_count) VALUES ($1,$2, now() - random() * interval '1000 days', 1) RETURNING id`,
-        [tenant, g.id],
-      );
-      const r = { rule_id: 'r', label: 'R', percent_bp: 100, rounding: 'up', sequence: 0, ...overrides };
-      await c.query(
-        `INSERT INTO garage_tax_rules (tenant_id, tax_set_id, rule_id, label, percent_bp, rounding, sequence) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [tenant, set.rows[0].id, r.rule_id, r.label, r.percent_bp, r.rounding, r.sequence],
-      );
-    });
-  for (const [overrides, constraint] of [
-    [{ rule_id: ' ' }, 'garage_tax_rules_rule_id_not_blank'],
-    [{ label: '' }, 'garage_tax_rules_label_not_blank'],
-    [{ percent_bp: 0 }, 'garage_tax_rules_percent_bp_positive'],
-    [{ rounding: 'ceil' }, 'garage_tax_rules_rounding_is_stated'],
-    [{ sequence: -1 }, 'garage_tax_rules_sequence_not_negative'],
-  ]) {
-    await assert.rejects(insertRule(overrides), (err) => err.constraint === constraint, constraint);
+  const at = '2026-02-01T00:00:00Z';
+  let refused = 0;
+  for (const blank of BLANKS) {
+    for (const key of ['id', 'label']) {
+      const res = await state(g.id, { effective_from: at, rules: [{ ...CITY, [key]: blank }] });
+      assert.equal(res.status, 400, `${key} = U+${blank.codePointAt(0).toString(16)}`);
+      const { error } = await res.json();
+      assert.match(error, REFUSED);
+      assert.match(error, new RegExp(`rules\\[0\\]\\.${key} must be a non-empty string`));
+      refused += 1;
+    }
   }
-  // CONTROL: the same insert with every field valid lands.
-  await insertRule({});
+  assert.equal(refused, 10);
+  assert.deepEqual(await read(g.id), [], 'none of the ten was stored');
+  // CONTROL: an ordinary id and label store.
+  assert.equal((await state(g.id, { effective_from: at, rules: [CITY] })).status, 201);
+  assert.equal((await read(g.id))[0].rules[0].label, CITY.label);
+});
+
+test('the inputs that used to answer 500 are named refusals now, and a valid value on each field stores', async () => {
+  const g = await newGarage();
+  const at = '2026-02-01T00:00:00Z';
+  // The engine refuses these three instants itself (Feb 30, Feb 29 in a
+  // non-leap year, year 0000).
+  for (const effective_from of ['2026-02-30T00:00:00Z', '2026-02-29T00:00:00Z', '0000-01-01T00:00:00Z']) {
+    const res = await state(g.id, { effective_from, rules: [] });
+    assert.equal(res.status, 400, effective_from);
+    const { error } = await res.json();
+    assert.match(error, REFUSED, effective_from);
+    assert.match(error, /effective_from is not ISO 8601/, effective_from);
+  }
+  // The engine ACCEPTS these -- a NUL in an id or a label, an offset of
+  // +23:59 -- and this platform cannot hold them: a storage refusal, named.
+  for (const [taxSet, field] of [
+    [{ effective_from: at, rules: [{ ...CITY, id: 'ci\u0000ty' }] }, 'tax_set.rules[0].id'],
+    [{ effective_from: at, rules: [{ ...CITY, label: 'City\u0000tax' }] }, 'tax_set.rules[0].label'],
+    [{ effective_from: '2026-02-01T00:00:00+23:59', rules: [] }, 'tax_set.effective_from'],
+  ]) {
+    assert.equal((await load([taxSet])).status, 200, `the engine accepts ${field}`);
+    const res = await state(g.id, taxSet);
+    assert.equal(res.status, 409, field);
+    const body = await res.json();
+    assert.equal(body.code, 'tax_set_not_storable', field);
+    assert.equal(body.details.field, field);
+  }
+  assert.deepEqual(await read(g.id), [], 'nothing was stored by any of them');
+  // CONTROL: a valid value on each of those fields stores.
+  for (const [i, effective_from] of ['2028-02-29T00:00:00Z', '2026-03-01T00:00:00Z', '0001-01-02T00:00:00Z', '2026-02-01T00:00:00+15:59'].entries()) {
+    assert.equal((await state(g.id, { effective_from, rules: [{ ...CITY, id: `city${i}`, label: `City tax ${i}` }] })).status, 201, effective_from);
+  }
+  assert.equal((await read(g.id)).length, 4);
+});
+
+test('a storage refusal is its own kind: the engine said valid, and the platform says it cannot hold it', async () => {
+  const g = await newGarage();
+  const at = '2026-02-01T00:00:00Z';
+  const cases = [
+    [{ ...CITY, label: 'City\u0000tax' }, 'tax_set.rules[0].label', 'text_nul', /U\+0000 \(NUL\), which PostgreSQL text cannot hold/],
+    [{ ...CITY, percent_bp: 2 ** 31 }, 'tax_set.rules[0].percent_bp', 'integer_range', /outside the column's integer range/],
+    [{ ...CITY, sequence: 2 ** 40 }, 'tax_set.rules[0].sequence', 'integer_range', /outside the column's integer range/],
+    [{ ...CITY, label: 'City \ud800 tax' }, 'tax_set.rules[0].label', 'text_encoding', /lone UTF-16 surrogate/],
+  ];
+  for (const [rule, field, limit, message] of cases) {
+    const taxSet = { effective_from: at, rules: [rule] };
+    // The door's word first: VALID.
+    const judged = await load([taxSet]);
+    assert.equal(judged.status, 200, `the engine accepts ${field}: ${JSON.stringify(judged.body)}`);
+    const res = await state(g.id, taxSet);
+    assert.equal(res.status, 409, field);
+    const body = await res.json();
+    assert.equal(body.code, 'tax_set_not_storable', field);
+    assert.deepEqual(body.details, { field, limit });
+    assert.match(body.error, message);
+    assert.match(body.error, /The rate engine accepts this set; this is a limit of where this platform keeps it, not a judgement of the set/);
+    assert.doesNotMatch(body.error, /the rate engine refused/, 'never worded as a validity refusal');
+  }
+  // And a validity refusal is not a storage one: a 400, no storage code.
+  const invalid = await state(g.id, { effective_from: at, rules: [{ ...CITY, percent_bp: 0 }] });
+  assert.equal(invalid.status, 400);
+  assert.equal((await invalid.json()).code, undefined);
+  assert.deepEqual(await read(g.id), [], 'nothing stored');
+  // CONTROL: the same set with an ordinary label and an in-range number stores.
+  const res = await state(g.id, { effective_from: at, rules: [{ ...CITY, percent_bp: 2 ** 31 - 1, sequence: 2 ** 31 - 1 }] });
+  assert.equal(res.status, 201);
+  assert.equal((await read(g.id))[0].rules[0].percent_bp, 2 ** 31 - 1);
+});
+
+test('an instant the engine reads and the store cannot give back is a storage refusal, not a set that never loads', async () => {
+  const g = await newGarage();
+  // Year 1 at +01:00 is 1 BC in UTC; 9999-12-31 at -05:00 is year 10000.
+  // The engine reads both; this platform hands the engine UTC, and cannot.
+  for (const effective_from of ['0001-01-01T00:00:00+01:00', '9999-12-31T23:00:00-05:00']) {
+    assert.equal((await load([{ effective_from, rules: [] }])).status, 200, effective_from);
+    const res = await state(g.id, { effective_from, rules: [] });
+    assert.equal(res.status, 409, effective_from);
+    const body = await res.json();
+    assert.equal(body.code, 'tax_set_not_storable', effective_from);
+  }
+  assert.deepEqual(await read(g.id), []);
+  // CONTROL: the other end of each range, inside it, stores and loads.
+  for (const effective_from of ['0001-01-01T00:00:00-01:00', '9999-12-31T23:00:00+05:00']) {
+    assert.equal((await state(g.id, { effective_from, rules: [] })).status, 201, effective_from);
+  }
+  assert.equal((await load(await read(g.id))).status, 200);
+});
+
+test('no engine to ask: the save answers 5xx, names it, and stores nothing', async () => {
+  const g = await newGarage();
+  const live = process.env.RATE_ENGINE_URL;
+  try {
+    process.env.RATE_ENGINE_URL = 'http://127.0.0.1:1';
+    const res = await state(g.id, { effective_from: '2026-01-01T00:00:00Z', rules: [CITY] });
+    assert.equal(res.status, 503);
+    const body = await res.json();
+    assert.equal(body.code, 'rate_engine_unavailable');
+    assert.match(body.error, /could not be reached.*the tax set was not stored/);
+    delete process.env.RATE_ENGINE_URL;
+    const unset = await state(g.id, { effective_from: '2026-01-01T00:00:00Z', rules: [CITY] });
+    assert.equal(unset.status, 503);
+    assert.equal((await unset.json()).code, 'rate_engine_unavailable');
+  } finally {
+    process.env.RATE_ENGINE_URL = live;
+  }
+  assert.deepEqual(await read(g.id), [], 'nothing stored');
+  // CONTROL: reachable, the same set is stored.
+  assert.equal((await state(g.id, { effective_from: '2026-01-01T00:00:00Z', rules: [CITY] })).status, 201);
+  assert.equal((await read(g.id)).length, 1);
+});
+
+test('every set stored through the route loads, garage by garage, as the whole list; a planted unloadable row is refused by the same load', async () => {
+  const garages = [await newGarage(), await newGarage(), await newGarage()];
+  const statements = [
+    [{ effective_from: '2026-01-01T00:00:00-05:00', rules: [STATE, CITY, FEE] }, { effective_from: '2026-07-01T00:00:00Z', rules: [] }],
+    [{ effective_from: '2000-01-01T00:00:00Z', rules: [] }, { effective_from: '2026-01-01T00:00:00.123456+05:30', rules: [CITY] },
+      { effective_from: '2026-01-01T00:00:00.1234575+05:30', rules: [FEE] }],
+    [{ effective_from: '2026-03-01T00:00:00.000001Z', rules: [FEE] }, { effective_from: '2026-03-01T00:00:00.000002Z', rules: [] }],
+  ];
+  for (const [i, sets] of statements.entries()) {
+    for (const taxSet of sets) {
+      const res = await state(garages[i].id, taxSet);
+      assert.equal(res.status, 201, JSON.stringify(await res.clone().json()));
+    }
+  }
+  // The instant stored is the one the engine READ: it keeps six digits of a
+  // second, so a seventh names the instant already held.
+  const seventh = await state(garages[1].id, { effective_from: '2026-01-01T00:00:00.1234569+05:30', rules: [] });
+  assert.equal(seventh.status, 409);
+  assert.equal((await seventh.json()).code, 'tax_set_effective_from_taken');
+  for (const [i, g] of garages.entries()) {
+    const sets = await read(g.id);
+    assert.equal(sets.length, statements[i].length);
+    const loaded = await load(sets);
+    assert.equal(loaded.status, 200, JSON.stringify(loaded.body));
+    assert.equal(loaded.body.tax_sets.length, sets.length, 'every set of the garage, loaded');
+  }
+  // CONTROL: a row the engine refuses, planted straight into the table --
+  // which judges nothing -- and the same load of the same garage refuses it.
+  const [g] = garages;
+  await withTenant(tenant, (c) => stateTaxes(c, tenant, g.id, {
+    effectiveFrom: '2027-01-01T00:00:00Z',
+    rules: [{ ...CITY, label: '\u001c' }],
+  }));
+  const planted = await load(await read(g.id));
+  assert.equal(planted.status, 400);
+  assert.match(planted.body.error, /label must be a non-empty string/);
+  // And the route's own proof sees it: a valid set for that garage is not
+  // stored on top of a list that would not load.
+  const res = await state(g.id, { effective_from: '2028-01-01T00:00:00Z', rules: [] });
+  assert.equal(res.status, 409);
+  const body = await res.json();
+  assert.equal(body.code, 'tax_set_not_storable');
+  assert.equal(body.details.limit, 'load');
+  assert.equal((await read(g.id)).length, 3, 'the planted row, and nothing added on top of it');
+});
+
+test('the platform holds no rule of its own on whether a tax set is valid', async () => {
+  // What a validity rule here would look like: the engine's key lists, its
+  // roundings, a blank test, a range on percent_bp or sequence, a parse of
+  // the instant, a CHECK or a per-set UNIQUE in the table.
+  const rules = [
+    /['"]up['"]\s*,\s*['"]down['"]/,
+    /\bTAX_ROUNDINGS\b|\bRULE_KEYS\b|\bSET_KEYS\b/,
+    /\.trim\(\)|\bbtrim\(/,
+    /percent_bp\s*(<|>|<=|>=)|sequence\s*(<|>|<=|>=)\s*0/,
+    /Date\.parse|new Date\(\s*(raw|set|body)/,
+    /(?<!WITH )\bCHECK\s*\((?!rule_count)/,
+    /UNIQUE\s*\(\s*tax_set_id/,
+  ];
+  const sources = ['src/taxes.js', 'migrations/0022_garage_tax_sets.sql'];
+  for (const path of sources) {
+    const text = await readFile(new URL(`../${path}`, import.meta.url), 'utf8');
+    // Positive control: the scan is reading the file it should.
+    assert.ok(text.includes('percent_bp') && text.includes('garage_tax_rules'), `${path} was read`);
+    const code = path.endsWith('.sql')
+      ? text.split('\n').filter((l) => !l.trimStart().startsWith('--')).join('\n')
+      : text.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').filter((l) => !l.trimStart().startsWith('//')).join('\n');
+    for (const rule of rules) assert.ok(!rule.test(code), `${path} holds a validity rule: ${rule}`);
+  }
+  // CONTROL: each pattern finds the rule it is for, in the shapes the old
+  // copy had.
+  for (const [rule, planted] of [
+    [rules[0], "const TAX_ROUNDINGS = ['up', 'down', 'nearest'];"],
+    [rules[1], 'exactKeys(r, RULE_KEYS, where);'],
+    [rules[2], "if (value.trim() === '') throw invalid();"],
+    [rules[3], 'if (percent_bp < 1) throw invalid();'],
+    [rules[4], 'Number.isNaN(Date.parse(effectiveFrom))'],
+    [rules[5], "CONSTRAINT x CHECK (btrim(label) <> '')"],
+    [rules[6], 'CONSTRAINT x UNIQUE (tax_set_id, sequence)'],
+  ]) {
+    assert.ok(rule.test(planted), `${rule} misses ${planted}`);
+  }
 });
 
 // --- 3. UNSTATED is not "none" --------------------------------------------------------
@@ -266,7 +480,7 @@ test('two sets at one instant are refused, both named -- the instant compared as
   assert.equal(res.status, 409);
   const body = await res.json();
   assert.equal(body.code, 'tax_set_effective_from_taken');
-  assert.match(body.error, new RegExp(`set ${first.tax_set.id}, stated \\S+, already takes effect at 2026-06-01T15:00:00\\.000Z`));
+  assert.match(body.error, new RegExp(`set ${first.tax_set.id}, stated \\S+, already takes effect at 2026-06-01T15:00:00\\.000000Z`));
   assert.match(body.error, /this set would take effect at 2026-06-01T10:00:00-05:00/);
   assert.equal(body.details.held.id, first.tax_set.id);
   assert.deepEqual(body.details.refused, { effective_from: '2026-06-01T10:00:00-05:00', rule_count: 0 });
@@ -367,6 +581,6 @@ test('no percentage is computed anywhere in this round: the tax store and the ro
   // The import path ('./taxes.js') is not a use.
   const uses = (app.match(/taxes\.\w+/g) ?? []).filter((u) => u !== 'taxes.js');
   assert.deepEqual([...new Set(uses)].sort(), [
-    'taxes.TaxSetRefused', 'taxes.storeTaxSet', 'taxes.taxSetDocument', 'taxes.taxSetsForGarage',
+    'taxes.TaxSetRefused', 'taxes.assertStorable', 'taxes.judgeTaxSet', 'taxes.storeTaxSet', 'taxes.taxSetsForGarage',
   ], 'the store is reached by its two operator routes and nothing else');
 });

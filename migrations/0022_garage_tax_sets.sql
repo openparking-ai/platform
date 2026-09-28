@@ -42,21 +42,26 @@
 -- a new set. Both tables are append-only by grant, like `rate_plans`.
 --
 -- TWO SETS AT ONE INSTANT IS A REFUSAL -- the engine refuses them at load
--- ("both take effect at ..., refused, both named"), and refusing the pair at
--- WRITE time is the same rule caught in front of an operator instead of a
--- driver. The UNIQUE constraint compares INSTANTS: `timestamptz` stores
--- `10:00-05:00` and `15:00Z` as one value. The route names both sets.
+-- ("both take effect at ..., refused, both named"), and the route proves a
+-- garage's whole list loads before it commits. The UNIQUE constraint is the
+-- one place both of two RACING requests are seen: each would load alone. It
+-- compares INSTANTS: `timestamptz` stores `10:00-05:00` and `15:00Z` as one
+-- value. The route names both sets.
 --
 -- THIS PLATFORM COMPUTES NO PERCENTAGE, EVER. `rate-engine`'s `tax.py` is the
--- only tax arithmetic in the estate. These tables store and validate; nothing
--- here or in the route multiplies anything. No stay carries a tax after this
+-- only tax arithmetic in the estate. These tables store; nothing here or in
+-- the route multiplies anything. No stay carries a tax after this
 -- migration: the close is untouched, and hands the engine no tax set.
 --
--- THE CHECKS BELOW ARE THE ENGINE'S LOAD RULES, held at the table so a direct
--- INSERT cannot store a set the engine would refuse: a non-empty label and
--- rule id, a positive whole `percent_bp`, a rounding the engine names
--- (`TAX_ROUNDINGS`: up, down, nearest -- there is no default), a non-negative
--- whole `sequence`, and no two rules in one set sharing an id or a sequence.
+-- THESE TABLES JUDGE NO TAX SET. Whether a set is valid is said by the
+-- engine's `load_tax_sets`, through its `/v1/validate-tax-sets`, before the
+-- route stores it -- and nowhere else. A copy of those rules here (a
+-- non-blank label, a positive `percent_bp`, a named rounding) once disagreed
+-- with the engine's on what "blank" means, and a set this table accepted was
+-- one the engine would never load. So there is no copy. What is left is
+-- storage and statement: the types, the count a set states, the tenant, and
+-- one set per instant -- the last kept because two requests racing each load
+-- alone at the door, and only the table sees both.
 --
 -- THE THIRD ACTIVATION CONDITION. `garages_activation_gate` (0014) is
 -- replaced whole below with one more condition: a tax set in force now. It
@@ -101,16 +106,10 @@ CREATE TABLE garage_tax_rules (
   sequence    integer NOT NULL,
 
   CONSTRAINT garage_tax_rules_set_is_the_tenants
-    FOREIGN KEY (tax_set_id, tenant_id) REFERENCES garage_tax_sets (id, tenant_id) ON DELETE CASCADE,
-  CONSTRAINT garage_tax_rules_rule_id_not_blank CHECK (btrim(rule_id) <> ''),
-  CONSTRAINT garage_tax_rules_label_not_blank CHECK (btrim(label) <> ''),
-  CONSTRAINT garage_tax_rules_percent_bp_positive CHECK (percent_bp >= 1),
-  CONSTRAINT garage_tax_rules_rounding_is_stated CHECK (rounding IN ('up', 'down', 'nearest')),
-  CONSTRAINT garage_tax_rules_sequence_not_negative CHECK (sequence >= 0),
-  CONSTRAINT garage_tax_rules_one_rule_per_id UNIQUE (tax_set_id, rule_id),
-  CONSTRAINT garage_tax_rules_one_rule_per_sequence UNIQUE (tax_set_id, sequence)
+    FOREIGN KEY (tax_set_id, tenant_id) REFERENCES garage_tax_sets (id, tenant_id) ON DELETE CASCADE
 );
 CREATE INDEX garage_tax_rules_tenant_id_idx ON garage_tax_rules (tenant_id);
+CREATE INDEX garage_tax_rules_tax_set_idx ON garage_tax_rules (tax_set_id);
 
 -- The garage is this tenant's. The foreign key alone would accept another
 -- tenant's garage id, because a foreign-key check runs as the table owner and

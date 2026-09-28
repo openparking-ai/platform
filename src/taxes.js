@@ -5,44 +5,54 @@
  * `rate-engine`'s `tax.py` is the only tax arithmetic in the estate, and it
  * has no persistence: it takes a garage's tax SETS -- each an
  * `effective_from` and its rules -- and picks the one in force at an instant.
- * This module is where those sets live. It does three things and computes
+ * This module is where those sets live. It judges none of them and computes
  * nothing:
  *
- *   validate  the set's shape, to the engine's own load rules: exactly
- *             `effective_from` and `rules` on a set, exactly `id`, `label`,
- *             `percent_bp`, `rounding` and `sequence` on a rule. A missing
- *             field and an unknown one -- `base` included, because there is
- *             one base and it is not stated -- are refused and named. The
- *             pinned engine has no door that validates a tax set, so this is
- *             said here and held again by the table's CHECKs; it is the
- *             engine's rule, restated, not a second opinion of it.
- *   store     the set and its rules, in one transaction, with the number of
- *             rules it states. Zero rules is the statement "this garage
- *             charges no tax". A set taking effect at an instant another set
- *             already holds is refused, both named.
+ *   judge     is the ENGINE's, and only the engine's. The set, exactly as the
+ *             request carried it, goes to `POST /v1/validate-tax-sets` --
+ *             which hands it to `load_tax_sets`, the loader the close will use
+ *             -- BEFORE anything here reads a field of it. Whatever that door
+ *             refuses is refused, in its words; whatever it loads is valid.
+ *             This platform once kept its own copy of those rules, and the two
+ *             disagreed on ten inputs: a set one accepted and the other
+ *             refused was stored where it could never be loaded again. So
+ *             there is no copy, here or in the table.
+ *   store     what the door accepted, and only that: the instant as the
+ *             engine READ it (its echo, not the request's spelling), the rules
+ *             as given. What a valid set can still fail is STORAGE -- a NUL
+ *             byte PostgreSQL text cannot hold, a number past its `integer`,
+ *             an instant `timestamptz` cannot hold or cannot give back. Each is
+ *             refused as `tax_set_not_storable`, named as a limit of where the
+ *             set is kept and never as a judgement of the set.
+ *   prove     before the transaction commits, the garage's WHOLE list is read
+ *             back in the form a load gets it and handed to the same door. A
+ *             stored set that would not load is not stored. That is the
+ *             failure this module exists to make impossible: sets are
+ *             append-only and the engine loads a garage's list whole, so one
+ *             unloadable set would make every later one unloadable too.
  *   read      every set of the garage, each with its rules in the garage's
- *             stated order. No selection here: the engine chooses the set in
- *             force, as it chooses the plan.
+ *             stated order, the instant to the microsecond it is stored at.
+ *             No selection here: the engine chooses the set in force.
  *
  * NO PERCENTAGE IS COMPUTED HERE, and nothing here hands a set to the close:
  * no stay carries a tax after this round.
  */
 import * as repo from './repository.js';
+import { EngineUnavailable, rateEngineUrl } from './ratePlans.js';
 
 export const TAX_SET_STATED_EVENT_KIND = 'tax_set_stated';
 
-/** The engine's `TAX_ROUNDINGS`. No default: who keeps the fraction is the garage's to state. */
-export const TAX_ROUNDINGS = Object.freeze(['up', 'down', 'nearest']);
-
-/** The engine's `TAX_SET_KEYS` and `TAX_RULE_KEYS`: all required, nothing else. */
-const SET_KEYS = Object.freeze(['effective_from', 'rules']);
-const RULE_KEYS = Object.freeze(['id', 'label', 'percent_bp', 'rounding', 'sequence']);
-
-/** The columns are `integer`; a larger number is refused by name, not by a 500. */
+/** PostgreSQL's `integer`, the type of `percent_bp` and `sequence`. A storage bound, not a rule of tax. */
+const INTEGER_MIN = -2_147_483_648;
 const INTEGER_MAX = 2_147_483_647;
 
-/** An ISO 8601 instant WITH an offset. A naive timestamp would be read in the server's zone. */
-const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+/**
+ * A stored instant as a load gets it: UTC, to the microsecond `timestamptz`
+ * holds. A JavaScript Date keeps milliseconds, so reading the column as one
+ * would hand the engine an instant the table does not hold -- and two sets a
+ * microsecond apart as one instant, which the engine refuses.
+ */
+const instantText = (column) => `to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
 
 /** Why the store would not store. `code` is published beside the message. */
 export class TaxSetRefused extends Error {
@@ -53,115 +63,130 @@ export class TaxSetRefused extends Error {
   }
 }
 
-const invalid = (message) => new TaxSetRefused('tax_set_invalid', message);
-
-function exactKeys(raw, keys, where) {
-  const missing = keys.filter((k) => !Object.hasOwn(raw, k));
-  const unknown = Object.keys(raw).filter((k) => !keys.includes(k));
-  if (missing.length || unknown.length) {
-    const said = [];
-    if (missing.length) said.push(`missing ${missing.join(', ')}`);
-    if (unknown.length) said.push(`unknown ${unknown.join(', ')}`);
-    throw invalid(
-      `${where}: ${said.join('; ')}. A ${where.includes('rules[') ? 'rule' : 'set'} carries exactly ` +
-        `${keys.join(', ')}` +
-        (unknown.includes('base')
-          ? ' -- there is no base: tax is a percentage of the money actually paid, and nothing states otherwise'
-          : ''),
-    );
-  }
-}
-
-function whole(value, label, { min }) {
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > INTEGER_MAX) {
-    throw invalid(`${label} must be a whole number from ${min} to ${INTEGER_MAX}, got ${JSON.stringify(value)}`);
-  }
-  return value;
-}
-
-function text(value, label, why = '') {
-  if (typeof value !== 'string' || value.trim() === '') {
-    throw invalid(`${label} must be a non-empty string${why}`);
-  }
-  return value;
-}
+const notStorable = (message, details) =>
+  new TaxSetRefused(
+    'tax_set_not_storable',
+    `${message}. The rate engine accepts this set; this is a limit of where this platform keeps it, not a judgement of the set, and nothing was stored`,
+    details,
+  );
 
 /**
- * The set from a request body, or a refusal naming the field. Returns
- * `{ effectiveFrom, rules }` with the rules as given; the order they arrive
- * in decides nothing -- `sequence` does.
- */
-export function taxSetDocument(raw) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    throw invalid('tax_set is required and must be a JSON object: { effective_from, rules }');
-  }
-  exactKeys(raw, SET_KEYS, 'tax_set');
-  const effectiveFrom = raw.effective_from;
-  if (typeof effectiveFrom !== 'string' || !INSTANT.test(effectiveFrom) || Number.isNaN(Date.parse(effectiveFrom))) {
-    throw invalid(
-      `tax_set.effective_from must be an ISO 8601 instant with a UTC offset, got ${JSON.stringify(effectiveFrom)}; ` +
-        'a naive timestamp would be read in whatever zone the server runs in',
-    );
-  }
-  if (!Array.isArray(raw.rules)) {
-    throw invalid(
-      'tax_set.rules must be a list. An EMPTY list is how a garage states that it charges no tax from effective_from',
-    );
-  }
-  const rules = raw.rules.map((r, i) => {
-    const where = `tax_set.rules[${i}]`;
-    if (!r || typeof r !== 'object' || Array.isArray(r)) throw invalid(`${where} must be an object`);
-    exactKeys(r, RULE_KEYS, where);
-    const rounding = r.rounding;
-    if (!TAX_ROUNDINGS.includes(rounding)) {
-      throw invalid(
-        `${where}.rounding is ${JSON.stringify(rounding)}; expected one of ${TAX_ROUNDINGS.join(', ')}. ` +
-          'There is no default: who keeps a fraction of a minor unit is the garage\'s to state',
-      );
-    }
-    return {
-      id: text(r.id, `${where}.id`),
-      label: text(r.label, `${where}.label`, '; it is what a driver and an operator both read on the line'),
-      percent_bp: whole(r.percent_bp, `${where}.percent_bp`, { min: 1 }),
-      rounding,
-      sequence: whole(r.sequence, `${where}.sequence`, { min: 0 }),
-    };
-  });
-  const byId = new Map();
-  const bySequence = new Map();
-  for (const rule of rules) {
-    if (byId.has(rule.id)) throw invalid(`tax_set.rules contains two rules with id ${JSON.stringify(rule.id)}`);
-    byId.set(rule.id, rule);
-    const other = bySequence.get(rule.sequence);
-    if (other) {
-      throw invalid(
-        `tax_set.rules: ${JSON.stringify(other.id)} and ${JSON.stringify(rule.id)} both state sequence ${rule.sequence}; ` +
-          'the order of a set\'s taxes is the garage\'s to state, and two rules in one place is an order nobody stated',
-      );
-    }
-    bySequence.set(rule.sequence, rule);
-  }
-  return { effectiveFrom, rules };
-}
-
-/**
- * Store one set for one garage, inside the caller's tenant transaction, and
- * record that it happened. Stating a set supersedes nothing: a later
- * `effective_from` is how a rate changes or a tax ends.
+ * Hand `taxSets` to the engine's `POST /v1/validate-tax-sets`, as they are.
  *
- * Two sets at one instant is refused with BOTH named: the one already held
- * (by id, and when it was stated) and this one (as written). The instant is
- * compared as an instant, by the table's UNIQUE constraint -- `10:00-05:00`
- * and `15:00Z` are one moment.
+ * `{ loaded: [{ effective_from, rule_count }, ...] }` -- the engine's reading of
+ * each set, in order -- or `{ refused: <the engine's sentence> }`. No engine,
+ * or an answer that is neither, is `EngineUnavailable`: handled as
+ * `quoteWithEngine` handles it, and never counted as a yes.
  */
-export async function storeTaxSet(client, tenantId, { garage, set, actor, now = null }) {
+async function askEngine(taxSets, { url = rateEngineUrl(), timeoutMs = 10 * 1000 } = {}) {
+  if (!url) {
+    throw new EngineUnavailable('RATE_ENGINE_URL is not set; a tax set is judged by the engine before it is stored, and by nothing else');
+  }
+  let res;
+  let text;
+  try {
+    res = await fetch(`${url}/v1/validate-tax-sets`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tax_sets: taxSets }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    text = await res.text();
+  } catch (err) {
+    throw new EngineUnavailable(`the rate engine at ${url} could not be reached (${err?.cause?.code ?? err?.name ?? err})`);
+  }
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = null;
+  }
+  if (!body || typeof body !== 'object') {
+    throw new EngineUnavailable(`the rate engine at ${url} answered HTTP ${res.status} without a JSON body`);
+  }
+  if (res.status === 400 && body.invalid === true && typeof body.error === 'string') {
+    return { refused: body.error };
+  }
+  if (
+    res.status === 200 &&
+    Array.isArray(body.tax_sets) &&
+    body.tax_sets.length === taxSets.length &&
+    body.tax_sets.every((s) => typeof s?.effective_from === 'string' && Number.isInteger(s?.rule_count))
+  ) {
+    return { loaded: body.tax_sets };
+  }
+  throw new EngineUnavailable(
+    `the rate engine at ${url} answered HTTP ${res.status} with a body this platform does not recognise as a tax-set validation: ${text.slice(0, 300)}`,
+  );
+}
+
+/**
+ * The set from a request body, judged by the engine and by nothing here --
+ * called before anything reads a field of it. Returns `{ given, effectiveFrom,
+ * rules }`: the set as written, the instant as the engine read it, and the
+ * rules the engine accepted. Refused sets are `tax_set_invalid`, carrying the
+ * engine's sentence.
+ */
+export async function judgeTaxSet(raw, engine = {}) {
+  const answer = await askEngine([raw ?? null], engine);
+  if (answer.refused !== undefined) {
+    throw new TaxSetRefused('tax_set_invalid', `the rate engine refused the tax set: ${answer.refused}`);
+  }
+  return { given: raw, effectiveFrom: answer.loaded[0].effective_from, rules: raw.rules };
+}
+
+/**
+ * The storage limits a set the engine accepted can still exceed, each named
+ * as one. Two of them are PostgreSQL's: text holds no U+0000, and `integer`
+ * ends at 2^31. The third is UTF-8's: a lone UTF-16 surrogate has no encoding,
+ * and the driver would silently write U+FFFD -- a text the engine never
+ * judged. Nothing here asks whether a value is a GOOD one.
+ */
+export function assertStorable(set) {
+  set.rules.forEach((rule, i) => {
+    for (const key of ['id', 'label']) {
+      const where = `tax_set.rules[${i}].${key}`;
+      if (rule[key].includes('\u0000')) {
+        throw notStorable(`${where} contains U+0000 (NUL), which PostgreSQL text cannot hold`, { field: where, limit: 'text_nul' });
+      }
+      if (!rule[key].isWellFormed()) {
+        throw notStorable(
+          `${where} contains a lone UTF-16 surrogate, which has no UTF-8 form; it would be stored as U+FFFD, a text nothing judged`,
+          { field: where, limit: 'text_encoding' },
+        );
+      }
+    }
+    for (const key of ['percent_bp', 'sequence']) {
+      const where = `tax_set.rules[${i}].${key}`;
+      if (rule[key] < INTEGER_MIN || rule[key] > INTEGER_MAX) {
+        throw notStorable(
+          `${where} is ${rule[key]}, outside the column's integer range ${INTEGER_MIN} to ${INTEGER_MAX}`,
+          { field: where, limit: 'integer_range' },
+        );
+      }
+    }
+  });
+}
+
+/**
+ * Store one judged set for one garage, inside the caller's tenant
+ * transaction, prove the garage's whole list still loads, and record it.
+ * Stating a set supersedes nothing: a later `effective_from` is how a rate
+ * changes or a tax ends.
+ *
+ * Two sets at one instant is refused with BOTH named, by the table's UNIQUE
+ * constraint -- which is here for the one case the door cannot see: two
+ * requests racing, each loading alone. The instant is compared as an instant:
+ * `10:00-05:00` and `15:00Z` are one moment.
+ */
+export async function storeTaxSet(client, tenantId, { garage, set, actor, now = null, engine = {} }) {
   await client.query('SAVEPOINT tax_set_insert');
   let row;
   try {
     const { rows } = await client.query(
       `INSERT INTO garage_tax_sets (tenant_id, garage_id, effective_from, rule_count)
        VALUES ($1, $2, $3::timestamptz, $4)
-       RETURNING *`,
+       RETURNING id`,
       [tenantId, garage.id, set.effectiveFrom, set.rules.length],
     );
     row = rows[0];
@@ -170,7 +195,7 @@ export async function storeTaxSet(client, tenantId, { garage, set, actor, now = 
       await client.query('ROLLBACK TO SAVEPOINT tax_set_insert');
       const held = (
         await client.query(
-          `SELECT id, effective_from, created_at FROM garage_tax_sets
+          `SELECT id, ${instantText('effective_from')} AS effective_from, created_at FROM garage_tax_sets
             WHERE tenant_id = $1 AND garage_id = $2 AND effective_from = $3::timestamptz`,
           [tenantId, garage.id, set.effectiveFrom],
         )
@@ -179,12 +204,20 @@ export async function storeTaxSet(client, tenantId, { garage, set, actor, now = 
         'tax_set_effective_from_taken',
         `two tax sets would be in force from one instant: set ${held?.id ?? '(stated concurrently)'}, stated ` +
           `${held?.created_at?.toISOString?.() ?? 'just now'}, already takes effect at ` +
-          `${held?.effective_from?.toISOString?.() ?? set.effectiveFrom}, and this set would take effect at ` +
-          `${set.effectiveFrom}. Which one is in force would be decided by nothing; refused, both named`,
+          `${held?.effective_from ?? set.effectiveFrom}, and this set would take effect at ` +
+          `${set.given.effective_from}. Which one is in force would be decided by nothing; refused, both named`,
         {
           held: held ? { id: held.id, effective_from: held.effective_from, created_at: held.created_at } : null,
-          refused: { effective_from: set.effectiveFrom, rule_count: set.rules.length },
+          refused: { effective_from: set.given.effective_from, rule_count: set.rules.length },
         },
+      );
+    }
+    // A data exception on this row can only be the instant: the engine read
+    // it, and `timestamptz` cannot hold it (an offset past +/-15:59, say).
+    if (err.code?.startsWith('22')) {
+      throw notStorable(
+        `tax_set.effective_from ${JSON.stringify(set.given.effective_from)} cannot be held as a PostgreSQL timestamptz (${err.message})`,
+        { field: 'tax_set.effective_from', limit: 'timestamptz' },
       );
     }
     throw err;
@@ -197,6 +230,38 @@ export async function storeTaxSet(client, tenantId, { garage, set, actor, now = 
       [tenantId, row.id, rule.id, rule.label, rule.percent_bp, rule.rounding, rule.sequence],
     );
   }
+
+  // Held as given? The instant must come back as the instant stored -- UTC
+  // before year 1 does not -- and the rules as the rules judged.
+  const faithful = (
+    await client.query(
+      `SELECT ${instantText('effective_from')}::timestamptz = effective_from AS instant FROM garage_tax_sets WHERE id = $1`,
+      [row.id],
+    )
+  ).rows[0];
+  const sets = await taxSetsForGarage(client, tenantId, garage.id);
+  const stored = sets.find((s) => s.id === row.id);
+  if (!faithful.instant) {
+    throw notStorable(
+      `tax_set.effective_from ${JSON.stringify(set.given.effective_from)} is stored, but reads back in UTC as ` +
+        `${stored.effective_from}, a different instant`,
+      { field: 'tax_set.effective_from', limit: 'timestamptz_read_back' },
+    );
+  }
+  const bySequence = (a, b) => a.sequence - b.sequence;
+  const judged = [...set.rules].sort(bySequence).map(({ id, label, percent_bp, rounding, sequence }) => ({ id, label, percent_bp, rounding, sequence }));
+  if (JSON.stringify(stored.rules) !== JSON.stringify(judged)) {
+    throw notStorable('tax_set.rules read back differently from how they were given', { field: 'tax_set.rules', limit: 'read_back' });
+  }
+  // The garage's whole list, as a load gets it, through the same door.
+  const load = await askEngine(sets.map((s) => ({ effective_from: s.effective_from, rules: s.rules })), engine);
+  if (load.refused !== undefined) {
+    throw notStorable(
+      `stored, this garage's tax sets would not load in the rate engine: ${load.refused}`,
+      { field: 'tax_set', limit: 'load' },
+    );
+  }
+
   // The record: who stated which set, for which garage. WHO travels inside
   // `detail`, the convention every operator act here follows.
   await repo.appendEvents(client, tenantId, [
@@ -205,17 +270,17 @@ export async function storeTaxSet(client, tenantId, { garage, set, actor, now = 
       laneId: null,
       eventId: `tax_set:${row.id}`,
       kind: TAX_SET_STATED_EVENT_KIND,
-      occurredAt: now ?? row.created_at,
+      occurredAt: now ?? stored.created_at,
       detail: {
         actor,
         tax_set_id: row.id,
-        effective_from: row.effective_from,
-        rule_count: row.rule_count,
-        rules: [...set.rules].sort((a, b) => a.sequence - b.sequence),
+        effective_from: stored.effective_from,
+        rule_count: stored.rule_count,
+        rules: stored.rules,
       },
     },
   ]);
-  return (await taxSetsForGarage(client, tenantId, garage.id)).find((s) => s.id === row.id);
+  return stored;
 }
 
 /**
@@ -223,15 +288,17 @@ export async function storeTaxSet(client, tenantId, { garage, set, actor, now = 
  * in their stated `sequence`. The ORDER decides nothing; the engine picks
  * the set in force by instant.
  *
- * Each rule is exactly the engine's five keys, so a set read here is a set
- * `tax.py` loads: `rule_id` is named back to `id` on the way out.
+ * Each set is exactly what a load takes -- `effective_from` as UTC text to
+ * the microsecond, each rule the engine's five keys (`rule_id` is named back
+ * to `id` on the way out) -- beside the store's own `id`, `garage_id`,
+ * `rule_count` and `created_at`.
  */
 export async function taxSetsForGarage(client, tenantId, garageId) {
   const { rows: sets } = await client.query(
-    `SELECT id, garage_id, effective_from, rule_count, created_at
-       FROM garage_tax_sets
-      WHERE tenant_id = $1 AND garage_id = $2
-      ORDER BY effective_from`,
+    `SELECT s.id, s.garage_id, ${instantText('s.effective_from')} AS effective_from, s.rule_count, s.created_at
+       FROM garage_tax_sets s
+      WHERE s.tenant_id = $1 AND s.garage_id = $2
+      ORDER BY s.effective_from`,
     [tenantId, garageId],
   );
   if (sets.length === 0) return [];

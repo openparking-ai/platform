@@ -1902,14 +1902,20 @@ export function createApp() {
    * garage charges no tax", and it satisfies the activation gate exactly as a
    * set with rules does; no set at all is UNSTATED, and does not.
    *
-   * Refused by name: a malformed set is a 400 naming the field (an unknown
-   * key, `base` included, is named, never dropped); a set taking effect at an
-   * instant another set already holds is `409 tax_set_effective_from_taken`,
-   * naming both. Nothing here computes a percentage, and no stay is taxed.
+   * JUDGED BY THE ENGINE FIRST, and by nothing here: the set goes to its
+   * `/v1/validate-tax-sets` exactly as sent, before any field of it is read,
+   * and a set it refuses is a 400 carrying its sentence. A set it accepts and
+   * this platform cannot hold (a NUL byte, a number past `integer`, an
+   * instant `timestamptz` cannot hold) is `409 tax_set_not_storable` -- a
+   * limit of storage, said as one. A set taking effect at an instant another
+   * set already holds is `409 tax_set_effective_from_taken`, naming both. No
+   * engine to ask is `503 rate_engine_unavailable`, and nothing is stored.
+   * Nothing here computes a percentage, and no stay is taxed.
    */
   operator.post('/garages/:garageId/tax-sets', async (req, res, next) => {
     try {
-      const set = taxes.taxSetDocument(req.body?.tax_set);
+      const set = await taxes.judgeTaxSet(req.body?.tax_set);
+      taxes.assertStorable(set);
       const out = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
@@ -2129,11 +2135,15 @@ function ratePlanRefusal(err) {
 }
 
 /**
- * The tax store's refusals onto the wire: a malformed set is a 400 like every
- * malformed body here; a well-formed set this platform will not hold is a
- * named conflict, with what it names in `details`.
+ * The tax store's refusals onto the wire: a set the engine refused is a 400
+ * like every malformed body here; a set it accepted and this platform will not
+ * hold is a named conflict, with what it names in `details`. No engine to ask
+ * is a NAMED 5xx: the save did not happen and can, once the engine answers.
  */
 function taxSetRefusal(err) {
+  if (err instanceof ratePlans.EngineUnavailable) {
+    return new HttpError(503, `${err.message}; the tax set was not stored`, 'rate_engine_unavailable');
+  }
   if (!(err instanceof taxes.TaxSetRefused)) return err;
   if (err.code === 'tax_set_invalid') return bad(err.message);
   const out = conflict(err.code, err.message);

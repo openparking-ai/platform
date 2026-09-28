@@ -2,23 +2,37 @@
 /**
  * The control for a garage's taxes (migration 0022).
  *
- * A tax set is stored exactly as stated, validated to the engine's load rules,
- * never inferred ("none" is a set that SAID zero rules), never two at one
- * instant, and a garage cannot activate while its taxes are unstated. Every
- * property is broken below, one at a time, and the suite is REQUIRED to go
- * red. A pass is the failure.
+ * A tax set is judged by the ENGINE and by nothing here, before anything
+ * reads it; stored as the engine read it; refused as STORAGE, by that name,
+ * when this platform cannot hold what the engine accepted; stored only if the
+ * garage's whole list, read back, still loads; never inferred ("none" is a
+ * set that SAID zero rules); never two at one instant; and a garage cannot
+ * activate while its taxes are unstated. Every property is broken below, one
+ * at a time, and the suite is REQUIRED to go red. A pass is the failure.
  *
  * SOURCE breaks, applied to a COPY of the tree; no tracked file is edited.
  *
- *   one_character              `percent_bp` minimum 1 becomes 0 -- ONE
- *                              character. The suite can fail on the smallest
- *                              edit there is.
- *   unknown_key_dropped        an unknown key -- `base` -- is ignored, not
- *                              named. A rule with a base would be stored as
- *                              if it had none.
- *   rounding_defaulted         the route stops checking `rounding`; the
- *                              table's CHECK is all that is left, and the
- *                              operator gets a 500 instead of a sentence.
+ *   one_character              the `integer` bound becomes 2^31 -- ONE
+ *                              character. A number the column cannot hold
+ *                              reaches the INSERT.
+ *   engine_not_asked           the route stores a set nobody judged.
+ *   engine_refusal_ignored     the engine's 400 is not treated as a refusal.
+ *   outage_counted_as_yes      an engine that cannot be reached answers "valid".
+ *   outage_not_named           no engine is an unnamed 500, not
+ *                              503 rate_engine_unavailable.
+ *   request_spelling_stored    the instant is stored as the request spelled it,
+ *                              not as the engine read it.
+ *   nul_not_refused            a NUL byte reaches PostgreSQL text.
+ *   surrogate_not_refused      a lone surrogate is not refused by name.
+ *   read_back_to_millisecond   a stored instant is read back to the
+ *                              millisecond: not the instant the table holds.
+ *   read_back_not_checked      an instant that reads back as another is stored.
+ *   load_not_proved            the garage's whole list is not loaded before
+ *                              commit: a set that never loads is stored.
+ *   validity_rule_restated     a rule of the engine's (a blank test) is copied
+ *                              back into the store.
+ *   table_rule_restated        the same, as a CHECK in the table (the file the
+ *                              scan reads; the database is not rebuilt).
  *   instant_not_named          two sets at one instant: the held set's id is
  *                              dropped from the refusal.
  *   read_order_by_id           the read orders rules by id, not by the
@@ -34,7 +48,8 @@
  *   no_count_trigger           a set is not held to its `rule_count`: a
  *                              half-written set commits, a "none" can be given
  *                              a rule later.
- *   no_instant_unique          two sets at one instant store.
+ *   no_instant_unique          two sets at one instant: nothing refuses the
+ *                              pair by name, both named.
  *   no_garage_trigger          a set can be written against another tenant's
  *                              garage (the foreign key runs as the owner).
  *   gate_ignores_taxes         the trigger activates a garage whose taxes are
@@ -62,24 +77,98 @@ const SCRATCH = process.env.TAXES_SCRATCH_DB || 'openparking_taxes_control';
 const SOURCE_BREAKS = [
   {
     name: 'one_character',
-    why: 'percent_bp accepts 0 (one character changed)',
+    why: 'the integer bound admits 2^31 (one character changed)',
     file: 'src/taxes.js',
-    from: "      percent_bp: whole(r.percent_bp, `${where}.percent_bp`, { min: 1 }),",
-    to: "      percent_bp: whole(r.percent_bp, `${where}.percent_bp`, { min: 0 }),",
+    from: 'const INTEGER_MAX = 2_147_483_647;',
+    to: 'const INTEGER_MAX = 2_147_483_648;',
   },
   {
-    name: 'unknown_key_dropped',
-    why: 'an unknown key such as base is ignored',
+    name: 'engine_not_asked',
+    why: 'the route stores a set nobody judged',
     file: 'src/taxes.js',
-    from: '  const unknown = Object.keys(raw).filter((k) => !keys.includes(k));',
-    to: '  const unknown = [];',
+    from: '  const answer = await askEngine([raw ?? null], engine);',
+    to: '  const answer = { loaded: [{ effective_from: raw?.effective_from }] };',
   },
   {
-    name: 'rounding_defaulted',
-    why: 'the route no longer checks rounding',
+    name: 'engine_refusal_ignored',
+    why: "the engine's refusal is not a refusal",
     file: 'src/taxes.js',
-    from: '    if (!TAX_ROUNDINGS.includes(rounding)) {',
-    to: '    if (false) {',
+    from: "  if (answer.refused !== undefined) {\n    throw new TaxSetRefused('tax_set_invalid'",
+    to: "  if (false) {\n    throw new TaxSetRefused('tax_set_invalid'",
+  },
+  {
+    name: 'outage_counted_as_yes',
+    why: 'an engine that cannot be reached answers valid',
+    file: 'src/taxes.js',
+    from: '    throw new EngineUnavailable(`the rate engine at ${url} could not be reached (${err?.cause?.code ?? err?.name ?? err})`);',
+    to: '    return { loaded: taxSets.map((s) => ({ effective_from: s?.effective_from, rule_count: s?.rules?.length })) };',
+  },
+  {
+    name: 'outage_not_named',
+    why: 'no engine is an unnamed 500',
+    file: 'src/app.js',
+    from: '  if (err instanceof ratePlans.EngineUnavailable) {',
+    to: '  if (false) {',
+  },
+  {
+    name: 'request_spelling_stored',
+    why: 'the instant is stored as spelled, not as the engine read it',
+    file: 'src/taxes.js',
+    from: '  return { given: raw, effectiveFrom: answer.loaded[0].effective_from, rules: raw.rules };',
+    to: '  return { given: raw, effectiveFrom: raw.effective_from, rules: raw.rules };',
+  },
+  {
+    name: 'nul_not_refused',
+    why: 'a NUL byte reaches PostgreSQL text',
+    file: 'src/taxes.js',
+    from: "      if (rule[key].includes('\\u0000')) {",
+    to: '      if (false) {',
+  },
+  {
+    name: 'surrogate_not_refused',
+    why: 'a lone surrogate is not refused by name',
+    file: 'src/taxes.js',
+    from: '      if (!rule[key].isWellFormed()) {',
+    to: '      if (false) {',
+  },
+  {
+    name: 'read_back_to_millisecond',
+    why: 'a stored instant is read back to the millisecond',
+    file: 'src/taxes.js',
+    from: `'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'`,
+    to: `'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'`,
+  },
+  {
+    name: 'read_back_not_checked',
+    why: 'an instant that reads back as another is stored',
+    file: 'src/taxes.js',
+    from: '  if (!faithful.instant) {',
+    to: '  if (false) {',
+  },
+  {
+    name: 'load_not_proved',
+    why: "the garage's whole list is not loaded before commit",
+    file: 'src/taxes.js',
+    from: '  if (load.refused !== undefined) {',
+    to: '  if (false) {',
+  },
+  {
+    name: 'validity_rule_restated',
+    why: 'the store copies a rule of the engine back (a blank test)',
+    file: 'src/taxes.js',
+    from: '  const answer = await askEngine([raw ?? null], engine);',
+    to:
+      "  if (raw?.rules?.some?.((r) => String(r.label).trim() === '')) throw new TaxSetRefused('tax_set_invalid', 'blank');\n" +
+      '  const answer = await askEngine([raw ?? null], engine);',
+  },
+  {
+    name: 'table_rule_restated',
+    why: 'the table copies a rule of the engine back (a CHECK)',
+    file: 'migrations/0022_garage_tax_sets.sql',
+    from: '    FOREIGN KEY (tax_set_id, tenant_id) REFERENCES garage_tax_sets (id, tenant_id) ON DELETE CASCADE\n);',
+    to:
+      '    FOREIGN KEY (tax_set_id, tenant_id) REFERENCES garage_tax_sets (id, tenant_id) ON DELETE CASCADE,\n' +
+      "  CONSTRAINT garage_tax_rules_label_not_blank CHECK (btrim(label) <> '')\n);",
   },
   {
     name: 'instant_not_named',

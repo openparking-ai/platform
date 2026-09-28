@@ -483,9 +483,23 @@ curl -H "authorization: Bearer $OPERATOR_TOKEN" \
 
 - **The engine's shape, column for column.** A set is `effective_from` and its
   rules; a rule is exactly `id`, `label`, `percent_bp` (whole basis points),
-  `rounding` (`up`, `down` or `nearest`, no default) and `sequence`. A missing
-  field and an unknown one are refused by name — `base` included: there is one
-  base, the money actually paid, and the table has no column for another.
+  `rounding` (`up`, `down` or `nearest`, no default) and `sequence`. There is
+  one base, the money actually paid, and the table has no column for another.
+- **Judged by the engine, and by nothing here.** The set goes to the engine's
+  `POST /v1/validate-tax-sets` — its tax loader, the one the close will use —
+  exactly as sent, before this platform reads a field of it. A set it refuses
+  is a `400` carrying its sentence; this platform holds no copy of its rules,
+  in the route or in the table. No engine to ask is
+  `503 rate_engine_unavailable`, and nothing is stored.
+- **Storage is its own refusal.** A set the engine accepts and this platform
+  cannot hold — a NUL byte, a number past PostgreSQL's `integer`, an instant
+  `timestamptz` cannot hold or give back — is `409 tax_set_not_storable`,
+  naming the field and the limit, and never worded as a judgement of the set.
+  The instant is stored as the engine read it, to the microsecond, and read
+  back in UTC to the microsecond.
+- **Every stored list loads.** Before the save commits, the garage's whole list
+  is read back as a load gets it and handed to the same door; a set that would
+  leave the list unloadable is not stored.
 - **"None" is stated, never inferred.** A set records how many rules it states,
   and the database holds it to that count when the transaction commits: a
   half-written set, and a rule added to a set afterwards, are both refused. So a
@@ -497,7 +511,8 @@ curl -H "authorization: Bearer $OPERATOR_TOKEN" \
   recorded as a `tax_set_stated` event naming the operator token.
 - **Two sets at one instant is refused, both named** —
   `409 tax_set_effective_from_taken` — compared as instants, so
-  `10:00-05:00` and `15:00Z` collide.
+  `10:00-05:00` and `15:00Z` collide. The table's constraint is what sees two
+  requests racing, each of which would load alone.
 
 `npm run taxes-fail-control` breaks each property in turn.
 
