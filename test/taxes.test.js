@@ -221,11 +221,13 @@ test('the inputs that used to answer 500 are named refusals now, and a valid val
     assert.match(error, REFUSED, effective_from);
     assert.match(error, /effective_from is not ISO 8601/, effective_from);
   }
-  // The engine ACCEPTS these -- a NUL in an id or a label, an offset of
+  // The engine ACCEPTS these five -- a NUL in an id or a label, an offset of
   // +23:59 -- and this platform cannot hold them: a storage refusal, named.
   for (const [taxSet, field] of [
     [{ effective_from: at, rules: [{ ...CITY, id: 'ci\u0000ty' }] }, 'tax_set.rules[0].id'],
+    [{ effective_from: at, rules: [{ ...CITY, id: '\u0000' }] }, 'tax_set.rules[0].id'],
     [{ effective_from: at, rules: [{ ...CITY, label: 'City\u0000tax' }] }, 'tax_set.rules[0].label'],
+    [{ effective_from: at, rules: [{ ...CITY, label: '\u0000' }] }, 'tax_set.rules[0].label'],
     [{ effective_from: '2026-02-01T00:00:00+23:59', rules: [] }, 'tax_set.effective_from'],
   ]) {
     assert.equal((await load([taxSet])).status, 200, `the engine accepts ${field}`);
