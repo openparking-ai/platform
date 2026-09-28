@@ -119,6 +119,12 @@ is kept. `garages.garage_pass_link` / `monthly_billing_link` name garages in
 other systems, not people. The `exit_covered` and `entitlement_links_stated`
 events are append-only like every event.
 
+**Added with migration 0022:** `garage_tax_sets` and `garage_tax_rules` hold a
+garage's stated taxes — an instant, a label, a percentage in basis points, a
+rounding and an order — and nothing about a person or a car. The purge does
+not touch them. The `tax_set_stated` event beside them names an operator
+token, not a person, and is append-only like every event.
+
 **Added with migration 0013:** `sessions.breakdown` (the engine's ledger lines),
 `sessions.pricing_refusal` (its findings) and `sessions.space_class` (the
 garage's) describe a price, not a person or a car; the purge leaves them where

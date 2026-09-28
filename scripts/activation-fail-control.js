@@ -38,7 +38,8 @@
  *                              created active, a mode can be un-stated,
  *                              activation can be undone.
  *   trigger_ignores_in_force   the trigger counts stored plans, not plans in
- *                              force.
+ *                              force. Edited in 0022, which holds the gate's
+ *                              function since the taxes condition.
  *
  * Needs the same environment as the suite, plus the engine
  * (RATE_ENGINE_PYTHON). The suite starts and stops the engine itself.
@@ -130,11 +131,16 @@ const SCHEMA_BREAKS = [
   {
     name: 'trigger_ignores_in_force',
     why: 'the trigger counts stored plans, not plans in force',
+    // 0022 replaces the gate's function with its taxes condition, so the
+    // function that runs is 0022's copy: a break in 0014's copy is overwritten
+    // before any test sees it, and this control reported PASSED (dead) until
+    // it was re-pointed here. The anchor names the plan counts, because 0022
+    // counts tax sets with the same SELECT line.
     edits: [
       {
-        file: '0014_activation_gate.sql',
-        from: '    SELECT count(*), count(*) FILTER (WHERE effective_from <= now())',
-        to: '    SELECT count(*), count(*)',
+        file: '0022_garage_tax_sets.sql',
+        from: '    SELECT count(*), count(*) FILTER (WHERE effective_from <= now())\n      INTO plans_stored, plans_in_force',
+        to: '    SELECT count(*), count(*)\n      INTO plans_stored, plans_in_force',
       },
     ],
   },
