@@ -73,12 +73,46 @@ export async function storePlan(client, tenantId, garageId, document) {
 }
 
 /**
+ * State a garage's taxes directly, as the database's side of the store would
+ * have them (0022): one set, its `rule_count`, and its rules. `rules: []` is
+ * the statement "this garage charges no tax". Tests of the route and its
+ * refusals are in test/taxes.test.js.
+ */
+export async function stateTaxes(client, tenantId, garageId, { rules = [], effectiveFrom = '2000-01-01T00:00:00Z' } = {}) {
+  const set = (
+    await client.query(
+      `INSERT INTO garage_tax_sets (tenant_id, garage_id, effective_from, rule_count)
+       VALUES ($1, $2, $3::timestamptz, $4) RETURNING id`,
+      [tenantId, garageId, effectiveFrom, rules.length],
+    )
+  ).rows[0].id;
+  for (const r of rules) {
+    await client.query(
+      `INSERT INTO garage_tax_rules (tenant_id, tax_set_id, rule_id, label, percent_bp, rounding, sequence)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [tenantId, set, r.id, r.label, r.percent_bp, r.rounding, r.sequence],
+    );
+  }
+  return set;
+}
+
+/**
  * Activate a garage directly: state its transient mode and set
  * `activated_at`, through the trigger that checks the gate's conditions
- * (0014) -- so a world that could not activate through the route cannot
- * activate here either. Tests of the gate itself go through the route.
+ * (0014, 0022) -- so a world that could not activate through the route
+ * cannot activate here either. Tests of the gate itself go through the route.
+ *
+ * A garage that has stated no taxes is made to state NONE first, in so many
+ * words (a set with no rules): these worlds exist to exercise lanes and
+ * closes, and no stay is taxed in this round whatever is stated. A garage
+ * that already stated its taxes keeps what it stated.
  */
 export async function activateGarage(client, tenantId, garageId, { transientAvailable = true } = {}) {
+  const stated = await client.query(
+    'SELECT 1 FROM garage_tax_sets WHERE tenant_id = $1 AND garage_id = $2 LIMIT 1',
+    [tenantId, garageId],
+  );
+  if (stated.rows.length === 0) await stateTaxes(client, tenantId, garageId);
   await client.query(
     `UPDATE garages SET transient_available = $3, activated_at = now() WHERE tenant_id = $1 AND id = $2`,
     [tenantId, garageId, transientAvailable],

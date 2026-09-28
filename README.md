@@ -419,8 +419,9 @@ suite to go red.
 
 ### The activation gate
 
-A garage is not usable until its **rate setup is complete** and its **transient
-mode is stated** (migration 0014). Two conditions, observed from the schema:
+A garage is not usable until its **rate setup is complete**, its **transient
+mode is stated** (migration 0014) and its **taxes are stated** (0022). Three
+conditions, observed from the schema:
 
 - **rate_setup_complete** — at least one plan is stored and a version is in
   force now. The store already refused a plan the engine found fault with, so
@@ -430,8 +431,12 @@ mode is stated** (migration 0014). Two conditions, observed from the schema:
   `garage-pass` ships, copied: unstated (`null`) is not false, nothing defaults
   it, and a request cannot send `null` as a value. Stated at creation or by
   `PATCH /api/v1/garages/<id>` at any time; restatable, never un-statable.
+- **taxes_stated** — a tax set is in force now: with rules, or stating that the
+  garage charges none. The same three states and the same rule — with rules,
+  none, or **unstated** — and no set in force is unstated, never "none". See
+  *A garage's taxes* below.
 
-There is no third condition. The payment-processor onboarding and the tested
+There is no payment condition. The payment-processor onboarding and the tested
 money collection are a separate requirement with its own place; this gate
 carries no such condition at all rather than an unchecked one, and a test
 sweeps `src/` and `migrations/` for the processor's name.
@@ -454,6 +459,47 @@ the lane's event id. `/lane/rules` carries `active` so a lane can see it.
 What the gate does not reach: a stay that outlived the plan that covered it. It
 still arrives at the exit with no price, and the unpriced close above is its
 backstop. `npm run activation-fail-control` breaks each property in turn.
+
+### A garage's taxes
+
+A garage says which taxes it charges — or that it charges none — before it can
+go live (migration 0022): one or the other, and never neither. No stay is
+taxed yet: the close is
+untouched, and this platform computes no percentage, ever —
+[`rate-engine`](https://github.com/openparking-ai/rate-engine)'s `tax.py` is the
+only tax arithmetic there is.
+
+```sh
+curl -H "authorization: Bearer $OPERATOR_TOKEN" -H 'content-type: application/json' \
+  -d '{"tax_set": {"effective_from": "2026-01-01T00:00:00-05:00", "rules": [
+        {"id": "city", "label": "City parking tax", "percent_bp": 1850, "rounding": "nearest", "sequence": 1}]}}' \
+  http://127.0.0.1:3000/api/v1/garages/<id>/tax-sets     # 201, the set as stored
+curl -H 'content-type: application/json' -H "authorization: Bearer $OPERATOR_TOKEN" \
+  -d '{"tax_set": {"effective_from": "2026-01-01T00:00:00-05:00", "rules": []}}' \
+  http://127.0.0.1:3000/api/v1/garages/<id>/tax-sets     # "this garage charges no tax"
+curl -H "authorization: Bearer $OPERATOR_TOKEN" \
+  http://127.0.0.1:3000/api/v1/garages/<id>/tax-sets     # every set, rules in stated order
+```
+
+- **The engine's shape, column for column.** A set is `effective_from` and its
+  rules; a rule is exactly `id`, `label`, `percent_bp` (whole basis points),
+  `rounding` (`up`, `down` or `nearest`, no default) and `sequence`. A missing
+  field and an unknown one are refused by name — `base` included: there is one
+  base, the money actually paid, and the table has no column for another.
+- **"None" is stated, never inferred.** A set records how many rules it states,
+  and the database holds it to that count when the transaction commits: a
+  half-written set, and a rule added to a set afterwards, are both refused. So a
+  set with no rules is one that *said* zero, and a garage with no set has said
+  nothing.
+- **One verb, append-only.** Stating a set supersedes nothing and nothing is
+  edited; a later `effective_from` is how a rate changes, a tax is added or a
+  tax ends. The application role can read and insert, nothing else. Each set is
+  recorded as a `tax_set_stated` event naming the operator token.
+- **Two sets at one instant is refused, both named** —
+  `409 tax_set_effective_from_taken` — compared as instants, so
+  `10:00-05:00` and `15:00Z` collide.
+
+`npm run taxes-fail-control` breaks each property in turn.
 
 ### The exit's three outcomes, and the two modules consulted
 

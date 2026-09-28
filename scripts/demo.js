@@ -99,6 +99,13 @@ const demo = await withTenant(tenantId, async (c) => {
      VALUES ($1, $2, $3::jsonb->>'plan_version', ($3::jsonb->>'effective_from')::timestamptz, $3::jsonb, 1)`,
     [tenantId, garage, JSON.stringify(plan)],
   );
+  // Its taxes, stated (0022): none. The demo's garage says so in so many
+  // words -- an unstated garage cannot activate.
+  await c.query(
+    `INSERT INTO garage_tax_sets (tenant_id, garage_id, effective_from, rule_count)
+     VALUES ($1, $2, '2000-01-01T00:00:00Z', 0)`,
+    [tenantId, garage],
+  );
   await c.query(`UPDATE garages SET transient_available = true, activated_at = now() WHERE tenant_id = $1 AND id = $2`, [tenantId, garage]);
 
   for (const [laneId, token, name] of [

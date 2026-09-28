@@ -325,3 +325,13 @@ jobs:
         # sentence. Each property is broken in turn -- a key demanded at boot,
         # Connect assumed, the sentence reworded -- and the suite must go red.
         run: npm run standalone-arm-fail-control
+
+      - name: Taxes fail-control
+        # A garage's taxes (0022): a set stored exactly as stated, to the
+        # engine's load rules, "none" a set that SAID zero rules and never an
+        # empty list read as none, never two sets at one instant, and a garage
+        # that cannot activate while its taxes are unstated -- at the route and
+        # at the trigger. Nothing computes a percentage. Each property is
+        # broken in turn -- one of them a single character -- plus six schema
+        # statements never created, and the suite must go red.
+        run: npm run taxes-fail-control

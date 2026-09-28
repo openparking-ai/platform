@@ -7,6 +7,7 @@ import * as repo from './repository.js';
 import { enqueueShadowSearch } from './shadow.js';
 import * as ratePlans from './ratePlans.js';
 import * as activation from './activation.js';
+import * as taxes from './taxes.js';
 import * as entitlement from './entitlement.js';
 import * as validations from './validations.js';
 import { reconcile } from './reconcile.js';
@@ -1892,6 +1893,56 @@ export function createApp() {
     }
   });
 
+  /**
+   * State a garage's taxes from an instant: a tax set, whole (0022).
+   *
+   * ONE VERB. A set is stated once and never edited; stating a new one
+   * supersedes nothing -- a later `effective_from` is how a rate changes, a
+   * tax is added or a tax ends. A set with no rules is the statement "this
+   * garage charges no tax", and it satisfies the activation gate exactly as a
+   * set with rules does; no set at all is UNSTATED, and does not.
+   *
+   * Refused by name: a malformed set is a 400 naming the field (an unknown
+   * key, `base` included, is named, never dropped); a set taking effect at an
+   * instant another set already holds is `409 tax_set_effective_from_taken`,
+   * naming both. Nothing here computes a percentage, and no stay is taxed.
+   */
+  operator.post('/garages/:garageId/tax-sets', async (req, res, next) => {
+    try {
+      const set = taxes.taxSetDocument(req.body?.tax_set);
+      const out = await withTenant(req.tenantId, async (client) => {
+        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!garage) throw new HttpError(404, 'garage not found');
+        return taxes.storeTaxSet(client, req.tenantId, {
+          garage,
+          set,
+          actor: `operator_token:${req.operatorTokenId}`,
+        });
+      });
+      res.status(201).json({ tax_set: out });
+    } catch (err) {
+      next(taxSetRefusal(err));
+    }
+  });
+
+  /**
+   * Every tax set of the garage, each with its rules in stated order. No
+   * "current set": the engine picks the one in force by instant, and the
+   * activation readout says which one that is today.
+   */
+  operator.get('/garages/:garageId/tax-sets', async (req, res, next) => {
+    try {
+      const sets = await withTenant(req.tenantId, async (client) => {
+        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!garage) throw new HttpError(404, 'garage not found');
+        return taxes.taxSetsForGarage(client, req.tenantId, garage.id);
+      });
+      res.json({ tax_sets: sets });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // Order matters and is load-bearing. '/api/v1' is a prefix of '/api/v1/lane',
   // so the operator router must be mounted AFTER the lane router. Mounted first
   // it answers every lane request 401 before the device router runs. The test
@@ -2025,7 +2076,7 @@ async function activeGarageOrRefuse({ tenantId, garageId, laneId, laneEventId, a
   );
   throw conflict(
     'garage_not_active',
-    `this garage is not active: no stay is ${action === 'open' ? 'opened' : 'closed'} here until its rate setup is complete and its transient mode is stated`,
+    `this garage is not active: no stay is ${action === 'open' ? 'opened' : 'closed'} here until its rate setup is complete, its transient mode is stated and its taxes are stated`,
   );
 }
 
@@ -2072,6 +2123,19 @@ function spaceClassField(raw) {
 function ratePlanRefusal(err) {
   if (!(err instanceof ratePlans.RatePlanRefused)) return err;
   if (err.code === 'plan_invalid') return bad(err.message);
+  const out = conflict(err.code, err.message);
+  out.details = err.details;
+  return out;
+}
+
+/**
+ * The tax store's refusals onto the wire: a malformed set is a 400 like every
+ * malformed body here; a well-formed set this platform will not hold is a
+ * named conflict, with what it names in `details`.
+ */
+function taxSetRefusal(err) {
+  if (!(err instanceof taxes.TaxSetRefused)) return err;
+  if (err.code === 'tax_set_invalid') return bad(err.message);
   const out = conflict(err.code, err.message);
   out.details = err.details;
   return out;

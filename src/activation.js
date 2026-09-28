@@ -1,8 +1,9 @@
 /**
  * The activation gate: a garage is not usable until its rate setup is
- * complete and its transient mode is stated (migration 0014).
+ * complete, its transient mode is stated and its taxes are stated
+ * (migrations 0014 and 0022).
  *
- * Two conditions, observed from the schema and never inferred:
+ * Three conditions, observed from the schema and never inferred:
  *
  *   rate_setup_complete    at least one plan is stored (0012) and a version
  *                          is in force now. The store already refused a plan
@@ -11,10 +12,14 @@
  *   transient_mode_stated  `transient_available` is true or false -- the
  *                          three-state field garage-pass ships, copied: NULL
  *                          is UNSTATED, not false, and no default fills it.
+ *   taxes_stated           a tax set (0022) is in force now: with rules, or
+ *                          stating none (`rule_count` 0). The same three
+ *                          states -- with rules, none, UNSTATED -- and the same
+ *                          rule: no set in force is unstated, never "none".
  *
- * There is deliberately no third condition. The payment-processor onboarding
- * and the tested money collection are a separate requirement with its own
- * place; this gate carries no payment condition at all rather than an
+ * There is deliberately no payment condition. The payment-processor
+ * onboarding and the tested money collection are a separate requirement with
+ * its own place; this gate carries no payment condition at all rather than an
  * unchecked one, because a gate never reports satisfied what it cannot
  * observe. (The test sweeps these sources for the processor's name, so it is
  * not written here even to say it is absent.)
@@ -26,6 +31,7 @@
  * thing between an unready garage and a live lane.
  */
 import * as repo from './repository.js';
+import { taxPosition } from './taxes.js';
 
 export const GARAGE_ACTIVATED_EVENT_KIND = 'garage_activated';
 export const GARAGE_INACTIVE_REFUSAL_EVENT_KIND = 'garage_inactive_refusal';
@@ -48,6 +54,7 @@ export async function readout(client, tenantId, garage, { now = null } = {}) {
     [tenantId, garage.id, now],
   );
   const plans = rows[0];
+  const taxes = await taxPosition(client, tenantId, garage.id, { now });
   const conditions = [
     {
       condition: 'rate_setup_complete',
@@ -66,6 +73,18 @@ export async function readout(client, tenantId, garage, { now = null } = {}) {
         garage.transient_available === null || garage.transient_available === undefined
           ? 'transient_available is unstated: say whether this garage sells transient parking (true) or is pass and monthly only (false)'
           : `transient_available is ${garage.transient_available}`,
+    },
+    {
+      condition: 'taxes_stated',
+      met: taxes.in_force > 0,
+      reason:
+        taxes.stated === 0
+          ? 'taxes are unstated: state the taxes this garage charges, or state that it charges none (a tax set with no rules)'
+          : taxes.in_force === 0
+            ? `${taxes.stated} tax set(s) stated, none in force yet; the earliest takes effect ${taxes.earliest.toISOString()}`
+            : taxes.current.rule_count === 0
+              ? `stated: this garage charges no tax, from ${new Date(taxes.current.effective_from).toISOString()}`
+              : `stated: ${taxes.current.rule_count} tax rule(s) in force, from ${new Date(taxes.current.effective_from).toISOString()}`,
     },
   ];
   return {

@@ -104,6 +104,36 @@ export const TENANT_TABLES = [
     appendOnly: true,
   },
   {
+    table: 'garage_tax_sets',
+    // A set stating no rules (0022), at an instant of its own: one set per
+    // instant per garage, so rows collide with nothing but a policy.
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO garage_tax_sets (tenant_id, garage_id, effective_from, rule_count)
+         VALUES ($1, $2, now() - random() * interval '100000 days', 0) RETURNING id`,
+        [t, w.garage],
+      ),
+    // Append-only by grant; asserted in taxes.test.js.
+    appendOnly: true,
+  },
+  {
+    table: 'garage_tax_rules',
+    // A set stating one rule and the rule, in one statement: the set must
+    // hold exactly what it states when the transaction commits.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH s AS (
+           INSERT INTO garage_tax_sets (tenant_id, garage_id, effective_from, rule_count)
+           VALUES ($1, $2, now() - random() * interval '100000 days', 1) RETURNING id
+         )
+         INSERT INTO garage_tax_rules (tenant_id, tax_set_id, rule_id, label, percent_bp, rounding, sequence)
+         SELECT $1, s.id, 'row', 'Row', 100, 'nearest', 0 FROM s
+         RETURNING id`,
+        [t, w.garage],
+      ),
+    appendOnly: true,
+  },
+  {
     table: 'events',
     insert: (c, t, w) =>
       c.query(

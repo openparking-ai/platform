@@ -1,6 +1,8 @@
 /**
- * The activation gate (migration 0014): a garage is not usable until its
- * rate setup is complete and its transient mode is stated.
+ * The activation gate (migrations 0014, 0022): a garage is not usable until
+ * its rate setup is complete, its transient mode is stated and its taxes are
+ * stated -- with rules, or as none. The taxes' own store is exercised in
+ * test/taxes.test.js; here is the condition.
  *
  * Every refusal here is paired with the same call succeeding once the one
  * missing thing is supplied, so "cannot" is measured against "can". And the
@@ -77,6 +79,13 @@ async function newGarage(body = {}) {
 const withPlan = (garageId, overrides = {}) =>
   withTenant(tenant, (c) => storePlan(c, tenant, garageId, flatHourlyPlan({ version: `v-${randomUUID().slice(0, 6)}`, ...overrides })));
 const activate = (garageId) => op('POST', `/garages/${garageId}/activate`);
+/** State a tax set through the operator door; `rules: []` states NONE. */
+const stateTaxes = async (garageId, { rules = [], effectiveFrom = '2000-01-01T00:00:00Z' } = {}) => {
+  const res = await op('POST', `/garages/${garageId}/tax-sets`, { tax_set: { effective_from: effectiveFrom, rules } });
+  assert.equal(res.status, 201, JSON.stringify(await res.clone().json()));
+  return (await res.json()).tax_set;
+};
+const VAT = { id: 'vat', label: 'VAT', percent_bp: 2000, rounding: 'nearest', sequence: 1 };
 const readout = async (garageId) => (await (await op('GET', `/garages/${garageId}/activation`)).json()).activation;
 const open = (token, plate, entryAt = '2026-08-26T09:00:00Z') =>
   fetch(`${base}/api/v1/lane/sessions/open`, asDevice(token, { plate, entry_at: entryAt, entry_confirmation: 'confirmed' }));
@@ -105,7 +114,7 @@ after(async () => {
 
 // --- the two conditions, through the route ------------------------------------------
 
-test('a new garage is inactive, unstated, and the readout names both conditions unmet', async () => {
+test('a new garage is inactive, unstated, and the readout names all three conditions unmet', async () => {
   const g = await newGarage();
   assert.equal(g.activated_at, null);
   assert.equal(g.transient_available, null, 'unstated, not false');
@@ -114,14 +123,17 @@ test('a new garage is inactive, unstated, and the readout names both conditions 
   assert.deepEqual(state.conditions.map((c) => [c.condition, c.met]), [
     ['rate_setup_complete', false],
     ['transient_mode_stated', false],
+    ['taxes_stated', false],
   ]);
   assert.match(state.conditions[0].reason, /no rate plan is stored/);
   assert.match(state.conditions[1].reason, /unstated/);
-  assert.equal(state.conditions.length, 2, 'two conditions and no third: nothing this gate cannot observe');
+  assert.match(state.conditions[2].reason, /taxes are unstated/);
+  assert.equal(state.conditions.length, 3, 'three conditions and no fourth: nothing this gate cannot observe');
 });
 
 test('a garage with no plan cannot be activated, by name; the same garage activates once a plan is in force', async () => {
   const g = await newGarage({ transient_available: true });
+  await stateTaxes(g.id);
   const res = await activate(g.id);
   assert.equal(res.status, 409);
   const body = await res.json();
@@ -141,6 +153,7 @@ test('a garage with no plan cannot be activated, by name; the same garage activa
 
 test('a garage whose only plan is not yet in force cannot be activated; it can once a version is in force', async () => {
   const g = await newGarage({ transient_available: false });
+  await stateTaxes(g.id);
   const future = new Date(Date.now() + 30 * 86_400_000).toISOString();
   await withPlan(g.id, { effectiveFrom: future });
   const res = await activate(g.id);
@@ -158,6 +171,7 @@ test('an unstated transient mode cannot be activated; stating it -- true or fals
   for (const stated of [true, false]) {
     const g = await newGarage();
     await withPlan(g.id);
+    await stateTaxes(g.id);
     const res = await activate(g.id);
     assert.equal(res.status, 409);
     const body = await res.json();
@@ -189,6 +203,7 @@ test('transient_available is true or false and nothing else; unstated is the abs
 test('activation is recorded -- who, when, what the gate saw -- and is idempotent', async () => {
   const g = await newGarage({ transient_available: true });
   await withPlan(g.id);
+  await stateTaxes(g.id);
   const first = await (await activate(g.id)).json();
   const again = await activate(g.id);
   assert.equal(again.status, 200);
@@ -199,7 +214,7 @@ test('activation is recorded -- who, when, what the gate saw -- and is idempoten
   assert.equal(events.length, 1, 'one act, one record');
   assert.equal(events[0].detail.actor, `operator_token:${operatorTokenId}`);
   assert.equal(events[0].detail.transient_available, true);
-  assert.deepEqual(events[0].detail.conditions.map((c) => c.met), [true, true]);
+  assert.deepEqual(events[0].detail.conditions.map((c) => c.met), [true, true, true]);
   assert.equal(events[0].lane_id, null);
 });
 
@@ -214,6 +229,69 @@ test('an unknown garage is 404 on the readout and the activation', async () => {
   assert.equal((await op('GET', `/garages/${randomUUID()}/activation`)).status, 404);
 });
 
+
+// --- the third condition: taxes stated (0022) ----------------------------------------
+
+test('UNSTATED taxes refuse activation, naming the condition; stated-none activates; stated-with-rules activates', async () => {
+  for (const [stated, reason] of [
+    [[], /stated: this garage charges no tax, from 2000-01-01T00:00:00.000Z/],
+    [[VAT], /stated: 1 tax rule\(s\) in force, from 2000-01-01T00:00:00.000Z/],
+  ]) {
+    const g = await newGarage({ transient_available: true });
+    await withPlan(g.id);
+    const res = await activate(g.id);
+    assert.equal(res.status, 409);
+    const body = await res.json();
+    assert.equal(body.code, 'garage_not_activatable');
+    assert.deepEqual(body.details.unmet.map((c) => c.condition), ['taxes_stated'], 'the tax condition, and only it');
+    assert.match(body.error, /taxes_stated -- taxes are unstated: state the taxes this garage charges, or state that it charges none/);
+    assert.deepEqual(await eventsOf(GARAGE_ACTIVATED_EVENT_KIND, g.id), []);
+    // CONTROL: state them -- none, or with rules -- and the same call activates.
+    await stateTaxes(g.id, { rules: stated });
+    const state = await readout(g.id);
+    assert.equal(state.conditions[2].met, true);
+    assert.match(state.conditions[2].reason, reason);
+    const ok = await activate(g.id);
+    assert.equal(ok.status, 201, `stated ${JSON.stringify(stated)}`);
+    const [event] = await eventsOf(GARAGE_ACTIVATED_EVENT_KIND, g.id);
+    assert.equal(event.detail.conditions[2].condition, 'taxes_stated');
+    assert.match(event.detail.conditions[2].reason, reason);
+  }
+});
+
+test('a tax set stated for later leaves the garage unstated today: set up, not in force', async () => {
+  const g = await newGarage({ transient_available: true });
+  await withPlan(g.id);
+  const future = new Date(Date.now() + 30 * 86_400_000).toISOString();
+  await stateTaxes(g.id, { effectiveFrom: future });
+  const res = await activate(g.id);
+  assert.equal(res.status, 409);
+  const body = await res.json();
+  assert.deepEqual(body.details.unmet.map((c) => c.condition), ['taxes_stated']);
+  assert.match(body.error, /1 tax set\(s\) stated, none in force yet; the earliest takes effect/);
+  // CONTROL: a set in force, and the same call activates.
+  await stateTaxes(g.id);
+  assert.equal((await activate(g.id)).status, 201);
+});
+
+test('the new condition has not replaced the old ones: stated taxes do not open a garage failing the rate condition', async () => {
+  const g = await newGarage({ transient_available: true });
+  await stateTaxes(g.id, { rules: [VAT] });
+  const res = await activate(g.id);
+  assert.equal(res.status, 409);
+  const body = await res.json();
+  assert.deepEqual(body.details.unmet.map((c) => c.condition), ['rate_setup_complete'], 'refused on the rate condition, alone');
+  assert.match(body.error, /no rate plan is stored/);
+  const unstatedMode = await newGarage();
+  await withPlan(unstatedMode.id);
+  await stateTaxes(unstatedMode.id);
+  const second = await (await activate(unstatedMode.id)).json();
+  assert.deepEqual(second.details.unmet.map((c) => c.condition), ['transient_mode_stated'], 'and on the transient mode, alone');
+  // CONTROL: the missing plan supplied, the first garage activates.
+  await withPlan(g.id);
+  assert.equal((await activate(g.id)).status, 201);
+});
+
 // --- the database is the second layer ------------------------------------------------
 
 test('the database itself refuses to activate an unready garage: a direct UPDATE does not go around the route', async () => {
@@ -225,8 +303,12 @@ test('the database itself refuses to activate an unready garage: a direct UPDATE
   await assert.rejects(setActive, (err) => err.constraint === 'garages_activation_needs_a_plan');
   await withPlan(g.id, { effectiveFrom: new Date(Date.now() + 86_400_000).toISOString() });
   await assert.rejects(setActive, (err) => err.constraint === 'garages_activation_needs_a_plan_in_force');
-  // CONTROL: with a version in force the same UPDATE lands.
   await withPlan(g.id);
+  await assert.rejects(setActive, (err) => err.constraint === 'garages_activation_needs_taxes_stated');
+  await stateTaxes(g.id, { effectiveFrom: new Date(Date.now() + 86_400_000).toISOString() });
+  await assert.rejects(setActive, (err) => err.constraint === 'garages_activation_needs_taxes_in_force');
+  // CONTROL: with a tax set in force the same UPDATE lands.
+  await stateTaxes(g.id);
   await setActive();
   assert.equal((await readout(g.id)).active, true);
 });
@@ -244,6 +326,7 @@ test('a garage is never created active, a stated mode is never un-stated, and ac
     (err) => err.constraint === 'garages_transient_mode_is_not_unstated',
   );
   await withPlan(g.id);
+  await stateTaxes(g.id);
   assert.equal((await activate(g.id)).status, 201);
   for (const sql of [
     `UPDATE garages SET activated_at = NULL WHERE id = $1`,
@@ -272,7 +355,7 @@ test('an inactive garage opens no stay: refused by name, and RECORDED before the
   assert.equal(res.status, 409);
   const body = await res.json();
   assert.equal(body.code, 'garage_not_active');
-  assert.match(body.error, /rate setup is complete and its transient mode is stated/);
+  assert.match(body.error, /rate setup is complete, its transient mode is stated and its taxes are stated/);
   const sessions = await withTenant(tenant, async (c) =>
     (await c.query('SELECT count(*) FROM sessions WHERE garage_id = $1', [g.id])).rows[0].count,
   );
@@ -292,6 +375,7 @@ test('an inactive garage opens no stay: refused by name, and RECORDED before the
   assert.equal((await eventsOf(GARAGE_INACTIVE_REFUSAL_EVENT_KIND, g.id)).length, 1);
 
   // CONTROL: activated, the same lane opens a stay exactly as before.
+  await stateTaxes(g.id);
   assert.equal((await activate(g.id)).status, 201);
   const opened = await open(g.entry, plate());
   assert.equal(opened.status, 201);
@@ -319,13 +403,15 @@ test('/lane/rules tells the lane whether its garage is active, and still serves 
   assert.equal(before.active, false);
   assert.equal(before.garage_id, g.id, 'the rules themselves are served');
   await withPlan(g.id);
-  await activate(g.id);
+  await stateTaxes(g.id);
+  assert.equal((await activate(g.id)).status, 201);
   assert.equal((await rules()).active, true);
 });
 
-test('an active garage with both conditions met operates as before: open, close, priced', async () => {
+test('an active garage with every condition met operates as before: open, close, priced', async () => {
   const g = await newGarage({ transient_available: true });
   await withPlan(g.id, { hourlyMinor: 300 });
+  await stateTaxes(g.id, { rules: [VAT] });
   assert.equal((await activate(g.id)).status, 201);
   const p = plate();
   assert.equal((await open(g.entry, p)).status, 201);
@@ -334,7 +420,9 @@ test('an active garage with both conditions met operates as before: open, close,
     asDevice(g.exit, { plate: p, exit_at: '2026-08-26T10:00:00Z', exit_confirmation: 'confirmed' }),
   );
   assert.equal(closed.status, 200);
-  assert.equal((await closed.json()).session.fee_minor, 300);
+  const session = (await closed.json()).session;
+  assert.equal(session.fee_minor, 300, 'a stated tax is not charged: no stay carries a tax in this round');
+  assert.ok(!JSON.stringify(session.breakdown).includes('VAT'), 'and the ledger names none');
   assert.deepEqual(await eventsOf(GARAGE_INACTIVE_REFUSAL_EVENT_KIND, g.id), [], 'and nothing was refused');
 });
 
@@ -352,7 +440,13 @@ test('an active garage with both conditions met operates as before: open, close,
 // field into src/activation.js and requires this to go red.
 test('activation has no Stripe condition, and the sweep can see one', async () => {
   const stripe = /stripe|connect_account|application_fee|payment_method/i;
-  const ACTIVATION_SOURCES = ['src/activation.js', 'migrations/0014_activation_gate.sql'];
+  const ACTIVATION_SOURCES = [
+    'src/activation.js',
+    'src/taxes.js',
+    'migrations/0014_activation_gate.sql',
+    // 0022 replaces the gate's trigger function with its third condition.
+    'migrations/0022_garage_tax_sets.sql',
+  ];
   const hits = [];
   for (const path of ACTIVATION_SOURCES) {
     const text = await readFile(new URL(`../${path}`, import.meta.url), 'utf8');
