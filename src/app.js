@@ -249,6 +249,9 @@ function confirmation(value, label, allowed = CONFIRMATIONS) {
  */
 const TICKET_REF_SHAPE = /^[A-Z0-9-]{6,64}$/;
 
+/** An ISO 8601 instant with an offset, to the microsecond: what is handed to `timestamptz` as an instant. */
+const INSTANT_SHAPE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$/;
+
 /**
  * The longest `plate` this platform will hold, and it is an ADDITION: until now
  * `plate` had no shape rule of any kind.
@@ -388,6 +391,20 @@ function localDecisionField(value) {
       }
     }
     if (!Array.isArray(value.breakdown)) throw bad('local_decision.breakdown must be the engine\'s ledger, a list');
+    // TAX ON THE STAY (0023). Absent on a lane older than it -- and then the
+    // decision is not consumed (`consumableDecision`), never refused here: an
+    // old lane's close must still close. Present, each is shaped.
+    if (value.subtotal_minor !== undefined && (!Number.isInteger(value.subtotal_minor) || value.subtotal_minor < 0)) {
+      throw bad('local_decision.subtotal_minor must be a whole number of minor units: the fee before tax');
+    }
+    if (value.tax_sets_held !== undefined) {
+      const held = value.tax_sets_held;
+      if (typeof held !== 'object' || held === null || Array.isArray(held)
+          || !Number.isInteger(held.count) || held.count < 0
+          || !(held.newest_effective_from === null || (typeof held.newest_effective_from === 'string' && INSTANT_SHAPE.test(held.newest_effective_from)))) {
+        throw bad('local_decision.tax_sets_held must be {count, newest_effective_from}: how many tax sets the lane held, and the latest instant among them');
+      }
+    }
   }
   if (status === 'covered' && (!Array.isArray(value.covered_by) || value.covered_by.length === 0)) {
     throw bad('local_decision.covered_by must name the module(s) that covered the stay');
@@ -401,8 +418,10 @@ function localDecisionField(value) {
  * Consumed: `covered` (the lane read a register that stands today) and
  * `priced` (the lane priced from its cached entry) -- when the priced
  * decision is about THIS stay, in this stay's currency, in this garage's
- * space class, on a plan version this garage holds. Everything else is said
- * by name and the close prices for itself: the lane could not decide
+ * space class, on a plan version this garage holds -- and, since 0023, carrying
+ * a pre-tax subtotal that adds up with its tax lines to its fee, taxed with
+ * the garage's current list of sets. Everything else is said by name and the
+ * close prices for itself: the lane could not decide
  * (`no_cached_entry`, `stale_facts`, the engine's refusals -- brief 4.5),
  * or it decided about a different stay or with different money, which is
  * the one case a lane's word is not taken and the record keeps the word.
@@ -411,7 +430,7 @@ function localDecisionField(value) {
  * a mismatch is a STATED RECONCILE on the record, never a 5xx the lane would
  * retry for ever and never a 4xx that leaves the stay open.
  */
-function consumableDecision(decision, { open, garage, planVersions }) {
+function consumableDecision(decision, { open, garage, planVersions, taxFacts }) {
   if (decision === null) return { consume: false, reason: 'no local decision on the close' };
   if (decision.status === 'covered') return { consume: true };
   if (decision.status !== 'priced') {
@@ -429,7 +448,53 @@ function consumableDecision(decision, { open, garage, planVersions }) {
   if (!planVersions.includes(decision.plan_version)) {
     return { consume: false, reason: `the decision names plan version ${decision.plan_version}, which this garage does not hold` };
   }
+  // TAX ON THE STAY (0023). A lane older than it wrote an untaxed fee; the
+  // close prices for itself rather than write that number onto the row.
+  if (decision.subtotal_minor === undefined || decision.tax_sets_held === undefined) {
+    return { consume: false, reason: 'the decision carries no pre-tax subtotal or tax facts: the lane that made it is older than tax on the stay' };
+  }
+  if (decision.subtotal_minor + taxes.taxDelta(decision.breakdown) !== decision.fee_minor) {
+    return {
+      consume: false,
+      reason: `the decision's subtotal ${decision.subtotal_minor} and its tax lines do not add up to its fee ${decision.fee_minor}`,
+    };
+  }
+  // A STALE TAX SET, refused as a stale plan version is. Two tests on two
+  // premises, and neither is redundant: COUNT rests on the table being
+  // append-only (0022 grants no UPDATE and no DELETE), so a lane that missed
+  // any set -- a backdated one included -- holds fewer; WINDOW rests on the
+  // lane's copy being the whole list, so a set later than the newest it held
+  // and in force by the exit is one it could not have used. Neither copies the
+  // engine's choice of set. COUNT also refuses a decision that was fine (only
+  // a future set was added): the close then prices for itself, the safe way
+  // to be wrong, until the lane's next refresh.
+  if (!INSTANT_SHAPE.test(decision.exit_at) || taxFacts === null) {
+    return { consume: false, reason: `the decision's exit_at ${JSON.stringify(decision.exit_at)} is not an instant a tax set can be chosen by` };
+  }
+  const held = decision.tax_sets_held;
+  if (taxFacts.stated > held.count) {
+    return {
+      consume: false,
+      reason: `the lane held ${held.count} tax set(s) and the garage has stated ${taxFacts.stated}: a set stated since the lane's last refresh may be the one in force`,
+    };
+  }
+  if (taxFacts.in_window > 0) {
+    return {
+      consume: false,
+      reason: `a tax set taking effect after the newest the lane held (${held.newest_effective_from}) and by the decision's exit (${decision.exit_at}) is in force: the lane taxed with an older one`,
+    };
+  }
   return { consume: true };
+}
+
+/**
+ * What `consumableDecision` judges a priced decision's tax facts against, read
+ * beside the open stay -- or null when the decision carries none it could be
+ * judged by (it is then not consumed, and says why).
+ */
+async function taxFactsForDecision(client, tenantId, garageId, decision) {
+  if (decision?.status !== 'priced' || decision.tax_sets_held === undefined || !INSTANT_SHAPE.test(decision.exit_at)) return null;
+  return taxes.taxFactsFor(client, tenantId, garageId, { newest: decision.tax_sets_held.newest_effective_from, at: decision.exit_at });
 }
 
 /**
@@ -1236,6 +1301,10 @@ export function createApp() {
         const garage = await repo.getGarage(client, tenantId, garageId);
         if (!garage) return { garage };
         const plans = ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, garageId));
+        // The garage's WHOLE list of tax sets, as a load takes them (0023):
+        // the lane replaces its copy with this, never merges into it, so the
+        // count and the newest instant it reports describe every set it holds.
+        const taxSets = taxes.loadable(await taxes.taxSetsForGarage(client, tenantId, garageId));
         // The cursor is read BEFORE the open set in the same transaction: a
         // row that lands between the two reads is then past the cursor and
         // arrives on the first delta, rather than being in the set AND past
@@ -1243,7 +1312,7 @@ export function createApp() {
         // cursor and in no delta.
         const cursor = await repo.stayCursor(client, tenantId, garageId);
         const open = await repo.openStaysForLane(client, tenantId, garageId);
-        return { garage, plans, stays: { cursor, open } };
+        return { garage, plans, taxSets, stays: { cursor, open } };
       });
       if (!payload.garage) throw new HttpError(404, 'garage not found');
       // Outside the transaction: two subprocesses, and nothing of theirs is
@@ -1266,6 +1335,7 @@ export function createApp() {
         // nothing by adding a key.
         active: payload.garage.activated_at !== null,
         rate_plans: payload.plans,
+        tax_sets: payload.taxSets,
         entitlements,
         stays: payload.stays,
         synced_at: new Date().toISOString(),
@@ -1461,9 +1531,10 @@ export function createApp() {
    *
    * The body is `{phone, local_decision}`: the decision the reader is showing,
    * which must be a priced one this platform would consume at the close for
-   * this very stay (`consumableDecision`) -- the claim is made on the fee the
-   * close will write, or not at all. A stay already holding a claim on that
-   * fee answers it again (`replay`), without the door: one validation per
+   * this very stay (`consumableDecision`) -- the claim is made on the PRE-TAX
+   * subtotal the close will write (0023), or not at all, and the reader is
+   * told the taxed discounted figure. A stay already holding a claim on that
+   * subtotal answers it again (`replay`), without the door: one validation per
    * stay. A hold on another fee is given back first. A stay that is not open
    * is refused: a claim is made before the close, never after.
    *
@@ -1481,7 +1552,9 @@ export function createApp() {
       const phone = phoneField(req.body?.phone);
       if (phone === null) throw bad('phone is required: the number the driver entered');
       const decision = localDecisionField(req.body?.local_decision);
-      if (decision === null || decision.status !== 'priced' || decision.fee_minor === 0) {
+      // On the PRE-TAX subtotal (0023): a discount taken off the taxed total
+      // would come off the tax too, and leave tax on money nobody paid.
+      if (decision === null || decision.status !== 'priced' || decision.subtotal_minor === 0) {
         throw conflict('nothing_to_discount', 'a validation is claimed on a priced fee above zero; this request carries none');
       }
       const sessionId = req.params.sessionId;
@@ -1499,11 +1572,13 @@ export function createApp() {
         const garage = await repo.getGarage(client, tenantId, garageId);
         const open = await repo.findOpenSessionById(client, tenantId, garageId, sessionId);
         const plans = ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, garageId));
-        const consumable = consumableDecision(decision, { open, garage, planVersions: plans.map((p) => p.plan_version) });
+        const taxFacts = await taxFactsForDecision(client, tenantId, garageId, decision);
+        const consumable = consumableDecision(decision, { open, garage, planVersions: plans.map((p) => p.plan_version), taxFacts });
         if (!consumable.consume) throw conflict('decision_not_consumable', consumable.reason);
         const current = stay.validation;
-        if (current?.state === 'held' && current.base_minor === decision.fee_minor) {
-          return { answer: { outcome: 'held', record: current, replay: true } };
+        if (current?.state === 'held' && current.base_minor === decision.subtotal_minor) {
+          const tax = await taxOnHold(client, tenantId, garage, current, decision);
+          return { answer: { outcome: 'held', record: current, replay: true, tax } };
         }
         if (!garage.validations_link) {
           return { answer: { outcome: 'not_linked', reason: 'the garage names no garage in a validations module' } };
@@ -1511,7 +1586,7 @@ export function createApp() {
         const attempt = randomUUID();
         const prior = current && validations.UNRESOLVED.has(current.state) ? current : null;
         await repo.setValidationRecord(client, tenantId, sessionId, validations.claimingRecord({
-          attempt, link: garage.validations_link, feeMinor: decision.fee_minor, currency: decision.currency, prior,
+          attempt, link: garage.validations_link, feeMinor: decision.subtotal_minor, currency: decision.currency, prior,
         }));
         return { attempt, prior };
       });
@@ -1536,13 +1611,18 @@ export function createApp() {
         // The claim is named by this attempt (A3): a release that arrives late
         // names an earlier one and cannot undo it.
         const claimed = await validations.claimAtReader({
-          garage, sessionId, claimId: pre.attempt, phone, feeMinor: decision.fee_minor, currency: decision.currency, exitAt: new Date(decision.exit_at),
+          garage, sessionId, claimId: pre.attempt, phone, feeMinor: decision.subtotal_minor, currency: decision.currency, exitAt: new Date(decision.exit_at),
         });
+        // The figure the reader is told: the tax on the discounted subtotal,
+        // at the decision's exit -- the instant the close uses, so the two
+        // choose the same set. Taken BEFORE `held` is written: an engine that
+        // cannot answer rolls this back to `claiming`, which no close records.
+        const tax = claimed.outcome === 'held' ? await taxOnHold(client, tenantId, garage, claimed.record, decision) : null;
         const record = claimed.record
           ?? (pre.prior
             ? {
                 ...pre.prior, state: 'released', released_at: new Date().toISOString(), released_by: 'reclaim',
-                reason: `claimed again on ${decision.fee_minor}, not ${pre.prior.base_minor}`, release: released,
+                reason: `claimed again on ${decision.subtotal_minor}, not ${pre.prior.base_minor}`, release: released,
               }
             : null);
         await repo.setValidationRecord(client, tenantId, sessionId, record);
@@ -1560,7 +1640,7 @@ export function createApp() {
             },
           ]);
         }
-        return { ...claimed, replay: false };
+        return { ...claimed, replay: false, tax };
       });
       res.status(200).json({ validation: presentClaim(out) });
     } catch (err) {
@@ -1682,11 +1762,14 @@ export function createApp() {
         // THE LANE'S DECISION FIRST (0017). One computation feeds the screen,
         // the card and the row: a close that carries a decision the platform
         // can consume WRITES THAT DECISION'S NUMBERS and neither consults nor
-        // prices again. What it decided from goes beside the fee, and the
+        // prices again -- unless a validation is recorded, when the engine is
+        // asked for the tax on the discounted subtotal and nothing else
+        // (0023). What it decided from goes beside the fee, and the
         // reconciler re-derives the number from it out of band.
         let plans = ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, garageId));
         const consumable = consumableDecision(localDecision, {
           open, garage, planVersions: plans.map((p) => p.plan_version),
+          taxFacts: await taxFactsForDecision(client, tenantId, garageId, localDecision),
         });
         const identity = vehicle.plate ?? vehicle.ticket_ref;
         let asked;
@@ -1707,14 +1790,22 @@ export function createApp() {
               covered_by: coveredBy,
             },
           };
+          // PRE-TAX, like every pricing until the tax step below (0023): the
+          // lane's subtotal and its base lines. Its own taxed total and whole
+          // ledger ride beside them, and are what is written when no
+          // validation is recorded -- the number the driver was shown.
           pricing = coveredBy.length
             ? { outcome: entitlement.EXIT_OUTCOMES.COVERED }
             : {
                 outcome: entitlement.EXIT_OUTCOMES.TRANSIENT,
-                feeMinor: assertMinor(localDecision.fee_minor, 'local_decision.fee_minor'),
+                feeMinor: assertMinor(localDecision.subtotal_minor, 'local_decision.subtotal_minor'),
                 planVersion: localDecision.plan_version,
-                breakdown: localDecision.breakdown,
+                breakdown: taxes.withoutTaxLines(localDecision.breakdown),
                 spaceClass: localDecision.space_class,
+                asDecided: {
+                  feeMinor: assertMinor(localDecision.fee_minor, 'local_decision.fee_minor'),
+                  breakdown: localDecision.breakdown,
+                },
               };
           decisionInputs = {
             status: localDecision.status,
@@ -1764,8 +1855,23 @@ export function createApp() {
         // release the module already made. Read under the row's lock, so the
         // sweep and this close never both act on one record.
         const heldAtClose = await repo.lockValidation(client, tenantId, open.id);
-        const validated = validations.recordAtClose({ held: heldAtClose, pricing, readerShown, at: new Date() });
-        pricing = validated.pricing;
+        // WHICH INSTANT CHOOSES THE TAX SET (0023): the decision's exit when
+        // the lane's numbers are what is written, the close's own when this
+        // platform priced. Never "now".
+        const taxAt = consumable.consume && localDecision.status === 'priced' ? new Date(localDecision.exit_at) : exitAt;
+        // The tax on a hold's discounted subtotal, worked out BEFORE
+        // `recordAtClose`, which stays pure: it judges what the reader showed
+        // against this figure, and these are the lines appended when it
+        // records the hold -- one derivation for both. Taken ONLY for a hold
+        // the close could record (`recordableHold`, the rule `recordAtClose`
+        // decides by -- not restated here): a released, releasing or unshown
+        // record costs no engine call, so a close consuming a lane's decision
+        // still closes while the engine is down (0017).
+        const taxOnHeld = validations.recordableHold({ held: heldAtClose, pricing, readerShown })
+          ? await taxes.taxOn(client, tenantId, garage, { subtotalMinor: heldAtClose.fee_after_minor, currency: heldAtClose.currency, at: taxAt })
+          : null;
+        const validated = validations.recordAtClose({ held: heldAtClose, pricing, readerShown, taxOnHeld, at: new Date() });
+        pricing = await taxedPricing(validated.pricing, { client, tenantId, garage, currency: open.currency, at: taxAt });
 
         // THE SHADOW SNAPSHOT, HERE AND NOWHERE ELSE: after the stay to close
         // is known, BEFORE `exit_at` is written on it, in this transaction.
@@ -1910,7 +2016,8 @@ export function createApp() {
    * limit of storage, said as one. A set taking effect at an instant another
    * set already holds is `409 tax_set_effective_from_taken`, naming both. No
    * engine to ask is `503 rate_engine_unavailable`, and nothing is stored.
-   * Nothing here computes a percentage, and no stay is taxed.
+   * Nothing here computes a percentage; the close takes its tax lines from
+   * the engine (0023).
    */
   operator.post('/garages/:garageId/tax-sets', async (req, res, next) => {
     try {
@@ -1986,16 +2093,32 @@ function presentClaim(out) {
     return { outcome: out.outcome, ...(out.reason !== undefined ? { reason: out.reason } : {}) };
   }
   const r = out.record;
+  // The record's amounts are PRE-TAX (0023): what the claim was made on, and
+  // what is left after it. The reader is told the TAXED figure: the subtotal
+  // after the discount plus the tax lines the engine took on it.
   return {
     outcome: 'held',
     replay: out.replay,
     currency: r.currency,
     fee_before_minor: r.base_minor,
     discount_minor: r.discount_minor,
-    fee_minor: r.fee_after_minor,
+    subtotal_minor: r.fee_after_minor,
+    tax_lines: out.tax.lines,
+    fee_minor: assertMinor(r.fee_after_minor + out.tax.totalMinor, 'fee_minor'),
     line: r.line,
     held_at: r.held_at,
   };
+}
+
+/**
+ * The tax on a hold's discounted subtotal, at the decision's exit. One
+ * derivation for the figure the reader is told; the close derives it again,
+ * at the same instant, to judge what the reader showed.
+ */
+function taxOnHold(client, tenantId, garage, record, decision) {
+  return taxes.taxOn(client, tenantId, garage, {
+    subtotalMinor: record.fee_after_minor, currency: record.currency, at: new Date(decision.exit_at),
+  });
 }
 
 /** Money leaves the database as a string; it leaves the API as a number. */
@@ -2004,6 +2127,7 @@ function presentSession(s) {
     ...s,
     hourly_minor_applied: toMinor(s.hourly_minor_applied, 'hourly_minor_applied'),
     fee_minor: toMinor(s.fee_minor, 'fee_minor'),
+    subtotal_minor: toMinor(s.subtotal_minor, 'subtotal_minor'),
   };
 }
 
@@ -2066,6 +2190,41 @@ async function priceStay({ garage, plans, session, exitAt }) {
     if (err instanceof ratePlans.PricingRefused) return { refusal: err.findings };
     throw err;
   }
+}
+
+/**
+ * THE TAX LINES, LAST (0023). `pricing` arrives PRE-TAX -- base lines, then a
+ * recorded validation line if there is one -- and leaves with the tax lines
+ * after them, `subtotalMinor` beside the fee, and the fee the running total:
+ *
+ *   a recorded validation   the lines `recordAtClose` judged the reader's
+ *                           figure by, taken on the discounted subtotal;
+ *   the lane's decision     written EXACTLY as the lane decided it, tax
+ *                           included -- the number the driver was shown, and a
+ *                           second derivation would be a second answer to one
+ *                           question (0017);
+ *   this platform priced    the engine's tax on the subtotal, at the close.
+ *
+ * A covered or unpriced stay carries no tax and no subtotal. The table checks
+ * the sum as well; this checks it first, so a mismatch is named here.
+ */
+async function taxedPricing(pricing, { client, tenantId, garage, currency, at }) {
+  if (!validations.isPriced(pricing)) return pricing;
+  const { asDecided, taxLines, ...rest } = pricing;
+  const subtotalMinor = assertMinor(rest.feeMinor, 'subtotal_minor');
+  let taxed;
+  if (taxLines !== undefined) {
+    taxed = { ...rest, subtotalMinor, feeMinor: subtotalMinor + taxes.taxDelta(taxLines), breakdown: [...rest.breakdown, ...taxLines] };
+  } else if (asDecided !== undefined) {
+    taxed = { ...rest, subtotalMinor, feeMinor: asDecided.feeMinor, breakdown: asDecided.breakdown };
+  } else {
+    const { lines } = await taxes.taxOn(client, tenantId, garage, { subtotalMinor, currency, at });
+    taxed = { ...rest, subtotalMinor, feeMinor: subtotalMinor + taxes.taxDelta(lines), breakdown: [...rest.breakdown, ...lines] };
+  }
+  if (taxed.subtotalMinor + taxes.taxDelta(taxed.breakdown) !== taxed.feeMinor) {
+    throw new Error(`the stay's subtotal ${taxed.subtotalMinor} and its tax lines do not add up to its fee ${taxed.feeMinor}`);
+  }
+  return taxed;
 }
 
 /**

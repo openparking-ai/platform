@@ -17,7 +17,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { createApp } from '../src/app.js';
-import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage } from './helpers.js';
+import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage, DEFAULT_TAXES_HELD } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
 import { DECISION_CHECK_EVENT_KIND, sweepLaneDecisions } from '../src/reconcile.js';
@@ -91,6 +91,8 @@ function pricedDecision(sessionId, { feeMinor = 500, planVersion = 'flat-250-USD
     breakdown: [{ stage: 'ACCUMULATE', rule: 'hourly', amount_minor: feeMinor }],
     entry_at: entryAt, exit_at: exitAt, session_id: sessionId, space_class: spaceClass,
     computed_from: { rules_refreshed_at: 1726920000.5, stays_refreshed_at: 1726920100.5, stays_cursor: '42', day: '2025-09-10', clock: 'America/New_York' },
+    // 0023: the garage states no tax by default, so the fee IS the subtotal.
+    subtotal_minor: feeMinor, tax_sets_held: DEFAULT_TAXES_HELD,
   };
 }
 

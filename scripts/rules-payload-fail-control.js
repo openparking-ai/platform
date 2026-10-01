@@ -62,8 +62,8 @@ const SOURCE_BREAKS = [
     name: 'hourly_back',
     why: 'the hourly figure is back on the payload',
     file: 'src/app.js',
-    from: '        rate_plans: payload.plans,\n        entitlements,',
-    to: '        rate_plans: payload.plans,\n        hourly_minor: 250,\n        entitlements,',
+    from: '        rate_plans: payload.plans,\n        tax_sets: payload.taxSets,\n        entitlements,',
+    to: '        rate_plans: payload.plans,\n        tax_sets: payload.taxSets,\n        hourly_minor: 250,\n        entitlements,',
   },
   {
     name: 'plans_latest_only',

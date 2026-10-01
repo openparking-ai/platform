@@ -190,13 +190,17 @@ export async function closeSession(
   },
 ) {
   const priced = pricing.outcome !== 'covered' && pricing.refusal === undefined;
+  // THE PRE-TAX SUBTOTAL (0023), on a priced stay only. The table refuses a
+  // row whose subtotal and tax lines do not add up to its fee.
+  const subtotal = priced && pricing.subtotalMinor !== undefined ? pricing.subtotalMinor : null;
   const { rows } = await client.query(
     `UPDATE sessions
         SET exit_at = $3, exit_lane_id = $4, close_event_id = $5,
             exit_confirmation = $6, exit_descriptor = $7,
             fee_minor = $8, plan_version = $9, breakdown = $10, space_class = $11,
             pricing_refusal = $12, exit_outcome = $13, entitlement = $14,
-            decided_by = $15, decision_inputs = $16, validation = $17
+            decided_by = $15, decision_inputs = $16, validation = $17,
+            subtotal_minor = $18
       WHERE tenant_id = $1 AND id = $2 AND exit_at IS NULL
       RETURNING *`,
     [tenantId, sessionId, exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor,
@@ -209,7 +213,8 @@ export async function closeSession(
      entitlement === null || entitlement === undefined ? null : JSON.stringify(entitlement),
      decidedBy,
      decisionInputs === null || decisionInputs === undefined ? null : JSON.stringify(decisionInputs),
-     validation === null || validation === undefined ? null : JSON.stringify(validation)],
+     validation === null || validation === undefined ? null : JSON.stringify(validation),
+     subtotal],
   );
   return rows[0] ?? null;
 }

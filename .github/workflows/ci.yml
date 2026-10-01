@@ -337,3 +337,19 @@ jobs:
         # broken in turn -- one of them a single character -- plus six schema
         # statements never created, and the suite must go red.
         run: npm run taxes-fail-control
+
+      - name: Tax-on-the-stay fail-control
+        # Tax on what the driver pays (0023): base lines, the validation, then
+        # the tax, taken on the subtotal after the validation at the stay's
+        # exit instant; a lane decision taxed with a set it did not hold is not
+        # written; the table refuses a subtotal and tax lines that do not make
+        # the fee. Each is broken on a copy of the tree (one on a scratch
+        # database) and test/tax-on-paid.test.js must go red every time.
+        run: npm run tax-on-paid-fail-control
+
+      - name: A test file whose before throws ends red, not hung
+        # Each file that once closed `server` unguarded in its `after` is run
+        # with a throw planted in its `before`, and must exit non-zero inside a
+        # minute. The positive control puts one unguarded close back and
+        # requires a HANG, so this step can see the failure it exists for.
+        run: npm run hanging-hooks-control

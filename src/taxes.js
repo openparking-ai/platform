@@ -10,7 +10,7 @@
  *
  *   judge     is the ENGINE's, and only the engine's. The set, exactly as the
  *             request carried it, goes to `POST /v1/validate-tax-sets` --
- *             which hands it to `load_tax_sets`, the loader the close will use
+ *             which hands it to `load_tax_sets`, the loader the close uses
  *             -- BEFORE anything here reads a field of it. Whatever that door
  *             refuses is refused, in its words; whatever it loads is valid.
  *             This platform once kept its own copy of those rules, and the two
@@ -34,8 +34,9 @@
  *             stated order, the instant to the microsecond it is stored at.
  *             No selection here: the engine chooses the set in force.
  *
- * NO PERCENTAGE IS COMPUTED HERE, and nothing here hands a set to the close:
- * no stay carries a tax after this round.
+ * NO PERCENTAGE IS COMPUTED HERE. The close's tax lines (0023) are the
+ * engine's: `taxWithEngine` hands the garage's whole list, a subtotal and an
+ * instant to `POST /v1/tax` and writes back what it answered.
  */
 import * as repo from './repository.js';
 import { EngineUnavailable, rateEngineUrl } from './ratePlans.js';
@@ -334,6 +335,137 @@ export async function taxPosition(client, tenantId, garageId, { now = null } = {
        FROM garage_tax_sets
       WHERE tenant_id = $1 AND garage_id = $2`,
     [tenantId, garageId, now],
+  );
+  return rows[0];
+}
+
+// ---------------------------------------------------------------------------
+// TAX ON THE STAY (0023): the tax lines on what the driver pays.
+// ---------------------------------------------------------------------------
+
+/**
+ * The code every tax line carries (`rate_engine.tax`), and the only way a tax
+ * line is told from any other: by its code, never by its position.
+ */
+export const TAX_LINE_CODE = 'tax.applied';
+
+export const isTaxLine = (line) => line?.code === TAX_LINE_CODE;
+
+/** The sum of a ledger's tax lines. */
+export function taxDelta(breakdown) {
+  return (breakdown ?? []).filter(isTaxLine).reduce((sum, l) => sum + Number(l.delta_minor), 0);
+}
+
+/** A ledger without its tax lines: the base lines, and a validation line if one is there. */
+export function withoutTaxLines(breakdown) {
+  return (breakdown ?? []).filter((l) => !isTaxLine(l));
+}
+
+/** The garage's sets exactly as a load takes them: each one's instant and its rules, nothing of the store's. */
+export function loadable(sets) {
+  return sets.map((s) => ({ effective_from: s.effective_from, rules: s.rules }));
+}
+
+/** The engine's 422 on a tax request: no set covers the instant. Its findings, verbatim. */
+export class TaxRefused extends Error {
+  constructor(findings) {
+    super(`the rate engine refused the tax: ${JSON.stringify(findings).slice(0, 300)}`);
+    this.findings = findings;
+  }
+}
+
+/**
+ * Hand a garage's sets, a subtotal and an instant to the engine's
+ * `POST /v1/tax`, and return what it answered: `{ lines, totalMinor }`, the
+ * lines as the engine wrote them. Nothing is computed here.
+ *
+ * `TaxRefused` on the engine's 422; `EngineUnavailable` for no engine, or an
+ * answer that is not a tax answer -- including a 400, which is a request this
+ * platform built wrong (every set it holds was loaded before it was stored),
+ * and is not a refusal to record against a stay.
+ */
+export async function taxWithEngine({ taxSets, subtotalMinor, currency, at }, { url = rateEngineUrl(), timeoutMs = 10 * 1000 } = {}) {
+  if (!url) throw new EngineUnavailable('RATE_ENGINE_URL is not set; the close takes its tax lines from the engine and nothing else');
+  let res;
+  let text;
+  try {
+    res = await fetch(`${url}/v1/tax`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tax_sets: taxSets, subtotal_minor: subtotalMinor, currency, at: at.toISOString() }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    text = await res.text();
+  } catch (err) {
+    throw new EngineUnavailable(`the rate engine at ${url} could not be reached for the tax (${err?.cause?.code ?? err?.name ?? err})`);
+  }
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = null;
+  }
+  if (!body || typeof body !== 'object') {
+    throw new EngineUnavailable(`the rate engine at ${url} answered the tax with HTTP ${res.status} and no JSON body`);
+  }
+  if (res.status === 422 && body.refused === true && Array.isArray(body.findings)) {
+    throw new TaxRefused(body.findings);
+  }
+  if (
+    res.status === 200 &&
+    Array.isArray(body.lines) &&
+    body.lines.every(isTaxLine) &&
+    Number.isInteger(body.total_minor) &&
+    body.total_minor === taxDelta(body.lines)
+  ) {
+    return { lines: body.lines, totalMinor: body.total_minor };
+  }
+  throw new EngineUnavailable(
+    `the rate engine at ${url} answered HTTP ${res.status} with a body this platform does not recognise as a tax answer: ${text.slice(0, 300)}`,
+  );
+}
+
+/**
+ * The tax lines on `subtotalMinor`, for this garage, at `at`: its WHOLE list
+ * of sets handed to the engine, which picks the one in force.
+ *
+ * A garage with no set in force at `at` is a BROKEN INVARIANT, not a stay to
+ * close untaxed or unpriced: activation requires a set in force (0022), sets
+ * are append-only, and an inactive garage closes nothing. It fails loudly, as
+ * an active garage with no plan does (`priceStay`).
+ */
+export async function taxOn(client, tenantId, garage, { subtotalMinor, currency, at }) {
+  const sets = await taxSetsForGarage(client, tenantId, garage.id);
+  if (sets.length === 0) {
+    throw new Error(`garage ${garage.id} is active and has stated no tax set; activation requires one and sets are append-only`);
+  }
+  try {
+    return await taxWithEngine({ taxSets: loadable(sets), subtotalMinor, currency, at });
+  } catch (err) {
+    if (err instanceof TaxRefused) {
+      throw new Error(
+        `garage ${garage.id} is active and has no tax set in force at ${at.toISOString()}; activation requires one and sets are append-only (${err.message})`,
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * What the platform knows that a lane's tax facts are judged against
+ * (`consumableDecision`): how many sets the garage has stated, and how many of
+ * them take effect AFTER the newest the lane held and AT OR BEFORE `at`.
+ * Compared in the database, as instants -- `timestamptz` holds microseconds
+ * and a JavaScript Date does not. `newest` is null when the lane held none.
+ */
+export async function taxFactsFor(client, tenantId, garageId, { newest, at }) {
+  const { rows } = await client.query(
+    `SELECT count(*)::int AS stated,
+            count(*) FILTER (WHERE ($3::timestamptz IS NULL OR effective_from > $3::timestamptz)
+                               AND effective_from <= $4::timestamptz)::int AS in_window
+       FROM garage_tax_sets
+      WHERE tenant_id = $1 AND garage_id = $2`,
+    [tenantId, garageId, newest, at],
   );
   return rows[0];
 }

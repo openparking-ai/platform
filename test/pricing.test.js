@@ -113,7 +113,9 @@ before(async () => {
 });
 
 after(async () => {
-  await new Promise((r) => server.close(r));
+  // Guarded: a `before` that threw leaves these unset, and an unguarded close
+  // would hang the file with whatever it had started still running.
+  if (server) await new Promise((r) => server.close(r));
   await engine?.stop();
   await pool.end();
 });

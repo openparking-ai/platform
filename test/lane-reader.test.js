@@ -82,9 +82,11 @@ before(async () => {
 });
 
 after(async () => {
+  // Guarded: a `before` that threw leaves these unset, and an unguarded close
+  // would hang the file with whatever it had started still running.
   unconfigure();
-  await new Promise((resolve) => server.close(resolve));
-  await stub.close();
+  if (server) await new Promise((resolve) => server.close(resolve));
+  if (stub) await stub.close();
   await pool.end();
 });
 

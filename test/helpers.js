@@ -78,6 +78,12 @@ export async function storePlan(client, tenantId, garageId, document) {
  * the statement "this garage charges no tax". Tests of the route and its
  * refusals are in test/taxes.test.js.
  */
+/**
+ * What a lane reports of its cache when it holds exactly the set `stateTaxes`
+ * states by default (0023): one set, and its instant as `/lane/rules` serves it.
+ */
+export const DEFAULT_TAXES_HELD = Object.freeze({ count: 1, newest_effective_from: '2000-01-01T00:00:00.000000Z' });
+
 export async function stateTaxes(client, tenantId, garageId, { rules = [], effectiveFrom = '2000-01-01T00:00:00Z' } = {}) {
   const set = (
     await client.query(
@@ -104,8 +110,9 @@ export async function stateTaxes(client, tenantId, garageId, { rules = [], effec
  *
  * A garage that has stated no taxes is made to state NONE first, in so many
  * words (a set with no rules): these worlds exist to exercise lanes and
- * closes, and no stay is taxed in this round whatever is stated. A garage
- * that already stated its taxes keeps what it stated.
+ * closes, and a set with no rules taxes nothing, so their fees are the
+ * engine's alone. A garage that already stated its taxes keeps what it
+ * stated -- and is taxed by it (0023).
  */
 export async function activateGarage(client, tenantId, garageId, { transientAvailable = true } = {}) {
   const stated = await client.query(

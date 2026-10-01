@@ -136,7 +136,7 @@ test('the payload carries the plans whole, the space class, the entitlements, th
   const payload = await rules(g.entry);
   assert.deepEqual(Object.keys(payload).sort(), [
     'active', 'currency', 'default_action', 'direction', 'entitlements', 'garage_id', 'lane_id',
-    'rate_plans', 'space_class', 'stays', 'synced_at', 'timezone',
+    'rate_plans', 'space_class', 'stays', 'synced_at', 'tax_sets', 'timezone',
   ]);
   for (const gone of ['hourly_minor', 'rate_id', 'plate_rules']) assert.equal(gone in payload, false, gone);
   assert.equal(payload.space_class, 'standard');

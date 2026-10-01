@@ -37,6 +37,7 @@
  *   claiming_left_by_close     the close takes no notice of a claim never held (A2.3).
  *   claiming_left_by_sweep     the sweep never gives back a claim never held (A2.3).
  *   releasing_recorded         a stay whose release began records the discount (A2.3).
+ *   releasing_recorded_masked  the same, behind the close's old held-only tax guard.
  *   release_never_finished     the close never asks the door after it commits (A2.3).
  *   unfinished_left            the sweep never finishes a release begun (A2.3).
  *   claim_not_named            every attempt's claim has the same name, so a late
@@ -96,22 +97,22 @@ const SOURCE_BREAKS = [
     name: 'line_not_on_ledger',
     why: 'the fee is discounted with no line',
     file: 'src/validations.js',
-    from: "      pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, held.line] },",
-    to: "      pricing: { ...pricing, feeMinor, breakdown: pricing.breakdown },",
+    from: "      pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, held.line], taxLines: taxOnHeld.lines },",
+    to: "      pricing: { ...pricing, feeMinor, breakdown: pricing.breakdown, taxLines: taxOnHeld.lines },",
   },
   {
     name: 'fee_not_discounted',
     why: 'the line is written and the fee left as priced',
     file: 'src/validations.js',
-    from: "      pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, held.line] },",
-    to: "      pricing: { ...pricing, breakdown: [...pricing.breakdown, held.line] },",
+    from: "      pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, held.line], taxLines: taxOnHeld.lines },",
+    to: "      pricing: { ...pricing, breakdown: [...pricing.breakdown, held.line], taxLines: taxOnHeld.lines },",
   },
   {
     name: 'hold_taken_at_another_fee',
     why: 'a hold is recorded on a fee it was not claimed on',
     file: 'src/validations.js',
-    from: "  if (held.state === 'held' && priced && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0 && shownDiscounted) {",
-    to: "  if (held.state === 'held' && priced && pricing.feeMinor > 0 && shownDiscounted) {",
+    from: "isPriced(pricing) && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0\n",
+    to: "isPriced(pricing) && pricing.feeMinor > 0\n",
   },
   {
     name: 'close_strands_hold',
@@ -173,7 +174,7 @@ const SOURCE_BREAKS = [
     name: 'replay_asks_door',
     why: 'a held claim asked again goes to the door',
     file: 'src/app.js',
-    from: "        if (current?.state === 'held' && current.base_minor === decision.fee_minor) {",
+    from: "        if (current?.state === 'held' && current.base_minor === decision.subtotal_minor) {",
     to: "        if (false) {",
   },
   {
@@ -194,22 +195,27 @@ const SOURCE_BREAKS = [
     name: 'unpriced_is_claimed',
     why: 'a covered or zero decision is claimed on',
     file: 'src/app.js',
-    from: "      if (decision === null || decision.status !== 'priced' || decision.fee_minor === 0) {",
+    from: "      if (decision === null || decision.status !== 'priced' || decision.subtotal_minor === 0) {",
     to: "      if (decision === null) {",
   },
   {
     name: 'reconciler_sees_line',
     why: 'the reconciler compares with the fee including the line',
     file: 'src/reconcile.js',
-    from: "  return Number(row.fee_minor) - validationDelta(row.breakdown);",
-    to: "  return Number(row.fee_minor) - 0 * validationDelta(row.breakdown);",
+    from: "  return Number(row.fee_minor) - validationDelta(row.breakdown) - taxDelta(row.breakdown);",
+    to: "  return Number(row.fee_minor) - 0 * validationDelta(row.breakdown) - taxDelta(row.breakdown);",
   },
   {
     name: 'shown_not_checked',
     why: 'a hold is recorded whatever the reader showed',
     file: 'src/validations.js',
-    from: "  const shownDiscounted = readerShown !== null && readerShown !== undefined",
-    to: "  const shownDiscounted = true || readerShown !== null && readerShown !== undefined",
+    from: "  if (recordable && readerShown.fee_minor === shownMinor && readerShown.currency === held.currency) {",
+    to: "  if (recordable) {",
+    also: [{
+      file: 'src/validations.js',
+      from: "    && readerShown !== null && readerShown !== undefined;",
+      to: "    && true;",
+    }],
   },
   {
     name: 'claiming_left_by_close',
@@ -229,8 +235,24 @@ const SOURCE_BREAKS = [
     name: 'releasing_recorded',
     why: 'a stay whose release began records the discount',
     file: 'src/validations.js',
-    from: "  if (held.state === 'held' && priced && pricing.feeMinor === held.base_minor",
-    to: "  if ((held.state === 'held' || held.state === 'releasing') && priced && pricing.feeMinor === held.base_minor",
+    from: "  return held?.state === 'held' && isPriced(pricing) && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0",
+    to: "  return (held?.state === 'held' || held?.state === 'releasing') && isPriced(pricing) && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0",
+  },
+  {
+    // The same break with the close's old guard put back -- the tax taken only
+    // for a `held` record. That guard once hid this break (the hold went
+    // untaxed, so unrecorded, so the suite stayed green); `recordAtClose` now
+    // refuses a recordable hold that arrives with no tax, so it cannot again.
+    name: 'releasing_recorded_masked',
+    why: 'a stay whose release began records the discount, behind a held-only tax guard',
+    file: 'src/validations.js',
+    from: "  return held?.state === 'held' && isPriced(pricing) && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0",
+    to: "  return (held?.state === 'held' || held?.state === 'releasing') && isPriced(pricing) && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0",
+    also: [{
+      file: 'src/app.js',
+      from: '        const taxOnHeld = validations.recordableHold({ held: heldAtClose, pricing, readerShown })',
+      to: "        const taxOnHeld = heldAtClose?.state === 'held' && validations.recordableHold({ held: heldAtClose, pricing, readerShown })",
+    }],
   },
   {
     name: 'release_never_finished',
@@ -394,11 +416,16 @@ async function buildScratch(dir, brk) {
  * first occurrence, and a break whose anchor also matches a line elsewhere in
  * the file lands on that line and measures nothing.
  */
+/** A break and its `also` edits, every one or none: each anchor exactly once. */
 function plant(dir, edit) {
-  const path = join(dir, edit.file);
-  const source = readFileSync(path, 'utf8');
-  if (source.split(edit.from).length !== 2) return false;
-  writeFileSync(path, source.replace(edit.from, edit.to));
+  const planned = [];
+  for (const e of [edit, ...(edit.also ?? [])]) {
+    const path = join(dir, e.file);
+    const source = planned.find((p) => p.path === path)?.text ?? readFileSync(path, 'utf8');
+    if (source.split(e.from).length !== 2) return false;
+    planned.push({ path, text: source.replace(e.from, e.to) });
+  }
+  for (const p of planned) writeFileSync(p.path, p.text);
   return true;
 }
 
