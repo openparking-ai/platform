@@ -90,6 +90,7 @@ const FORBIDDEN_DIGESTS = new Map([
   ['5e0176c9d2070a5a2a22bf74b4abed303654690d58d64221ccbd022af827abc4', 'a sibling product name'],
   ['f6f6ead0bd85c3127bd5004115a60942d61204561649d9e713bf4f74058de4d1', 'a sibling product name'],
   ['74953c9d406bceeacf22dd9a93605e0a5962858b8cfdbcb7562d429af8b2ae21', 'a sibling hostname'],
+  ['a75544eb8ef8befb84aca80cead6f71160719bbdd9eb1e2ac676f66836e91df1', 'the gate control word (scratch branch only)'],
 ]);
 
 //: The number of names the private source held when this block was generated.
@@ -99,7 +100,7 @@ const FORBIDDEN_DIGESTS = new Map([
 //: 12 -> 11: one entry left the private source because it was never within
 //: the rule's scope, which names the estate's products and hostnames and
 //: nothing about the maintainer personally.
-const EXPECTED_DIGEST_COUNT = 11;
+const EXPECTED_DIGEST_COUNT = 12;
 
 if (FORBIDDEN_DIGESTS.size !== EXPECTED_DIGEST_COUNT) {
   console.error(
