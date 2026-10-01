@@ -22,8 +22,8 @@
  *   VALIDATION_HOLD_MINUTES=30   the hold window (default 30)
  *   VERBOSE=1                    a line per tenant even when there was nothing
  *
- * Needs the validations door (ENTITLEMENT_BIN_DIR or PATH) and its DSN, as
- * the close does. A release the door could not make leaves the hold for the
+ * Needs the validations door (VALIDATIONS_DOOR, found in ENTITLEMENT_BIN_DIR
+ * or on PATH) and its DSN, as the close does. A release the door could not make leaves the hold for the
  * next run; the exit code says how many.
  */
 import { pool } from '../src/db.js';

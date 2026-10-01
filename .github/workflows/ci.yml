@@ -56,6 +56,31 @@ jobs:
         if: github.event_name != 'pull_request'
         run: node .github/scripts/check-no-commercial-values.js
 
+      - name: No name from outside this project (self-test)
+        # Before trusting the scan, prove it can fail: a planted word is found
+        # in a line, inside an identifier and in a path; a longer word holding
+        # it is not.
+        run: node .github/scripts/check-no-sibling-names.js --self-test
+
+      - name: No name from outside this project (this pull request)
+        # Every tracked file's contents AND path, and the PR's commit messages.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: node .github/scripts/check-no-sibling-names.js "$BASE..$HEAD"
+
+      - name: No name from outside this project (whole history)
+        if: github.event_name != 'pull_request'
+        run: node .github/scripts/check-no-sibling-names.js
+
+      - name: No name from outside this project (working tree)
+        # Tracked and untracked files, contents and paths, and every commit
+        # message. Plants its own controls -- a word in a file, a word in a
+        # file's name -- and requires each caught, in the same run, before the
+        # real scan is read.
+        run: node .github/scripts/check-no-sibling-names.js --worktree
+
       - name: Migration 0002's SQL is frozen
         # Its comments may change; its statements may not. It is applied
         # everywhere it will ever be applied.
@@ -138,6 +163,15 @@ jobs:
             if [ -n "$(printenv "$v")" ]; then echo "$v is set; the suite must run without Connect"; exit 1; fi
           done
           echo "no Connect setting present"
+
+      - name: The suite runs with no validations door named
+        # This repository names no validations module: VALIDATIONS_DOOR has no
+        # default, and unset means the deployment has none. The tests that need
+        # the door name the stand-in themselves; everything else runs as a
+        # deployment without one.
+        run: |
+          if [ -n "$(printenv VALIDATIONS_DOOR)" ]; then echo "VALIDATIONS_DOOR is set; the suite must run without it"; exit 1; fi
+          echo "no validations door named"
 
       - name: Tests
         run: npm test
@@ -294,6 +328,14 @@ jobs:
         # property is broken in turn, plus three schema statements never
         # created, and the suite must go red.
         run: npm run validations-fail-control
+
+      - name: Validations-door fail-control
+        # The door is named by VALIDATIONS_DOOR and by nothing else. Each break
+        # removes one property of that -- a default put back, the refusal
+        # skipped or reworded, a value that is not a bare command run, a
+        # deployment with no door answering "not validated" -- and requires
+        # test/validations-door.test.js to go red.
+        run: npm run validations-door-fail-control
 
       - name: Stripe-account fail-control
         # A garage's own Stripe account (0020): created only on the operator's

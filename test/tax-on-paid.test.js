@@ -31,6 +31,7 @@ import { startRateEngine } from './rate-engine.js';
 import { laneDecidedCloses } from '../src/reconcile.js';
 
 const DOOR_DIR = new URL('./fixtures/validations-door/', import.meta.url).pathname;
+const DOOR_NAME = 'validations-stand-in';
 const scratch = mkdtempSync(join(tmpdir(), 'openparking-tax-on-paid-'));
 const STATE = join(scratch, 'state.json');
 const LOG = join(scratch, 'calls.jsonl');
@@ -177,6 +178,7 @@ before(async () => {
   engine = await startRateEngine();
   process.env.RATE_ENGINE_URL = engine.url;
   process.env.ENTITLEMENT_BIN_DIR = DOOR_DIR;
+  process.env.VALIDATIONS_DOOR = DOOR_NAME;
   process.env.VALIDATIONS_STANDIN_STATE = STATE;
   process.env.VALIDATIONS_STANDIN_LOG = LOG;
   tenant = await createTenant('tax-on-paid');

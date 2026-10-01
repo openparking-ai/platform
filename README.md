@@ -758,6 +758,19 @@ module it is —
 `PUT /api/v1/garages/<id>/validations-link` with `{validations: {tenant_id,
 garage_id}}` or `null` — and the link is probed before it is stored.
 
+**Which command is the door is the deployment's to say.** `VALIDATIONS_DOOR`
+names it — a bare command name, found in `ENTITLEMENT_BIN_DIR` or on the PATH —
+and **there is no default**: this repository does not know which module a
+deployment links, so it names none. **Unset means this deployment has no
+validations module.** Stating a link is then refused by name, `409
+validations_not_configured` ("This deployment has no validations module
+configured."), and no door is ever run: a reader claim at an unlinked garage
+answers `not_linked` and a close asks nothing, exactly as without the setting.
+Unlinking (`null`) needs no door. A garage that already links a module while the
+setting is unset cannot be answered for, so it takes the could-not-decide path
+below, by name — never a silent no-validation. Whoever deploys a platform with a
+validations module sets it.
+
 **The claim is made when the phone is entered, not at the close** (amendment
 A1): the close comes after the barrier opens, and the driver has to see the
 discounted amount before paying. The reader shows the fee the lane priced with
@@ -825,7 +838,8 @@ that claim again. A door that **refused** holds nothing, with a
 the fee **without** the validation line or the tax lines.
 
 `test/validations.test.js` runs against the real engine and a stand-in for the
-door (`test/fixtures/validations-door`) that speaks the door's contract and
+door (`test/fixtures/validations-door`, named to the suite by
+`VALIDATIONS_DOOR`) that speaks the door's contract and
 computes nothing; `npm run validations-fail-control` breaks each property in
 turn.
 
