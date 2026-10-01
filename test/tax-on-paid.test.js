@@ -568,3 +568,102 @@ test('THE TABLE refuses a row whose subtotal and tax lines do not add up to its 
   // And a row with no subtotal -- every row closed before this round -- is not judged.
   await admin.query('UPDATE sessions SET subtotal_minor = NULL, fee_minor = fee_minor + 1 WHERE id = $1', [id]);
 });
+
+// --- the engine down, and a hold the close cannot record (gate F1) --------------------------
+
+/** No engine at this address: nothing listens on the discard port. */
+const DEAD_ENGINE = 'http://127.0.0.1:9';
+async function engineAt(url, fn) {
+  const live = process.env.RATE_ENGINE_URL;
+  process.env.RATE_ENGINE_URL = url;
+  try {
+    return await fn();
+  } finally {
+    process.env.RATE_ENGINE_URL = live;
+  }
+}
+/**
+ * THE INSTRUMENT for "how many tax calls": every `fetch` in this process whose
+ * URL ends `/v1/tax`, counted while `fn` runs. The platform runs in this
+ * process, so its calls to the engine are among them; the test's own calls
+ * here are to the platform, never to the engine.
+ */
+async function taxCallsDuring(fn) {
+  const real = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (url, ...rest) => {
+    if (String(url).endsWith('/v1/tax')) calls += 1;
+    return real(url, ...rest);
+  };
+  try {
+    await fn();
+  } finally {
+    globalThis.fetch = real;
+  }
+  return calls;
+}
+
+/**
+ * A stay at an exit, its validation HELD on the lane's decision, then left in
+ * `state`: 'released' or 'releasing' as the sweep leaves it, or 'held'. The
+ * reader's figure goes on the close only when `shown`.
+ */
+async function heldStay(state, { shown }) {
+  const g = await garage({ validations: [validation(200)] });
+  const car = plate('DOWN');
+  const id = await opened(g, car);
+  const decision = laneDecides(await rules(g.exit), { sessionId: id });
+  const answer = (await (await claim(g, id, decision)).json()).validation;
+  assert.equal(answer.outcome, 'held');
+  if (state !== 'held') {
+    await withTenant(tenant, (c) => c.query(
+      `UPDATE sessions SET validation = validation || jsonb_build_object('state', $2::text, 'released_by', 'sweep') WHERE id = $1`, [id, state]));
+  }
+  const extra = { local_decision: decision, ...(shown ? { reader_shown: { fee_minor: answer.fee_minor, currency: 'USD' } } : {}) };
+  return { g, car, id, decision, extra };
+}
+
+const UNRECORDABLE = [['released', true], ['releasing', true], ['held', false]];
+
+for (const [state, shown] of UNRECORDABLE) {
+  test(`ENGINE DOWN: a lane-decided close whose hold cannot be recorded (${state}${shown ? '' : ', nothing shown'}) still closes, at the lane's numbers`, async () => {
+    const s = await heldStay(state, { shown });
+    const res = await engineAt(DEAD_ENGINE, () => close(s.g, s.car, s.extra));
+    assert.equal(res.status, 200, await res.clone().text());
+    const row = await rowFor(s.id);
+    assert.equal(row.decided_by, 'lane');
+    assert.notEqual(row.validation.state, 'recorded');
+    assert.deepStrictEqual(row.breakdown, s.decision.breakdown, "the lane's ledger, tax included");
+    assert.deepEqual([Number(row.fee_minor), Number(row.subtotal_minor)], [s.decision.fee_minor, s.decision.subtotal_minor]);
+  });
+}
+
+test('CONTROL: ENGINE DOWN and a RECORDABLE hold -- the close fails and the stay stays open (the reader\'s figure cannot be judged)', async () => {
+  const s = await heldStay('held', { shown: true });
+  const res = await engineAt(DEAD_ENGINE, () => close(s.g, s.car, s.extra));
+  assert.ok(res.status >= 500, `${res.status} ${await res.text()}`);
+  const row = await rowFor(s.id);
+  assert.equal(row.exit_at, null);
+  assert.equal(row.validation.state, 'held');
+});
+
+test('ENGINE DOWN and a stay the platform prices itself: the close fails, as before this round', async () => {
+  const g = await garage();
+  const car = plate('SELFDN');
+  const id = await opened(g, car);
+  const res = await engineAt(DEAD_ENGINE, () => close(g, car));
+  assert.ok(res.status >= 500, `${res.status} ${await res.text()}`);
+  assert.equal((await rowFor(id)).exit_at, null);
+});
+
+test('TAX CALLS, counted: ZERO for a close whose hold cannot be recorded; exactly ONE for a recordable hold', async () => {
+  const counts = [];
+  for (const [state, shown] of [...UNRECORDABLE, ['held', true]]) {
+    const s = await heldStay(state, { shown });
+    counts.push(await taxCallsDuring(async () => {
+      const res = await close(s.g, s.car, s.extra);
+      assert.equal(res.status, 200, await res.clone().text());
+    }));
+  }
+  assert.deepEqual(counts, [0, 0, 0, 1], 'released, releasing, held-not-shown, then the recordable hold');
+});

@@ -334,6 +334,21 @@ export function isPriced(pricing) {
 }
 
 /**
+ * Whether the close COULD record this hold, judged on everything that needs no
+ * tax figure: the record is `held`, the stay is priced, its pre-tax fee is the
+ * subtotal the claim was made on and above zero, and the close says what the
+ * reader showed. The ONE statement of that rule: `recordAtClose` decides by
+ * it, and the close asks it before deriving the hold's tax -- so a record that
+ * can never be recorded (released, releasing, claiming, held but not shown)
+ * costs no engine call, and a close that consumes a lane's decision still
+ * needs no engine for it (0017).
+ */
+export function recordableHold({ held, pricing, readerShown }) {
+  return held?.state === 'held' && isPriced(pricing) && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0
+    && readerShown !== null && readerShown !== undefined;
+}
+
+/**
  * THE CLOSE RECORDS WHAT WAS CLAIMED AND SHOWN. `held` is the stay's validation
  * record as it stands under the close's lock; `readerShown` is what the close
  * says the reader showed (`{fee_minor, currency}`), or null; `taxOnHeld` is the
@@ -342,7 +357,9 @@ export function isPriced(pricing) {
  * total including it, the record `recorded`, and `taxOnHeld`'s lines handed on
  * as `taxLines` to go after it -- only when the close's PRE-TAX fee is the
  * subtotal the claim was made on AND the reader showed the discounted subtotal
- * plus that tax. Nothing asks the door and nothing is recomputed.
+ * plus that tax. Nothing asks the door and nothing is recomputed. A hold
+ * `recordableHold` passes and no `taxOnHeld` is a caller's error, and THROWS:
+ * released quietly instead, a hold the close should have judged would vanish.
  *
  * Anything else still unresolved -- a hold the close cannot take (covered,
  * unpriced, another fee, a reader that showed the fee as priced or said
@@ -356,15 +373,17 @@ export function isPriced(pricing) {
 export function recordAtClose({ held, pricing, readerShown, taxOnHeld = null, at }) {
   if (!held || !UNRESOLVED.has(held.state)) return { pricing, record: held ?? null, releaseAfter: false };
   const priced = isPriced(pricing);
+  const recordable = recordableHold({ held, pricing, readerShown });
+  if (recordable && taxOnHeld === null) {
+    throw new Error('a recordable hold reached the close with no tax on its discounted subtotal; the caller derives it when recordableHold says so');
+  }
   // `pricing` is PRE-TAX and so is the record (0023): the claim was made on
   // the subtotal and `fee_after_minor` is what is left of it. The reader was
   // told the TAXED figure, so that is what it is held to: the discounted
   // subtotal plus `taxOnHeld`, the tax the caller took on it at the stay's
   // instant. Those lines go on the ledger when the hold is recorded.
-  const shownMinor = taxOnHeld === null ? null : held.fee_after_minor + taxOnHeld.totalMinor;
-  const shownDiscounted = readerShown !== null && readerShown !== undefined && shownMinor !== null
-    && readerShown.fee_minor === shownMinor && readerShown.currency === held.currency;
-  if (held.state === 'held' && priced && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0 && shownDiscounted) {
+  const shownMinor = recordable ? held.fee_after_minor + taxOnHeld.totalMinor : null;
+  if (recordable && readerShown.fee_minor === shownMinor && readerShown.currency === held.currency) {
     const feeMinor = assertMinor(pricing.feeMinor + held.line.delta_minor, 'fee_minor');
     return {
       pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, held.line], taxLines: taxOnHeld.lines },

@@ -15,6 +15,9 @@
  *   claim_on_taxed            the validation is claimed on the lane's TAXED fee.
  *   tax_on_undiscounted       the close takes the hold's tax on the fee BEFORE
  *                             the discount.
+ *   tax_for_unrecordable      the close takes the tax for a hold it cannot
+ *                             record, so an engine outage stops a lane-decided
+ *                             close that needs no engine (gate F1).
  *   lane_tax_kept             with a validation recorded, the lane's ledger --
  *                             tax on the full fee -- is written anyway.
  *   zero_tax_line             a driver paying nothing gets a zero tax line.
@@ -76,6 +79,15 @@ const SOURCE_BREAKS = [
     }],
   },
   {
+    name: 'tax_for_unrecordable',
+    why: 'the close takes the tax for a hold it cannot record (released, releasing, not shown)',
+    edits: [{
+      file: 'src/app.js',
+      from: '        const taxOnHeld = validations.recordableHold({ held: heldAtClose, pricing, readerShown })',
+      to: '        const taxOnHeld = Number.isInteger(heldAtClose?.fee_after_minor) && validations.isPriced(pricing)',
+    }],
+  },
+  {
     name: 'lane_tax_kept',
     why: "with a validation recorded, the lane's ledger is written anyway",
     edits: [{
@@ -98,8 +110,8 @@ const SOURCE_BREAKS = [
     why: 'what the reader showed is compared with the untaxed discounted subtotal',
     edits: [{
       file: 'src/validations.js',
-      from: '  const shownMinor = taxOnHeld === null ? null : held.fee_after_minor + taxOnHeld.totalMinor;',
-      to: '  const shownMinor = held.fee_after_minor;',
+      from: '  const shownMinor = recordable ? held.fee_after_minor + taxOnHeld.totalMinor : null;',
+      to: '  const shownMinor = recordable ? held.fee_after_minor : null;',
     }],
   },
   {

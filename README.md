@@ -546,7 +546,11 @@ Every priced close carries its tax (migration 0023), in one order everywhere:
   the taxed discounted figure (`fee_minor`, with `subtotal_minor` and
   `tax_lines` beside it). The validation record's amounts stay pre-tax; what
   the reader showed is compared with the discounted subtotal plus the tax the
-  close takes on it, at the same instant — one derivation for both.
+  close takes on it, at the same instant — one derivation for both. That tax
+  is taken only for a hold the close could record (`recordableHold`: held, on
+  this fee, with the reader's figure on the close); a released, releasing or
+  unshown hold costs no engine call, so a close consuming a lane's decision
+  still closes while the engine is down.
 - **A garage with no set in force at the instant is a broken invariant**, and
   the close fails loudly: activation requires a set in force and sets are
   append-only.

@@ -1862,10 +1862,12 @@ export function createApp() {
         // The tax on a hold's discounted subtotal, worked out BEFORE
         // `recordAtClose`, which stays pure: it judges what the reader showed
         // against this figure, and these are the lines appended when it
-        // records the hold -- one derivation for both. Taken for any record
-        // that has a discounted subtotal: WHICH states may be recorded is
-        // `recordAtClose`'s rule alone, and is not repeated here.
-        const taxOnHeld = Number.isInteger(heldAtClose?.fee_after_minor) && validations.isPriced(pricing)
+        // records the hold -- one derivation for both. Taken ONLY for a hold
+        // the close could record (`recordableHold`, the rule `recordAtClose`
+        // decides by -- not restated here): a released, releasing or unshown
+        // record costs no engine call, so a close consuming a lane's decision
+        // still closes while the engine is down (0017).
+        const taxOnHeld = validations.recordableHold({ held: heldAtClose, pricing, readerShown })
           ? await taxes.taxOn(client, tenantId, garage, { subtotalMinor: heldAtClose.fee_after_minor, currency: heldAtClose.currency, at: taxAt })
           : null;
         const validated = validations.recordAtClose({ held: heldAtClose, pricing, readerShown, taxOnHeld, at: new Date() });
