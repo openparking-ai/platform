@@ -142,3 +142,80 @@ for (const spec of tables) {
     }
   });
 }
+
+// ---------------------------------------------------------------------------
+// The owner's reads (U2a): tenant A's SESSION and A's KEY against tenant B's
+// garage, on every new read -- 404 or empty, never B's row. Over HTTP as the
+// app role, so row-level security and the routes' own predicate both stand.
+// Then the PREDICATE ALONE: the same repository reads through a connection
+// that bypasses row-level security, so removing a read's tenant predicate has
+// nothing else to hide behind and goes red here.
+// ---------------------------------------------------------------------------
+
+test('owner reads: a tenant\'s session and its key never see B\'s garages, garage or lanes', async () => {
+  const { createApp } = await import('../src/app.js');
+  const { generateDeviceToken, hashToken } = await import('../src/auth.js');
+  const { createAdmin } = await import('../src/adminAccount.js');
+  const origin = 'https://admin.example.test';
+  const saved = process.env.ADMIN_ORIGIN;
+  process.env.ADMIN_ORIGIN = origin;
+  const server = createApp().listen(0, '127.0.0.1');
+  if (saved === undefined) delete process.env.ADMIN_ORIGIN;
+  else process.env.ADMIN_ORIGIN = saved;
+  await new Promise((r) => server.once('listening', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    // A tenant of its own: A's admin row is the registry's, planted above.
+    const C = await createTenant('iso-reads');
+    const worldC = await buildWorld(C);
+    const key = generateDeviceToken();
+    await withTenant(C, (c) => c.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'iso',$2)`, [C, hashToken(key)]));
+    const email = `iso-reads-${C.slice(0, 8)}@example.com`;
+    const password = 'correct horse battery staple';
+    await createAdmin({ tenantId: C, email, password });
+    const signedIn = await fetch(`${base}/api/v1/auth/sign-in`, {
+      method: 'POST', headers: { 'content-type': 'application/json', origin }, body: JSON.stringify({ email, password }),
+    });
+    const cookie = signedIn.headers.getSetCookie()[0]?.split(';')[0];
+    assert.equal(signedIn.status, 200, 'the premise: the owner signed in');
+    for (const auth of [{ cookie }, { authorization: `Bearer ${key}` }]) {
+      const as = (path) => fetch(`${base}/api/v1${path}`, { headers: auth }).then(async (r) => ({ status: r.status, text: await r.text() }));
+      const list = await as('/garages');
+      assert.equal(list.status, 200);
+      const ids = JSON.parse(list.text).garages.map((g) => g.id);
+      assert.ok(ids.includes(worldC.garage), 'the owner sees its own');
+      assert.equal(ids.includes(worldB.garage), false, 'and never B\'s');
+      for (const path of [`/garages/${worldB.garage}`, `/garages/${worldB.garage}/lanes`]) {
+        const r = await as(path);
+        assert.equal(r.status, 404, path);
+        assert.equal(r.text.includes(worldB.entryLane) || r.text.includes(worldB.exitLane), false, path);
+      }
+    }
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('owner reads, the PREDICATE ALONE: with row-level security bypassed, A\'s reads still return none of B\'s rows', async () => {
+  const repo = await import('../src/repository.js');
+  const pg = (await import('pg')).default;
+  const owner = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await owner.connect();
+  try {
+    const role = (await owner.query('SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user')).rows[0];
+    assert.ok(role.rolsuper || role.rolbypassrls, 'the premise: this connection bypasses RLS, so only the predicate is under test');
+    // Plant B's rows where a read without its predicate would find them: a device and a reader on B's lane.
+    await owner.query(`INSERT INTO lane_devices (tenant_id, lane_id, name, token_hash) VALUES ($1,$2,'b-pi', md5(gen_random_uuid()::text))`, [B, worldB.entryLane]);
+    const garages = await repo.garagesForTenant(owner, A);
+    assert.ok(garages.length > 0);
+    assert.equal(garages.some((g) => g.id === worldB.garage), false, 'garagesForTenant returned B\'s garage');
+    assert.equal(await repo.getGarage(owner, A, worldB.garage), null, 'getGarage returned B\'s garage');
+    assert.deepEqual(await repo.lanesForGarage(owner, A, worldB.garage), [], 'lanesForGarage returned B\'s lanes');
+    // Mixed: A's tenant with B's lane rows in the same garage-shaped query must not cross either.
+    const own = await repo.lanesForGarage(owner, A, worldA.garage);
+    assert.ok(own.length >= 2);
+    assert.equal(own.some((l) => l.devices.some((d) => d.name === 'b-pi')), false);
+  } finally {
+    await owner.end();
+  }
+});

@@ -367,6 +367,62 @@ export async function stayChangesSince(client, tenantId, garageId, since, limit)
   return { changes: rows.slice(0, limit).map(stayRow), more };
 }
 
+/**
+ * THE OWNER'S SCREENS READ THESE (U2a). Each is tenant-scoped in its own
+ * predicate as well as by row-level security: two controls, either one alone a
+ * mistake from a leak (docs/RLS_TEMPLATE.md).
+ *
+ * A garage as the screens show it: id, name, time zone, currency, and whether
+ * it is live -- activated (0014) -- and nothing else.
+ */
+export function presentGarage(row) {
+  return { id: row.id, name: row.name, timezone: row.timezone, currency: row.currency, live: row.activated_at !== null };
+}
+
+/** The tenant's garages, oldest first. */
+export async function garagesForTenant(client, tenantId) {
+  const { rows } = await client.query(
+    'SELECT id, name, timezone, currency, activated_at FROM garages WHERE tenant_id = $1 ORDER BY created_at, id',
+    [tenantId],
+  );
+  return rows;
+}
+
+/**
+ * A garage's lanes, each with its devices and when each was last heard from,
+ * and the card reader bound to it, if one is. A revoked device is shown WITH
+ * `revoked_at`, as the devices route shows it: a revoked device that stops
+ * being heard from is not a fault, and the screen must be able to tell. An
+ * unbound reader is no longer the lane's reader and is not shown.
+ * `token_hash` is never selected. Every query carries the tenant.
+ */
+export async function lanesForGarage(client, tenantId, garageId) {
+  const lanes = (await client.query(
+    'SELECT id, name, direction FROM lanes WHERE tenant_id = $1 AND garage_id = $2 ORDER BY created_at, id',
+    [tenantId, garageId],
+  )).rows;
+  const devices = (await client.query(
+    `SELECT d.id, d.lane_id, d.name, d.last_seen_at, d.revoked_at
+       FROM lane_devices d JOIN lanes l ON l.id = d.lane_id AND l.tenant_id = d.tenant_id
+      WHERE d.tenant_id = $1 AND l.garage_id = $2
+      ORDER BY d.created_at, d.id`,
+    [tenantId, garageId],
+  )).rows;
+  const readers = (await client.query(
+    `SELECT lane_id, reader_id, label, bound_at FROM lane_readers
+      WHERE tenant_id = $1 AND garage_id = $2 AND unbound_at IS NULL`,
+    [tenantId, garageId],
+  )).rows;
+  return lanes.map((lane) => {
+    const reader = readers.find((r) => r.lane_id === lane.id);
+    return {
+      ...lane,
+      devices: devices.filter((d) => d.lane_id === lane.id).map(({ id, name, last_seen_at, revoked_at }) => ({ id, name, last_seen_at, revoked_at })),
+      reader: reader ? { reader_id: reader.reader_id, label: reader.label, bound_at: reader.bound_at } : null,
+    };
+  });
+}
+
 export async function getGarage(client, tenantId, garageId) {
   const { rows } = await client.query('SELECT * FROM garages WHERE tenant_id = $1 AND id = $2', [
     tenantId,

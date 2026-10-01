@@ -45,6 +45,7 @@
     "reset-admin-password": "node scripts/reset-admin-password.js",
     "measure-scrypt": "node scripts/measure-scrypt.js",
     "owner-sign-in-fail-control": "node scripts/owner-sign-in-fail-control.js",
+    "garage-reads-fail-control": "node scripts/garage-reads-fail-control.js",
     "check-no-real-data": "node .github/scripts/check-no-real-data.js",
     "check-no-commercial-values": "node .github/scripts/check-no-commercial-values.js",
     "check-no-sibling-names": "node .github/scripts/check-no-sibling-names.js"
