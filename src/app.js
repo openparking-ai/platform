@@ -13,6 +13,7 @@ import * as validations from './validations.js';
 import { reconcile } from './reconcile.js';
 import * as stripeAccount from './stripeAccount.js';
 import * as terminal from './terminal.js';
+import * as signIn from './signIn.js';
 
 class HttpError extends Error {
   constructor(status, message, code = null) {
@@ -644,6 +645,16 @@ function refuseFuture(at, label, now = new Date()) {
 
 export function createApp() {
   const app = express();
+  const authSettings = signIn.readAuthSettings();
+  if (authSettings.trustProxy !== null) app.set('trust proxy', authSettings.trustProxy);
+
+  // FIRST, before the app-wide body parser and before the operator router.
+  // The operator router answers 401 to everything under /api/v1, so mounted
+  // after it sign-in is unreachable; and the auth routes read their own body,
+  // so a body that cannot be parsed is answered with their one sentence and
+  // never with the parser's text, which quotes what was sent.
+  app.use('/api/v1/auth', signIn.createAuthRouter(authSettings));
+
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/healthz', (_req, res) => res.json({ ok: true }));
@@ -663,16 +674,38 @@ export function createApp() {
    *
    * Same bootstrap problem as lane devices, same answer: resolve_operator_token
    * is SECURITY DEFINER because the tenant is what the lookup is for.
+   *
+   * OR the owner's session cookie (0024): a Bearer KEY is read first and is
+   * unchanged; with none, the cookie. A request authenticated by the cookie
+   * that changes something must carry an Origin equal to ADMIN_ORIGIN, checked
+   * BEFORE the session is looked up, so a refused cross-site request does not
+   * even keep a session alive. An ended session answers 401 `session_ended`.
+   * A session token presented as a Bearer key is not a key and is refused.
    */
-  operator.use(async (req, _res, next) => {
+  operator.use(signIn.noStore);
+  operator.use(async (req, res, next) => {
     try {
       const token = bearerFrom(req.get('authorization'));
-      if (!token) throw new HttpError(401, 'operator token required');
-      const { rows } = await pool.query('SELECT * FROM resolve_operator_token($1)', [hashToken(token)]);
-      if (rows.length === 0) throw new HttpError(401, 'unknown or revoked operator token');
-      req.tenantId = rows[0].tenant_id;
-      req.operatorTokenId = rows[0].token_id;
-      pool.query('SELECT touch_operator_token($1)', [req.operatorTokenId]).catch(() => {});
+      if (token) {
+        const { rows } = await pool.query('SELECT * FROM resolve_operator_token($1)', [hashToken(token)]);
+        if (rows.length === 0) throw new HttpError(401, 'unknown or revoked operator token');
+        req.tenantId = rows[0].tenant_id;
+        req.operatorTokenId = rows[0].token_id;
+        pool.query('SELECT touch_operator_token($1)', [req.operatorTokenId]).catch(() => {});
+        return next();
+      }
+      const session = signIn.sessionToken(req);
+      if (session === null) throw new HttpError(401, 'operator token required');
+      if (!signIn.originAllows(req, authSettings)) {
+        throw new HttpError(403, signIn.ORIGIN_REFUSED.error, signIn.ORIGIN_REFUSED.code);
+      }
+      const found = await signIn.resolveSession(session, authSettings);
+      if (!found) {
+        signIn.clearCookie(res, authSettings);
+        throw new HttpError(401, signIn.SESSION_ENDED.error, signIn.SESSION_ENDED.code);
+      }
+      req.tenantId = found.tenant_id;
+      req.operatorTokenId = found.token_id;
       next();
     } catch (err) {
       next(err);

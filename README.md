@@ -292,6 +292,82 @@ curl -H "authorization: Bearer $OPERATOR_TOKEN" \
   http://127.0.0.1:3000/api/v1/garages/<id>/sessions/open
 ```
 
+### The owner signs in
+
+**One admin per tenant**: an email and a password, and nothing else — no roles,
+no user management, no sign-up and no email sent from this repository. A
+sign-in **is a session token**, minted the way operator tokens are (random 32
+bytes, only its SHA-256 stored), so every operator route works unchanged behind
+it (migration 0024).
+
+    POST /api/v1/auth/sign-in    {email, password}  ->  200 {email, tenant_id, session_ends_at} and the cookie
+    POST /api/v1/auth/sign-out   revokes the session row                 ->  204
+    GET  /api/v1/auth/me         {email, tenant_id, session_ends_at}
+
+**The admin is made at the database, never over HTTP**, as an operator token is:
+
+```sh
+npm run create-admin -- --tenant <tenant-id> --email <email>            # prompts, twice, no echo
+npm run reset-admin-password -- --email <email> --password-file <path>  # or from a file
+```
+
+The password **never arrives on the command line** — argv is in the process
+list — and a password argument, in any spelling, is refused by name. It is at
+least 12 characters; length is the one rule. A reset revokes every session of
+that admin and clears every lock on it. There is no change-password route yet;
+that comes with the account page.
+
+**The cookie** is `op_session`: `HttpOnly` (page script can never read it),
+`Secure`, `SameSite=Strict`, `Path=/api`, no `Domain`. So **the admin site is
+served from the same origin as `/api`** — there is no CORS here. `Secure` may be
+turned off only by `SESSION_COOKIE_INSECURE=true`, for plain-http local
+development, and `serve` says so out loud when it is.
+
+**The operator router takes a Bearer key (unchanged) or the cookie.** A request
+the cookie authenticates that **changes** something (POST, PUT, PATCH, DELETE)
+must carry an `Origin` equal to `ADMIN_ORIGIN`, or it is refused `403
+origin_refused` before the session is looked up. With no `ADMIN_ORIGIN` set,
+sign-in is off and answers `409 sign_in_not_configured`. A sign-in with a
+foreign `Origin` is refused, and one not sent as JSON cannot be read. A session
+token presented as a Bearer key is not a key.
+
+**A session ends** 30 minutes after its last use and 12 hours after sign-in,
+whichever is first (`SESSION_IDLE_MINUTES`, `SESSION_MAX_HOURS`). An ended
+session answers `401 session_ended`, so the screen can say what happened, and
+presenting it again revives nothing.
+
+**Guessing.** Ten wrong passwords **from one caller address** lock that address
+out of that account for 30 minutes; wrong passwords during the lock still count
+and re-arm it. Other addresses are unaffected, so knowing the admin's email is
+not enough to keep the admin out — there is no account-wide lock. Separately,
+each address gets `SIGN_IN_ATTEMPTS_PER_ADDRESS` attempts (default 30) per
+`SIGN_IN_ATTEMPTS_WINDOW_MINUTES` (default 15), held in this process, then `429
+sign_in_rate_limited`. The address is the **socket's**; `X-Forwarded-For` is
+read only when `TRUST_PROXY` is declared (Express's `trust proxy` forms). An
+IPv6 address counts by its /64. ⚠ **Behind a proxy with no `TRUST_PROXY`, every
+caller is the proxy, so the lock is in effect account-wide** — declare it.
+
+**No oracle.** An unknown email, a wrong password and a locked address answer
+the same `401 sign_in_refused`, byte for byte, and each runs exactly one hash.
+
+**Nothing secret is written out.** The password, the token, the cookie and the
+stored hash appear in no log line and no response body. A body that cannot be
+read answers one fixed sentence (`400 sign_in_unreadable`), never the JSON
+parser's text, which quotes what was sent; a failure inside sign-in is logged by
+its class and code, never its message. Every operator and auth response carries
+`Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. No auth route
+takes a credential in its path or query.
+
+**The password hash** is `node:crypto` scrypt (no dependency), stored with its
+own parameters; a stored string in a format this code does not know is refused
+by name and never compared. The parameters were measured with `npm run
+measure-scrypt` (`src/passwords.js` names the machine). Each hash at N=2¹⁷ takes
+128 MiB; Node runs at most its thread pool's worth at once.
+
+`test/owner-sign-in.test.js`, `test/admin-cli.test.js` and
+`test/owner-sign-in-output.test.js` hold each of these; `npm run
+owner-sign-in-fail-control` breaks each one in turn.
+
 ### A lane that has gone quiet
 
 `GET /api/v1/garages/<id>/devices` lists the devices on that garage's lanes with

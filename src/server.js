@@ -1,6 +1,7 @@
 import { createApp } from './app.js';
 import { closePool } from './db.js';
 import { assertSchemaCurrent } from './schema.js';
+import { readAuthSettings } from './signIn.js';
 
 const port = Number(process.env.PORT || 3000);
 
@@ -13,6 +14,27 @@ try {
   console.error(`[platform] REFUSING TO SERVE: ${err.message}`);
   await closePool().catch(() => {});
   process.exit(1);
+}
+
+// The sign-in settings are read before the port opens too: a value that is
+// not one of their forms refuses to start, and the two that weaken or switch
+// off owner sign-in are said out loud.
+let auth;
+try {
+  auth = readAuthSettings();
+} catch (err) {
+  console.error(`[platform] REFUSING TO SERVE: ${err.message}`);
+  await closePool().catch(() => {});
+  process.exit(1);
+}
+if (!auth.cookieSecure) {
+  console.error(
+    '[platform] WARNING: SESSION_COOKIE_INSECURE=true -- the sign-in cookie is sent WITHOUT Secure, ' +
+      'over plain http. For local development only; never on a deployment anyone reaches.',
+  );
+}
+if (auth.adminOrigin === null) {
+  console.log('[platform] owner sign-in is off: ADMIN_ORIGIN is not set');
 }
 
 createApp().listen(port, () => console.log(`[platform] listening on :${port}`));
