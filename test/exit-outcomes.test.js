@@ -233,20 +233,32 @@ test('no amount travels to either module: the argv carries an identity, a garage
   const w = await linkedWorld();
   await open(w.entry, w.passCar);
   const { session } = await (await close(w.exit, w.passCar)).json();
+  // The WHOLE argv, every value the one this test supplied: an amount can
+  // arrive neither as an extra argument nor inside an existing one. Scanning
+  // the joined argv for money words instead failed about one run in sixty:
+  // the tenants, the lane and the garage are random hex, and hex spells "fee".
+  const expected = {
+    garage_pass: [
+      'access-in-store', '--tenant', modules.garage_pass.tenant, '--garage', w.gpGarage,
+      '--vehicle', w.passCar, '--lane', w.exitLane, '--direction', 'exit', '--at', '2026-09-10T14:00:00.000Z',
+    ],
+    monthly_billing: [
+      'covered-in-store', '--tenant', modules.monthly_billing.tenant, '--garage', w.mbGarage,
+      '--vehicle', w.passCar, '--at', '2026-09-10T14:00:00.000Z', '--entered-at', '2026-09-10T12:00:00.000Z',
+    ],
+  };
+  // The words this platform writes itself -- the verb and the flags -- name no money.
+  const MONEY = /minor|amount|fee|price|currency/i;
   for (const module of ['garage_pass', 'monthly_billing']) {
     const argv = session.entitlement[module].argv;
-    assert.ok(Array.isArray(argv) && argv.length > 0);
-    const flags = argv.filter((a) => a.startsWith('--'));
-    assert.deepEqual(
-      flags,
-      module === 'garage_pass'
-        ? ['--tenant', '--garage', '--vehicle', '--lane', '--direction', '--at']
-        : ['--tenant', '--garage', '--vehicle', '--at', '--entered-at'],
-    );
-    assert.ok(!/minor|amount|fee|price|currency/i.test(argv.join(' ')), `${module} was handed money`);
+    assert.deepEqual(argv, expected[module], `${module} was handed something other than an identity, a garage, a lane and instants`);
+    const words = argv.filter((a, i) => i === 0 || a.startsWith('--'));
+    assert.ok(!words.some((a) => MONEY.test(a)), `${module} was handed money`);
   }
-  // CONTROL: the sweep would catch an amount.
-  assert.ok(/minor|amount|fee|price|currency/i.test('--fee-minor 500'));
+  // CONTROL: the comparison sees an amount, as an extra argument or inside a value.
+  const argv = session.entitlement.garage_pass.argv;
+  assert.notDeepEqual([...argv, '--fee-minor', '500'], expected.garage_pass);
+  assert.notDeepEqual(argv.map((a) => (a === w.passCar ? `${a} 500` : a)), expected.garage_pass);
 });
 
 // --- could not decide is not not-covered ---------------------------------------------------

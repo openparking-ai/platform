@@ -33,6 +33,10 @@
  *   identity_guessed           the platform consults with the plate even for
  *                              a ticket stay (the ticket text replaced by an
  *                              empty identity).
+ *   amount_as_an_argument      garage-pass is handed `--fee-minor 500`.
+ *   amount_inside_a_value      garage-pass is handed `500` inside its `--lane`
+ *                              value, which only the exact-argv comparison in
+ *                              "no amount travels" can see.
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0015, so the property genuinely never existed.
@@ -137,6 +141,22 @@ const SOURCE_BREAKS = [
     file: 'src/app.js',
     from: '        const identity = vehicle.plate ?? vehicle.ticket_ref;',
     to: "        const identity = vehicle.plate ?? 'unknown';",
+  },
+  {
+    name: 'amount_as_an_argument',
+    why: 'an amount is handed to garage-pass as an argument of its own',
+    file: 'src/entitlement.js',
+    from: "          '--vehicle', identity, '--lane', laneId, '--direction', 'exit', '--at', at,\n",
+    to: "          '--vehicle', identity, '--lane', laneId, '--direction', 'exit', '--at', at, '--fee-minor', '500',\n",
+  },
+  {
+    // The one only "no amount travels" catches: garage-pass accepts the value,
+    // and a scan for money WORDS finds none in "500".
+    name: 'amount_inside_a_value',
+    why: 'an amount rides inside an argument garage-pass already takes',
+    file: 'src/entitlement.js',
+    from: "          '--vehicle', identity, '--lane', laneId, '--direction', 'exit', '--at', at,\n",
+    to: "          '--vehicle', identity, '--lane', `${laneId} 500`, '--direction', 'exit', '--at', at,\n",
   },
 ];
 
