@@ -567,7 +567,7 @@ test('an unknown garage is 404 on both verbs', async () => {
 
 // --- nothing is computed ----------------------------------------------------------------
 
-test('no percentage is computed anywhere in this round: the tax store and the route hold no arithmetic on percent_bp', async () => {
+test('no percentage is computed on this side: the tax store and the routes hold no arithmetic on percent_bp', async () => {
   const sources = ['src/taxes.js', 'migrations/0022_garage_tax_sets.sql'];
   const arithmetic = /percent_bp\s*[*/]|[*/]\s*percent_bp|\b10_?000\b|basis_points_per/i;
   for (const path of sources) {
@@ -577,12 +577,16 @@ test('no percentage is computed anywhere in this round: the tax store and the ro
   }
   // CONTROL: the pattern finds arithmetic when there is some.
   assert.ok(arithmetic.test('const tax = subtotal * rule.percent_bp / 10000;'));
-  // And the close hands the engine no tax: the route's close path never
-  // names the store.
+  // Every use of the store from the routes, pinned: the two operator routes,
+  // and since 0023 the close, the claim and /lane/rules -- through a door to
+  // the engine (`taxOn`), the lines it returned (`taxDelta`,
+  // `withoutTaxLines`), the list as a load takes it (`loadable`) and the
+  // stale-set facts (`taxFactsFor`). A new use is a change to this list.
   const app = await readFile(new URL('../src/app.js', import.meta.url), 'utf8');
   // The import path ('./taxes.js') is not a use.
   const uses = (app.match(/taxes\.\w+/g) ?? []).filter((u) => u !== 'taxes.js');
   assert.deepEqual([...new Set(uses)].sort(), [
-    'taxes.TaxSetRefused', 'taxes.assertStorable', 'taxes.judgeTaxSet', 'taxes.storeTaxSet', 'taxes.taxSetsForGarage',
-  ], 'the store is reached by its two operator routes and nothing else');
+    'taxes.TaxSetRefused', 'taxes.assertStorable', 'taxes.judgeTaxSet', 'taxes.loadable', 'taxes.storeTaxSet',
+    'taxes.taxDelta', 'taxes.taxFactsFor', 'taxes.taxOn', 'taxes.taxSetsForGarage', 'taxes.withoutTaxLines',
+  ], 'the store is reached by these and nothing else');
 });

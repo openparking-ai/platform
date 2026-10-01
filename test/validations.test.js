@@ -25,7 +25,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../src/app.js';
-import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage } from './helpers.js';
+import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage, DEFAULT_TAXES_HELD } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
 import { laneDecidedCloses, sweepLaneDecisions } from '../src/reconcile.js';
@@ -79,6 +79,8 @@ const priced = (sessionId, { feeMinor = 500, entryAt = '2026-09-10T12:00:00+00:0
   breakdown: [{ code: 'increment.first_period', rule_id: 'hourly', text: 'first hour', delta_minor: 250 },
     { code: 'increment.repeat_periods', rule_id: 'hourly', text: 'more hours', delta_minor: feeMinor - 250 }],
   entry_at: entryAt, exit_at: exitAt, session_id: sessionId, space_class: 'standard', computed_from: computedFrom,
+  // 0023: the garage states no tax by default, so the fee IS the subtotal.
+  subtotal_minor: feeMinor, tax_sets_held: DEFAULT_TAXES_HELD,
 });
 /** What the reader showed: the discounted fee of the stand-in's default validation (500 - 200). */
 const SHOWN = { fee_minor: 300, currency: 'USD' };
@@ -228,7 +230,7 @@ test('the phone is claimed when it is entered: the reader is answered the discou
   assert.equal(res.status, 200, await res.clone().text());
   const { validation } = await res.json();
   assert.deepEqual(validation, {
-    outcome: 'held', replay: false, currency: 'USD', fee_before_minor: 500, discount_minor: 200, fee_minor: 300,
+    outcome: 'held', replay: false, currency: 'USD', fee_before_minor: 500, discount_minor: 200, subtotal_minor: 300, tax_lines: [], fee_minor: 300,
     line: { code: LINE_CODE, rule_id: null, delta_minor: -200, text: 'Validation from Example Name (2.00 USD off): -2.00 USD' },
     held_at: validation.held_at,
   });
@@ -652,12 +654,24 @@ test('a door that refused: nothing held, and a human is told', async () => {
 });
 
 test('money the module asserts that does not fit the question is not held: 5xx', async () => {
+  // The 5xx says only "internal error"; the operator's log says why. Read, so
+  // a refusal for another reason -- the engine refusing a negative subtotal
+  // the money check let through (0023) -- cannot stand in for this one.
+  const why = { bad_money: /outside 0\.\./, wrong_base: /the claim answered for .* it was asked about/ };
   for (const mode of ['bad_money', 'wrong_base']) {
     const g = await linked();
     const car = plate('MONY');
     const id = await opened(g, car);
     setMode(mode);
-    assert.equal((await claimAt(g.exit, id, PHONE, priced(id))).status, 500, mode);
+    const logged = [];
+    const original = console.error;
+    console.error = (...args) => logged.push(args.map(String).join(' '));
+    try {
+      assert.equal((await claimAt(g.exit, id, PHONE, priced(id))).status, 500, mode);
+    } finally {
+      console.error = original;
+    }
+    assert.match(logged.join('\n'), why[mode], mode);
     assert.equal((await rowFor(id)).validation.state, 'claiming', mode);
   }
 });

@@ -328,14 +328,21 @@ export function claimIdsOf(record) {
 /** The states in which the module may hold a claim for this stay that no close will record. */
 export const UNRESOLVED = new Set(['held', 'claiming', 'releasing']);
 
+/** A pricing with a fee: transient, not refused, a whole number of minor units. */
+export function isPriced(pricing) {
+  return pricing.outcome === 'transient' && pricing.refusal === undefined && Number.isInteger(pricing.feeMinor);
+}
+
 /**
  * THE CLOSE RECORDS WHAT WAS CLAIMED AND SHOWN. `held` is the stay's validation
  * record as it stands under the close's lock; `readerShown` is what the close
- * says the reader showed (`{fee_minor, currency}`), or null. A hold is taken
- * -- its line appended to the ledger, the fee the running total including it,
- * the record `recorded` -- only when the close's fee is the fee the claim was
- * made on AND the reader showed the discounted fee. Nothing asks the door and
- * nothing is recomputed.
+ * says the reader showed (`{fee_minor, currency}`), or null; `taxOnHeld` is the
+ * tax on the hold's discounted subtotal, worked out by the caller (0023). A
+ * hold is taken -- its line appended to the ledger, the subtotal the running
+ * total including it, the record `recorded`, and `taxOnHeld`'s lines handed on
+ * as `taxLines` to go after it -- only when the close's PRE-TAX fee is the
+ * subtotal the claim was made on AND the reader showed the discounted subtotal
+ * plus that tax. Nothing asks the door and nothing is recomputed.
  *
  * Anything else still unresolved -- a hold the close cannot take (covered,
  * unpriced, another fee, a reader that showed the fee as priced or said
@@ -346,15 +353,21 @@ export const UNRESOLVED = new Set(['held', 'claiming', 'releasing']);
  *
  * Returns `{ pricing, record, releaseAfter }`.
  */
-export function recordAtClose({ held, pricing, readerShown, at }) {
+export function recordAtClose({ held, pricing, readerShown, taxOnHeld = null, at }) {
   if (!held || !UNRESOLVED.has(held.state)) return { pricing, record: held ?? null, releaseAfter: false };
-  const priced = pricing.outcome === 'transient' && pricing.refusal === undefined && Number.isInteger(pricing.feeMinor);
-  const shownDiscounted = readerShown !== null && readerShown !== undefined
-    && readerShown.fee_minor === held.fee_after_minor && readerShown.currency === held.currency;
+  const priced = isPriced(pricing);
+  // `pricing` is PRE-TAX and so is the record (0023): the claim was made on
+  // the subtotal and `fee_after_minor` is what is left of it. The reader was
+  // told the TAXED figure, so that is what it is held to: the discounted
+  // subtotal plus `taxOnHeld`, the tax the caller took on it at the stay's
+  // instant. Those lines go on the ledger when the hold is recorded.
+  const shownMinor = taxOnHeld === null ? null : held.fee_after_minor + taxOnHeld.totalMinor;
+  const shownDiscounted = readerShown !== null && readerShown !== undefined && shownMinor !== null
+    && readerShown.fee_minor === shownMinor && readerShown.currency === held.currency;
   if (held.state === 'held' && priced && pricing.feeMinor === held.base_minor && pricing.feeMinor > 0 && shownDiscounted) {
     const feeMinor = assertMinor(pricing.feeMinor + held.line.delta_minor, 'fee_minor');
     return {
-      pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, held.line] },
+      pricing: { ...pricing, feeMinor, breakdown: [...pricing.breakdown, held.line], taxLines: taxOnHeld.lines },
       record: {
         ...held, state: 'recorded', recorded_at: at.toISOString(), fee_before_minor: pricing.feeMinor, fee_after_minor: feeMinor,
         reader_shown: readerShown,
@@ -368,7 +381,7 @@ export function recordAtClose({ held, pricing, readerShown, at }) {
       : !priced ? 'the stay closed with no priced fee'
         : pricing.feeMinor !== held.base_minor ? `the stay closed at ${pricing.feeMinor}, not the ${held.base_minor} the claim was made on`
           : readerShown === null || readerShown === undefined ? 'the close does not say the reader showed the discounted fee'
-            : `the reader showed ${readerShown.fee_minor} ${readerShown.currency}, not the discounted ${held.fee_after_minor} ${held.currency}`;
+            : `the reader showed ${readerShown.fee_minor} ${readerShown.currency}, not the discounted ${shownMinor} ${held.currency}`;
   return {
     pricing,
     record: {

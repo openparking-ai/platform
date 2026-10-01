@@ -17,15 +17,19 @@ import { withTenant } from './db.js';
 import * as ratePlans from './ratePlans.js';
 import * as repo from './repository.js';
 import { validationDelta } from './validations.js';
+import { taxDelta } from './taxes.js';
 
 /**
- * The fee the ENGINE came to on a row: the row's fee less its validation
- * lines (0019). A validation is the module's assertion, appended after the
- * engine's lines; the engine never priced it, so a re-derivation is compared
- * with the fee without it.
+ * The fee the ENGINE's quote came to on a row: the row's fee less its
+ * validation lines (0019) and its tax lines (0023). A validation is the
+ * module's assertion, and the tax is taken on the subtotal after it; neither
+ * is the quote's, so a re-derivation of the quote is compared with the fee
+ * without them. What re-derives is the BASE only: the tax is held by the
+ * write's own check (subtotal plus tax lines is the fee) and by the close's
+ * refusal of a stale tax set, not re-derived here.
  */
 function engineFee(row) {
-  return Number(row.fee_minor) - validationDelta(row.breakdown);
+  return Number(row.fee_minor) - validationDelta(row.breakdown) - taxDelta(row.breakdown);
 }
 
 /**

@@ -31,6 +31,8 @@
     "lane-reader-fail-control": "node scripts/lane-reader-fail-control.js",
     "standalone-arm-fail-control": "node scripts/standalone-arm-fail-control.js",
     "taxes-fail-control": "node scripts/taxes-fail-control.js",
+    "tax-on-paid-fail-control": "node scripts/tax-on-paid-fail-control.js",
+    "hanging-hooks-control": "node scripts/hanging-hooks-control.js",
     "reconcile-lane-decisions": "node scripts/reconcile-lane-decisions.js",
     "release-validation-holds": "node scripts/release-validation-holds.js",
     "demo": "node scripts/demo.js",

@@ -13,7 +13,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { createApp } from '../src/app.js';
-import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage } from './helpers.js';
+import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage, DEFAULT_TAXES_HELD } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
 import { startEntitlementModules } from './entitlement-modules.js';
@@ -117,6 +117,9 @@ function pricedDecision(sessionId, { feeMinor = 500, planVersion = 'flat-250-USD
     session_id: sessionId,
     space_class: spaceClass,
     computed_from: { rules_refreshed_at: 1758480000.5, stays_refreshed_at: 1758480100.5, stays_cursor: '42', day: '2026-09-10', clock: 'America/New_York' },
+    // 0023: the garage states no tax by default, so the fee IS the subtotal.
+    subtotal_minor: feeMinor,
+    tax_sets_held: DEFAULT_TAXES_HELD,
   };
 }
 const coveredDecision = () => ({
@@ -222,7 +225,7 @@ test('a close carrying no decision takes today\'s path exactly: the engine price
   const { session } = await res.json();
   assert.equal(session.fee_minor, 500, 'two hours at 250');
   assert.equal(session.decided_by, 'platform');
-  assert.equal(counting.requests(), before + 1, 'the engine was asked once');
+  assert.equal(counting.requests(), before + 2, 'the engine was asked twice: the quote, then the tax on it (0023)');
   const row = await rowFor(id);
   assert.equal(row.decision_inputs, null);
   assert.equal(row.entitlement.local_decision_ignored, undefined);

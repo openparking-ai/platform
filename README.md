@@ -463,11 +463,11 @@ backstop. `npm run activation-fail-control` breaks each property in turn.
 ### A garage's taxes
 
 A garage says which taxes it charges — or that it charges none — before it can
-go live (migration 0022): one or the other, and never neither. No stay is
-taxed yet: the close is
-untouched, and this platform computes no percentage, ever —
+go live (migration 0022): one or the other, and never neither. Since 0023
+every priced close is taxed on what the driver pays — after any validation —
+and this platform still computes no percentage, ever:
 [`rate-engine`](https://github.com/openparking-ai/rate-engine)'s `tax.py` is the
-only tax arithmetic there is.
+only tax arithmetic there is (*Tax on the stay*, below).
 
 ```sh
 curl -H "authorization: Bearer $OPERATOR_TOKEN" -H 'content-type: application/json' \
@@ -486,7 +486,7 @@ curl -H "authorization: Bearer $OPERATOR_TOKEN" \
   `rounding` (`up`, `down` or `nearest`, no default) and `sequence`. There is
   one base, the money actually paid, and the table has no column for another.
 - **Judged by the engine, and by nothing here.** The set goes to the engine's
-  `POST /v1/validate-tax-sets` — its tax loader, the one the close will use —
+  `POST /v1/validate-tax-sets` — its tax loader, the one the close uses —
   exactly as sent, before this platform reads a field of it. A set it refuses
   is a `400` carrying its sentence; this platform holds no copy of its rules,
   in the route or in the table. No engine to ask is
@@ -515,6 +515,58 @@ curl -H "authorization: Bearer $OPERATOR_TOKEN" \
   requests racing, each of which would load alone.
 
 `npm run taxes-fail-control` breaks each property in turn.
+
+### Tax on the stay: on what the driver pays
+
+Every priced close carries its tax (migration 0023), in one order everywhere:
+
+    base lines  ->  the validation line  ->  the tax lines      fee_minor = the running total
+
+- **The base is what the driver pays** — the subtotal after any validation,
+  before tax. A validation is a price adjustment on what the driver pays; a
+  driver paying nothing is charged no tax and carries **no tax line at all**,
+  not a zero one.
+- **The tax lines are the engine's**: the garage's whole list of sets, the
+  subtotal and an instant go to `rate-engine`'s `POST /v1/tax`, which picks
+  the set in force and writes the lines (`code: 'tax.applied'`). On the lane
+  the same function runs in-process. Tax lines are told by their code, never
+  by their position.
+- **The instant is the stay's exit**: the lane decision's `exit_at` when its
+  numbers are written, the close's own `exit_at` when this platform priced.
+  Never "now".
+- **`sessions.subtotal_minor`** keeps the pre-tax subtotal beside the fee —
+  NULL for a covered or unpriced stay and for every row closed before 0023 —
+  and the table refuses a row whose subtotal plus its tax lines is not its fee.
+- **A lane's decision with no validation is written exactly as the lane
+  decided it**, tax included: it is what the driver was shown. With a
+  validation, the close goes back to the decision's subtotal and base lines,
+  appends the validation, then the tax on the new subtotal; the lane's tax on
+  the full fee is not kept.
+- **A validation is claimed on the pre-tax subtotal**, and the reader is told
+  the taxed discounted figure (`fee_minor`, with `subtotal_minor` and
+  `tax_lines` beside it). The validation record's amounts stay pre-tax; what
+  the reader showed is compared with the discounted subtotal plus the tax the
+  close takes on it, at the same instant — one derivation for both.
+- **A garage with no set in force at the instant is a broken invariant**, and
+  the close fails loudly: activation requires a set in force and sets are
+  append-only.
+
+**A stale tax set on the lane is refused, as a stale plan version is.** A set
+may take effect immediately, so a lane refreshed before it was stated would
+tax with the one before. A priced decision carries `subtotal_minor` and
+`tax_sets_held` — how many sets the lane's copy held and the newest
+`effective_from` among them — and the close does not consume it when the garage
+has stated MORE sets than that (the table is append-only, so a lane that missed
+any set, a backdated one included, holds fewer), or when a set later than the
+lane's newest is in force by the decision's exit. Neither test copies the
+engine's choice of set. The first also refuses decisions that were fine — only
+a future set was added — until the lane's next refresh; the close then prices
+for itself, and for that window **a validation cannot be claimed at the reader
+at that garage** (`decision_not_consumable`). That is expected behaviour.
+
+**The reconciler re-derives the base only**, netting the validation and the
+tax lines out of the fee; the tax stands on the table's check and the stale-set
+refusal. `npm run tax-on-paid-fail-control` breaks each property in turn.
 
 ### The exit's three outcomes, and the two modules consulted
 
@@ -582,6 +634,10 @@ from what it already holds — and what it holds comes from `GET /lane/rules`
 - **`stays`** — the garage's open stays (`plate` or `ticket_ref`, `entry_at`,
   `entry_lane`) and a **cursor**. A transient cannot be priced without its
   entry time, and the entry time lives here.
+- **`tax_sets`** — every tax set of the garage, whole, oldest first, each
+  exactly as a load takes it: `effective_from` to the microsecond and its
+  rules (0023). A reader replaces its copy with this list, never merges into
+  it, which is what lets the close judge a stale copy (*Tax on the stay*).
 
 **Two cadences.** Plans, entitlements and settings change rarely; open stays
 change with every car. So `GET /lane/stays?since=<cursor>` is the fast one:
@@ -624,8 +680,11 @@ is on the row: `sessions.decided_by` is `'platform'` or `'lane'`, and every
 closed stay says which.
 
 **What the close does not consume.** A decision that names a session other
-than the one being closed, prices in another currency or space class, or names
-a plan version this garage does not hold is not written as the fee: the close
+than the one being closed, prices in another currency or space class, names
+a plan version this garage does not hold, carries no pre-tax subtotal or tax
+facts (a lane older than 0023), does not add up (subtotal plus tax lines is not
+its fee), or was taxed with a stale set (*Tax on the stay*) is not written as
+the fee: the close
 prices itself and keeps the decision it did not take on the entitlement record
 under `local_decision_ignored`, with its reason. A lane that could not decide
 (`no_cached_entry`, `stale_facts`, `engine_refused`, `engine_invalid`) says so
@@ -701,10 +760,11 @@ discounted amount before paying. The reader shows the fee the lane priced with
 an optional phone number; the lane sends what was entered to
 `POST /api/v1/lane/sessions/<id>/validation` with the decision on screen, and
 this platform reads and, when a validation is live, **claims it for the stay on
-that fee** and holds it on the open stay. The answer — the line, the fee before
-and after — is what the reader shows next. The claim is made only on a priced
+that fee's pre-tax subtotal** and holds it on the open stay. The answer — the
+line, the subtotal before and after, the tax on the discounted subtotal and the
+taxed figure — is what the reader shows next. The claim is made only on a priced
 decision above zero that the close would consume for this very stay; asked
-again on the same fee it answers the held claim, without the door.
+again on the same subtotal it answers the held claim, without the door.
 
 The discount is **the module's assertion**, checked for shape — whole minor
 units, not more than the fee, the fee and currency echoed back — and it becomes
@@ -712,7 +772,8 @@ units, not more than the fee, the fee and currency echoed back — and it become
 **The close records the held claim — when the reader showed it** (amendment
 A2): the close carries `reader_shown`, `{fee_minor, currency}`, what the reader
 actually put up, and the line is appended, the fee the running total including
-it, only when that is the discounted fee. A reader that gave up waiting and
+it and the tax after it, only when that is the taxed discounted figure. A
+reader that gave up waiting and
 showed the fee as priced, or a close that says nothing about the reader, gives
 the hold back: the row says what the driver saw. No door asked, nothing
 re-priced.
@@ -757,7 +818,7 @@ a read that says `already_claimed` is asked on, because the claim it names may
 be this stay's own from a claim whose hold was not stored — the module answers
 that claim again. A door that **refused** holds nothing, with a
 `validation_refused` event. The reconciler compares the engine's number with
-the fee **without** the validation line.
+the fee **without** the validation line or the tax lines.
 
 `test/validations.test.js` runs against the real engine and a stand-in for the
 door (`test/fixtures/validations-door`) that speaks the door's contract and

@@ -86,6 +86,8 @@ const stateTaxes = async (garageId, { rules = [], effectiveFrom = '2000-01-01T00
   return (await res.json()).tax_set;
 };
 const VAT = { id: 'vat', label: 'VAT', percent_bp: 2000, rounding: 'nearest', sequence: 1 };
+/** 20% of 3.00 is exactly 0.60: no rounding, so the figure is the rule's alone. */
+const VAT_ON_300 = 60;
 const readout = async (garageId) => (await (await op('GET', `/garages/${garageId}/activation`)).json()).activation;
 const open = (token, plate, entryAt = '2026-08-26T09:00:00Z') =>
   fetch(`${base}/api/v1/lane/sessions/open`, asDevice(token, { plate, entry_at: entryAt, entry_confirmation: 'confirmed' }));
@@ -107,7 +109,9 @@ before(async () => {
 });
 
 after(async () => {
-  await new Promise((r) => server.close(r));
+  // Guarded: a `before` that threw leaves these unset, and an unguarded close
+  // would hang the file with whatever it had started still running.
+  if (server) await new Promise((r) => server.close(r));
   await engine?.stop();
   await pool.end();
 });
@@ -408,7 +412,7 @@ test('/lane/rules tells the lane whether its garage is active, and still serves 
   assert.equal((await rules()).active, true);
 });
 
-test('an active garage with every condition met operates as before: open, close, priced', async () => {
+test('an active garage with every condition met operates as before: open, close, priced -- and taxed', async () => {
   const g = await newGarage({ transient_available: true });
   await withPlan(g.id, { hourlyMinor: 300 });
   await stateTaxes(g.id, { rules: [VAT] });
@@ -421,8 +425,11 @@ test('an active garage with every condition met operates as before: open, close,
   );
   assert.equal(closed.status, 200);
   const session = (await closed.json()).session;
-  assert.equal(session.fee_minor, 300, 'a stated tax is not charged: no stay carries a tax in this round');
-  assert.ok(!JSON.stringify(session.breakdown).includes('VAT'), 'and the ledger names none');
+  // Since 0023 the stated tax IS charged: on the 300 the driver pays, as its
+  // own line after the engine's, with the subtotal kept beside the fee.
+  assert.equal(session.subtotal_minor, 300, 'the subtotal is the fee before tax');
+  assert.equal(session.fee_minor, 300 + VAT_ON_300, 'the stated tax is charged on it');
+  assert.deepEqual(session.breakdown.filter((l) => l.code === 'tax.applied').map((l) => l.delta_minor), [VAT_ON_300], 'as one line on the ledger');
   assert.deepEqual(await eventsOf(GARAGE_INACTIVE_REFUSAL_EVENT_KIND, g.id), [], 'and nothing was refused');
 });
 
