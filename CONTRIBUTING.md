@@ -69,3 +69,5 @@ Comments should say why, not what.
 ---
 
 Built by 72 Knots Method by 72Knots.ai
+
+planted for the gate: the zzqxgatethreeplant door
