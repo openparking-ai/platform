@@ -3,10 +3,12 @@
  * The control for the validations door's setting (`VALIDATIONS_DOOR`): this
  * repository names no validations module, so unset means the deployment has
  * none -- stating a link is refused by name, nothing is ever run, and a garage
- * that already links one takes the could-not-decide path.
+ * that already links one takes the could-not-decide path. Set, it is checked
+ * before the port opens: a door that could never run refuses to serve.
  *
  * Every property is broken below, one at a time, and
- * `test/validations-door.test.js` is REQUIRED to go red. A pass is the failure.
+ * `test/validations-door.test.js` with `test/validations-door-start.test.js`
+ * are REQUIRED to go red. A pass is the failure.
  *
  * SOURCE breaks, applied to a COPY of the tree; no tracked file is edited.
  * Each anchor must occur exactly once in its file, or the break is reported as
@@ -18,6 +20,11 @@
  *   bare_unchecked          a value that is not a bare command name is run.
  *   unset_is_no_validation  a deployment with no door answers "not validated"
  *                           instead of could-not-decide.
+ *   startup_unchecked       the setting is not checked before the port opens.
+ *   dotdot_allowed          a name with `..` in it counts as bare.
+ *   existence_unchecked     a bare name is taken as the door without looking
+ *                           for its file.
+ *   execute_bit_unchecked   a file the process may not execute counts as the door.
  */
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -57,7 +64,7 @@ const SOURCE_BREAKS = [
     name: 'bare_unchecked',
     why: 'a value that is not a bare command name is run',
     file: 'src/validations.js',
-    from: '  if (!BARE_COMMAND.test(name)) {',
+    from: "  if (!BARE_COMMAND.test(name) || name.includes('..')) {",
     to: '  if (false) {',
   },
   {
@@ -67,9 +74,37 @@ const SOURCE_BREAKS = [
     from: '    try {\n      command = doorPath(env);\n    } catch (err) {\n      reject(err);\n      return;\n    }',
     to: "    if (!doorConfigured(env)) {\n      resolve({ exit_code: 1, stdout: '{\"outcome\":\"not_validated\",\"reason\":\"none\"}', stderr: '' });\n      return;\n    }\n    try {\n      command = doorPath(env);\n    } catch (err) {\n      reject(err);\n      return;\n    }",
   },
+  {
+    name: 'startup_unchecked',
+    why: 'the setting is not checked before the port opens',
+    file: 'src/server.js',
+    from: '  assertValidationsDoor();\n',
+    to: '',
+  },
+  {
+    name: 'dotdot_allowed',
+    why: 'a name with .. in it counts as bare',
+    file: 'src/validations.js',
+    from: "  if (!BARE_COMMAND.test(name) || name.includes('..')) {",
+    to: '  if (!BARE_COMMAND.test(name)) {',
+  },
+  {
+    name: 'existence_unchecked',
+    why: 'a bare name is taken as the door without looking for its file',
+    file: 'src/validations.js',
+    from: '  const path = dirs.map((dir) => join(dir, name)).find(executableFile);',
+    to: '  const path = dirs.map((dir) => join(dir, name)).find(() => true);',
+  },
+  {
+    name: 'execute_bit_unchecked',
+    why: 'a file the process may not execute counts as the door',
+    file: 'src/validations.js',
+    from: '    accessSync(path, constants.X_OK);',
+    to: '    accessSync(path, constants.F_OK);',
+  },
 ];
 
-const SUITE = ['--test', 'test/validations-door.test.js'];
+const SUITE = ['--test', 'test/validations-door.test.js', 'test/validations-door-start.test.js'];
 
 function stage() {
   const dir = mkdtempSync(join(tmpdir(), 'openparking-validations-door-control-'));

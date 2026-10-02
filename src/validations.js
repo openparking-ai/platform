@@ -88,7 +88,8 @@
  * nothing is held, and a `validation_refused` event tells a human.
  */
 import { spawn } from 'node:child_process';
-import { join } from 'node:path';
+import { accessSync, constants, statSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import { withTenant } from './db.js';
 import * as repo from './repository.js';
 import { assertMinor, formatMinor } from './money.js';
@@ -126,6 +127,7 @@ export class LinkUnanswerable extends Error {
 }
 
 //: A bare command name: no directory, no option, nothing a shell would read.
+//: `..` is refused anywhere in it, not only on its own.
 const BARE_COMMAND = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 /**
@@ -136,21 +138,63 @@ export function doorConfigured(env = process.env) {
   return env.VALIDATIONS_DOOR !== undefined && env.VALIDATIONS_DOOR !== '';
 }
 
+/** A regular file this process may execute. A directory carries the bit too, and is not one. */
+function executableFile(path) {
+  try {
+    accessSync(path, constants.X_OK);
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /**
- * The command to run, joined to ENTITLEMENT_BIN_DIR or left to PATH. Throws
- * `ValidationsUnavailable` when the deployment names none, or names something
- * that is not a bare command -- a door this platform cannot run is a door that
- * could not decide, never a no-validation. The value is not repeated.
+ * THE ONE LOOKUP of the door: start-up (`assertValidationsDoor`) and every run
+ * (`doorPath`) ask it, so the two cannot disagree. A bare command name, found
+ * in ENTITLEMENT_BIN_DIR or, without one, on PATH -- the search a spawn of a
+ * bare name makes, done here so that what was found is what is run -- as a file
+ * this process may execute. Returns `{ path }`, or `{ why }`: a reason that
+ * does not repeat the value.
  */
-function doorPath(env = process.env) {
+function findDoor(env) {
   if (!doorConfigured(env)) {
-    throw new ValidationsUnavailable('this deployment names no validations door (VALIDATIONS_DOOR is unset)');
+    return { why: 'this deployment names no validations door (VALIDATIONS_DOOR is unset)' };
   }
   const name = env.VALIDATIONS_DOOR;
-  if (!BARE_COMMAND.test(name)) {
-    throw new ValidationsUnavailable('VALIDATIONS_DOOR is not a bare command name');
+  if (!BARE_COMMAND.test(name) || name.includes('..')) {
+    return { why: 'VALIDATIONS_DOOR is not a bare command name' };
   }
-  return env.ENTITLEMENT_BIN_DIR ? join(env.ENTITLEMENT_BIN_DIR, name) : name;
+  const dirs = env.ENTITLEMENT_BIN_DIR ? [env.ENTITLEMENT_BIN_DIR] : (env.PATH ?? '').split(delimiter).filter(Boolean);
+  const path = dirs.map((dir) => join(dir, name)).find(executableFile);
+  if (path === undefined) {
+    return { why: `VALIDATIONS_DOOR names no executable file ${env.ENTITLEMENT_BIN_DIR ? 'in ENTITLEMENT_BIN_DIR' : 'on PATH'}` };
+  }
+  return { path };
+}
+
+/**
+ * The door's file, as found now. Throws `ValidationsUnavailable` when the
+ * deployment names none, names something that is not a bare command, or names
+ * one that is not there to run -- a door this platform cannot run is a door
+ * that could not decide, never a no-validation. Start-up has already refused
+ * the last two; a file removed or replaced since lands here, by name.
+ */
+function doorPath(env = process.env) {
+  const { path, why } = findDoor(env);
+  if (why !== undefined) throw new ValidationsUnavailable(why);
+  return path;
+}
+
+/**
+ * Before the port opens (`src/server.js`): a door that is named and could
+ * never run is refused here, in one sentence naming the setting and its value,
+ * rather than accepted and refused at every close. Unset is a real state -- no
+ * validations module -- and passes. The value is not a secret.
+ */
+export function assertValidationsDoor(env = process.env) {
+  if (!doorConfigured(env)) return;
+  const { why } = findDoor(env);
+  if (why !== undefined) throw new Error(`${why} (it is set to ${JSON.stringify(env.VALIDATIONS_DOOR)}).`);
 }
 
 /**
