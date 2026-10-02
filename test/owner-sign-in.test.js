@@ -577,10 +577,17 @@ test('NO ORACLE, IN WORK: unknown email, wrong password and locked address run t
   for (let i = 0; i < signIn.MAX_FAILED; i += 1) {
     await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: lockedWho.email, password: WRONG } });
   }
-  const locks = async () => Number((await admin.query('SELECT count(*) FROM operator_sign_in_locks')).rows[0].count);
-  const before = await locks();
+  // Counted at an address of this test's own, not over the whole table: other
+  // files in the suite write lock rows while this runs. The control shows the
+  // count sees a row when one is written.
+  const locksAt = async (address) => Number((await admin.query('SELECT count(*) FROM operator_sign_in_locks WHERE address = $1', [address])).rows[0].count);
+  const salt = Math.floor(Math.random() * 250) + 1;
+  const [nobodyAt, controlAt] = [`203.0.113.${salt}`, `198.18.200.${salt}`];
+  await call(trusted.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG }, headers: { 'x-forwarded-for': nobodyAt } });
+  assert.equal(await locksAt(nobodyAt), 0, 'an unknown email makes no lock row');
+  await call(trusted.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG }, headers: { 'x-forwarded-for': controlAt } });
+  assert.equal(await locksAt(controlAt), 1, 'CONTROL: a wrong password from that kind of address makes one');
   const unknown = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG } }));
-  assert.equal(await locks(), before, 'an unknown email makes no lock row');
   const wrong = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG } }));
   const locked = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: lockedWho.email, password: PASSWORD } }));
   assert.ok(unknown.some((q) => /operator_sign_in_locks/.test(q) && /^\s*SELECT/.test(q)), 'the unknown email ran the lock lookup');
