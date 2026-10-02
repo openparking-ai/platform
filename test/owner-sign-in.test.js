@@ -11,9 +11,11 @@
  */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
+import http from 'node:http';
 import pg from 'pg';
-import { createApp } from '../src/app.js';
+import { createApp, BODY_TOO_LARGE, BODY_UNREADABLE } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { createAdmin, resetAdminPassword } from '../src/adminAccount.js';
@@ -109,9 +111,11 @@ let limited;
 before(async () => {
   admin = new pg.Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
-  main = await serve({ ADMIN_ORIGIN, SIGN_IN_ATTEMPTS_PER_ADDRESS: '1000', TRUST_PROXY: undefined, SESSION_COOKIE_INSECURE: undefined });
-  trusted = await serve({ ADMIN_ORIGIN, SIGN_IN_ATTEMPTS_PER_ADDRESS: '1000', TRUST_PROXY: 'loopback', SESSION_COOKIE_INSECURE: undefined });
-  limited = await serve({ ADMIN_ORIGIN, SIGN_IN_ATTEMPTS_PER_ADDRESS: '3', TRUST_PROXY: undefined, SESSION_COOKIE_INSECURE: undefined });
+  // The floor at its least, so the many refusals here stay quick; THE FLOOR below holds it at a larger value.
+  const quick = { SIGN_IN_REFUSAL_FLOOR_MS: '200', SESSION_COOKIE_INSECURE: undefined };
+  main = await serve({ ADMIN_ORIGIN, SIGN_IN_ATTEMPTS_PER_ADDRESS: '1000', TRUST_PROXY: undefined, ...quick });
+  trusted = await serve({ ADMIN_ORIGIN, SIGN_IN_ATTEMPTS_PER_ADDRESS: '1000', TRUST_PROXY: 'loopback', ...quick });
+  limited = await serve({ ADMIN_ORIGIN, SIGN_IN_ATTEMPTS_PER_ADDRESS: '3', TRUST_PROXY: undefined, ...quick });
 });
 
 after(async () => {
@@ -544,9 +548,305 @@ test('the settings: no admin origin means sign-in is off, by name; a malformed o
   assert.deepEqual(r.json, signIn.NOT_CONFIGURED);
   assert.throws(() => signIn.readAuthSettings({ ADMIN_ORIGIN: 'https://admin.example.test/path' }), /origin/);
   assert.throws(() => signIn.readAuthSettings({ SESSION_COOKIE_INSECURE: 'yes' }), /exactly "true"/);
-  assert.throws(() => signIn.readAuthSettings({ SESSION_IDLE_MINUTES: '0' }), /positive/);
+  assert.throws(() => signIn.readAuthSettings({ SESSION_IDLE_MINUTES: '0' }), /SESSION_IDLE_MINUTES must be a whole number from 1 to 1440/);
   assert.equal(signIn.readAuthSettings({}).cookieSecure, true, 'Secure by default');
   assert.equal(signIn.readAuthSettings({ SESSION_COOKIE_INSECURE: 'true' }).cookieSecure, false);
+});
+
+// --- no oracle, in work: the same statements, and the floor --------------------------------
+
+/** The text of every statement any pg client runs while `fn` runs. */
+async function statementsDuring(fn) {
+  const seen = [];
+  const real = pg.Client.prototype.query;
+  pg.Client.prototype.query = function query(q, ...rest) {
+    seen.push(typeof q === 'string' ? q : q?.text);
+    return real.call(this, q, ...rest);
+  };
+  try {
+    await fn();
+  } finally {
+    pg.Client.prototype.query = real;
+  }
+  return seen;
+}
+
+test('NO ORACLE, IN WORK: unknown email, wrong password and locked address run the same statements, and an unknown email makes no lock row', async () => {
+  const who = await owner('si-same');
+  const lockedWho = await owner('si-same-l');
+  for (let i = 0; i < signIn.MAX_FAILED; i += 1) {
+    await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: lockedWho.email, password: WRONG } });
+  }
+  const locks = async () => Number((await admin.query('SELECT count(*) FROM operator_sign_in_locks')).rows[0].count);
+  const before = await locks();
+  const unknown = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG } }));
+  assert.equal(await locks(), before, 'an unknown email makes no lock row');
+  const wrong = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG } }));
+  const locked = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: lockedWho.email, password: PASSWORD } }));
+  assert.ok(unknown.some((q) => /operator_sign_in_locks/.test(q) && /^\s*SELECT/.test(q)), 'the unknown email ran the lock lookup');
+  assert.ok(unknown.some((q) => /INSERT INTO operator_sign_in_locks/.test(q)), 'and the failure write');
+  assert.deepEqual(wrong, unknown, 'a wrong password runs what an unknown email runs');
+  assert.deepEqual(locked, unknown, 'a locked address runs what an unknown email runs');
+});
+
+test('THE FLOOR: no sign-in refusal of any kind is answered sooner than SIGN_IN_REFUSAL_FLOOR_MS after it arrived; a sign-in is not held to it', async () => {
+  const FLOOR = 900;
+  const floored = await serve({
+    ADMIN_ORIGIN, TRUST_PROXY: 'loopback', SIGN_IN_REFUSAL_FLOOR_MS: String(FLOOR), SIGN_IN_ATTEMPTS_PER_ADDRESS: '2',
+    SIGN_IN_HASH_LINE: '1', SIGN_IN_HASH_LINE_PER_ADDRESS: '1',
+  });
+  const off = await serve({ ADMIN_ORIGIN: undefined, SIGN_IN_REFUSAL_FLOOR_MS: String(FLOOR) });
+  const who = await owner('si-floor');
+  const timed = async (base, opts) => {
+    const t0 = performance.now();
+    const r = await call(base, 'POST', '/api/v1/auth/sign-in', opts);
+    return { ...r, ms: performance.now() - t0 };
+  };
+  const from = (n, extra = {}) => ({ ...extra, headers: { 'x-forwarded-for': `192.0.2.${n}`, ...(extra.headers ?? {}) } });
+  const seen = {};
+  seen.unknown = await timed(floored.base, from(11, { body: { email: 'nobody-floor@example.com', password: WRONG } }));
+  seen.wrong = await timed(floored.base, from(12, { body: { email: who.email, password: WRONG } }));
+  seen.unreadable = await timed(floored.base, from(13, { raw: '{"email":', headers: { 'content-type': 'application/json' } }));
+  seen.not_gzip = await timed(floored.base, from(14, { raw: '{"email":1}', headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' } }));
+  seen.wrong_shape = await timed(floored.base, from(15, { body: { email: 'x@example.com' } }));
+  seen.foreign_origin = await timed(floored.base, from(16, { body: { email: who.email, password: PASSWORD }, origin: FOREIGN_ORIGIN }));
+  seen.not_configured = await timed(off.base, { body: { email: who.email, password: PASSWORD } });
+  await call(floored.base, 'POST', '/api/v1/auth/sign-in', from(17, { body: { email: 'a-floor@example.com', password: WRONG } }));
+  await call(floored.base, 'POST', '/api/v1/auth/sign-in', from(17, { body: { email: 'a-floor@example.com', password: WRONG } }));
+  seen.rate_limited = await timed(floored.base, from(17, { body: { email: 'a-floor@example.com', password: WRONG } }));
+  // The line holds one: an attempt held at its hash keeps it full while the busy one is timed.
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const realVerify = signIn.internals.verifyPassword;
+  signIn.internals.verifyPassword = async (...a) => {
+    await held;
+    return realVerify(...a);
+  };
+  try {
+    const holding = call(floored.base, 'POST', '/api/v1/auth/sign-in', from(18, { body: { email: 'holder@example.com', password: WRONG } }));
+    await new Promise((r) => setTimeout(r, 150));
+    seen.busy = await timed(floored.base, from(19, { body: { email: who.email, password: PASSWORD } }));
+    release();
+    await holding;
+  } finally {
+    signIn.internals.verifyPassword = realVerify;
+  }
+  const statuses = Object.fromEntries(Object.entries(seen).map(([k, r]) => [k, r.status]));
+  assert.deepEqual(statuses, {
+    unknown: 401, wrong: 401, unreadable: 400, not_gzip: 400, wrong_shape: 400, foreign_origin: 403, not_configured: 409, rate_limited: 429, busy: 503,
+  });
+  const early = Object.entries(seen).filter(([, r]) => r.ms < FLOOR - 2).map(([k, r]) => `${k} ${r.ms.toFixed(0)} ms`);
+  assert.deepEqual(early, [], `answered sooner than the ${FLOOR} ms floor`);
+  const ok = await timed(floored.base, from(20, { body: { email: who.email, password: PASSWORD }, origin: ADMIN_ORIGIN }));
+  assert.equal(ok.status, 200);
+  assert.ok(ok.ms < FLOOR, `a sign-in is not held to the floor (${ok.ms.toFixed(0)} ms)`);
+});
+
+// --- waiting: the hash line ----------------------------------------------------------------
+
+test('the hash line: at most its length held, at most the per-address share from one address, and a place given back once', () => {
+  const line = signIn.hashLine({ max: 3, perAddress: 2 });
+  const a1 = line.enter('a');
+  const a2 = line.enter('a');
+  assert.equal(line.enter('a'), null, 'a third place for one address');
+  const b1 = line.enter('b');
+  assert.equal(line.enter('c'), null, 'the line is full');
+  assert.equal(line.held, 3);
+  a1();
+  a1();
+  assert.equal(line.held, 2, 'a place given back twice is given back once');
+  assert.ok(line.enter('c'));
+  a2();
+  b1();
+});
+
+test('THE LINE: a full line answers busy before the email is looked at -- the same for every email -- and one address holds only its share', async () => {
+  const lined = await serve({ ADMIN_ORIGIN, TRUST_PROXY: 'loopback', SIGN_IN_HASH_LINE: '2', SIGN_IN_HASH_LINE_PER_ADDRESS: '1', SIGN_IN_REFUSAL_FLOOR_MS: '200' });
+  const who = await owner('si-line');
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const realVerify = signIn.internals.verifyPassword;
+  signIn.internals.verifyPassword = async (...a) => {
+    await held;
+    return realVerify(...a);
+  };
+  const at = (address, email, password = WRONG) =>
+    call(lined.base, 'POST', '/api/v1/auth/sign-in', { body: { email, password }, headers: { 'x-forwarded-for': address } });
+  let first;
+  let second;
+  const busy = [];
+  try {
+    first = at('198.51.100.1', 'held-one@example.com');
+    await new Promise((r) => setTimeout(r, 150));
+    busy.push(await at('198.51.100.1', who.email, PASSWORD)); // its address holds its one place
+    second = at('198.51.100.2', 'held-two@example.com');
+    await new Promise((r) => setTimeout(r, 150));
+    busy.push(await at('198.51.100.3', 'nobody-line@example.com')); // the line is full
+    busy.push(await at('198.51.100.4', who.email, PASSWORD));
+    busy.push(await at('198.51.100.5', who.email, WRONG));
+  } finally {
+    release();
+    signIn.internals.verifyPassword = realVerify;
+  }
+  for (const r of busy) {
+    assert.equal(r.status, 503);
+    assert.equal(r.text, JSON.stringify(signIn.BUSY));
+    assert.equal(r.headers.get('retry-after'), '2');
+    assert.deepEqual(r.cookies, []);
+  }
+  assert.equal((await first).status, 401);
+  assert.equal((await second).status, 401);
+  const locks = (await admin.query('SELECT count(*) FROM operator_sign_in_locks WHERE tenant_id = $1', [who.tenant])).rows[0].count;
+  assert.equal(locks, '0', 'a busy answer counted nothing against the account');
+  const back = await call(lined.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: PASSWORD }, origin: ADMIN_ORIGIN, headers: { 'x-forwarded-for': '198.51.100.7' } });
+  assert.equal(back.status, 200, 'with the line free, the admin signs in');
+});
+
+// --- a body that lies about itself --------------------------------------------------------
+
+test('A BODY THAT LIES ABOUT ITS ENCODING: under /api/v1/auth any body that cannot be read is the one sentence, never a 500; a path that is not a route is 404', async () => {
+  const lies = [
+    { 'content-encoding': 'gzip' },
+    { 'content-encoding': 'deflate' },
+    { 'content-encoding': 'br' },
+    { 'content-encoding': 'x-made-up' },
+    { 'content-type': 'application/json; charset=koi8-r' },
+  ];
+  for (const headers of lies) {
+    const r = await call(main.base, 'POST', '/api/v1/auth/sign-in', { raw: `{"email":"x@example.com","password":"${PASSWORD}"}`, headers: { 'content-type': 'application/json', ...headers } });
+    assert.equal(r.status, 400, JSON.stringify(headers));
+    assert.deepEqual(r.json, signIn.UNREADABLE, JSON.stringify(headers));
+  }
+  for (const path of ['/api/v1/auth/nope', '/api/v1/auth/sign-in/more', '/api/v1/auth/']) {
+    for (const headers of [{}, { 'content-encoding': 'gzip' }]) {
+      const r = await call(main.base, 'POST', path, { raw: 'not gzip, not json', headers: { 'content-type': 'application/json', ...headers } });
+      assert.equal(r.status, 404, `${path} ${JSON.stringify(headers)}`);
+      assert.deepEqual(r.json, { error: 'not found' });
+    }
+  }
+});
+
+test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, oversized or wrongly encoded, on every changing operator route, is one fixed sentence with no-store and nosniff', async () => {
+  const who = await owner('si-body');
+  const token = await signedIn(main.base, who);
+  const key = generateDeviceToken();
+  secrets.add(key);
+  await withTenant(who.tenant, (c) => c.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'ops',$2)`, [who.tenant, hashToken(key)]));
+  const changing = routeTable(main.app).filter((r) => r.base === '/api/v1' && r.method !== 'GET');
+  assert.equal(changing.length, 18, `the walk found ${changing.length} changing operator routes`);
+  const cases = [
+    { name: 'malformed', raw: '{"name": "Echo-Me-Back", oops', headers: {}, status: 400, body: BODY_UNREADABLE },
+    { name: 'oversized', raw: JSON.stringify({ name: `Echo-Me-Back${'x'.repeat(1024 * 1024)}` }), headers: {}, status: 413, body: BODY_TOO_LARGE },
+    { name: 'not gzip', raw: '{"name":"Echo-Me-Back"}', headers: { 'content-encoding': 'gzip' }, status: 400, body: BODY_UNREADABLE },
+    { name: 'bad charset', raw: '{"name":"Echo-Me-Back"}', headers: { 'content-type': 'application/json; charset=koi8-r' }, status: 400, body: BODY_UNREADABLE },
+  ];
+  const wrong = [];
+  let answers = 0;
+  for (const r of changing) {
+    for (const c of cases) {
+      for (const auth of [{ headers: { authorization: `Bearer ${key}` } }, { cookie: token, origin: ADMIN_ORIGIN, headers: {} }]) {
+        const res = await call(main.base, r.method, `${r.base}${concrete(r.path)}`, {
+          ...auth, raw: c.raw, headers: { 'content-type': 'application/json', ...auth.headers, ...c.headers },
+        });
+        answers += 1;
+        const ok = res.status === c.status && res.text === JSON.stringify(c.body) && !res.text.includes('Echo-Me-Back')
+          && res.headers.get('cache-control') === 'no-store' && res.headers.get('x-content-type-options') === 'nosniff';
+        if (!ok) wrong.push(`${r.method} ${r.path} ${c.name}: ${res.status} ${res.text.slice(0, 80)} cc=${res.headers.get('cache-control')}`);
+      }
+    }
+  }
+  assert.equal(answers, 18 * cases.length * 2);
+  assert.deepEqual(wrong, []);
+});
+
+// --- settings are checked at start -----------------------------------------------------------
+
+test('SETTINGS ARE CHECKED AT START: every value the gate tried is refused by name with its range, and one good value of each is taken', () => {
+  const bad = ['abc', '0', '-5', '1e400', '0.4', '0.001', '0.0001', '0x10', '1e12', '999999999999', ' 30', '30.0'];
+  for (const [name, { min, max, fallback }] of Object.entries(signIn.NUMBER_SETTINGS)) {
+    for (const value of bad) {
+      assert.throws(() => signIn.readAuthSettings({ [name]: value }), new RegExp(`^Error: ${name} must be a whole number from ${min} to ${max}, not `), `${name}=${value}`);
+    }
+    assert.throws(() => signIn.readAuthSettings({ [name]: String(max + 1) }), new RegExp(`^Error: ${name} must be a whole number`), `${name} above its range`);
+    assert.doesNotThrow(() => signIn.readAuthSettings({ [name]: String(fallback) }), `${name}=${fallback}`);
+  }
+  const s = signIn.readAuthSettings({ SESSION_IDLE_MINUTES: '45', SESSION_MAX_HOURS: '24', SIGN_IN_ATTEMPTS_PER_ADDRESS: '10', SIGN_IN_ATTEMPTS_WINDOW_MINUTES: '5', SIGN_IN_REFUSAL_FLOOR_MS: '750', SIGN_IN_HASH_LINE: '20', SIGN_IN_HASH_LINE_PER_ADDRESS: '3' });
+  assert.deepEqual([s.idleSeconds, s.maxSeconds, s.attemptsPerAddress, s.attemptsWindowSeconds, s.refusalFloorMs, s.hashLine, s.hashLinePerAddress], [2700, 86400, 10, 300, 750, 20, 3]);
+  assert.throws(() => signIn.readAuthSettings({ SESSION_IDLE_MINUTES: '1440', SESSION_MAX_HOURS: '12' }), /SESSION_IDLE_MINUTES cannot be longer than SESSION_MAX_HOURS/);
+  assert.throws(() => signIn.readAuthSettings({ SIGN_IN_HASH_LINE: '4', SIGN_IN_HASH_LINE_PER_ADDRESS: '5' }), /SIGN_IN_HASH_LINE_PER_ADDRESS cannot be more than SIGN_IN_HASH_LINE/);
+
+  for (const value of ['true', 'TRUE', 'yes', 'abc', '-1', '0', '6', '999999999999', 'loopback,true', 'linklocal', 'uniquelocal', '10.0.0.0/0', '::/0', '10.0.0.1/33', '10.0.0.1/8/1', '300.1.1.1', '10.0.0.1,,10.0.0.2']) {
+    assert.throws(() => signIn.readAuthSettings({ TRUST_PROXY: value }), /^Error: TRUST_PROXY must be a number of proxy hops from 1 to 5, "loopback", or a comma-separated list/, `TRUST_PROXY=${value}`);
+  }
+  assert.equal(signIn.readAuthSettings({ TRUST_PROXY: '1' }).trustProxy, 1);
+  assert.equal(signIn.readAuthSettings({ TRUST_PROXY: '5' }).trustProxy, 5);
+  assert.equal(signIn.readAuthSettings({ TRUST_PROXY: 'loopback' }).trustProxy, 'loopback');
+  assert.deepEqual(signIn.readAuthSettings({ TRUST_PROXY: '10.0.0.1, 10.8.0.0/16,2001:db8::/32' }).trustProxy, ['10.0.0.1', '10.8.0.0/16', '2001:db8::/32']);
+  assert.equal(signIn.readAuthSettings({}).trustProxy, null);
+});
+
+test('the real entrypoint refuses a bad setting by name and with no stack trace', () => {
+  for (const [name, value] of [['TRUST_PROXY', 'true'], ['TRUST_PROXY', '999999999999'], ['SIGN_IN_ATTEMPTS_WINDOW_MINUTES', '0.0001'], ['SESSION_MAX_HOURS', '1e12'], ['SIGN_IN_HASH_LINE', '0']]) {
+    const env = { ...process.env, PORT: '0', ADMIN_ORIGIN, [name]: value };
+    const r = spawnSync(process.execPath, ['src/server.js'], { env, encoding: 'utf8', timeout: 30_000 });
+    assert.equal(r.status, 1, `${name}=${value}: ${r.stdout} ${r.stderr}`);
+    assert.match(r.stderr, new RegExp(`^\\[platform\\] REFUSING TO SERVE: ${name} must be`, 'm'), `${name}=${value}`);
+    assert.equal(/\n\s+at /.test(r.stderr), false, `${name}=${value} printed a stack trace`);
+  }
+});
+
+// --- decisions 4 and 6 -----------------------------------------------------------------------
+
+/** One request with the cookie header sent as given: one header, or one per value. */
+function rawCookie(base, path, cookies) {
+  return new Promise((resolve, reject) => {
+    const r = http.request(`${base}${path}`, { method: 'GET' }, (res) => {
+      let text = '';
+      res.on('data', (c) => { text += c; });
+      res.on('end', () => {
+        bodies.push(text);
+        resolve({ status: res.statusCode, json: JSON.parse(text) });
+      });
+    });
+    r.setHeader('cookie', cookies);
+    r.on('error', reject);
+    r.end();
+  });
+}
+
+test('DECISION 4: a cookie sent twice is no cookie it can use -- the same value or two live sessions, in one header or in two -- and answers session_ended', async () => {
+  const who = await owner('si-twice');
+  const a = await signedIn(main.base, who);
+  const b = await signedIn(main.base, who);
+  const c = signIn.COOKIE;
+  for (const cookies of [`${c}=${a}; ${c}=${a}`, `${c}=${a}; ${c}=${b}`, [`${c}=${a}`, `${c}=${a}`], [`${c}=${a}`, `${c}=${b}`]]) {
+    const r = await rawCookie(main.base, '/api/v1/auth/me', cookies);
+    const label = Array.isArray(cookies) ? 'two headers' : 'one header';
+    assert.equal(r.status, 401, label);
+    assert.equal(r.json.code, 'session_ended', label);
+  }
+  // Control: each one alone is a live session.
+  assert.equal((await rawCookie(main.base, '/api/v1/auth/me', `${c}=${a}`)).status, 200);
+  assert.equal((await rawCookie(main.base, '/api/v1/auth/me', `${c}=${b}`)).status, 200);
+});
+
+test('DECISION 6: a sign-in deletes that admin\'s ended sessions -- signed out, idle or past their end -- and leaves the live ones and the keys', async () => {
+  const who = await owner('si-prune');
+  // All four first: each sign-in prunes, so the endings come after.
+  const out = await signedIn(main.base, who);
+  const idle = await signedIn(main.base, who);
+  const old = await signedIn(main.base, who);
+  const live = await signedIn(main.base, who);
+  assert.equal((await call(main.base, 'POST', '/api/v1/auth/sign-out', { cookie: out, origin: ADMIN_ORIGIN })).status, 204);
+  await ageSession(idle, `last_seen_at = now() - interval '31 minutes'`);
+  await ageSession(old, `expires_at = now() - interval '1 second', last_seen_at = now()`);
+  const key = generateDeviceToken();
+  secrets.add(key);
+  await withTenant(who.tenant, (cl) => cl.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'ops',$2)`, [who.tenant, hashToken(key)]));
+  const rows = async () => (await admin.query('SELECT token_hash FROM operator_tokens WHERE tenant_id = $1 ORDER BY 1', [who.tenant])).rows.map((r) => r.token_hash);
+  assert.equal((await rows()).length, 5);
+  const fresh = await signedIn(main.base, who);
+  assert.deepEqual(await rows(), [hashToken(live), hashToken(fresh), hashToken(key)].sort());
 });
 
 // --- last: nothing secret in any response ---------------------------------------------------

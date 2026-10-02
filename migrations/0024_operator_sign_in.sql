@@ -150,6 +150,31 @@ CREATE FUNCTION resolve_operator_session(p_token_hash text, p_idle_seconds integ
   $$;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON operator_users, operator_sign_in_locks TO openparking_app;
+
+-- ---------------------------------------------------------------------------
+-- WHO MAY RUN A DEFINER. A function is executable by PUBLIC when it is made,
+-- and a SECURITY DEFINER function runs as its owner: so until now ANY role on
+-- the database -- one with no grant at all -- could call these, and
+-- resolve_operator_user hands back a password hash. Every SECURITY DEFINER
+-- function in the schema is taken from PUBLIC here, the ones from 0002 and
+-- 0003 as well, and given to exactly the role that calls it: the application,
+-- for its operator keys, its sessions, its lane devices and its maintenance
+-- sweep. test/definer-grants.test.js walks pg_proc and holds this for every
+-- definer there is, not for this list.
+-- ---------------------------------------------------------------------------
+REVOKE EXECUTE ON FUNCTION resolve_lane_device(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION touch_lane_device(uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION resolve_operator_token(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION touch_operator_token(uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION list_tenant_ids_for_maintenance() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION resolve_operator_user(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION resolve_operator_session(text, integer) FROM PUBLIC;
+
+GRANT EXECUTE ON FUNCTION resolve_lane_device(text) TO openparking_app;
+GRANT EXECUTE ON FUNCTION touch_lane_device(uuid) TO openparking_app;
+GRANT EXECUTE ON FUNCTION resolve_operator_token(text) TO openparking_app;
+GRANT EXECUTE ON FUNCTION touch_operator_token(uuid) TO openparking_app;
+GRANT EXECUTE ON FUNCTION list_tenant_ids_for_maintenance() TO openparking_app;
 GRANT EXECUTE ON FUNCTION resolve_operator_user(text) TO openparking_app;
 GRANT EXECUTE ON FUNCTION resolve_operator_session(text, integer) TO openparking_app;
 

@@ -343,12 +343,34 @@ not enough to keep the admin out — there is no account-wide lock. Separately,
 each address gets `SIGN_IN_ATTEMPTS_PER_ADDRESS` attempts (default 30) per
 `SIGN_IN_ATTEMPTS_WINDOW_MINUTES` (default 15), held in this process, then `429
 sign_in_rate_limited`. The address is the **socket's**; `X-Forwarded-For` is
-read only when `TRUST_PROXY` is declared (Express's `trust proxy` forms). An
-IPv6 address counts by its /64. ⚠ **Behind a proxy with no `TRUST_PROXY`, every
-caller is the proxy, so the lock is in effect account-wide** — declare it.
+read only when `TRUST_PROXY` is declared: a number of proxy hops from 1 to 5,
+`loopback`, or a comma-separated list of the proxies' addresses or subnets.
+`true`, and any other form, refuses to start: it means "trust whatever the
+caller says". An IPv6 address counts by its /64. ⚠ **Behind a proxy with no
+`TRUST_PROXY`, every caller is the proxy, so the lock is in effect
+account-wide** — declare it. Likewise, **people who share one address (one
+office NAT, one carrier gateway) share one lock**: ten wrong passwords from any
+of them lock all of them out of that account for the window.
 
 **No oracle.** An unknown email, a wrong password and a locked address answer
-the same `401 sign_in_refused`, byte for byte, and each runs exactly one hash.
+the same `401 sign_in_refused`, byte for byte, and each runs exactly one hash
+and the same database statements (the lock lookup and the failure write, which
+for an unknown email find and write nothing). No sign-in refusal of any kind is
+answered sooner than `SIGN_IN_REFUSAL_FLOOR_MS` (default 500) after the request
+arrived, so what difference is left in the work is not on the wire.
+
+**Waiting.** Hashes run four at a time (Node's thread pool). The line for them
+is capped: `SIGN_IN_HASH_LINE` sign-ins at once (default 48, about 2 seconds at
+about 26 hashes a second) and `SIGN_IN_HASH_LINE_PER_ADDRESS` of them from one
+address (default 2). A sign-in that finds the line full is answered at once,
+held to the floor, with `503 sign_in_busy` and `Retry-After: 2` — decided before
+the email is read, so the same for every email — instead of waiting behind
+everyone else's.
+
+**Settings are checked at start.** Every setting above is a whole number in its
+range, or one of its stated forms, or `serve` refuses to start, naming the
+setting and the range (`.env.example` lists each). Idle may not be longer than
+the end, nor the per-address share longer than the line.
 
 **Nothing secret is written out.** The password, the token, the cookie and the
 stored hash appear in no log line and no response body. A body that cannot be
@@ -363,6 +385,24 @@ own parameters; a stored string in a format this code does not know is refused
 by name and never compared. The parameters were measured with `npm run
 measure-scrypt` (`src/passwords.js` names the machine). Each hash at N=2¹⁷ takes
 128 MiB; Node runs at most its thread pool's worth at once.
+
+⚠ **Deploy rule: never turn on statement or parameter logging** (`log_statement`
+other than `none`/`ddl`, `log_min_duration_statement` with parameters,
+`log_parameter_max_length`, an extension that records parameters) **on a database
+that holds `operator_users`.** Creating an admin and resetting a password write
+the stored hash as a bind parameter, so such a log holds every admin's hash:
+an offline guessing target that no lock and no limit here can slow down.
+
+**The admin commands** refuse a password file that anyone but its owner can
+read (`chmod 600` it), and a refusal never repeats an argument back: an unknown
+option may be a password (`-p<password>` is one word).
+
+**An id in the address that is not a uuid** answers what an id naming nothing
+answers on that route (404 and its not-found body; on the lane's validation
+claim, `409 stay_not_open`), before the body is read and before the database
+is reached. A body the operator surface cannot read answers one sentence,
+`400 body_unreadable` or `413 body_too_large`, never the parser's own words,
+which quote what was sent.
 
 `test/owner-sign-in.test.js`, `test/admin-cli.test.js` and
 `test/owner-sign-in-output.test.js` hold each of these; `npm run
