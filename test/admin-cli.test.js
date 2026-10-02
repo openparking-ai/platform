@@ -154,6 +154,28 @@ test('a password file anyone but its owner can read is refused by name, with the
   assert.match(reset.err, /can be read by users other than its owner/);
 });
 
+test('a password file anyone but its owner can WRITE is refused too: whoever can write it chooses the password', async () => {
+  const tenant = await createTenant('cli-wmode');
+  const email = `cli-wmode-${tenant.slice(0, 8)}@example.com`;
+  for (const mode of [0o620, 0o602, 0o666]) {
+    const r = run('create-admin', ['--tenant', tenant, '--email', email, '--password-file', file(`wmode-${mode.toString(8)}`, `${PASSWORD}\n`, mode)]);
+    assert.equal(r.status, 2, mode.toString(8));
+    // 0666 can be read as well, and is refused for that first.
+    const why = mode & 0o044 ? 'read' : 'written';
+    assert.match(r.err, new RegExp(`refused: the password file can be ${why} by users other than its owner \\(mode 0${mode.toString(8)}\\); make it the owner's only with: chmod 600 <the file>; nothing was changed`), mode.toString(8));
+    assert.equal(r.err.includes(PASSWORD), false);
+  }
+  assert.deepEqual(await users(tenant), []);
+  for (const mode of [0o600, 0o400]) {
+    const other = await createTenant('cli-wmode-ok');
+    const ok = run('create-admin', ['--tenant', other, '--email', `cli-wmode-ok-${other.slice(0, 8)}@example.com`, '--password-file', file(`wok-${mode.toString(8)}`, PASSWORD, mode)]);
+    assert.equal(ok.status, 0, `${mode.toString(8)}: ${ok.err}`);
+  }
+  const reset = run('reset-admin-password', ['--email', email, '--password-file', file('reset-620', PASSWORD, 0o620)]);
+  assert.equal(reset.status, 2);
+  assert.match(reset.err, /can be written by users other than its owner/);
+});
+
 test('no refusal repeats what was typed: an option glued to a password, an unknown option holding one, and a bare value', async () => {
   const tenant = await createTenant('cli-echo');
   const email = `cli-echo-${tenant.slice(0, 8)}@example.com`;

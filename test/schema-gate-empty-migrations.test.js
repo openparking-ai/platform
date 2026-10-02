@@ -75,16 +75,18 @@ test('the build ships migrations, so the control below has a populated case to r
   assert.ok(shipped.length > 0, 'migrations/ is empty in the repository itself');
 });
 
-test('a build shipping NO migrations refuses to serve, naming why', () => {
+test('a build shipping NO migrations refuses to serve, naming why', async () => {
   const dir = buildTree({ migrations: [] });
+  // A free port, not PORT=0: 0 is refused at start-up now, by name, before the
+  // schema check this test is about would run. A broken guard listens on it
+  // and is killed at the timeout. `timeout` is what turns a regression into a
+  // red test rather than a hung suite -- a gate that lets this through does not
+  // exit at all.
+  const port = await freePort();
   try {
-    // PORT=0 so a broken guard cannot collide with anything; it would listen on
-    // an ephemeral port and be killed at the timeout. `timeout` is what turns a
-    // regression into a red test rather than a hung suite -- a gate that lets
-    // this through does not exit at all.
     const result = spawnSync(process.execPath, ['src/server.js'], {
       cwd: dir,
-      env: { ...process.env, PORT: '0' },
+      env: { ...process.env, PORT: String(port) },
       encoding: 'utf8',
       timeout: 30_000,
     });

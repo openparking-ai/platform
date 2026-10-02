@@ -46,6 +46,10 @@
  *   id_unchecked             an id that is not a uuid reaches the handler and the database (C3).
  *   unknown_garage_lane_500  a lane added to a garage that is not there is a database error (C3).
  *   unknown_lane_device_500  a device added to a lane that is not there is a database error (C3).
+ *   body_check_by_path_case  an unreadable body is answered in one sentence only on the lower-case path (R1).
+ *   decoy_after_listen       the port opens before the decoy hash is finished (R2).
+ *   start_settings_unchecked PORT, PG_POOL_MAX and MAX_CLOCK_SKEW_SECONDS are not checked at start (R4).
+ *   password_file_writable_taken  a password file others can write is taken (R6).
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0024, so the property genuinely never existed:
@@ -71,6 +75,8 @@ const CLI = ['test/admin-cli.test.js'];
 const OUTPUT = ['test/owner-sign-in-output.test.js'];
 const DEFINERS = ['test/definer-grants.test.js'];
 const IDS = ['test/ids.test.js'];
+const COLD_START = ['test/sign-in-cold-start.test.js'];
+const START = ['test/start-settings.test.js'];
 
 const SOURCE_BREAKS = [
   {
@@ -378,6 +384,38 @@ const SOURCE_BREAKS = [
     from: "        if (lane.rowCount === 0) throw new HttpError(404, 'lane not found');\n",
     to: '',
   },
+  {
+    name: 'body_check_by_path_case',
+    why: 'an unreadable body is answered in one sentence only on the lower-case path',
+    suite: SIGN_IN,
+    file: 'src/app.js',
+    from: '    if (err.bodyUnreadable) {\n',
+    to: "    if (err.bodyUnreadable && req.path.startsWith('/api/v1/') && !req.path.startsWith('/api/v1/lane/')) {\n",
+  },
+  {
+    name: 'decoy_after_listen',
+    why: 'the port opens before the decoy hash is finished',
+    suite: COLD_START,
+    file: 'src/server.js',
+    from: '  await dummyHash();\n',
+    to: '  void dummyHash;\n',
+  },
+  {
+    name: 'start_settings_unchecked',
+    why: 'PORT, PG_POOL_MAX and MAX_CLOCK_SKEW_SECONDS are not checked at start',
+    suite: START,
+    file: 'src/server.js',
+    from: '  ({ PORT: port } = assertStartSettings());\n',
+    to: '  port = Number(process.env.PORT || 3000);\n',
+  },
+  {
+    name: 'password_file_writable_taken',
+    why: 'a password file others can write is taken',
+    suite: CLI,
+    file: 'src/adminAccount.js',
+    from: '    if (mode & 0o022) {\n',
+    to: '    if (mode & 0) {\n',
+  },
 ];
 
 const SCHEMA_BREAKS = [
@@ -510,7 +548,7 @@ const report = (brk, broken) => {
 const intactDir = stage();
 try {
   console.log('== control A: the suites must PASS intact ==');
-  for (const suite of [SIGN_IN, CLI, OUTPUT, DEFINERS, IDS]) {
+  for (const suite of [SIGN_IN, CLI, OUTPUT, DEFINERS, IDS, COLD_START, START]) {
     const intact = run(intactDir, suite);
     if (intact.status === 0) {
       console.log(`  control A OK — ${suite.join(' ')}: ${summarise(intact)}`);
