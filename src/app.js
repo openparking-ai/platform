@@ -839,7 +839,9 @@ export function createApp() {
    * PROBED before it is stored: the module must answer a read about that
    * garage, and a link it cannot answer is refused by name. Recorded with
    * what changed. The module itself is the operator's; this platform only
-   * asks it (0019).
+   * asks it (0019). A deployment that names no validations door
+   * (`VALIDATIONS_DOOR` unset) refuses a link by name, 409
+   * `validations_not_configured`, and runs nothing; unlinking needs no door.
    */
   operator.put('/garages/:garageId/validations-link', async (req, res, next) => {
     try {
@@ -858,6 +860,9 @@ export function createApp() {
       });
       res.json({ garage });
     } catch (err) {
+      if (err instanceof validations.ValidationsNotConfigured) {
+        return next(conflict('validations_not_configured', err.message));
+      }
       if (err instanceof validations.LinkUnanswerable) {
         return next(conflict('validations_link_unanswerable', err.message));
       }

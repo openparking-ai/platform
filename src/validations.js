@@ -9,14 +9,22 @@
  * THIS REPOSITORY GETS THE ABILITY TO ASK, NEVER THE MODULE: a garage links one
  * (`validations_link`, `{tenant_id, garage_id}`) or links none.
  *
- *   valet-validations validation-in-store --tenant T --garage G --at EXIT     < phone
+ * WHICH COMMAND IS THE DEPLOYMENT'S TO SAY. `VALIDATIONS_DOOR` names it, a bare
+ * command name, and there is NO default: this repository does not know which
+ * module a deployment links, so it does not name one. Unset is a real state --
+ * this deployment has no validations module. Stating a link is then refused by
+ * name (`ValidationsNotConfigured`), and nothing ever runs a door; a garage
+ * that already links one while the setting is unset cannot be answered for, and
+ * takes the could-not-decide path (`ValidationsUnavailable`), by name.
+ *
+ *   <door> validation-in-store --tenant T --garage G --at EXIT     < phone
  *       exit 0 validated · 1 not validated (the JSON names why) · 2 could not
  *       decide (configuration) · 3 the request was refused.
- *   valet-validations claim-in-store --tenant T --garage G --at EXIT
+ *   <door> claim-in-store --tenant T --garage G --at EXIT
  *       --consumer openparking --ref SESSION --claim ATTEMPT --base-minor FEE --currency C  < phone
  *       exit 0 claimed, with the discount in minor units · 1 nothing to claim
  *       · 2 could not decide · 3 refused.
- *   valet-validations release-in-store --tenant T --garage G --at NOW
+ *   <door> release-in-store --tenant T --garage G --at NOW
  *       --consumer openparking --ref SESSION --claim ATTEMPT
  *       exit 0 released · 1 not released (none, already_superseded, superseded) · 2 · 3.
  *
@@ -80,12 +88,12 @@
  * nothing is held, and a `validation_refused` event tells a human.
  */
 import { spawn } from 'node:child_process';
-import { join } from 'node:path';
+import { accessSync, constants, statSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import { withTenant } from './db.js';
 import * as repo from './repository.js';
 import { assertMinor, formatMinor } from './money.js';
 
-export const SCRIPT = 'valet-validations';
 export const CONSUMER = 'openparking';
 export const LINE_CODE = 'validation';
 export const LINK_STATED_EVENT_KIND = 'validations_link_stated';
@@ -100,6 +108,17 @@ export class ValidationsUnavailable extends Error {
   }
 }
 
+//: The sentence stating a link answers with when this deployment names no
+//: door. One sentence, the same everywhere, as the Connect routes' is.
+export const NO_VALIDATIONS_CONFIGURED = 'This deployment has no validations module configured.';
+
+/** Stating a link on a deployment that names no validations door. */
+export class ValidationsNotConfigured extends Error {
+  constructor() {
+    super(NO_VALIDATIONS_CONFIGURED);
+  }
+}
+
 /** A stated link the module cannot answer questions about. */
 export class LinkUnanswerable extends Error {
   constructor(message) {
@@ -107,8 +126,75 @@ export class LinkUnanswerable extends Error {
   }
 }
 
-function scriptPath(env = process.env) {
-  return env.ENTITLEMENT_BIN_DIR ? join(env.ENTITLEMENT_BIN_DIR, SCRIPT) : SCRIPT;
+//: A bare command name: no directory, no option, nothing a shell would read.
+//: `..` is refused anywhere in it, not only on its own.
+const BARE_COMMAND = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Whether this deployment names a validations door, read now. Unset and empty
+ * are the same statement: it has none.
+ */
+export function doorConfigured(env = process.env) {
+  return env.VALIDATIONS_DOOR !== undefined && env.VALIDATIONS_DOOR !== '';
+}
+
+/** A regular file this process may execute. A directory carries the bit too, and is not one. */
+function executableFile(path) {
+  try {
+    accessSync(path, constants.X_OK);
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * THE ONE LOOKUP of the door: start-up (`assertValidationsDoor`) and every run
+ * (`doorPath`) ask it, so the two cannot disagree. A bare command name, found
+ * in ENTITLEMENT_BIN_DIR or, without one, on PATH -- the search a spawn of a
+ * bare name makes, done here so that what was found is what is run -- as a file
+ * this process may execute. Returns `{ path }`, or `{ why }`: a reason that
+ * does not repeat the value.
+ */
+function findDoor(env) {
+  if (!doorConfigured(env)) {
+    return { why: 'this deployment names no validations door (VALIDATIONS_DOOR is unset)' };
+  }
+  const name = env.VALIDATIONS_DOOR;
+  if (!BARE_COMMAND.test(name) || name.includes('..')) {
+    return { why: 'VALIDATIONS_DOOR is not a bare command name' };
+  }
+  const dirs = env.ENTITLEMENT_BIN_DIR ? [env.ENTITLEMENT_BIN_DIR] : (env.PATH ?? '').split(delimiter).filter(Boolean);
+  const path = dirs.map((dir) => join(dir, name)).find(executableFile);
+  if (path === undefined) {
+    return { why: `VALIDATIONS_DOOR names no executable file ${env.ENTITLEMENT_BIN_DIR ? 'in ENTITLEMENT_BIN_DIR' : 'on PATH'}` };
+  }
+  return { path };
+}
+
+/**
+ * The door's file, as found now. Throws `ValidationsUnavailable` when the
+ * deployment names none, names something that is not a bare command, or names
+ * one that is not there to run -- a door this platform cannot run is a door
+ * that could not decide, never a no-validation. Start-up has already refused
+ * the last two; a file removed or replaced since lands here, by name.
+ */
+function doorPath(env = process.env) {
+  const { path, why } = findDoor(env);
+  if (why !== undefined) throw new ValidationsUnavailable(why);
+  return path;
+}
+
+/**
+ * Before the port opens (`src/server.js`): a door that is named and could
+ * never run is refused here, in one sentence naming the setting and its value,
+ * rather than accepted and refused at every close. Unset is a real state -- no
+ * validations module -- and passes. The value is not a secret.
+ */
+export function assertValidationsDoor(env = process.env) {
+  if (!doorConfigured(env)) return;
+  const { why } = findDoor(env);
+  if (why !== undefined) throw new Error(`${why} (it is set to ${JSON.stringify(env.VALIDATIONS_DOOR)}).`);
 }
 
 /**
@@ -118,10 +204,17 @@ function scriptPath(env = process.env) {
 function door(argv, stdin, { env = process.env, timeoutMs = 15_000 } = {}) {
   return new Promise((resolve, reject) => {
     let child;
+    let command;
     try {
-      child = spawn(scriptPath(env), argv, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+      command = doorPath(env);
     } catch (err) {
-      reject(new ValidationsUnavailable(`${SCRIPT} could not be run (${err.code ?? err.message})`));
+      reject(err);
+      return;
+    }
+    try {
+      child = spawn(command, argv, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (err) {
+      reject(new ValidationsUnavailable(`the validations door could not be run (${err.code ?? err.message})`));
       return;
     }
     let stdout = '';
@@ -135,19 +228,19 @@ function door(argv, stdin, { env = process.env, timeoutMs = 15_000 } = {}) {
     };
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
-      finish(() => reject(new ValidationsUnavailable(`${SCRIPT} did not answer within ${timeoutMs} ms`)));
+      finish(() => reject(new ValidationsUnavailable(`the validations door did not answer within ${timeoutMs} ms`)));
     }, timeoutMs);
     child.stdout.setEncoding('utf8').on('data', (d) => { stdout += d; });
     child.stderr.setEncoding('utf8').on('data', (d) => { stderr += d; });
     // A door that exits without reading stdin closes the pipe under the write.
     child.stdin.on('error', () => {});
     child.on('error', (err) =>
-      finish(() => reject(new ValidationsUnavailable(`${SCRIPT} could not be run (${err.code ?? err.message})`))),
+      finish(() => reject(new ValidationsUnavailable(`the validations door could not be run (${err.code ?? err.message})`))),
     );
     child.on('close', (code, signal) =>
       finish(() =>
         code === null
-          ? reject(new ValidationsUnavailable(`${SCRIPT} was stopped by ${signal}`))
+          ? reject(new ValidationsUnavailable(`the validations door was stopped by ${signal}`))
           : resolve({ exit_code: code, stdout, stderr }),
       ),
     );
@@ -574,8 +667,13 @@ export async function probeLink(link, options = {}) {
   throw new LinkUnanswerable(unavailable('validation-in-store', out).message);
 }
 
-/** Store the link, probed, and record who stated it. `link` null unlinks. */
+/**
+ * Store the link, probed, and record who stated it. `link` null unlinks, and
+ * needs no door. A link on a deployment that names no door is refused by name
+ * before anything is run.
+ */
 export async function stateLink(client, tenantId, garage, link, { actor, options = {} }) {
+  if (link && !doorConfigured(options.env ?? process.env)) throw new ValidationsNotConfigured();
   const probe = link ? await probeLink(link, options) : null;
   const { rows } = await client.query(
     `UPDATE garages SET validations_link = $3 WHERE tenant_id = $1 AND id = $2 RETURNING *`,

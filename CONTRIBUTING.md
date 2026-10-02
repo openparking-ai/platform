@@ -47,6 +47,13 @@ a tenant boundary.
 failing when the thing it protects is removed. `npm run rls-fail-control` in the
 platform repository is the worked example.
 
+**A name from outside this project.** No product, module or hostname from the
+maintainer's other, private software appears here — not in code, a comment, a
+document, a test, a fixture, a file's path or a commit message. Where this
+platform asks a module it does not ship, the deployment names the command
+(`VALIDATIONS_DOOR` is the example); the repository does not.
+`.github/scripts/check-no-sibling-names.js` enforces it in CI.
+
 **A silent guess in the lane.** When vehicle identification is not confident
 enough, the lane takes its declared fallback path. It does not pick the most
 likely answer and open the gate.
