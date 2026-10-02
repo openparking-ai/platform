@@ -11,10 +11,14 @@
  *
  * This starts the REAL `src/server.js` once per sign-in and sends ONE request
  * the moment it says it is listening: a real admin's email with a wrong
- * password, or an email nobody has, alternately. At the lowest floor the two
- * medians must sit within TOLERANCE_MS of each other; the failure this guards
- * against is a whole hash apart (about 150 ms here, more on a slower machine).
- * The receipt's measurement is the finer instrument: this is the tripwire.
+ * password, or an email nobody has, alternately. At the lowest floor the
+ * FASTEST of each must sit within TOLERANCE_MS of the other. The fastest, not
+ * the median: the rest of the suite runs beside this file, and load only ever
+ * adds time -- a median here swung by 200 ms under a full suite -- while the
+ * failure this guards against puts a whole second hash under EVERY unknown
+ * sign-in (about 110 ms here at this floor, more on a slower machine), the
+ * fastest one included. The receipt's measurement is the finer instrument:
+ * this is the tripwire.
  */
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -79,10 +83,6 @@ async function firstSignIn(email, address) {
   }
 }
 
-const median = (xs) => {
-  const s = [...xs].sort((a, b) => a - b);
-  return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
-};
 
 test('THE FIRST SIGN-IN AFTER A START: a real admin\'s email and an unknown one take the same time at the lowest floor', async () => {
   const tenant = await createTenant('cold-start');
@@ -94,7 +94,7 @@ test('THE FIRST SIGN-IN AFTER A START: a real admin\'s email and an unknown one 
     times.known.push(await firstSignIn(known, `198.51.100.${2 * i + 1}`));
     times.unknown.push(await firstSignIn(`nobody-${tenant.slice(0, 8)}-${i}@example.com`, `198.51.100.${2 * i + 2}`));
   }
-  const gap = median(times.unknown) - median(times.known);
+  const gap = Math.min(...times.unknown) - Math.min(...times.known);
   const shown = `known ${times.known.map((t) => t.toFixed(0)).join(',')} | unknown ${times.unknown.map((t) => t.toFixed(0)).join(',')}`;
-  assert.ok(Math.abs(gap) < TOLERANCE_MS, `median gap ${gap.toFixed(1)} ms: ${shown}`);
+  assert.ok(Math.abs(gap) < TOLERANCE_MS, `fastest unknown minus fastest known ${gap.toFixed(1)} ms: ${shown}`);
 });
