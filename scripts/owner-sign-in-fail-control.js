@@ -27,11 +27,31 @@
  *   password_argument_taken  a password on the command line is accepted.
  *   no_store_dropped         operator responses may be stored.
  *   short_password_taken     the length rule is not enforced.
+ *   refusal_floor_dropped    a refusal is answered as soon as its work is done (F1).
+ *   unknown_skips_lock_read  an unknown email skips the lock lookup (F1).
+ *   unknown_skips_failure_write  an unknown email skips the failure write (F1).
+ *   hash_line_uncapped       the hash line has no length and no per-address share (F5).
+ *   auth_body_failure_500    a sign-in body that cannot be read is a 500 (F4).
+ *   auth_parser_router_wide  every path under /auth reads a body, so a non-route is not a 404 (F4).
+ *   operator_parser_text     an operator body that cannot be read is answered in the parser's words (F3).
+ *   operator_parse_headers_dropped  that answer may be stored and sniffed (F3).
+ *   number_setting_unchecked a number setting is taken whatever it is (F6).
+ *   hop_count_unbounded      TRUST_PROXY may name any number of hops (F6).
+ *   password_file_mode_ignored  a password file others can read is taken (F7).
+ *   refusal_echoes_argument  a refused option is repeated back, password and all (F7).
+ *   no_origin_signs_in       with no ADMIN_ORIGIN, sign-in is on (decision 1).
+ *   foreign_origin_signs_in  a sign-in from a foreign Origin is taken (decision 2).
+ *   cookie_twice_first_taken a cookie sent twice is read as its first value (decision 4).
+ *   ended_sessions_kept      a sign-in leaves the admin's ended sessions in place (decision 6).
+ *   id_unchecked             an id that is not a uuid reaches the handler and the database (C3).
+ *   unknown_garage_lane_500  a lane added to a garage that is not there is a database error (C3).
+ *   unknown_lane_device_500  a device added to a lane that is not there is a database error (C3).
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0024, so the property genuinely never existed:
  *   absolute_unchecked       a session past its absolute end is still found.
  *   session_is_a_key         a session token is accepted as a Bearer key.
+ *   public_execute_restored  resolve_operator_user is executable by PUBLIC again (F2).
  *
  * Needs the same environment as the suite.
  */
@@ -49,6 +69,8 @@ const SCRATCH = process.env.SIGN_IN_SCRATCH_DB || 'openparking_sign_in_control';
 const SIGN_IN = ['test/owner-sign-in.test.js'];
 const CLI = ['test/admin-cli.test.js'];
 const OUTPUT = ['test/owner-sign-in-output.test.js'];
+const DEFINERS = ['test/definer-grants.test.js'];
+const IDS = ['test/ids.test.js'];
 
 const SOURCE_BREAKS = [
   {
@@ -81,8 +103,8 @@ const SOURCE_BREAKS = [
     why: "an unreadable body is answered with the parser's text",
     suite: SIGN_IN,
     file: 'src/signIn.js',
-    from: '      return res.status(400).json(UNREADABLE);\n    }\n    // A stored hash',
-    to: '      return res.status(400).json({ error: err.message, code: UNREADABLE.code });\n    }\n    // A stored hash',
+    from: '    if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);\n    // A stored hash',
+    to: '    if (err?.unreadable) return refuse(req, res, 400, { error: err.cause?.message, code: UNREADABLE.code });\n    // A stored hash',
   },
   {
     name: 'query_read',
@@ -97,16 +119,16 @@ const SOURCE_BREAKS = [
     why: 'an unknown email runs no hash',
     suite: SIGN_IN,
     file: 'src/signIn.js',
-    from: '      const matches = await internals.verifyPassword(body.password, user ? user.password_hash : await dummyHash());\n',
-    to: '      const matches = user ? await internals.verifyPassword(body.password, user.password_hash) : false;\n',
+    from: '      const matches = await internals.verifyPassword(body.password, found ? found.password_hash : await dummyHash());\n',
+    to: '      const matches = found ? await internals.verifyPassword(body.password, found.password_hash) : false;\n',
   },
   {
     name: 'lock_off_by_one',
     why: 'the tenth wrong password does not lock',
     suite: SIGN_IN,
     file: 'src/signIn.js',
-    from: '        [user.tenant_id, user.user_id, address, MAX_FAILED, LOCK_MINUTES],',
-    to: '        [user.tenant_id, user.user_id, address, MAX_FAILED + 1, LOCK_MINUTES],',
+    from: '        [user.tenant_id, user.user_id, address, MAX_FAILED, LOCK_MINUTES, counted],',
+    to: '        [user.tenant_id, user.user_id, address, MAX_FAILED + 1, LOCK_MINUTES, counted],',
   },
   {
     name: 'lock_whole_account',
@@ -204,6 +226,158 @@ const SOURCE_BREAKS = [
     from: '  if (length < MIN_PASSWORD_LENGTH) return',
     to: '  if (length < 1) return',
   },
+  {
+    name: 'refusal_floor_dropped',
+    why: 'a refusal is answered as soon as its work is done',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '    if (wait > 0) await sleep(wait);\n',
+    to: '',
+  },
+  {
+    name: 'unknown_skips_lock_read',
+    why: 'an unknown email skips the lock lookup',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      const lock = await internals.lockOf(user, address);\n',
+    to: '      const lock = found ? await internals.lockOf(user, address) : null;\n',
+  },
+  {
+    name: 'unknown_skips_failure_write',
+    why: 'an unknown email skips the failure write',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '        await internals.recordFailure(user, address, Boolean(found) && !matches);\n',
+    to: '        if (found) await internals.recordFailure(user, address, Boolean(found) && !matches);\n',
+  },
+  {
+    name: 'hash_line_uncapped',
+    why: 'the hash line has no length and no per-address share',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      if (held >= max || mine >= perAddress) return null;\n',
+    to: '      if (held < 0 || mine < 0) return null;\n',
+  },
+  {
+    name: 'auth_body_failure_500',
+    why: 'a sign-in body that cannot be read is a 500',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '    if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);\n',
+    to: '',
+  },
+  {
+    name: 'auth_parser_router_wide',
+    why: 'every path under /auth reads a body, so a non-route is not a 404',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '  router.use(noStore);\n\n  router.post(',
+    to: '  router.use(noStore);\n  router.use(readSignInBody);\n\n  router.post(',
+  },
+  {
+    name: 'operator_parser_text',
+    why: "an operator body that cannot be read is answered in the parser's words",
+    suite: SIGN_IN,
+    file: 'src/app.js',
+    from: ': res.status(400).json(BODY_UNREADABLE);',
+    to: ': res.status(400).json({ error: err.message });',
+  },
+  {
+    name: 'operator_parse_headers_dropped',
+    why: 'an operator body that cannot be read is answered without no-store and nosniff',
+    suite: SIGN_IN,
+    file: 'src/app.js',
+    from: "      res.set('Cache-Control', 'no-store');\n      res.set('X-Content-Type-Options', 'nosniff');\n      return err.status === 413",
+    to: '      return err.status === 413',
+  },
+  {
+    name: 'number_setting_unchecked',
+    why: 'a number setting is taken whatever it is',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '  if (!/^[0-9]{1,6}$/.test(raw) || Number(raw) < min || Number(raw) > max) {\n',
+    to: '  if (Number.isNaN(Number(raw))) {\n',
+  },
+  {
+    name: 'hop_count_unbounded',
+    why: 'TRUST_PROXY may name any number of hops',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '    if (value < 1 || value > MAX_PROXY_HOPS) throw',
+    to: '    if (value < 0) throw',
+  },
+  {
+    name: 'password_file_mode_ignored',
+    why: 'a password file others can read is taken',
+    suite: CLI,
+    file: 'src/adminAccount.js',
+    from: '    if (mode & 0o044) {\n',
+    to: '    if (mode & 0) {\n',
+  },
+  {
+    name: 'refusal_echoes_argument',
+    why: 'a refused option is repeated back, password and all',
+    suite: CLI,
+    file: 'src/adminAccount.js',
+    from: '`an unknown option (not repeated here: it may hold a password); this command takes',
+    to: '`unknown option ${name}; this command takes',
+  },
+  {
+    name: 'no_origin_signs_in',
+    why: 'with no ADMIN_ORIGIN, sign-in is on',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      if (settings.adminOrigin === null) return await refuse(req, res, 409, NOT_CONFIGURED);\n',
+    to: '',
+  },
+  {
+    name: 'foreign_origin_signs_in',
+    why: 'a sign-in from a foreign Origin is taken',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      if (origin !== undefined && origin !== settings.adminOrigin) return await refuse(req, res, 403, ORIGIN_REFUSED);\n',
+    to: '',
+  },
+  {
+    name: 'cookie_twice_first_taken',
+    why: 'a cookie sent twice is read as its first value',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '  if (values.length !== 1 || ',
+    to: '  if (values.length < 1 || ',
+  },
+  {
+    name: 'ended_sessions_kept',
+    why: "a sign-in leaves the admin's ended sessions in place",
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "        `DELETE FROM operator_tokens WHERE user_id = $1 AND kind = 'session'\n",
+    to: "        `SELECT 1 FROM operator_tokens WHERE user_id = $1 AND kind = 'session'\n",
+  },
+  {
+    name: 'id_unchecked',
+    why: 'an id that is not a uuid reaches the handler and the database',
+    suite: IDS,
+    file: 'src/app.js',
+    from: '    router.param(name, (req, _res, next, value) => next(UUID.test(value) ? undefined : notFound(req.route.path)));\n',
+    to: '    router.param(name, (_req, _res, next) => next());\n',
+  },
+  {
+    name: 'unknown_garage_lane_500',
+    why: 'a lane added to a garage that is not there is a database error',
+    suite: IDS,
+    file: 'src/app.js',
+    from: "        if (!(await repo.getGarage(client, req.tenantId, req.params.garageId))) throw new HttpError(404, 'garage not found');\n",
+    to: '',
+  },
+  {
+    name: 'unknown_lane_device_500',
+    why: 'a device added to a lane that is not there is a database error',
+    suite: IDS,
+    file: 'src/app.js',
+    from: "        if (lane.rowCount === 0) throw new HttpError(404, 'lane not found');\n",
+    to: '',
+  },
 ];
 
 const SCHEMA_BREAKS = [
@@ -218,6 +392,12 @@ const SCHEMA_BREAKS = [
     why: 'a session token is accepted as a Bearer key',
     suite: SIGN_IN,
     edits: [{ file: '0024_operator_sign_in.sql', from: "      AND t.kind = 'key'\n", to: '' }],
+  },
+  {
+    name: 'public_execute_restored',
+    why: 'resolve_operator_user is executable by PUBLIC again',
+    suite: DEFINERS,
+    edits: [{ file: '0024_operator_sign_in.sql', from: 'REVOKE EXECUTE ON FUNCTION resolve_operator_user(text) FROM PUBLIC;\n', to: '' }],
   },
 ];
 
@@ -330,7 +510,7 @@ const report = (brk, broken) => {
 const intactDir = stage();
 try {
   console.log('== control A: the suites must PASS intact ==');
-  for (const suite of [SIGN_IN, CLI, OUTPUT]) {
+  for (const suite of [SIGN_IN, CLI, OUTPUT, DEFINERS, IDS]) {
     const intact = run(intactDir, suite);
     if (intact.status === 0) {
       console.log(`  control A OK — ${suite.join(' ')}: ${summarise(intact)}`);

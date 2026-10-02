@@ -11,7 +11,7 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
@@ -23,9 +23,11 @@ const PASSWORD = 'correct horse battery staple';
 const secrets = new Set([PASSWORD]);
 let admin;
 
-function file(name, text) {
+function file(name, text, mode = 0o600) {
   const path = join(scratch, name);
-  writeFileSync(path, text, { mode: 0o600 });
+  writeFileSync(path, text, { mode });
+  // The mode exactly, whatever the umask took away or left.
+  chmodSync(path, mode);
   return path;
 }
 function run(script, args) {
@@ -130,4 +132,43 @@ test('a reset gives a new password, revokes every session and clears every lock 
   const nobody = run('reset-admin-password', ['--email', 'nobody-here@example.com', '--password-file', file('r3', NEW)]);
   assert.equal(nobody.status, 2);
   assert.match(nobody.err, /no admin has that email/);
+});
+
+test('a password file anyone but its owner can read is refused by name, with the one-line fix, and nothing is made', async () => {
+  const tenant = await createTenant('cli-mode');
+  const email = `cli-mode-${tenant.slice(0, 8)}@example.com`;
+  for (const mode of [0o644, 0o640, 0o604, 0o666]) {
+    const r = run('create-admin', ['--tenant', tenant, '--email', email, '--password-file', file(`mode-${mode.toString(8)}`, `${PASSWORD}\n`, mode)]);
+    assert.equal(r.status, 2, mode.toString(8));
+    assert.match(r.err, new RegExp(`refused: the password file can be read by users other than its owner \\(mode 0${mode.toString(8)}\\); make it the owner's only with: chmod 600 <the file>; nothing was changed`), mode.toString(8));
+    assert.equal(r.err.includes(PASSWORD), false);
+  }
+  assert.deepEqual(await users(tenant), []);
+  for (const mode of [0o600, 0o400]) {
+    const other = await createTenant('cli-mode-ok');
+    const ok = run('create-admin', ['--tenant', other, '--email', `cli-mode-ok-${other.slice(0, 8)}@example.com`, '--password-file', file(`ok-${mode.toString(8)}`, PASSWORD, mode)]);
+    assert.equal(ok.status, 0, `${mode.toString(8)}: ${ok.err}`);
+  }
+  const reset = run('reset-admin-password', ['--email', email, '--password-file', file('reset-644', PASSWORD, 0o644)]);
+  assert.equal(reset.status, 2);
+  assert.match(reset.err, /can be read by users other than its owner/);
+});
+
+test('no refusal repeats what was typed: an option glued to a password, an unknown option holding one, and a bare value', async () => {
+  const tenant = await createTenant('cli-echo');
+  const email = `cli-echo-${tenant.slice(0, 8)}@example.com`;
+  for (const args of [
+    [`-p${PASSWORD}`], [`-P${PASSWORD}`], [`--secret=${PASSWORD}`], [`--new-password=${PASSWORD}`], [`--Password=${PASSWORD}`],
+    [`--password_file=${PASSWORD}`], [`--${PASSWORD}`], ['--', PASSWORD], [PASSWORD],
+  ]) {
+    for (const script of ['create-admin', 'reset-admin-password']) {
+      const base = script === 'create-admin' ? ['--tenant', tenant, '--email', email] : ['--email', email];
+      const r = run(script, [...base, ...args]);
+      assert.equal(r.status, 2, `${script} ${args.length}`);
+      assert.match(r.err, /^refused: /);
+      assert.equal(r.err.includes(PASSWORD) || r.out.includes(PASSWORD), false, `${script}: the refusal repeated what was typed`);
+      assert.equal(r.err.includes(PASSWORD.split(' ')[0]), false, `${script}: not even part of it`);
+    }
+  }
+  assert.deepEqual(await users(tenant), []);
 });

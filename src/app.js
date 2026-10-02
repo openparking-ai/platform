@@ -63,6 +63,40 @@ const bad = (message) => new HttpError(400, message);
 const CONFLICT_STATUS = 409;
 const conflict = (code, message) => new HttpError(CONFLICT_STATUS, message, code);
 
+/** The one refusal of a validation claimed on a stay that is not open -- or that never was. */
+const STAY_NOT_OPEN = 'the stay is not open in this garage: a validation is claimed before the close, never after';
+
+/**
+ * AN ID THAT IS NOT AN ID. Every path parameter is a uuid, and one that is not
+ * is answered here -- before the handler reads the body, and before anything
+ * reaches the database, where it was a 500 -- exactly as that route answers an
+ * id that names nothing. `test/ids.test.js` walks both routers and requires
+ * every parameter to be one of these.
+ */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+//: The Connect routes (0020, 0021) name their not-found with a code; the rest do not.
+const CONNECT_ROUTE = /\/stripe-account|\/readers?(\/|$)/;
+export const ID_PARAMS = Object.freeze({
+  operator: Object.freeze({
+    garageId: (route) => (CONNECT_ROUTE.test(route) ? new HttpError(404, 'garage not found', 'garage_not_found') : new HttpError(404, 'garage not found')),
+    laneId: (route) => (CONNECT_ROUTE.test(route) ? new HttpError(404, 'lane not found', 'lane_not_found') : new HttpError(404, 'lane not found')),
+    deviceId: () => new HttpError(404, 'device not found'),
+    tokenId: () => new HttpError(404, 'operator token not found'),
+  }),
+  lane: Object.freeze({
+    sessionId: () => conflict('stay_not_open', STAY_NOT_OPEN),
+  }),
+});
+function checkIds(router, params) {
+  for (const [name, notFound] of Object.entries(params)) {
+    router.param(name, (req, _res, next, value) => next(UUID.test(value) ? undefined : notFound(req.route.path)));
+  }
+}
+
+//: A body the operator router cannot read: one sentence per case, never the parser's text.
+export const BODY_UNREADABLE = Object.freeze({ error: 'The request body could not be read. Send JSON.', code: 'body_unreadable' });
+export const BODY_TOO_LARGE = Object.freeze({ error: 'The request body is too large.', code: 'body_too_large' });
+
 /** `POST /garages/:id/rates` is gone for good: 410, with the name a caller can match on. */
 const RATES_RETIRED_STATUS = 410;
 const RATES_RETIRED_CODE = 'rates_retired';
@@ -655,7 +689,10 @@ export function createApp() {
   // never with the parser's text, which quotes what was sent.
   app.use('/api/v1/auth', signIn.createAuthRouter(authSettings));
 
-  app.use(express.json({ limit: '1mb' }));
+  // Any failure to read a body is marked as one, so the operator surface can
+  // answer it in its own sentence (below); the lane's answer is unchanged.
+  const json = express.json({ limit: '1mb' });
+  app.use((req, res, next) => json(req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined)));
 
   app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
@@ -683,6 +720,7 @@ export function createApp() {
    * A session token presented as a Bearer key is not a key and is refused.
    */
   operator.use(signIn.noStore);
+  checkIds(operator, ID_PARAMS.operator);
   operator.use(async (req, res, next) => {
     try {
       const token = bearerFrom(req.get('authorization'));
@@ -986,6 +1024,8 @@ export function createApp() {
         throw bad("name and direction ('entry' or 'exit') are required");
       }
       const lane = await withTenant(req.tenantId, async (client) => {
+        // Asked first: a garage that is not there is a 404, not a foreign-key violation.
+        if (!(await repo.getGarage(client, req.tenantId, req.params.garageId))) throw new HttpError(404, 'garage not found');
         const { rows } = await client.query(
           `INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1,$2,$3,$4) RETURNING *`,
           [req.tenantId, req.params.garageId, name, direction],
@@ -1085,6 +1125,9 @@ export function createApp() {
       // exactly once. There is no endpoint that can show it again.
       const token = generateDeviceToken();
       const device = await withTenant(req.tenantId, async (client) => {
+        // Asked first: a lane that is not there is a 404, not a foreign-key violation.
+        const lane = await client.query('SELECT 1 FROM lanes WHERE tenant_id = $1 AND id = $2', [req.tenantId, req.params.laneId]);
+        if (lane.rowCount === 0) throw new HttpError(404, 'lane not found');
         const { rows } = await client.query(
           `INSERT INTO lane_devices (tenant_id, lane_id, name, token_hash) VALUES ($1,$2,$3,$4)
            RETURNING id, lane_id, name, created_at`,
@@ -1278,6 +1321,7 @@ export function createApp() {
   // Lane surface. Authenticated by device token.
   // -------------------------------------------------------------------------
   const lane = express.Router();
+  checkIds(lane, ID_PARAMS.lane);
 
   lane.use(async (req, _res, next) => {
     try {
@@ -1605,7 +1649,7 @@ export function createApp() {
       const pre = await withTenant(tenantId, async (client) => {
         const stay = await repo.lockOpenStay(client, tenantId, garageId, sessionId);
         if (!stay) {
-          throw conflict('stay_not_open', 'the stay is not open in this garage: a validation is claimed before the close, never after');
+          throw conflict('stay_not_open', STAY_NOT_OPEN);
         }
         const garage = await repo.getGarage(client, tenantId, garageId);
         const open = await repo.findOpenSessionById(client, tenantId, garageId, sessionId);
@@ -1637,7 +1681,7 @@ export function createApp() {
       const out = await withTenant(tenantId, async (client) => {
         const stay = await repo.lockOpenStay(client, tenantId, garageId, sessionId);
         if (!stay) {
-          throw conflict('stay_not_open', 'the stay is not open in this garage: a validation is claimed before the close, never after');
+          throw conflict('stay_not_open', STAY_NOT_OPEN);
         }
         if (stay.validation?.state !== 'claiming' || stay.validation.attempt !== pre.attempt) {
           throw conflict('claim_superseded', 'another claim or a release for this stay came first; nothing was asked');
@@ -2102,7 +2146,15 @@ export function createApp() {
   app.use('/api/v1/lane', lane);
   app.use('/api/v1', operator);
 
-  app.use((err, _req, res, _next) => {
+  app.use((err, req, res, _next) => {
+    // An operator request whose body could not be read: one fixed sentence,
+    // never the parser's, which quotes what was sent; and never stored or
+    // sniffed, like every operator answer. The lane's answer is as it was.
+    if (err.bodyUnreadable && req.path.startsWith('/api/v1/') && !req.path.startsWith('/api/v1/lane/')) {
+      res.set('Cache-Control', 'no-store');
+      res.set('X-Content-Type-Options', 'nosniff');
+      return err.status === 413 ? res.status(413).json(BODY_TOO_LARGE) : res.status(400).json(BODY_UNREADABLE);
+    }
     const status = err.status ?? 500;
     // A NAMED 5xx is ours and says what failed upstream -- Stripe refused, or
     // could not be reached -- and the operator needs that sentence. Anything

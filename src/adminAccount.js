@@ -13,7 +13,7 @@
  *
  * A reset revokes every session of that admin and clears every lock on it.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { pool, withTenant } from './db.js';
 import { hashPassword, passwordRuleBroken } from './passwords.js';
 
@@ -26,7 +26,8 @@ const PASSWORD_ARGUMENT =
 /**
  * The options a command takes, from argv. Each option takes one value. Any
  * argument that looks like a password, anything unknown and any bare value are
- * refused, the first by its own sentence.
+ * refused, the first by its own sentence. A refusal NEVER repeats what was
+ * typed: an unknown argument may be a password (`-p<password>` is one word).
  */
 export function parseArgs(argv, allowed) {
   const out = {};
@@ -38,7 +39,7 @@ export function parseArgs(argv, allowed) {
     }
     if (!allowed.includes(name)) {
       throw new AdminCommandRefused(
-        arg.startsWith('-') ? `unknown option ${name}; this command takes ${allowed.join(', ')}`
+        arg.startsWith('-') ? `an unknown option (not repeated here: it may hold a password); this command takes ${allowed.join(', ')}`
           : `a bare value is not taken (a password is never an argument); this command takes ${allowed.join(', ')}`,
       );
     }
@@ -84,10 +85,19 @@ function promptHidden(question, { stdin = process.stdin, stderr = process.stderr
 export async function readNewPassword({ file, stdin = process.stdin, stderr = process.stderr } = {}) {
   let password;
   if (file !== undefined) {
+    let mode;
     try {
+      mode = statSync(file).mode;
       password = readFileSync(file, 'utf8').replace(/\r?\n$/, '');
     } catch (err) {
       throw new AdminCommandRefused(`the password file could not be read (${err.code ?? 'error'})`);
+    }
+    // A password anyone else on the machine can read is not a secret any more.
+    if (mode & 0o044) {
+      throw new AdminCommandRefused(
+        `the password file can be read by users other than its owner (mode ${(mode & 0o777).toString(8).padStart(4, '0')}); ` +
+          'make it the owner\'s only with: chmod 600 <the file>; nothing was changed',
+      );
     }
   } else {
     if (!stdin.isTTY) throw new AdminCommandRefused('no terminal to prompt at: run it at a terminal, or pass --password-file <path>');

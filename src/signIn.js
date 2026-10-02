@@ -15,7 +15,18 @@
  *
  * NO ORACLE. An unknown email, a wrong password and a locked address answer
  * the SAME status and the SAME body, and each runs exactly one hash -- an
- * unknown email is checked against a hash of nothing anyone knows.
+ * unknown email is checked against a hash of nothing anyone knows. Each also
+ * runs the SAME database statements: the lock lookup and the failure write,
+ * which for an unknown email name no user and so find and write nothing. And
+ * no refusal is answered sooner than a fixed floor after the request arrived
+ * (SIGN_IN_REFUSAL_FLOOR_MS), set above a refusal's own work, so what is left
+ * of the difference in work is not on the wire.
+ *
+ * WAITING. Hashes are slow by design, and only a few run at once. The line
+ * for them is capped (SIGN_IN_HASH_LINE), and one address holds only a few
+ * places in it (SIGN_IN_HASH_LINE_PER_ADDRESS): an attempt that finds it full
+ * is answered `503 sign_in_busy` -- before the email is looked at, so it is
+ * the same for every email -- instead of waiting behind everyone else's.
  *
  * GUESSING. Ten wrong passwords from one caller address lock THAT address out
  * of THAT account for thirty minutes; wrong passwords during the lock still
@@ -42,7 +53,8 @@
  * served same-origin as `/api`: there is no CORS here.
  */
 import express from 'express';
-import { isIPv6 } from 'node:net';
+import { isIP, isIPv6 } from 'node:net';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { pool, withTenant } from './db.js';
 import { generateDeviceToken, hashToken } from './auth.js';
 import { dummyHash, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
@@ -60,6 +72,12 @@ export const ORIGIN_REFUSED = Object.freeze({ error: 'This request did not come 
 export const NOT_CONFIGURED = Object.freeze({ error: 'This deployment has no admin origin configured, so owner sign-in is off.', code: 'sign_in_not_configured' });
 export const SESSION_ENDED = Object.freeze({ error: 'The session has ended. Sign in again.', code: 'session_ended' });
 export const SIGN_IN_REQUIRED = Object.freeze({ error: 'Sign in first.', code: 'sign_in_required' });
+//: The hash line is full. Decided before the email is read, so the same for every email.
+export const BUSY = Object.freeze({ error: 'Sign-in is busy. Try again in a moment.', code: 'sign_in_busy' });
+
+//: Who an unknown email is: no user and no tenant, so the lock lookup and the
+//: failure write run as they do for a known email and find and write nothing.
+export const NOBODY = Object.freeze({ user_id: '00000000-0000-0000-0000-000000000000', tenant_id: '00000000-0000-0000-0000-000000000000' });
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
@@ -68,11 +86,71 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 // below is refused at start, never guessed at.
 // ---------------------------------------------------------------------------
 
-function positive(env, name, fallback) {
+/**
+ * Every number setting sign-in reads: a whole number inside its bounds, and
+ * its default. The defaults of the floor and the line are measured (README,
+ * "The owner signs in"): one hash at N=2^17 is about 151 ms, four run at once.
+ */
+export const NUMBER_SETTINGS = Object.freeze({
+  SESSION_IDLE_MINUTES: { min: 1, max: 1440, fallback: 30 },
+  SESSION_MAX_HOURS: { min: 1, max: 168, fallback: 12 },
+  SIGN_IN_ATTEMPTS_PER_ADDRESS: { min: 1, max: 1000, fallback: 30 },
+  SIGN_IN_ATTEMPTS_WINDOW_MINUTES: { min: 1, max: 1440, fallback: 15 },
+  SIGN_IN_REFUSAL_FLOOR_MS: { min: 200, max: 5000, fallback: 500 },
+  SIGN_IN_HASH_LINE: { min: 1, max: 1000, fallback: 48 },
+  SIGN_IN_HASH_LINE_PER_ADDRESS: { min: 1, max: 16, fallback: 2 },
+});
+
+//: The most proxy hops TRUST_PROXY may name.
+export const MAX_PROXY_HOPS = 5;
+
+function whole(env, name) {
+  const { min, max, fallback } = NUMBER_SETTINGS[name];
   const raw = env[name];
   if (raw === undefined || raw === '') return fallback;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive number, not ${JSON.stringify(raw)}`);
+  if (!/^[0-9]{1,6}$/.test(raw) || Number(raw) < min || Number(raw) > max) {
+    throw new Error(`${name} must be a whole number from ${min} to ${max}, not ${JSON.stringify(String(raw).slice(0, 40))}`);
+  }
+  return Number(raw);
+}
+
+const TRUST_PROXY_FORMS =
+  `TRUST_PROXY must be a number of proxy hops from 1 to ${MAX_PROXY_HOPS}, "loopback", or a comma-separated list of ` +
+  'proxy addresses or subnets (CIDR); "true" and any other form are refused, because they trust whatever the caller says';
+
+/** One proxy address or subnet, as written; or null when it is not one. */
+function proxyEntry(entry) {
+  const [address, prefix, extra] = entry.split('/');
+  const family = isIP(address);
+  if (!family || extra !== undefined) return null;
+  if (prefix === undefined) return address;
+  if (!/^[0-9]{1,3}$/.test(prefix)) return null;
+  const bits = Number(prefix);
+  // A /0 is every address there is: the caller's say-so again.
+  return bits >= 1 && bits <= (family === 4 ? 32 : 128) ? `${address}/${bits}` : null;
+}
+
+/** TRUST_PROXY as Express is to be told it, or null when unset. Anything else is refused by name. */
+export function readTrustProxy(raw) {
+  if (raw === undefined || raw === '') return null;
+  let value;
+  if (/^[0-9]{1,6}$/.test(raw)) {
+    value = Number(raw);
+    if (value < 1 || value > MAX_PROXY_HOPS) throw new Error(`${TRUST_PROXY_FORMS}; not ${JSON.stringify(raw)}`);
+  } else if (raw === 'loopback') {
+    value = 'loopback';
+  } else {
+    const entries = raw.split(',').map((e) => proxyEntry(e.trim()));
+    if (entries.some((e) => e === null)) throw new Error(`${TRUST_PROXY_FORMS}; not ${JSON.stringify(String(raw).slice(0, 80))}`);
+    value = entries;
+  }
+  // Express is asked to compile it here, at start-up, so a form it would
+  // refuse later is refused now and by name -- never a stack trace.
+  try {
+    express().set('trust proxy', value);
+  } catch {
+    throw new Error(`${TRUST_PROXY_FORMS}; not ${JSON.stringify(String(raw).slice(0, 80))}`);
+  }
   return value;
 }
 
@@ -94,21 +172,23 @@ export function readAuthSettings(env = process.env) {
   if (insecure !== undefined && insecure !== '' && insecure !== 'true') {
     throw new Error('SESSION_COOKIE_INSECURE is unset, or exactly "true" for plain-http local development');
   }
-  const idleMinutes = positive(env, 'SESSION_IDLE_MINUTES', 30);
-  const maxHours = positive(env, 'SESSION_MAX_HOURS', 12);
+  const idleMinutes = whole(env, 'SESSION_IDLE_MINUTES');
+  const maxHours = whole(env, 'SESSION_MAX_HOURS');
   if (idleMinutes * 60 > maxHours * 3600) throw new Error('SESSION_IDLE_MINUTES cannot be longer than SESSION_MAX_HOURS');
-  let trustProxy = null;
-  if (env.TRUST_PROXY !== undefined && env.TRUST_PROXY !== '') {
-    trustProxy = /^\d+$/.test(env.TRUST_PROXY) ? Number(env.TRUST_PROXY) : env.TRUST_PROXY;
-  }
+  const hashLine = whole(env, 'SIGN_IN_HASH_LINE');
+  const hashLinePerAddress = whole(env, 'SIGN_IN_HASH_LINE_PER_ADDRESS');
+  if (hashLinePerAddress > hashLine) throw new Error('SIGN_IN_HASH_LINE_PER_ADDRESS cannot be more than SIGN_IN_HASH_LINE');
   return {
     adminOrigin,
     cookieSecure: insecure !== 'true',
-    idleSeconds: Math.round(idleMinutes * 60),
-    maxSeconds: Math.round(maxHours * 3600),
-    trustProxy,
-    attemptsPerAddress: Math.round(positive(env, 'SIGN_IN_ATTEMPTS_PER_ADDRESS', 30)),
-    attemptsWindowSeconds: Math.round(positive(env, 'SIGN_IN_ATTEMPTS_WINDOW_MINUTES', 15) * 60),
+    idleSeconds: idleMinutes * 60,
+    maxSeconds: maxHours * 3600,
+    trustProxy: readTrustProxy(env.TRUST_PROXY),
+    attemptsPerAddress: whole(env, 'SIGN_IN_ATTEMPTS_PER_ADDRESS'),
+    attemptsWindowSeconds: whole(env, 'SIGN_IN_ATTEMPTS_WINDOW_MINUTES') * 60,
+    refusalFloorMs: whole(env, 'SIGN_IN_REFUSAL_FLOOR_MS'),
+    hashLine,
+    hashLinePerAddress,
   };
 }
 
@@ -152,6 +232,36 @@ export function addressLimiter({ max, windowSeconds, now = () => Date.now() }) {
       }
       entry.count += 1;
       return entry.count <= max;
+    },
+  };
+}
+
+/**
+ * The line for hashes: at most `max` sign-ins between admission and answer,
+ * at most `perAddress` of them from one address. `enter` answers a function
+ * that gives the place back, or null when there is none.
+ */
+export function hashLine({ max, perAddress }) {
+  let held = 0;
+  const byAddress = new Map();
+  return {
+    get held() {
+      return held;
+    },
+    enter(address) {
+      const mine = byAddress.get(address) ?? 0;
+      if (held >= max || mine >= perAddress) return null;
+      held += 1;
+      byAddress.set(address, mine + 1);
+      let left = false;
+      return () => {
+        if (left) return;
+        left = true;
+        held -= 1;
+        const rest = byAddress.get(address) - 1;
+        if (rest > 0) byAddress.set(address, rest);
+        else byAddress.delete(address);
+      };
     },
   };
 }
@@ -214,21 +324,29 @@ export function noStore(_req, res, next) {
 export const internals = {
   verifyPassword,
 
+  /** The lock row of this user at this address. For NOBODY: the same statement, finding nothing. */
   async lockOf(user, address) {
     return withTenant(user.tenant_id, async (c) =>
       (await c.query('SELECT failed_count, locked_until FROM operator_sign_in_locks WHERE user_id = $1 AND address = $2', [user.user_id, address])).rows[0] ?? null);
   },
 
-  async recordFailure(user, address) {
+  /**
+   * The failure write, run on EVERY refusal so each runs the same statements.
+   * It counts only when `counted` (a wrong password) AND the user exists in
+   * this tenant -- so NOBODY, and a right password during a lock, write
+   * nothing, and an unknown email never makes a lock row.
+   */
+  async recordFailure(user, address, counted) {
     await withTenant(user.tenant_id, (c) =>
       c.query(
         `INSERT INTO operator_sign_in_locks AS l (tenant_id, user_id, address, failed_count, locked_until)
-         VALUES ($1, $2, $3, 1, CASE WHEN 1 >= $4 THEN now() + make_interval(mins => $5) END)
+         SELECT $1, $2, $3, 1, CASE WHEN 1 >= $4 THEN now() + make_interval(mins => $5) END
+          WHERE $6::boolean AND EXISTS (SELECT 1 FROM operator_users u WHERE u.id = $2 AND u.tenant_id = $1)
          ON CONFLICT (user_id, address) DO UPDATE SET
            failed_count = l.failed_count + 1,
            locked_until = CASE WHEN l.failed_count + 1 >= $4 THEN now() + make_interval(mins => $5) ELSE l.locked_until END,
            updated_at = now()`,
-        [user.tenant_id, user.user_id, address, MAX_FAILED, LOCK_MINUTES],
+        [user.tenant_id, user.user_id, address, MAX_FAILED, LOCK_MINUTES, counted],
       ));
   },
 
@@ -271,48 +389,73 @@ function logFailure(where, err) {
   console.error(`[auth] ${where} failed: ${kind}${err?.code ? ` ${err.code}` : ''}`);
 }
 
+/** Sign-in's body, read on that route only: any failure to read it is the one unreadable sentence. */
+const jsonBody = express.json({ limit: '4kb' });
+function readSignInBody(req, res, next) {
+  jsonBody(req, res, (err) => next(err ? Object.assign(new Error('the sign-in body could not be read', { cause: err }), { unreadable: true }) : undefined));
+}
+
 export function createAuthRouter(settings) {
   const router = express.Router();
   const limiter = addressLimiter({ max: settings.attemptsPerAddress, windowSeconds: settings.attemptsWindowSeconds });
+  const line = hashLine({ max: settings.hashLine, perAddress: settings.hashLinePerAddress });
   // Made before the first request, so an unknown email's one hash is the
   // check, not the making of the hash it is checked against.
   dummyHash().catch(() => {});
 
+  /** Every sign-in answer but a sign-in: never sooner than the floor after the request arrived. */
+  const refuse = async (req, res, status, body) => {
+    const wait = settings.refusalFloorMs - (performance.now() - req.arrivedAt);
+    if (wait > 0) await sleep(wait);
+    if (status === 503) res.set('Retry-After', '2');
+    return res.status(status).json(body);
+  };
+
+  router.use((req, _res, next) => {
+    req.arrivedAt = performance.now();
+    next();
+  });
   router.use(noStore);
-  router.use(express.json({ limit: '4kb' }));
 
-  router.post('/sign-in', async (req, res, next) => {
+  router.post('/sign-in', readSignInBody, async (req, res, next) => {
+    let leave = null;
     try {
-      if (settings.adminOrigin === null) return res.status(409).json(NOT_CONFIGURED);
+      if (settings.adminOrigin === null) return await refuse(req, res, 409, NOT_CONFIGURED);
       const origin = req.get('origin');
-      if (origin !== undefined && origin !== settings.adminOrigin) return res.status(403).json(ORIGIN_REFUSED);
-      if (!req.is('application/json')) return res.status(400).json(UNREADABLE);
+      if (origin !== undefined && origin !== settings.adminOrigin) return await refuse(req, res, 403, ORIGIN_REFUSED);
+      if (!req.is('application/json')) return await refuse(req, res, 400, UNREADABLE);
       const body = signInBody(req.body);
-      if (!body) return res.status(400).json(UNREADABLE);
+      if (!body) return await refuse(req, res, 400, UNREADABLE);
       const address = callerAddress(req, settings);
-      if (!limiter.take(address)) return res.status(429).json(RATE_LIMITED);
+      if (!limiter.take(address)) return await refuse(req, res, 429, RATE_LIMITED);
+      leave = line.enter(address);
+      if (!leave) return await refuse(req, res, 503, BUSY);
 
-      const user = (await pool.query('SELECT * FROM resolve_operator_user($1)', [body.email])).rows[0] ?? null;
-      const lock = user ? await internals.lockOf(user, address) : null;
+      const found = (await pool.query('SELECT * FROM resolve_operator_user($1)', [body.email])).rows[0] ?? null;
+      const user = found ?? NOBODY;
+      const lock = await internals.lockOf(user, address);
       const locked = Boolean(lock?.locked_until && new Date(lock.locked_until) > new Date());
-      const matches = await internals.verifyPassword(body.password, user ? user.password_hash : await dummyHash());
+      const matches = await internals.verifyPassword(body.password, found ? found.password_hash : await dummyHash());
+      // The place is for the hash, not for the floor: given back the moment it is done.
+      leave();
 
-      if (!user) return res.status(401).json(REFUSED);
-      if (!matches) {
-        await internals.recordFailure(user, address);
-        return res.status(401).json(REFUSED);
+      if (!found || !matches || locked) {
+        // The same write for every refusal; it counts only a wrong password of a real user.
+        await internals.recordFailure(user, address, Boolean(found) && !matches);
+        return await refuse(req, res, 401, REFUSED);
       }
-      if (locked) return res.status(401).json(REFUSED);
 
-      const { token, row } = await internals.mintSession(user, address, settings);
+      const { token, row } = await internals.mintSession(found, address, settings);
       setCookie(res, settings, token);
       return res.status(200).json({
         email: body.email,
-        tenant_id: user.tenant_id,
+        tenant_id: found.tenant_id,
         session_ends_at: endsAt({ expires_at: row.expires_at, idle_ends_at: row.idle_ends_at }).toISOString(),
       });
     } catch (err) {
-      next(err);
+      return next(err);
+    } finally {
+      leave?.();
     }
   });
 
@@ -352,16 +495,15 @@ export function createAuthRouter(settings) {
   // Anything else under /auth is not a route.
   router.use((_req, res) => res.status(404).json({ error: 'not found' }));
 
-  // A body the parser could not read answers the one sentence -- never the
+  // A body sign-in could not read answers the one sentence -- never the
   // parser's own text, which quotes what was sent. Anything else is logged by
-  // what it is, never by what it says.
-  router.use((err, req, res, _next) => {
-    if (err?.type?.startsWith?.('entity.') || err?.type === 'encoding.unsupported' || err?.type === 'charset.unsupported'
-      || err?.type === 'request.aborted' || err?.type === 'request.size.invalid' || err?.type === 'stream.encoding.set') {
-      return res.status(400).json(UNREADABLE);
-    }
+  // what it is, never by what it says. On sign-in, neither comes before the floor.
+  router.use(async (err, req, res, _next) => {
+    const onSignIn = req.method === 'POST' && req.path === '/sign-in';
+    if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);
     // A stored hash this code does not know is named here, PasswordHashUnrecognised.
     logFailure(req.path.replace(/^\//, ''), err);
+    if (onSignIn) return refuse(req, res, 500, { error: 'internal error' });
     return res.status(500).json({ error: 'internal error' });
   });
 
