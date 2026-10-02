@@ -99,6 +99,13 @@ export async function readNewPassword({ file, stdin = process.stdin, stderr = pr
           'make it the owner\'s only with: chmod 600 <the file>; nothing was changed',
       );
     }
+    // Nor is one anyone else can write: they choose the password before this reads it.
+    if (mode & 0o022) {
+      throw new AdminCommandRefused(
+        `the password file can be written by users other than its owner (mode ${(mode & 0o777).toString(8).padStart(4, '0')}); ` +
+          'make it the owner\'s only with: chmod 600 <the file>; nothing was changed',
+      );
+    }
   } else {
     if (!stdin.isTTY) throw new AdminCommandRefused('no terminal to prompt at: run it at a terminal, or pass --password-file <path>');
     password = await promptHidden('New password: ', { stdin, stderr });

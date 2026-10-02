@@ -14,6 +14,7 @@ import { reconcile } from './reconcile.js';
 import * as stripeAccount from './stripeAccount.js';
 import * as terminal from './terminal.js';
 import * as signIn from './signIn.js';
+import { startSetting } from './startSettings.js';
 
 class HttpError extends Error {
   constructor(status, message, code = null) {
@@ -93,7 +94,7 @@ function checkIds(router, params) {
   }
 }
 
-//: A body the operator router cannot read: one sentence per case, never the parser's text.
+//: A body that cannot be read: one sentence per case, never the parser's text.
 export const BODY_UNREADABLE = Object.freeze({ error: 'The request body could not be read. Send JSON.', code: 'body_unreadable' });
 export const BODY_TOO_LARGE = Object.freeze({ error: 'The request body is too large.', code: 'body_too_large' });
 
@@ -639,17 +640,9 @@ function parseTime(value, label) {
  */
 export const CLOCK_SKEW = 'clock_skew';
 
-const MAX_CLOCK_SKEW_SECONDS = (() => {
-  const raw = process.env.MAX_CLOCK_SKEW_SECONDS;
-  if (raw === undefined || raw === '') return 120;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value < 0) {
-    throw new Error(
-      `MAX_CLOCK_SKEW_SECONDS must be a non-negative number of seconds, not ${JSON.stringify(raw)}`,
-    );
-  }
-  return value;
-})();
+// Checked before the port opens (src/startSettings.js): a whole number of
+// seconds, 0 to 3600.
+const MAX_CLOCK_SKEW_SECONDS = startSetting('MAX_CLOCK_SKEW_SECONDS');
 
 /**
  * Refuse a lane time that has not happened yet.
@@ -689,8 +682,8 @@ export function createApp() {
   // never with the parser's text, which quotes what was sent.
   app.use('/api/v1/auth', signIn.createAuthRouter(authSettings));
 
-  // Any failure to read a body is marked as one, so the operator surface can
-  // answer it in its own sentence (below); the lane's answer is unchanged.
+  // Any failure to read a body is marked as one, so it is answered in one
+  // fixed sentence (below), whatever the path.
   const json = express.json({ limit: '1mb' });
   app.use((req, res, next) => json(req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined)));
 
@@ -2185,10 +2178,14 @@ export function createApp() {
   app.use('/api/v1', operator);
 
   app.use((err, req, res, _next) => {
-    // An operator request whose body could not be read: one fixed sentence,
-    // never the parser's, which quotes what was sent; and never stored or
-    // sniffed, like every operator answer. The lane's answer is as it was.
-    if (err.bodyUnreadable && req.path.startsWith('/api/v1/') && !req.path.startsWith('/api/v1/lane/')) {
+    // A request whose body could not be read: one fixed sentence, never the
+    // parser's, which quotes what was sent; and never stored or sniffed. For
+    // EVERY request, not for a path prefix: routing ignores the letter case of
+    // the path and a prefix test does not, so `/API/V1/garages` was routed as
+    // an operator request and answered in the parser's words. The parser runs
+    // before any router, so no path here is known to be anyone's. The lane is
+    // answered the same way: still a 4xx, without the parser's text.
+    if (err.bodyUnreadable) {
       res.set('Cache-Control', 'no-store');
       res.set('X-Content-Type-Options', 'nosniff');
       return err.status === 413 ? res.status(413).json(BODY_TOO_LARGE) : res.status(400).json(BODY_UNREADABLE);

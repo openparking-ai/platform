@@ -577,10 +577,17 @@ test('NO ORACLE, IN WORK: unknown email, wrong password and locked address run t
   for (let i = 0; i < signIn.MAX_FAILED; i += 1) {
     await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: lockedWho.email, password: WRONG } });
   }
-  const locks = async () => Number((await admin.query('SELECT count(*) FROM operator_sign_in_locks')).rows[0].count);
-  const before = await locks();
+  // Counted at an address of this test's own, not over the whole table: other
+  // files in the suite write lock rows while this runs. The control shows the
+  // count sees a row when one is written.
+  const locksAt = async (address) => Number((await admin.query('SELECT count(*) FROM operator_sign_in_locks WHERE address = $1', [address])).rows[0].count);
+  const salt = Math.floor(Math.random() * 250) + 1;
+  const [nobodyAt, controlAt] = [`203.0.113.${salt}`, `198.18.200.${salt}`];
+  await call(trusted.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG }, headers: { 'x-forwarded-for': nobodyAt } });
+  assert.equal(await locksAt(nobodyAt), 0, 'an unknown email makes no lock row');
+  await call(trusted.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG }, headers: { 'x-forwarded-for': controlAt } });
+  assert.equal(await locksAt(controlAt), 1, 'CONTROL: a wrong password from that kind of address makes one');
   const unknown = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG } }));
-  assert.equal(await locks(), before, 'an unknown email makes no lock row');
   const wrong = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG } }));
   const locked = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: lockedWho.email, password: PASSWORD } }));
   assert.ok(unknown.some((q) => /operator_sign_in_locks/.test(q) && /^\s*SELECT/.test(q)), 'the unknown email ran the lock lookup');
@@ -726,7 +733,7 @@ test('A BODY THAT LIES ABOUT ITS ENCODING: under /api/v1/auth any body that cann
   }
 });
 
-test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, oversized or wrongly encoded, on every changing operator route, is one fixed sentence with no-store and nosniff', async () => {
+test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, not JSON, oversized or wrongly encoded, on every changing operator route and whatever the letter case of the path, is one fixed sentence with no-store and nosniff', async () => {
   const who = await owner('si-body');
   const token = await signedIn(main.base, who);
   const key = generateDeviceToken();
@@ -736,26 +743,39 @@ test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, oversized or wrongly e
   assert.equal(changing.length, 18, `the walk found ${changing.length} changing operator routes`);
   const cases = [
     { name: 'malformed', raw: '{"name": "Echo-Me-Back", oops', headers: {}, status: 400, body: BODY_UNREADABLE },
+    // The parser's own text for this one quotes what was sent.
+    { name: 'not JSON', raw: 'Echo-Me-Back, not JSON at all', headers: {}, status: 400, body: BODY_UNREADABLE },
     { name: 'oversized', raw: JSON.stringify({ name: `Echo-Me-Back${'x'.repeat(1024 * 1024)}` }), headers: {}, status: 413, body: BODY_TOO_LARGE },
     { name: 'not gzip', raw: '{"name":"Echo-Me-Back"}', headers: { 'content-encoding': 'gzip' }, status: 400, body: BODY_UNREADABLE },
     { name: 'bad charset', raw: '{"name":"Echo-Me-Back"}', headers: { 'content-type': 'application/json; charset=koi8-r' }, status: 400, body: BODY_UNREADABLE },
   ];
   const wrong = [];
   let answers = 0;
+  // Routing ignores the letter case of the path, so the answer must too: the
+  // path as written, and three other spellings of it.
+  const spellings = [
+    (p) => p,
+    (p) => p.replace('/api/v1/', '/Api/v1/'),
+    (p) => p.replace('/api/v1/', '/API/V1/'),
+    (p) => p.toUpperCase(),
+  ];
   for (const r of changing) {
-    for (const c of cases) {
-      for (const auth of [{ headers: { authorization: `Bearer ${key}` } }, { cookie: token, origin: ADMIN_ORIGIN, headers: {} }]) {
-        const res = await call(main.base, r.method, `${r.base}${concrete(r.path)}`, {
-          ...auth, raw: c.raw, headers: { 'content-type': 'application/json', ...auth.headers, ...c.headers },
-        });
-        answers += 1;
-        const ok = res.status === c.status && res.text === JSON.stringify(c.body) && !res.text.includes('Echo-Me-Back')
-          && res.headers.get('cache-control') === 'no-store' && res.headers.get('x-content-type-options') === 'nosniff';
-        if (!ok) wrong.push(`${r.method} ${r.path} ${c.name}: ${res.status} ${res.text.slice(0, 80)} cc=${res.headers.get('cache-control')}`);
+    for (const spell of spellings) {
+      const path = spell(`${r.base}${concrete(r.path)}`);
+      for (const c of cases) {
+        for (const auth of [{ headers: { authorization: `Bearer ${key}` } }, { cookie: token, origin: ADMIN_ORIGIN, headers: {} }]) {
+          const res = await call(main.base, r.method, path, {
+            ...auth, raw: c.raw, headers: { 'content-type': 'application/json', ...auth.headers, ...c.headers },
+          });
+          answers += 1;
+          const ok = res.status === c.status && res.text === JSON.stringify(c.body) && !res.text.includes('Echo-Me-Back')
+            && res.headers.get('cache-control') === 'no-store' && res.headers.get('x-content-type-options') === 'nosniff';
+          if (!ok) wrong.push(`${r.method} ${path} ${c.name}: ${res.status} ${res.text.slice(0, 80)} cc=${res.headers.get('cache-control')}`);
+        }
       }
     }
   }
-  assert.equal(answers, 18 * cases.length * 2);
+  assert.equal(answers, 18 * spellings.length * cases.length * 2);
   assert.deepEqual(wrong, []);
 });
 
@@ -785,9 +805,14 @@ test('SETTINGS ARE CHECKED AT START: every value the gate tried is refused by na
   assert.equal(signIn.readAuthSettings({}).trustProxy, null);
 });
 
-test('the real entrypoint refuses a bad setting by name and with no stack trace', () => {
+test('the real entrypoint refuses a bad setting by name and with no stack trace', async () => {
+  // A free port, not PORT=0: 0 is refused by name before these settings are read.
+  const free = http.createServer();
+  await new Promise((r) => free.listen(0, '127.0.0.1', r));
+  const port = free.address().port;
+  await new Promise((r) => free.close(r));
   for (const [name, value] of [['TRUST_PROXY', 'true'], ['TRUST_PROXY', '999999999999'], ['SIGN_IN_ATTEMPTS_WINDOW_MINUTES', '0.0001'], ['SESSION_MAX_HOURS', '1e12'], ['SIGN_IN_HASH_LINE', '0']]) {
-    const env = { ...process.env, PORT: '0', ADMIN_ORIGIN, [name]: value };
+    const env = { ...process.env, PORT: String(port), ADMIN_ORIGIN, [name]: value };
     const r = spawnSync(process.execPath, ['src/server.js'], { env, encoding: 'utf8', timeout: 30_000 });
     assert.equal(r.status, 1, `${name}=${value}: ${r.stdout} ${r.stderr}`);
     assert.match(r.stderr, new RegExp(`^\\[platform\\] REFUSING TO SERVE: ${name} must be`, 'm'), `${name}=${value}`);

@@ -346,7 +346,13 @@ sign_in_rate_limited`. The address is the **socket's**; `X-Forwarded-For` is
 read only when `TRUST_PROXY` is declared: a number of proxy hops from 1 to 5,
 `loopback`, or a comma-separated list of the proxies' addresses or subnets.
 `true`, and any other form, refuses to start: it means "trust whatever the
-caller says". An IPv6 address counts by its /64. ⚠ **Behind a proxy with no
+caller says". ⚠ **A number of hops must equal the real number of proxies in
+front of this server.** The server cannot see the chain and cannot check it.
+If the number is larger than the real chain, the caller writes the address
+that is used: a forged `X-Forwarded-For` chooses which address is counted, so
+one caller can dodge the lock and the attempt limit by changing it. Smaller,
+and every caller is counted as a proxy. The start-up line says the same. An
+IPv6 address counts by its /64. ⚠ **Behind a proxy with no
 `TRUST_PROXY`, every caller is the proxy, so the lock is in effect
 account-wide** — declare it. Likewise, **people who share one address (one
 office NAT, one carrier gateway) share one lock**: ten wrong passwords from any
@@ -355,7 +361,9 @@ of them lock all of them out of that account for the window.
 **No oracle.** An unknown email, a wrong password and a locked address answer
 the same `401 sign_in_refused`, byte for byte, and each runs exactly one hash
 and the same database statements (the lock lookup and the failure write, which
-for an unknown email find and write nothing). No sign-in refusal of any kind is
+for an unknown email find and write nothing). The decoy hash an unknown email
+is checked against is finished before the port opens, so this holds for the
+first sign-in after a start too. No sign-in refusal of any kind is
 answered sooner than `SIGN_IN_REFUSAL_FLOOR_MS` (default 500) after the request
 arrived, so what difference is left in the work is not on the wire.
 
@@ -394,15 +402,19 @@ the stored hash as a bind parameter, so such a log holds every admin's hash:
 an offline guessing target that no lock and no limit here can slow down.
 
 **The admin commands** refuse a password file that anyone but its owner can
-read (`chmod 600` it), and a refusal never repeats an argument back: an unknown
+read or write (`chmod 600` it), and a refusal never repeats an argument back: an unknown
 option may be a password (`-p<password>` is one word).
 
 **An id in the address that is not a uuid** answers what an id naming nothing
 answers on that route (404 and its not-found body; on the lane's validation
-claim, `409 stay_not_open`), before the body is read and before the database
-is reached. A body the operator surface cannot read answers one sentence,
-`400 body_unreadable` or `413 body_too_large`, never the parser's own words,
-which quote what was sent.
+claim, `409 stay_not_open`). The database is reached only to authenticate the
+caller. The body is NOT checked first: every request's body is read (up to
+1 MB) before any route runs, before authentication too, so a request whose body
+cannot be read answers that, whatever its id, and an unauthenticated request's
+body is read before its 401. A body that cannot be read answers one sentence,
+`400 body_unreadable` or `413 body_too_large`, with `no-store` and `nosniff`,
+on every path in any letter case, never the parser's own words, which quote
+what was sent.
 
 `test/owner-sign-in.test.js`, `test/admin-cli.test.js` and
 `test/owner-sign-in-output.test.js` hold each of these; `npm run
