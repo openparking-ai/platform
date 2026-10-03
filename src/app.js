@@ -793,6 +793,44 @@ export function createApp() {
    * true or false, statable here at any time, restatable, never un-statable
    * -- the trigger refuses NULL after a value -- and never defaulted.
    */
+  /**
+   * THE THREE READS THE OWNER'S SCREENS NEED (U2a): the tenant's garages, one
+   * garage, and its lanes with their devices and reader. Tenant from the
+   * session or key, as every operator route; another tenant's garage is NOT
+   * FOUND. Reads only: nothing here writes.
+   */
+  operator.get('/garages', async (req, res, next) => {
+    try {
+      const rows = await withTenant(req.tenantId, (client) => repo.garagesForTenant(client, req.tenantId));
+      res.json({ garages: rows.map(repo.presentGarage) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  operator.get('/garages/:garageId', async (req, res, next) => {
+    try {
+      const garage = await withTenant(req.tenantId, (client) => repo.getGarage(client, req.tenantId, req.params.garageId));
+      if (!garage) throw new HttpError(404, 'garage not found');
+      res.json({ garage: repo.presentGarage(garage) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  operator.get('/garages/:garageId/lanes', async (req, res, next) => {
+    try {
+      const lanes = await withTenant(req.tenantId, async (client) => {
+        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!garage) throw new HttpError(404, 'garage not found');
+        return repo.lanesForGarage(client, req.tenantId, req.params.garageId);
+      });
+      res.json({ lanes });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   operator.patch('/garages/:garageId', async (req, res, next) => {
     try {
       const action = defaultAction(req.body?.default_action, { required: false });

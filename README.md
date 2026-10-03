@@ -434,6 +434,22 @@ what was sent.
 `test/owner-sign-in-output.test.js` hold each of these; `npm run
 owner-sign-in-fail-control` breaks each one in turn.
 
+### The owner's reads
+
+What the owner's screens read, behind the session or a key, tenant-scoped in
+each query as well as by row-level security; another tenant's garage is `404`.
+
+    GET /api/v1/garages                     {garages: [{id, name, timezone, currency, live}]}
+    GET /api/v1/garages/<id>                {garage: {id, name, timezone, currency, live}}
+    GET /api/v1/garages/<id>/lanes          {lanes: [{id, name, direction,
+                                                      devices: [{id, name, last_seen_at, revoked_at}],
+                                                      reader: {reader_id, label, bound_at} | null}]}
+
+`live` is whether the garage is activated. A revoked device is listed with its
+`revoked_at`, as the devices route lists it; a reader is the one bound now. No
+credential hash is ever in an answer. `npm run garage-reads-fail-control`
+breaks each property in turn.
+
 ### A lane that has gone quiet
 
 `GET /api/v1/garages/<id>/devices` lists the devices on that garage's lanes with

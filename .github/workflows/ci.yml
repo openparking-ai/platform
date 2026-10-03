@@ -348,6 +348,14 @@ jobs:
         # requires the sign-in suites to go red.
         run: npm run owner-sign-in-fail-control
 
+      - name: Garage-reads fail-control
+        # The owner's three reads. Each break removes one property -- a tenant
+        # predicate (list, garage, lanes), the 404 for another tenant's garage,
+        # "live", the exact garage shape, revoked_at on a device, the unbound
+        # reader hidden, the credential hash kept out -- and requires the reads
+        # suite and the isolation suite to go red.
+        run: npm run garage-reads-fail-control
+
       - name: Stripe-account fail-control
         # A garage's own Stripe account (0020): created only on the operator's
         # request, as the garage's -- no Stripe dashboard, its own Stripe
