@@ -452,6 +452,80 @@ test('SESSIONS END — the hash changed alone in the database, its time left as 
   assert.equal((await call(main.base, 'GET', '/api/v1/auth/me', { cookie: fresh })).status, 401);
 });
 
+/**
+ * A sign-in whose hash check is under way when the password changes: `during`
+ * runs inside the check, after the stored hash was read; `settle` once the
+ * sign-in has answered. Answers what each attempt's sign-in got and whether
+ * its session works afterwards.
+ */
+async function signInDuringChange(who, attempts, during, settle = async () => {}) {
+  const realVerify = signIn.internals.verifyPassword;
+  const seen = [];
+  let current = PASSWORD;
+  try {
+    for (let i = 0; i < attempts; i += 1) {
+      const next = `the password after change ${i} here`;
+      secrets.add(next);
+      signIn.internals.verifyPassword = async (...a) => {
+        const matched = await realVerify(...a);
+        await during(next, i);
+        return matched;
+      };
+      const r = await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: current }, origin: ADMIN_ORIGIN });
+      signIn.internals.verifyPassword = realVerify;
+      await settle();
+      secrets.add((await admin.query('SELECT password_hash FROM operator_users WHERE tenant_id = $1', [who.tenant])).rows[0].password_hash);
+      const token = tokenOf(r);
+      const me = token ? (await call(main.base, 'GET', '/api/v1/auth/me', { cookie: token })).status : null;
+      seen.push({ status: r.status, works: me === 200 });
+      current = next;
+    }
+  } finally {
+    signIn.internals.verifyPassword = realVerify;
+  }
+  return seen;
+}
+
+test('A SIGN-IN IN FLIGHT DURING A PASSWORD CHANGE never yields a working session: the change by SQL, committed during the hash check, 12 attempts', async () => {
+  const who = await owner('si-race-sql');
+  const seen = await signInDuringChange(who, 12, async (next) => {
+    await admin.query('UPDATE operator_users SET password_hash = $2 WHERE tenant_id = $1', [who.tenant, await hashPassword(next)]);
+  });
+  assert.deepEqual(seen.filter((s) => s.works), [], `working sessions: ${JSON.stringify(seen)}`);
+  assert.deepEqual(seen.map((s) => s.status), Array(12).fill(401));
+});
+
+test('A SIGN-IN IN FLIGHT DURING A PASSWORD CHANGE never yields a working session: the reset command during the hash check, 12 attempts', async () => {
+  const who = await owner('si-race-reset');
+  const seen = await signInDuringChange(who, 12, async (next) => {
+    await resetAdminPassword({ email: who.email, password: next });
+  });
+  assert.deepEqual(seen.filter((s) => s.works), [], `working sessions: ${JSON.stringify(seen)}`);
+  assert.deepEqual(seen.map((s) => s.status), Array(12).fill(401));
+});
+
+test('A SIGN-IN IN FLIGHT DURING A PASSWORD CHANGE: a change begun during the hash check and committed only after the sign-in has gone on to make its session holds the sign-in until it lands, then refuses it; 6 attempts', async () => {
+  const who = await owner('si-race-held');
+  const changer = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await changer.connect();
+  let committed = Promise.resolve();
+  try {
+    const seen = await signInDuringChange(who, 6, async (next) => {
+      const hash = await hashPassword(next);
+      await committed;
+      await changer.query('BEGIN');
+      await changer.query('UPDATE operator_users SET password_hash = $2 WHERE tenant_id = $1', [who.tenant, hash]);
+      // Committed once the sign-in has had time to reach its session write.
+      committed = new Promise((r) => setTimeout(r, 300)).then(() => changer.query('COMMIT'));
+    }, () => committed);
+    assert.deepEqual(seen.filter((s) => s.works), [], `working sessions: ${JSON.stringify(seen)}`);
+    assert.deepEqual(seen.map((s) => s.status), Array(6).fill(401));
+  } finally {
+    await changer.query('ROLLBACK').catch(() => {});
+    await changer.end();
+  }
+});
+
 // --- cross-site ---------------------------------------------------------------------------
 
 test('CROSS-SITE: a cookie-authenticated change with a foreign Origin, or none, is refused and changes nothing; from the admin site it works', async () => {

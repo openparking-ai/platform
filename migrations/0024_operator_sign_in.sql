@@ -153,7 +153,10 @@ CREATE OR REPLACE FUNCTION resolve_operator_token(p_token_hash text)
 --
 -- Nor is a session issued before the admin's password last changed, revoked
 -- or not: any change of the hash, by any path, moves `password_changed_at`
--- (the trigger above), and so ends every session signed in before it.
+-- (the trigger above), and so ends every session signed in before it. A
+-- sign-in still checking the old password when the change lands gets no
+-- session at all: src/signIn.js makes one only while the hash it checked is
+-- still the admin's, with the row held until the session is written.
 CREATE FUNCTION resolve_operator_session(p_token_hash text, p_idle_seconds integer)
   RETURNS TABLE (token_id uuid, tenant_id uuid, user_id uuid, email text, expires_at timestamptz, idle_ends_at timestamptz)
   LANGUAGE sql

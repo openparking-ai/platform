@@ -319,7 +319,10 @@ before the admin's password last changed (`password_changed_at`) is never found
 again, revoked or not. The database sets `password_changed_at` itself whenever
 the hash changes, so **any change of the hash, by any path** — the reset
 command, or SQL by hand that sets the hash alone — ends every session signed in
-before it. There is no change-password route yet;
+before it. A sign-in still checking the old password when the change lands is
+refused like any refusal and gets no session: one is made only while the hash it
+checked is still the admin's, with the admin's row held from that reading until
+the session is written. There is no change-password route yet;
 that comes with the account page.
 
 **The cookie** is `op_session`: `HttpOnly` (page script can never read it),

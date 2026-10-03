@@ -52,6 +52,8 @@
  *   password_file_writable_taken  a password file others can write is taken (R6).
  *   password_folder_writable_taken  a password file in a folder others can write is taken (round 3, F1).
  *   lock_count_never_restarts  after a lock ends the count goes on, so one wrong password locks again (round 3, F3).
+ *   minted_after_password_change  a sign-in that checked the old password gets a session after the change (round 4, F6).
+ *   user_row_not_held        the hash is read again but the row is not held, so a change lands before the session (round 4, F6).
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0024, so the property genuinely never existed:
@@ -440,6 +442,22 @@ const SOURCE_BREAKS = [
       '             ELSE l.locked_until END,\n',
     to: '           failed_count = l.failed_count + 1,\n' +
       '           locked_until = CASE WHEN l.failed_count + 1 >= $4 THEN now() + make_interval(mins => $5) ELSE l.locked_until END,\n',
+  },
+  {
+    name: 'minted_after_password_change',
+    why: 'a sign-in that checked the old password gets a session after the change',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      if (still.rowCount !== 1) return null;\n',
+    to: '',
+  },
+  {
+    name: 'user_row_not_held',
+    why: 'the hash is read again but the row is not held, so a change lands before the session',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: ' AND password_hash = $2 FOR SHARE\'',
+    to: ' AND password_hash = $2\'',
   },
 ];
 
