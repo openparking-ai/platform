@@ -314,7 +314,10 @@ npm run reset-admin-password -- --email <email> --password-file <path>  # or fro
 The password **never arrives on the command line** — argv is in the process
 list — and a password argument, in any spelling, is refused by name. It is at
 least 12 characters; length is the one rule. A reset revokes every session of
-that admin and clears every lock on it. There is no change-password route yet;
+that admin and clears every lock on it. Apart from the revoke, a session issued
+before the admin's password last changed (`password_changed_at`) is never found
+again, revoked or not, so a password changed in the database by hand ends the
+sessions signed in with the old one too. There is no change-password route yet;
 that comes with the account page.
 
 **The cookie** is `op_session`: `HttpOnly` (page script can never read it),

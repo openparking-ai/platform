@@ -57,6 +57,7 @@
  *   absolute_unchecked       a session past its absolute end is still found.
  *   session_is_a_key         a session token is accepted as a Bearer key.
  *   public_execute_restored  resolve_operator_user is executable by PUBLIC again (F2).
+ *   session_outlives_password_change  a session from before a password change is still found (round 3, F2).
  *
  * Needs the same environment as the suite.
  */
@@ -445,6 +446,12 @@ const SCHEMA_BREAKS = [
     why: 'resolve_operator_user is executable by PUBLIC again',
     suite: DEFINERS,
     edits: [{ file: '0024_operator_sign_in.sql', from: 'REVOKE EXECUTE ON FUNCTION resolve_operator_user(text) FROM PUBLIC;\n', to: '' }],
+  },
+  {
+    name: 'session_outlives_password_change',
+    why: 'a session from before a password change is still found',
+    suite: SIGN_IN,
+    edits: [{ file: '0024_operator_sign_in.sql', from: '         AND t.created_at >= u.password_changed_at\n', to: '' }],
   },
 ];
 

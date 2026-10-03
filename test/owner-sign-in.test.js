@@ -19,7 +19,7 @@ import { createApp, BODY_TOO_LARGE, BODY_UNREADABLE } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { createAdmin, resetAdminPassword } from '../src/adminAccount.js';
-import { hashCount } from '../src/passwords.js';
+import { hashCount, hashPassword } from '../src/passwords.js';
 import * as signIn from '../src/signIn.js';
 import { holdsSecret } from './secrets.js';
 
@@ -346,6 +346,41 @@ test('SESSIONS END — a password reset revokes every session of that admin and 
   assert.equal(back.status, 200, 'the reset cleared the lock on that address');
   const old = await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: PASSWORD } });
   assert.equal(old.status, 401, 'the old password no longer signs in');
+});
+
+test('SESSIONS END — a password changed in the database, with no session revoked, ends every session signed in before the change', async () => {
+  const who = await owner('si-pwchg');
+  const before = await signedIn(main.base, who);
+  assert.equal((await garageRead(main.base, who, before)).status, 200);
+  const NEW = 'changed straight in the database';
+  secrets.add(NEW);
+  const hash = await hashPassword(NEW);
+  secrets.add(hash);
+  // The change as SQL would make it, around the command: the hash and its time, and nothing revoked.
+  await admin.query('UPDATE operator_users SET password_hash = $2, password_changed_at = now() WHERE tenant_id = $1', [who.tenant, hash]);
+  const live = async () => Number((await admin.query(
+    `SELECT count(*) FROM operator_tokens t JOIN operator_users u ON u.id = t.user_id WHERE u.tenant_id = $1 AND t.kind = 'session' AND t.revoked_at IS NULL`,
+    [who.tenant],
+  )).rows[0].count);
+  assert.equal(await live(), 1, 'the session row is still unrevoked');
+  const read = await garageRead(main.base, who, before);
+  assert.equal(read.status, 401, 'a read with the session from before the change');
+  assert.deepEqual(read.json, signIn.SESSION_ENDED);
+  assert.equal((await call(main.base, 'GET', '/api/v1/auth/me', { cookie: before })).status, 401, '/me with it');
+  const write = await call(main.base, 'POST', '/api/v1/garages', { cookie: before, origin: ADMIN_ORIGIN, body: { name: 'After the change', timezone: 'UTC', currency: 'USD' } });
+  assert.equal(write.status, 401, 'a write with it');
+  // CONTROL: a sign-in after the change, with the new password, is a session that works.
+  const after = await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: NEW }, origin: ADMIN_ORIGIN });
+  assert.equal(after.status, 200, after.text);
+  const fresh = tokenOf(after);
+  assert.equal((await garageRead(main.base, who, fresh)).status, 200, 'CONTROL: a session from after the change reads');
+  assert.equal((await call(main.base, 'GET', '/api/v1/auth/me', { cookie: fresh })).status, 200);
+  // And the command's path still revokes, the fresh session too.
+  const done = await resetAdminPassword({ email: who.email, password: PASSWORD });
+  assert.equal(done.sessions_revoked, 2, 'the reset revokes both rows: the one ended by the change, and the fresh one');
+  secrets.add((await admin.query('SELECT password_hash FROM operator_users WHERE tenant_id = $1', [who.tenant])).rows[0].password_hash);
+  assert.equal(await live(), 0);
+  assert.equal((await garageRead(main.base, who, fresh)).status, 401, 'after the reset the fresh session is refused');
 });
 
 // --- cross-site ---------------------------------------------------------------------------
