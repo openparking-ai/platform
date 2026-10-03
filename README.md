@@ -341,7 +341,8 @@ presenting it again revives nothing.
 
 **Guessing.** Ten wrong passwords **from one caller address** lock that address
 out of that account for 30 minutes; wrong passwords during the lock still count
-and re-arm it. Other addresses are unaffected, so knowing the admin's email is
+and re-arm it. Once a lock has ended the count starts again: the next wrong
+password counts as 1, and it takes ten again to lock. Other addresses are unaffected, so knowing the admin's email is
 not enough to keep the admin out — there is no account-wide lock. Separately,
 each address gets `SIGN_IN_ATTEMPTS_PER_ADDRESS` attempts (default 30) per
 `SIGN_IN_ATTEMPTS_WINDOW_MINUTES` (default 15), held in this process, then `429

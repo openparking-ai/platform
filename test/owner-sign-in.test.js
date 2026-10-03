@@ -244,6 +244,32 @@ test('LOCKOUT: attempt 10 locks; attempt 11 with the RIGHT password is refused l
   assert.deepEqual(await lockRow(), [], 'and a sign-in clears the count');
 });
 
+test('LOCKOUT ENDS: once a lock has ended the count starts again -- one wrong password is 1, not a new lock -- and ten are needed to lock again; during a lock a wrong one still re-arms it', async () => {
+  const who = await owner('si-relock');
+  const wrong = () => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG } });
+  const row = async () => (await admin.query('SELECT failed_count, locked_until, locked_until > now() AS locked FROM operator_sign_in_locks WHERE tenant_id = $1', [who.tenant])).rows[0];
+  for (let i = 0; i < signIn.MAX_FAILED; i += 1) assert.equal((await wrong()).status, 401);
+  assert.equal((await row()).locked, true, 'ten wrong passwords lock');
+  // CONTROL: a wrong password DURING the lock still counts and re-arms it, as before.
+  await admin.query(`UPDATE operator_sign_in_locks SET locked_until = now() + interval '1 minute' WHERE tenant_id = $1`, [who.tenant]);
+  const shortened = (await row()).locked_until;
+  await wrong();
+  const during = await row();
+  assert.equal(during.failed_count, signIn.MAX_FAILED + 1, 'CONTROL: counted during the lock');
+  assert.ok(during.locked_until > shortened, 'CONTROL: and re-armed');
+  // The clock past the lock.
+  await admin.query(`UPDATE operator_sign_in_locks SET locked_until = now() - interval '1 second' WHERE tenant_id = $1`, [who.tenant]);
+  assert.equal((await wrong()).status, 401);
+  const first = await row();
+  assert.deepEqual([first.failed_count, first.locked], [1, null], 'one wrong password after the lock ended is 1, and no lock');
+  for (let n = 2; n < signIn.MAX_FAILED; n += 1) await wrong();
+  const nine = await row();
+  assert.deepEqual([nine.failed_count, nine.locked], [signIn.MAX_FAILED - 1, null], 'nine since the lock ended do not lock');
+  await wrong();
+  const ten = await row();
+  assert.deepEqual([ten.failed_count, ten.locked], [signIn.MAX_FAILED, true], 'the tenth since the lock ended locks again');
+});
+
 test('LOCK IS PER ADDRESS: address A locked out; address B with the right password signs in', async () => {
   const who = await owner('si-addr');
   const A = '203.0.113.10';
