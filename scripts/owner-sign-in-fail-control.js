@@ -50,6 +50,7 @@
  *   decoy_after_listen       the port opens before the decoy hash is finished (R2).
  *   start_settings_unchecked PORT, PG_POOL_MAX and MAX_CLOCK_SKEW_SECONDS are not checked at start (R4).
  *   password_file_writable_taken  a password file others can write is taken (R6).
+ *   password_folder_writable_taken  a password file in a folder others can write is taken (round 3, F1).
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0024, so the property genuinely never existed:
@@ -415,6 +416,14 @@ const SOURCE_BREAKS = [
     file: 'src/adminAccount.js',
     from: '    if (mode & 0o022) {\n',
     to: '    if (mode & 0) {\n',
+  },
+  {
+    name: 'password_folder_writable_taken',
+    why: 'a password file in a folder others can write is taken',
+    suite: CLI,
+    file: 'src/adminAccount.js',
+    from: '      if (folder & 0o022 && !(folder & 0o1000)) {\n',
+    to: '      if (folder & 0) {\n',
   },
 ];
 

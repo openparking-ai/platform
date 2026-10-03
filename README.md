@@ -401,9 +401,14 @@ that holds `operator_users`.** Creating an admin and resetting a password write
 the stored hash as a bind parameter, so such a log holds every admin's hash:
 an offline guessing target that no lock and no limit here can slow down.
 
-**The admin commands** refuse a password file that anyone but its owner can
-read or write (`chmod 600` it), and a refusal never repeats an argument back: an unknown
-option may be a password (`-p<password>` is one word).
+**The admin commands** refuse a password file whose permission bits let anyone
+but its owner read or write it (`chmod 600` it), or whose folder's permission
+bits let anyone but its owner write there, unless that folder is sticky (as
+`/tmp` is): whoever can write the folder can put another file in its place.
+That is the folder named and, when a link is named, the folder of the file it
+points to. **Only permission bits are checked; ACLs are not read**, so a file
+or folder an ACL opens to others is not refused. A refusal never repeats an
+argument back: an unknown option may be a password (`-p<password>` is one word).
 
 **An id in the address that is not a uuid** answers what an id naming nothing
 answers on that route (404 and its not-found body; on the lane's validation

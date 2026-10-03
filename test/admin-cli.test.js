@@ -11,7 +11,7 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
@@ -174,6 +174,37 @@ test('a password file anyone but its owner can WRITE is refused too: whoever can
   const reset = run('reset-admin-password', ['--email', email, '--password-file', file('reset-620', PASSWORD, 0o620)]);
   assert.equal(reset.status, 2);
   assert.match(reset.err, /can be written by users other than its owner/);
+});
+
+test('a 0600 password file in a folder anyone but its owner can write is refused: they can put another file in its place; a sticky folder is not', async () => {
+  const tenant = await createTenant('cli-dir');
+  const email = `cli-dir-${tenant.slice(0, 8)}@example.com`;
+  const inFolder = (mode) => {
+    const dir = join(scratch, `dir-${mode.toString(8)}`);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, 'pw');
+    writeFileSync(path, PASSWORD, { mode: 0o600 });
+    chmodSync(path, 0o600);
+    // The folder's mode exactly, whatever the umask took away or left.
+    chmodSync(dir, mode);
+    return path;
+  };
+  for (const mode of [0o777, 0o770, 0o707]) {
+    const r = run('create-admin', ['--tenant', tenant, '--email', email, '--password-file', inFolder(mode)]);
+    assert.equal(r.status, 2, mode.toString(8));
+    assert.match(r.err, new RegExp(`refused: the folder holding the password file can be written by users other than its owner \\(mode 0${mode.toString(8)}\\), so they can put another file in its place; make it the owner's only with: chmod 700 <the folder>; nothing was changed`), mode.toString(8));
+    assert.equal(r.err.includes(PASSWORD), false);
+  }
+  assert.deepEqual(await users(tenant), []);
+  const reset = run('reset-admin-password', ['--email', email, '--password-file', inFolder(0o777)]);
+  assert.equal(reset.status, 2);
+  assert.match(reset.err, /the folder holding the password file can be written by users other than its owner/);
+  // CONTROLS: a sticky folder (as /tmp is) lets no one but the owner replace the file; an owner-only folder neither.
+  for (const mode of [0o1777, 0o700]) {
+    const other = await createTenant('cli-dir-ok');
+    const ok = run('create-admin', ['--tenant', other, '--email', `cli-dir-ok-${other.slice(0, 8)}@example.com`, '--password-file', inFolder(mode)]);
+    assert.equal(ok.status, 0, `${mode.toString(8)}: ${ok.err}`);
+  }
 });
 
 test('no refusal repeats what was typed: an option glued to a password, an unknown option holding one, and a bare value', async () => {
