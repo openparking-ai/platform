@@ -19,7 +19,7 @@ import { createApp, BODY_TOO_LARGE, BODY_UNREADABLE } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { createAdmin, resetAdminPassword } from '../src/adminAccount.js';
-import { hashCount } from '../src/passwords.js';
+import { hashCount, hashPassword } from '../src/passwords.js';
 import * as signIn from '../src/signIn.js';
 import { holdsSecret } from './secrets.js';
 
@@ -244,6 +244,32 @@ test('LOCKOUT: attempt 10 locks; attempt 11 with the RIGHT password is refused l
   assert.deepEqual(await lockRow(), [], 'and a sign-in clears the count');
 });
 
+test('LOCKOUT ENDS: once a lock has ended the count starts again -- one wrong password is 1, not a new lock -- and ten are needed to lock again; during a lock a wrong one still re-arms it', async () => {
+  const who = await owner('si-relock');
+  const wrong = () => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG } });
+  const row = async () => (await admin.query('SELECT failed_count, locked_until, locked_until > now() AS locked FROM operator_sign_in_locks WHERE tenant_id = $1', [who.tenant])).rows[0];
+  for (let i = 0; i < signIn.MAX_FAILED; i += 1) assert.equal((await wrong()).status, 401);
+  assert.equal((await row()).locked, true, 'ten wrong passwords lock');
+  // CONTROL: a wrong password DURING the lock still counts and re-arms it, as before.
+  await admin.query(`UPDATE operator_sign_in_locks SET locked_until = now() + interval '1 minute' WHERE tenant_id = $1`, [who.tenant]);
+  const shortened = (await row()).locked_until;
+  await wrong();
+  const during = await row();
+  assert.equal(during.failed_count, signIn.MAX_FAILED + 1, 'CONTROL: counted during the lock');
+  assert.ok(during.locked_until > shortened, 'CONTROL: and re-armed');
+  // The clock past the lock.
+  await admin.query(`UPDATE operator_sign_in_locks SET locked_until = now() - interval '1 second' WHERE tenant_id = $1`, [who.tenant]);
+  assert.equal((await wrong()).status, 401);
+  const first = await row();
+  assert.deepEqual([first.failed_count, first.locked], [1, null], 'one wrong password after the lock ended is 1, and no lock');
+  for (let n = 2; n < signIn.MAX_FAILED; n += 1) await wrong();
+  const nine = await row();
+  assert.deepEqual([nine.failed_count, nine.locked], [signIn.MAX_FAILED - 1, null], 'nine since the lock ended do not lock');
+  await wrong();
+  const ten = await row();
+  assert.deepEqual([ten.failed_count, ten.locked], [signIn.MAX_FAILED, true], 'the tenth since the lock ended locks again');
+});
+
 test('LOCK IS PER ADDRESS: address A locked out; address B with the right password signs in', async () => {
   const who = await owner('si-addr');
   const A = '203.0.113.10';
@@ -346,6 +372,41 @@ test('SESSIONS END — a password reset revokes every session of that admin and 
   assert.equal(back.status, 200, 'the reset cleared the lock on that address');
   const old = await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: PASSWORD } });
   assert.equal(old.status, 401, 'the old password no longer signs in');
+});
+
+test('SESSIONS END — a password changed in the database, with no session revoked, ends every session signed in before the change', async () => {
+  const who = await owner('si-pwchg');
+  const before = await signedIn(main.base, who);
+  assert.equal((await garageRead(main.base, who, before)).status, 200);
+  const NEW = 'changed straight in the database';
+  secrets.add(NEW);
+  const hash = await hashPassword(NEW);
+  secrets.add(hash);
+  // The change as SQL would make it, around the command: the hash and its time, and nothing revoked.
+  await admin.query('UPDATE operator_users SET password_hash = $2, password_changed_at = now() WHERE tenant_id = $1', [who.tenant, hash]);
+  const live = async () => Number((await admin.query(
+    `SELECT count(*) FROM operator_tokens t JOIN operator_users u ON u.id = t.user_id WHERE u.tenant_id = $1 AND t.kind = 'session' AND t.revoked_at IS NULL`,
+    [who.tenant],
+  )).rows[0].count);
+  assert.equal(await live(), 1, 'the session row is still unrevoked');
+  const read = await garageRead(main.base, who, before);
+  assert.equal(read.status, 401, 'a read with the session from before the change');
+  assert.deepEqual(read.json, signIn.SESSION_ENDED);
+  assert.equal((await call(main.base, 'GET', '/api/v1/auth/me', { cookie: before })).status, 401, '/me with it');
+  const write = await call(main.base, 'POST', '/api/v1/garages', { cookie: before, origin: ADMIN_ORIGIN, body: { name: 'After the change', timezone: 'UTC', currency: 'USD' } });
+  assert.equal(write.status, 401, 'a write with it');
+  // CONTROL: a sign-in after the change, with the new password, is a session that works.
+  const after = await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: NEW }, origin: ADMIN_ORIGIN });
+  assert.equal(after.status, 200, after.text);
+  const fresh = tokenOf(after);
+  assert.equal((await garageRead(main.base, who, fresh)).status, 200, 'CONTROL: a session from after the change reads');
+  assert.equal((await call(main.base, 'GET', '/api/v1/auth/me', { cookie: fresh })).status, 200);
+  // And the command's path still revokes, the fresh session too.
+  const done = await resetAdminPassword({ email: who.email, password: PASSWORD });
+  assert.equal(done.sessions_revoked, 2, 'the reset revokes both rows: the one ended by the change, and the fresh one');
+  secrets.add((await admin.query('SELECT password_hash FROM operator_users WHERE tenant_id = $1', [who.tenant])).rows[0].password_hash);
+  assert.equal(await live(), 0);
+  assert.equal((await garageRead(main.base, who, fresh)).status, 401, 'after the reset the fresh session is refused');
 });
 
 // --- cross-site ---------------------------------------------------------------------------
@@ -577,16 +638,27 @@ test('NO ORACLE, IN WORK: unknown email, wrong password and locked address run t
   for (let i = 0; i < signIn.MAX_FAILED; i += 1) {
     await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: lockedWho.email, password: WRONG } });
   }
-  // Counted at an address of this test's own, not over the whole table: other
-  // files in the suite write lock rows while this runs. The control shows the
-  // count sees a row when one is written.
+  // Counted at an address of this test's own, and for this test's own users at
+  // ANY address -- rows and their counts -- not over the whole table: other
+  // files in the suite write lock rows while this runs, but none for these
+  // users. A lock row needs a real user, so an unknown email could only ever
+  // be charged to one: at the caller's address, or somewhere else. The
+  // controls show each count sees a row when one is written.
   const locksAt = async (address) => Number((await admin.query('SELECT count(*) FROM operator_sign_in_locks WHERE address = $1', [address])).rows[0].count);
+  const ownLocks = async () => (await admin.query(
+    `SELECT count(*)::int AS rows, coalesce(sum(l.failed_count), 0)::int AS failed
+       FROM operator_sign_in_locks l JOIN operator_users u ON u.id = l.user_id WHERE u.tenant_id = ANY($1::uuid[])`,
+    [[who.tenant, lockedWho.tenant]],
+  )).rows[0];
   const salt = Math.floor(Math.random() * 250) + 1;
   const [nobodyAt, controlAt] = [`203.0.113.${salt}`, `198.18.200.${salt}`];
+  const ownBefore = await ownLocks();
   await call(trusted.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG }, headers: { 'x-forwarded-for': nobodyAt } });
   assert.equal(await locksAt(nobodyAt), 0, 'an unknown email makes no lock row');
+  assert.deepEqual(await ownLocks(), ownBefore, "an unknown email is charged to none of this test's users, at any address");
   await call(trusted.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG }, headers: { 'x-forwarded-for': controlAt } });
   assert.equal(await locksAt(controlAt), 1, 'CONTROL: a wrong password from that kind of address makes one');
+  assert.deepEqual(await ownLocks(), { rows: ownBefore.rows + 1, failed: ownBefore.failed + 1 }, "CONTROL: and this test's users' count sees it");
   const unknown = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG } }));
   const wrong = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG } }));
   const locked = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: lockedWho.email, password: PASSWORD } }));

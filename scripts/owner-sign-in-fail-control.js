@@ -50,12 +50,15 @@
  *   decoy_after_listen       the port opens before the decoy hash is finished (R2).
  *   start_settings_unchecked PORT, PG_POOL_MAX and MAX_CLOCK_SKEW_SECONDS are not checked at start (R4).
  *   password_file_writable_taken  a password file others can write is taken (R6).
+ *   password_folder_writable_taken  a password file in a folder others can write is taken (round 3, F1).
+ *   lock_count_never_restarts  after a lock ends the count goes on, so one wrong password locks again (round 3, F3).
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0024, so the property genuinely never existed:
  *   absolute_unchecked       a session past its absolute end is still found.
  *   session_is_a_key         a session token is accepted as a Bearer key.
  *   public_execute_restored  resolve_operator_user is executable by PUBLIC again (F2).
+ *   session_outlives_password_change  a session from before a password change is still found (round 3, F2).
  *
  * Needs the same environment as the suite.
  */
@@ -416,6 +419,27 @@ const SOURCE_BREAKS = [
     from: '    if (mode & 0o022) {\n',
     to: '    if (mode & 0) {\n',
   },
+  {
+    name: 'password_folder_writable_taken',
+    why: 'a password file in a folder others can write is taken',
+    suite: CLI,
+    file: 'src/adminAccount.js',
+    from: '      if (folder & 0o022 && !(folder & 0o1000)) {\n',
+    to: '      if (folder & 0) {\n',
+  },
+  {
+    name: 'lock_count_never_restarts',
+    why: 'after a lock ends the count goes on, so one wrong password locks again',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '           failed_count = CASE WHEN l.locked_until <= now() THEN 1 ELSE l.failed_count + 1 END,\n' +
+      '           locked_until = CASE\n' +
+      '             WHEN (CASE WHEN l.locked_until <= now() THEN 1 ELSE l.failed_count + 1 END) >= $4 THEN now() + make_interval(mins => $5)\n' +
+      '             WHEN l.locked_until <= now() THEN NULL\n' +
+      '             ELSE l.locked_until END,\n',
+    to: '           failed_count = l.failed_count + 1,\n' +
+      '           locked_until = CASE WHEN l.failed_count + 1 >= $4 THEN now() + make_interval(mins => $5) ELSE l.locked_until END,\n',
+  },
 ];
 
 const SCHEMA_BREAKS = [
@@ -436,6 +460,12 @@ const SCHEMA_BREAKS = [
     why: 'resolve_operator_user is executable by PUBLIC again',
     suite: DEFINERS,
     edits: [{ file: '0024_operator_sign_in.sql', from: 'REVOKE EXECUTE ON FUNCTION resolve_operator_user(text) FROM PUBLIC;\n', to: '' }],
+  },
+  {
+    name: 'session_outlives_password_change',
+    why: 'a session from before a password change is still found',
+    suite: SIGN_IN,
+    edits: [{ file: '0024_operator_sign_in.sql', from: '         AND t.created_at >= u.password_changed_at\n', to: '' }],
   },
 ];
 

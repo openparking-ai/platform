@@ -13,7 +13,8 @@
  *
  * A reset revokes every session of that admin and clears every lock on it.
  */
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { pool, withTenant } from './db.js';
 import { hashPassword, passwordRuleBroken } from './passwords.js';
 
@@ -86,8 +87,11 @@ export async function readNewPassword({ file, stdin = process.stdin, stderr = pr
   let password;
   if (file !== undefined) {
     let mode;
+    let folders;
     try {
       mode = statSync(file).mode;
+      // The folder named, and the one the file is really in when a link was named.
+      folders = [...new Set([dirname(resolve(file)), dirname(realpathSync(file))])].map((d) => statSync(d).mode);
       password = readFileSync(file, 'utf8').replace(/\r?\n$/, '');
     } catch (err) {
       throw new AdminCommandRefused(`the password file could not be read (${err.code ?? 'error'})`);
@@ -105,6 +109,17 @@ export async function readNewPassword({ file, stdin = process.stdin, stderr = pr
         `the password file can be written by users other than its owner (mode ${(mode & 0o777).toString(8).padStart(4, '0')}); ` +
           'make it the owner\'s only with: chmod 600 <the file>; nothing was changed',
       );
+    }
+    // Nor is one in a folder anyone else can write: they can put another file in its place.
+    // Unless the folder is sticky (as /tmp is): then only the file's owner, or the folder's, can.
+    // Permission bits only, here as above; ACLs are not read.
+    for (const folder of folders) {
+      if (folder & 0o022 && !(folder & 0o1000)) {
+        throw new AdminCommandRefused(
+          `the folder holding the password file can be written by users other than its owner (mode ${(folder & 0o777).toString(8).padStart(4, '0')}), ` +
+            'so they can put another file in its place; make it the owner\'s only with: chmod 700 <the folder>; nothing was changed',
+        );
+      }
     }
   } else {
     if (!stdin.isTTY) throw new AdminCommandRefused('no terminal to prompt at: run it at a terminal, or pass --password-file <path>');

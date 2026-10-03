@@ -335,6 +335,10 @@ export const internals = {
    * It counts only when `counted` (a wrong password) AND the user exists in
    * this tenant -- so NOBODY, and a right password during a lock, write
    * nothing, and an unknown email never makes a lock row.
+   *
+   * A lock that has ended is over: the count starts again at 1, and it takes
+   * the full number again to lock. During a lock a wrong password still
+   * counts and re-arms it.
    */
   async recordFailure(user, address, counted) {
     await withTenant(user.tenant_id, (c) =>
@@ -343,8 +347,11 @@ export const internals = {
          SELECT $1, $2, $3, 1, CASE WHEN 1 >= $4 THEN now() + make_interval(mins => $5) END
           WHERE $6::boolean AND EXISTS (SELECT 1 FROM operator_users u WHERE u.id = $2 AND u.tenant_id = $1)
          ON CONFLICT (user_id, address) DO UPDATE SET
-           failed_count = l.failed_count + 1,
-           locked_until = CASE WHEN l.failed_count + 1 >= $4 THEN now() + make_interval(mins => $5) ELSE l.locked_until END,
+           failed_count = CASE WHEN l.locked_until <= now() THEN 1 ELSE l.failed_count + 1 END,
+           locked_until = CASE
+             WHEN (CASE WHEN l.locked_until <= now() THEN 1 ELSE l.failed_count + 1 END) >= $4 THEN now() + make_interval(mins => $5)
+             WHEN l.locked_until <= now() THEN NULL
+             ELSE l.locked_until END,
            updated_at = now()`,
         [user.tenant_id, user.user_id, address, MAX_FAILED, LOCK_MINUTES, counted],
       ));

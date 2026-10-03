@@ -127,6 +127,10 @@ CREATE OR REPLACE FUNCTION resolve_operator_token(p_token_hash text)
 -- successful touch. An ended session is never revived by presenting it again:
 -- nothing here can move `expires_at`, and a session past its idle window is
 -- not found, so it is not touched.
+--
+-- Nor is a session issued before the admin's password last changed, revoked
+-- or not: a password changed by any route, the reset command or SQL by hand,
+-- ends every session signed in with the one before it.
 CREATE FUNCTION resolve_operator_session(p_token_hash text, p_idle_seconds integer)
   RETURNS TABLE (token_id uuid, tenant_id uuid, user_id uuid, email text, expires_at timestamptz, idle_ends_at timestamptz)
   LANGUAGE sql
@@ -137,16 +141,19 @@ CREATE FUNCTION resolve_operator_session(p_token_hash text, p_idle_seconds integ
     WITH used AS (
       UPDATE operator_tokens t
          SET last_seen_at = now()
+        FROM operator_users u
        WHERE t.token_hash = p_token_hash
          AND t.kind = 'session'
          AND t.revoked_at IS NULL
          AND t.expires_at > now()
          AND t.last_seen_at > now() - make_interval(secs => p_idle_seconds)
-      RETURNING t.id, t.tenant_id, t.user_id, t.expires_at, t.last_seen_at
+         AND u.id = t.user_id AND u.tenant_id = t.tenant_id
+         AND t.created_at >= u.password_changed_at
+      RETURNING t.id, t.tenant_id, t.user_id, u.email, t.expires_at, t.last_seen_at
     )
-    SELECT used.id, used.tenant_id, used.user_id, u.email, used.expires_at,
+    SELECT used.id, used.tenant_id, used.user_id, used.email, used.expires_at,
            used.last_seen_at + make_interval(secs => p_idle_seconds)
-      FROM used JOIN operator_users u ON u.id = used.user_id AND u.tenant_id = used.tenant_id
+      FROM used
   $$;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON operator_users, operator_sign_in_locks TO openparking_app;

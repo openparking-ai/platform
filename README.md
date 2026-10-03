@@ -314,7 +314,10 @@ npm run reset-admin-password -- --email <email> --password-file <path>  # or fro
 The password **never arrives on the command line** — argv is in the process
 list — and a password argument, in any spelling, is refused by name. It is at
 least 12 characters; length is the one rule. A reset revokes every session of
-that admin and clears every lock on it. There is no change-password route yet;
+that admin and clears every lock on it. Apart from the revoke, a session issued
+before the admin's password last changed (`password_changed_at`) is never found
+again, revoked or not, so a password changed in the database by hand ends the
+sessions signed in with the old one too. There is no change-password route yet;
 that comes with the account page.
 
 **The cookie** is `op_session`: `HttpOnly` (page script can never read it),
@@ -338,7 +341,8 @@ presenting it again revives nothing.
 
 **Guessing.** Ten wrong passwords **from one caller address** lock that address
 out of that account for 30 minutes; wrong passwords during the lock still count
-and re-arm it. Other addresses are unaffected, so knowing the admin's email is
+and re-arm it. Once a lock has ended the count starts again: the next wrong
+password counts as 1, and it takes ten again to lock. Other addresses are unaffected, so knowing the admin's email is
 not enough to keep the admin out — there is no account-wide lock. Separately,
 each address gets `SIGN_IN_ATTEMPTS_PER_ADDRESS` attempts (default 30) per
 `SIGN_IN_ATTEMPTS_WINDOW_MINUTES` (default 15), held in this process, then `429
@@ -401,9 +405,14 @@ that holds `operator_users`.** Creating an admin and resetting a password write
 the stored hash as a bind parameter, so such a log holds every admin's hash:
 an offline guessing target that no lock and no limit here can slow down.
 
-**The admin commands** refuse a password file that anyone but its owner can
-read or write (`chmod 600` it), and a refusal never repeats an argument back: an unknown
-option may be a password (`-p<password>` is one word).
+**The admin commands** refuse a password file whose permission bits let anyone
+but its owner read or write it (`chmod 600` it), or whose folder's permission
+bits let anyone but its owner write there, unless that folder is sticky (as
+`/tmp` is): whoever can write the folder can put another file in its place.
+That is the folder named and, when a link is named, the folder of the file it
+points to. **Only permission bits are checked; ACLs are not read**, so a file
+or folder an ACL opens to others is not refused. A refusal never repeats an
+argument back: an unknown option may be a password (`-p<password>` is one word).
 
 **An id in the address that is not a uuid** answers what an id naming nothing
 answers on that route (404 and its not-found body; on the lane's validation
