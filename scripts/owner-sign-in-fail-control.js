@@ -59,6 +59,7 @@
  *   session_is_a_key         a session token is accepted as a Bearer key.
  *   public_execute_restored  resolve_operator_user is executable by PUBLIC again (F2).
  *   session_outlives_password_change  a session from before a password change is still found (round 3, F2).
+ *   hash_change_moves_no_time  a change of the hash alone leaves password_changed_at, so sessions live on (round 4, F5).
  *
  * Needs the same environment as the suite.
  */
@@ -466,6 +467,20 @@ const SCHEMA_BREAKS = [
     why: 'a session from before a password change is still found',
     suite: SIGN_IN,
     edits: [{ file: '0024_operator_sign_in.sql', from: '         AND t.created_at >= u.password_changed_at\n', to: '' }],
+  },
+  {
+    name: 'hash_change_moves_no_time',
+    why: 'a change of the hash alone leaves password_changed_at, so sessions live on',
+    suite: SIGN_IN,
+    edits: [{
+      file: '0024_operator_sign_in.sql',
+      from: 'CREATE TRIGGER operator_users_password_changed\n' +
+        '  BEFORE UPDATE OF password_hash ON operator_users\n' +
+        '  FOR EACH ROW\n' +
+        '  WHEN (NEW.password_hash IS DISTINCT FROM OLD.password_hash)\n' +
+        '  EXECUTE FUNCTION operator_users_password_changed();\n',
+      to: '',
+    }],
   },
 ];
 

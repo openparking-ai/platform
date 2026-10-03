@@ -409,6 +409,49 @@ test('SESSIONS END — a password changed in the database, with no session revok
   assert.equal((await garageRead(main.base, who, fresh)).status, 401, 'after the reset the fresh session is refused');
 });
 
+test('SESSIONS END — the hash changed alone in the database, its time left as it was, ends every session signed in before the change', async () => {
+  const who = await owner('si-hashonly');
+  const before = await signedIn(main.base, who);
+  const changedAt = async () => (await admin.query('SELECT password_changed_at FROM operator_users WHERE tenant_id = $1', [who.tenant])).rows[0].password_changed_at;
+  // CONTROL: a change that leaves the hash alone ends nothing and moves no time.
+  const at = await changedAt();
+  await admin.query("UPDATE operator_users SET email = email || '' , created_at = created_at WHERE tenant_id = $1", [who.tenant]);
+  assert.deepEqual(await changedAt(), at, 'a change without the hash leaves password_changed_at');
+  assert.equal((await garageRead(main.base, who, before)).status, 200, 'CONTROL: and the session still reads');
+  const NEW = 'only the hash was changed here';
+  secrets.add(NEW);
+  const hash = await hashPassword(NEW);
+  secrets.add(hash);
+  await admin.query('UPDATE operator_users SET password_hash = $2 WHERE tenant_id = $1', [who.tenant, hash]);
+  assert.ok((await changedAt()) > at, 'the hash change moved password_changed_at');
+  assert.equal((await garageRead(main.base, who, before)).status, 401, 'a read with the session from before the change');
+  assert.equal((await call(main.base, 'GET', '/api/v1/auth/me', { cookie: before })).status, 401, '/me with it');
+  // CONTROL: a sign-in after the change, with the new password, works.
+  const after = await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: NEW }, origin: ADMIN_ORIGIN });
+  assert.equal(after.status, 200, after.text);
+  const fresh = tokenOf(after);
+  assert.equal((await call(main.base, 'GET', '/api/v1/auth/me', { cookie: fresh })).status, 200, 'CONTROL: a session from after the change');
+  // A change made in a transaction OPENED BEFORE a sign-in, and run after it: the
+  // session was signed in before the change, so it ends with it.
+  const NEWER = 'and then changed once again';
+  secrets.add(NEWER);
+  const newer = await hashPassword(NEWER);
+  secrets.add(newer);
+  await admin.query('BEGIN');
+  try {
+    await admin.query('SELECT now()');
+    const during = tokenOf(await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: NEW }, origin: ADMIN_ORIGIN }));
+    assert.ok(during);
+    await admin.query('UPDATE operator_users SET password_hash = $2 WHERE tenant_id = $1', [who.tenant, newer]);
+    await admin.query('COMMIT');
+    assert.equal((await call(main.base, 'GET', '/api/v1/auth/me', { cookie: during })).status, 401, 'signed in before the change ran, though after its transaction began');
+  } catch (err) {
+    await admin.query('ROLLBACK').catch(() => {});
+    throw err;
+  }
+  assert.equal((await call(main.base, 'GET', '/api/v1/auth/me', { cookie: fresh })).status, 401);
+});
+
 // --- cross-site ---------------------------------------------------------------------------
 
 test('CROSS-SITE: a cookie-authenticated change with a foreign Origin, or none, is refused and changes nothing; from the admin site it works', async () => {
