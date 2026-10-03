@@ -30,7 +30,7 @@ let world;
 let entryToken;
 let exitToken;
 
-const THRESHOLDS = { structure: 0.75, colour_bhattacharyya: 0.69 };
+const THRESHOLDS = { structure: 0.75, colour: 0.69 };
 
 async function issueDeviceToken(tenantId, laneId, name) {
   const token = generateDeviceToken();
@@ -104,8 +104,8 @@ function recordMatching(ids, body) {
     })),
     thresholds_applied: body.thresholds,
     descriptor_version: 1,
-    descriptor_kind: 'orb',
-    rule: 'match when structure <= thresholds.structure AND colour_bhattacharyya <= thresholds.colour_bhattacharyya',
+    descriptor_kind: 'kind-a',
+    rule: 'match when structure <= thresholds.structure AND colour <= thresholds.colour',
     time: new Date().toISOString(),
   };
 }
@@ -469,7 +469,7 @@ test('retention reaches a shadow row: the session references go, the outcome and
                                         true_stay_comparable, searched_at, outcome, matched_ids,
                                         true_stay_matched, counts, thresholds, search_ref, attempts)
            VALUES ($1,$2,$3,$4,$5,$6::uuid[],3,2,true,$7,'match',$8::uuid[],true,
-                   '{"candidates":2,"matched":1,"excluded":1,"refused":0}', '{"structure":0.75,"colour_bhattacharyya":0.69}',
+                   '{"candidates":2,"matched":1,"excluded":1,"refused":0}', '{"structure":0.75,"colour":0.69}',
                    'ref', 1)
            RETURNING id`,
           [tenant, world.garage, s.id, world.exitLane, s.close_event_id, [s.id, other], ago(closedDaysAgo), [s.id]],
