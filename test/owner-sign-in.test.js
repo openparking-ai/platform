@@ -638,16 +638,27 @@ test('NO ORACLE, IN WORK: unknown email, wrong password and locked address run t
   for (let i = 0; i < signIn.MAX_FAILED; i += 1) {
     await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: lockedWho.email, password: WRONG } });
   }
-  // Counted at an address of this test's own, not over the whole table: other
-  // files in the suite write lock rows while this runs. The control shows the
-  // count sees a row when one is written.
+  // Counted at an address of this test's own, and for this test's own users at
+  // ANY address -- rows and their counts -- not over the whole table: other
+  // files in the suite write lock rows while this runs, but none for these
+  // users. A lock row needs a real user, so an unknown email could only ever
+  // be charged to one: at the caller's address, or somewhere else. The
+  // controls show each count sees a row when one is written.
   const locksAt = async (address) => Number((await admin.query('SELECT count(*) FROM operator_sign_in_locks WHERE address = $1', [address])).rows[0].count);
+  const ownLocks = async () => (await admin.query(
+    `SELECT count(*)::int AS rows, coalesce(sum(l.failed_count), 0)::int AS failed
+       FROM operator_sign_in_locks l JOIN operator_users u ON u.id = l.user_id WHERE u.tenant_id = ANY($1::uuid[])`,
+    [[who.tenant, lockedWho.tenant]],
+  )).rows[0];
   const salt = Math.floor(Math.random() * 250) + 1;
   const [nobodyAt, controlAt] = [`203.0.113.${salt}`, `198.18.200.${salt}`];
+  const ownBefore = await ownLocks();
   await call(trusted.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG }, headers: { 'x-forwarded-for': nobodyAt } });
   assert.equal(await locksAt(nobodyAt), 0, 'an unknown email makes no lock row');
+  assert.deepEqual(await ownLocks(), ownBefore, "an unknown email is charged to none of this test's users, at any address");
   await call(trusted.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG }, headers: { 'x-forwarded-for': controlAt } });
   assert.equal(await locksAt(controlAt), 1, 'CONTROL: a wrong password from that kind of address makes one');
+  assert.deepEqual(await ownLocks(), { rows: ownBefore.rows + 1, failed: ownBefore.failed + 1 }, "CONTROL: and this test's users' count sees it");
   const unknown = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG } }));
   const wrong = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG } }));
   const locked = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: lockedWho.email, password: PASSWORD } }));
