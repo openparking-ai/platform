@@ -292,6 +292,148 @@ curl -H "authorization: Bearer $OPERATOR_TOKEN" \
   http://127.0.0.1:3000/api/v1/garages/<id>/sessions/open
 ```
 
+### The owner signs in
+
+**One admin per tenant**: an email and a password, and nothing else — no roles,
+no user management, no sign-up and no email sent from this repository. A
+sign-in **is a session token**, minted the way operator tokens are (random 32
+bytes, only its SHA-256 stored), so every operator route works unchanged behind
+it (migration 0024).
+
+    POST /api/v1/auth/sign-in    {email, password}  ->  200 {email, tenant_id, session_ends_at} and the cookie
+    POST /api/v1/auth/sign-out   revokes the session row                 ->  204
+    GET  /api/v1/auth/me         {email, tenant_id, session_ends_at}
+
+**The admin is made at the database, never over HTTP**, as an operator token is:
+
+```sh
+npm run create-admin -- --tenant <tenant-id> --email <email>            # prompts, twice, no echo
+npm run reset-admin-password -- --email <email> --password-file <path>  # or from a file
+```
+
+The password **never arrives on the command line** — argv is in the process
+list — and a password argument, in any spelling, is refused by name. It is at
+least 12 characters; length is the one rule. A reset revokes every session of
+that admin and clears every lock on it. Apart from the revoke, a session issued
+before the admin's password last changed (`password_changed_at`) is never found
+again, revoked or not. The database sets `password_changed_at` itself whenever
+the hash changes, so **any change of the hash, by any path** — the reset
+command, or SQL by hand that sets the hash alone — ends every session signed in
+before it. A sign-in still checking the old password when the change lands is
+refused like any refusal and gets no session: one is made only while the hash it
+checked is still the admin's, with the admin's row held from that reading until
+the session is written. There is no change-password route yet;
+that comes with the account page.
+
+**The cookie** is `op_session`: `HttpOnly` (page script can never read it),
+`Secure`, `SameSite=Strict`, `Path=/api`, no `Domain`. So **the admin site is
+served from the same origin as `/api`** — there is no CORS here. `Secure` may be
+turned off only by `SESSION_COOKIE_INSECURE=true`, for plain-http local
+development, and `serve` says so out loud when it is.
+
+**The operator router takes a Bearer key (unchanged) or the cookie.** A request
+the cookie authenticates that **changes** something (POST, PUT, PATCH, DELETE)
+must carry an `Origin` equal to `ADMIN_ORIGIN`, or it is refused `403
+origin_refused` before the session is looked up. With no `ADMIN_ORIGIN` set,
+sign-in is off and answers `409 sign_in_not_configured`. A sign-in with a
+foreign `Origin` is refused, and one not sent as JSON cannot be read. A session
+token presented as a Bearer key is not a key.
+
+**A session ends** 30 minutes after its last use and 12 hours after sign-in,
+whichever is first (`SESSION_IDLE_MINUTES`, `SESSION_MAX_HOURS`). An ended
+session answers `401 session_ended`, so the screen can say what happened, and
+presenting it again revives nothing.
+
+**Guessing.** Ten wrong passwords **from one caller address** lock that address
+out of that account for 30 minutes; wrong passwords during the lock still count
+and re-arm it. Once a lock has ended the count starts again: the next wrong
+password counts as 1, and it takes ten again to lock. Other addresses are unaffected, so knowing the admin's email is
+not enough to keep the admin out — there is no account-wide lock. Separately,
+each address gets `SIGN_IN_ATTEMPTS_PER_ADDRESS` attempts (default 30) per
+`SIGN_IN_ATTEMPTS_WINDOW_MINUTES` (default 15), held in this process, then `429
+sign_in_rate_limited`. The address is the **socket's**; `X-Forwarded-For` is
+read only when `TRUST_PROXY` is declared: a number of proxy hops from 1 to 5,
+`loopback`, or a comma-separated list of the proxies' addresses or subnets.
+`true`, and any other form, refuses to start: it means "trust whatever the
+caller says". ⚠ **A number of hops must equal the real number of proxies in
+front of this server.** The server cannot see the chain and cannot check it.
+If the number is larger than the real chain, the caller writes the address
+that is used: a forged `X-Forwarded-For` chooses which address is counted, so
+one caller can dodge the lock and the attempt limit by changing it. Smaller,
+and every caller is counted as a proxy. The start-up line says the same. An
+IPv6 address counts by its /64. ⚠ **Behind a proxy with no
+`TRUST_PROXY`, every caller is the proxy, so the lock is in effect
+account-wide** — declare it. Likewise, **people who share one address (one
+office NAT, one carrier gateway) share one lock**: ten wrong passwords from any
+of them lock all of them out of that account for the window.
+
+**No oracle.** An unknown email, a wrong password and a locked address answer
+the same `401 sign_in_refused`, byte for byte, and each runs exactly one hash
+and the same database statements (the lock lookup and the failure write, which
+for an unknown email find and write nothing). The decoy hash an unknown email
+is checked against is finished before the port opens, so this holds for the
+first sign-in after a start too. No sign-in refusal of any kind is
+answered sooner than `SIGN_IN_REFUSAL_FLOOR_MS` (default 500) after the request
+arrived, so what difference is left in the work is not on the wire.
+
+**Waiting.** Hashes run four at a time (Node's thread pool). The line for them
+is capped: `SIGN_IN_HASH_LINE` sign-ins at once (default 48, about 2 seconds at
+about 26 hashes a second) and `SIGN_IN_HASH_LINE_PER_ADDRESS` of them from one
+address (default 2). A sign-in that finds the line full is answered at once,
+held to the floor, with `503 sign_in_busy` and `Retry-After: 2` — decided before
+the email is read, so the same for every email — instead of waiting behind
+everyone else's.
+
+**Settings are checked at start.** Every setting above is a whole number in its
+range, or one of its stated forms, or `serve` refuses to start, naming the
+setting and the range (`.env.example` lists each). Idle may not be longer than
+the end, nor the per-address share longer than the line.
+
+**Nothing secret is written out.** The password, the token, the cookie and the
+stored hash appear in no log line and no response body. A body that cannot be
+read answers one fixed sentence (`400 sign_in_unreadable`), never the JSON
+parser's text, which quotes what was sent; a failure inside sign-in is logged by
+its class and code, never its message. Every operator and auth response carries
+`Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. No auth route
+takes a credential in its path or query.
+
+**The password hash** is `node:crypto` scrypt (no dependency), stored with its
+own parameters; a stored string in a format this code does not know is refused
+by name and never compared. The parameters were measured with `npm run
+measure-scrypt` (`src/passwords.js` names the machine). Each hash at N=2¹⁷ takes
+128 MiB; Node runs at most its thread pool's worth at once.
+
+⚠ **Deploy rule: never turn on statement or parameter logging** (`log_statement`
+other than `none`/`ddl`, `log_min_duration_statement` with parameters,
+`log_parameter_max_length`, an extension that records parameters) **on a database
+that holds `operator_users`.** Creating an admin and resetting a password write
+the stored hash as a bind parameter, so such a log holds every admin's hash:
+an offline guessing target that no lock and no limit here can slow down.
+
+**The admin commands** refuse a password file whose permission bits let anyone
+but its owner read or write it (`chmod 600` it), or whose folder's permission
+bits let anyone but its owner write there, unless that folder is sticky (as
+`/tmp` is): whoever can write the folder can put another file in its place.
+That is the folder named and, when a link is named, the folder of the file it
+points to. **Only permission bits are checked; ACLs are not read**, so a file
+or folder an ACL opens to others is not refused. A refusal never repeats an
+argument back: an unknown option may be a password (`-p<password>` is one word).
+
+**An id in the address that is not a uuid** answers what an id naming nothing
+answers on that route (404 and its not-found body; on the lane's validation
+claim, `409 stay_not_open`). The database is reached only to authenticate the
+caller. The body is NOT checked first: every request's body is read (up to
+1 MB) before any route runs, before authentication too, so a request whose body
+cannot be read answers that, whatever its id, and an unauthenticated request's
+body is read before its 401. A body that cannot be read answers one sentence,
+`400 body_unreadable` or `413 body_too_large`, with `no-store` and `nosniff`,
+on every path in any letter case, never the parser's own words, which quote
+what was sent.
+
+`test/owner-sign-in.test.js`, `test/admin-cli.test.js` and
+`test/owner-sign-in-output.test.js` hold each of these; `npm run
+owner-sign-in-fail-control` breaks each one in turn.
+
 ### A lane that has gone quiet
 
 `GET /api/v1/garages/<id>/devices` lists the devices on that garage's lanes with

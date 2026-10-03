@@ -167,6 +167,34 @@ export const TENANT_TABLES = [
       ),
   },
   {
+    table: 'operator_users',
+    // One admin per tenant (0024), so a second insert for the same tenant
+    // touches the first rather than colliding with UNIQUE (tenant_id).
+    insert: (c, t) =>
+      c.query(
+        `INSERT INTO operator_users (tenant_id, email, password_hash)
+         VALUES ($1, 'iso-' || gen_random_uuid()::text || '@example.com', 'scrypt$row')
+         ON CONFLICT (tenant_id) DO UPDATE SET password_changed_at = now() RETURNING tenant_id AS id`,
+        [t],
+      ),
+    singleton: true,
+  },
+  {
+    table: 'operator_sign_in_locks',
+    // A lock row belongs to the tenant's one admin, made here if it is not.
+    insert: (c, t) =>
+      c.query(
+        `WITH u AS (
+           INSERT INTO operator_users (tenant_id, email, password_hash)
+           VALUES ($1, 'iso-' || gen_random_uuid()::text || '@example.com', 'scrypt$row')
+           ON CONFLICT (tenant_id) DO UPDATE SET password_changed_at = now() RETURNING id, tenant_id
+         )
+         INSERT INTO operator_sign_in_locks (tenant_id, user_id, address)
+         SELECT tenant_id, id, gen_random_uuid()::text FROM u RETURNING id`,
+        [t],
+      ),
+  },
+  {
     table: 'garage_stripe_accounts',
     // One per garage (0020), so each row gets a garage of its own.
     insert: (c, t) =>
@@ -246,12 +274,15 @@ export const TABLES_WITHOUT_TENANT_ID = {
 /**
  * Tables that are ENABLE ROW LEVEL SECURITY but deliberately NOT FORCE.
  *
- * BOTH are credential-resolution tables, and they are on this list for the one
+ * ALL THREE are credential-resolution tables, and they are on this list for the one
  * reason the RLS template cannot express: a credential is presented and the
  * tenant that owns it is precisely what the lookup exists to discover, so no
  * tenant policy can gate it. Nothing else may join this list without the same
  * argument.
- * See migration 0002 for why lane_devices is the exception, and
- * rls-coverage.test.js for the assertion that it is the ONLY one.
+ * See migration 0002 for why lane_devices is the exception, 0003 for
+ * operator_tokens, 0024 for operator_users (an email is presented and its
+ * tenant is what the lookup finds), and rls-coverage.test.js for the assertion
+ * that these are the ONLY ones. 0024's other table, operator_sign_in_locks, is
+ * read only once the tenant is known, and is FORCED like any other.
  */
-export const NOT_FORCED_BY_DESIGN = ['lane_devices', 'operator_tokens'];
+export const NOT_FORCED_BY_DESIGN = ['lane_devices', 'operator_tokens', 'operator_users'];

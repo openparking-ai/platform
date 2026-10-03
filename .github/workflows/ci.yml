@@ -337,6 +337,17 @@ jobs:
         # test/validations-door.test.js to go red.
         run: npm run validations-door-fail-control
 
+      - name: Owner sign-in fail-control
+        # The owner's sign-in (0024). Each break removes one property -- the
+        # mount order, a token or a message in the log, the parser's text in
+        # a response, a credential read from the query, the unknown email's
+        # hash, the lock's count, its address, the header it must not trust,
+        # the idle and absolute ends, sign-out and reset revoking, the cookie's
+        # HttpOnly and Secure, the Origin rule, the password argument refused,
+        # no-store, the length rule, and a session accepted as a key -- and
+        # requires the sign-in suites to go red.
+        run: npm run owner-sign-in-fail-control
+
       - name: Stripe-account fail-control
         # A garage's own Stripe account (0020): created only on the operator's
         # request, as the garage's -- no Stripe dashboard, its own Stripe

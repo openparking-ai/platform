@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { startSetting } from './startSettings.js';
 
 const { Pool } = pg;
 
@@ -8,7 +9,8 @@ const { Pool } = pg;
  */
 export const pool = new Pool({
   connectionString: process.env.APP_DATABASE_URL,
-  max: Number(process.env.PG_POOL_MAX || 10),
+  // Checked before the port opens (src/startSettings.js): 1 to 100.
+  max: startSetting('PG_POOL_MAX'),
 });
 
 // A pool with no error handler takes the process down on any idle-client

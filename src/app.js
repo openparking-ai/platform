@@ -13,6 +13,8 @@ import * as validations from './validations.js';
 import { reconcile } from './reconcile.js';
 import * as stripeAccount from './stripeAccount.js';
 import * as terminal from './terminal.js';
+import * as signIn from './signIn.js';
+import { startSetting } from './startSettings.js';
 
 class HttpError extends Error {
   constructor(status, message, code = null) {
@@ -61,6 +63,40 @@ const bad = (message) => new HttpError(400, message);
  */
 const CONFLICT_STATUS = 409;
 const conflict = (code, message) => new HttpError(CONFLICT_STATUS, message, code);
+
+/** The one refusal of a validation claimed on a stay that is not open -- or that never was. */
+const STAY_NOT_OPEN = 'the stay is not open in this garage: a validation is claimed before the close, never after';
+
+/**
+ * AN ID THAT IS NOT AN ID. Every path parameter is a uuid, and one that is not
+ * is answered here -- before the handler reads the body, and before anything
+ * reaches the database, where it was a 500 -- exactly as that route answers an
+ * id that names nothing. `test/ids.test.js` walks both routers and requires
+ * every parameter to be one of these.
+ */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+//: The Connect routes (0020, 0021) name their not-found with a code; the rest do not.
+const CONNECT_ROUTE = /\/stripe-account|\/readers?(\/|$)/;
+export const ID_PARAMS = Object.freeze({
+  operator: Object.freeze({
+    garageId: (route) => (CONNECT_ROUTE.test(route) ? new HttpError(404, 'garage not found', 'garage_not_found') : new HttpError(404, 'garage not found')),
+    laneId: (route) => (CONNECT_ROUTE.test(route) ? new HttpError(404, 'lane not found', 'lane_not_found') : new HttpError(404, 'lane not found')),
+    deviceId: () => new HttpError(404, 'device not found'),
+    tokenId: () => new HttpError(404, 'operator token not found'),
+  }),
+  lane: Object.freeze({
+    sessionId: () => conflict('stay_not_open', STAY_NOT_OPEN),
+  }),
+});
+function checkIds(router, params) {
+  for (const [name, notFound] of Object.entries(params)) {
+    router.param(name, (req, _res, next, value) => next(UUID.test(value) ? undefined : notFound(req.route.path)));
+  }
+}
+
+//: A body that cannot be read: one sentence per case, never the parser's text.
+export const BODY_UNREADABLE = Object.freeze({ error: 'The request body could not be read. Send JSON.', code: 'body_unreadable' });
+export const BODY_TOO_LARGE = Object.freeze({ error: 'The request body is too large.', code: 'body_too_large' });
 
 /** `POST /garages/:id/rates` is gone for good: 410, with the name a caller can match on. */
 const RATES_RETIRED_STATUS = 410;
@@ -604,17 +640,9 @@ function parseTime(value, label) {
  */
 export const CLOCK_SKEW = 'clock_skew';
 
-const MAX_CLOCK_SKEW_SECONDS = (() => {
-  const raw = process.env.MAX_CLOCK_SKEW_SECONDS;
-  if (raw === undefined || raw === '') return 120;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value < 0) {
-    throw new Error(
-      `MAX_CLOCK_SKEW_SECONDS must be a non-negative number of seconds, not ${JSON.stringify(raw)}`,
-    );
-  }
-  return value;
-})();
+// Checked before the port opens (src/startSettings.js): a whole number of
+// seconds, 0 to 3600.
+const MAX_CLOCK_SKEW_SECONDS = startSetting('MAX_CLOCK_SKEW_SECONDS');
 
 /**
  * Refuse a lane time that has not happened yet.
@@ -644,7 +672,20 @@ function refuseFuture(at, label, now = new Date()) {
 
 export function createApp() {
   const app = express();
-  app.use(express.json({ limit: '1mb' }));
+  const authSettings = signIn.readAuthSettings();
+  if (authSettings.trustProxy !== null) app.set('trust proxy', authSettings.trustProxy);
+
+  // FIRST, before the app-wide body parser and before the operator router.
+  // The operator router answers 401 to everything under /api/v1, so mounted
+  // after it sign-in is unreachable; and the auth routes read their own body,
+  // so a body that cannot be parsed is answered with their one sentence and
+  // never with the parser's text, which quotes what was sent.
+  app.use('/api/v1/auth', signIn.createAuthRouter(authSettings));
+
+  // Any failure to read a body is marked as one, so it is answered in one
+  // fixed sentence (below), whatever the path.
+  const json = express.json({ limit: '1mb' });
+  app.use((req, res, next) => json(req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined)));
 
   app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
@@ -663,16 +704,39 @@ export function createApp() {
    *
    * Same bootstrap problem as lane devices, same answer: resolve_operator_token
    * is SECURITY DEFINER because the tenant is what the lookup is for.
+   *
+   * OR the owner's session cookie (0024): a Bearer KEY is read first and is
+   * unchanged; with none, the cookie. A request authenticated by the cookie
+   * that changes something must carry an Origin equal to ADMIN_ORIGIN, checked
+   * BEFORE the session is looked up, so a refused cross-site request does not
+   * even keep a session alive. An ended session answers 401 `session_ended`.
+   * A session token presented as a Bearer key is not a key and is refused.
    */
-  operator.use(async (req, _res, next) => {
+  operator.use(signIn.noStore);
+  checkIds(operator, ID_PARAMS.operator);
+  operator.use(async (req, res, next) => {
     try {
       const token = bearerFrom(req.get('authorization'));
-      if (!token) throw new HttpError(401, 'operator token required');
-      const { rows } = await pool.query('SELECT * FROM resolve_operator_token($1)', [hashToken(token)]);
-      if (rows.length === 0) throw new HttpError(401, 'unknown or revoked operator token');
-      req.tenantId = rows[0].tenant_id;
-      req.operatorTokenId = rows[0].token_id;
-      pool.query('SELECT touch_operator_token($1)', [req.operatorTokenId]).catch(() => {});
+      if (token) {
+        const { rows } = await pool.query('SELECT * FROM resolve_operator_token($1)', [hashToken(token)]);
+        if (rows.length === 0) throw new HttpError(401, 'unknown or revoked operator token');
+        req.tenantId = rows[0].tenant_id;
+        req.operatorTokenId = rows[0].token_id;
+        pool.query('SELECT touch_operator_token($1)', [req.operatorTokenId]).catch(() => {});
+        return next();
+      }
+      const session = signIn.sessionToken(req);
+      if (session === null) throw new HttpError(401, 'operator token required');
+      if (!signIn.originAllows(req, authSettings)) {
+        throw new HttpError(403, signIn.ORIGIN_REFUSED.error, signIn.ORIGIN_REFUSED.code);
+      }
+      const found = await signIn.resolveSession(session, authSettings);
+      if (!found) {
+        signIn.clearCookie(res, authSettings);
+        throw new HttpError(401, signIn.SESSION_ENDED.error, signIn.SESSION_ENDED.code);
+      }
+      req.tenantId = found.tenant_id;
+      req.operatorTokenId = found.token_id;
       next();
     } catch (err) {
       next(err);
@@ -953,6 +1017,8 @@ export function createApp() {
         throw bad("name and direction ('entry' or 'exit') are required");
       }
       const lane = await withTenant(req.tenantId, async (client) => {
+        // Asked first: a garage that is not there is a 404, not a foreign-key violation.
+        if (!(await repo.getGarage(client, req.tenantId, req.params.garageId))) throw new HttpError(404, 'garage not found');
         const { rows } = await client.query(
           `INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1,$2,$3,$4) RETURNING *`,
           [req.tenantId, req.params.garageId, name, direction],
@@ -1052,6 +1118,9 @@ export function createApp() {
       // exactly once. There is no endpoint that can show it again.
       const token = generateDeviceToken();
       const device = await withTenant(req.tenantId, async (client) => {
+        // Asked first: a lane that is not there is a 404, not a foreign-key violation.
+        const lane = await client.query('SELECT 1 FROM lanes WHERE tenant_id = $1 AND id = $2', [req.tenantId, req.params.laneId]);
+        if (lane.rowCount === 0) throw new HttpError(404, 'lane not found');
         const { rows } = await client.query(
           `INSERT INTO lane_devices (tenant_id, lane_id, name, token_hash) VALUES ($1,$2,$3,$4)
            RETURNING id, lane_id, name, created_at`,
@@ -1245,6 +1314,7 @@ export function createApp() {
   // Lane surface. Authenticated by device token.
   // -------------------------------------------------------------------------
   const lane = express.Router();
+  checkIds(lane, ID_PARAMS.lane);
 
   lane.use(async (req, _res, next) => {
     try {
@@ -1572,7 +1642,7 @@ export function createApp() {
       const pre = await withTenant(tenantId, async (client) => {
         const stay = await repo.lockOpenStay(client, tenantId, garageId, sessionId);
         if (!stay) {
-          throw conflict('stay_not_open', 'the stay is not open in this garage: a validation is claimed before the close, never after');
+          throw conflict('stay_not_open', STAY_NOT_OPEN);
         }
         const garage = await repo.getGarage(client, tenantId, garageId);
         const open = await repo.findOpenSessionById(client, tenantId, garageId, sessionId);
@@ -1604,7 +1674,7 @@ export function createApp() {
       const out = await withTenant(tenantId, async (client) => {
         const stay = await repo.lockOpenStay(client, tenantId, garageId, sessionId);
         if (!stay) {
-          throw conflict('stay_not_open', 'the stay is not open in this garage: a validation is claimed before the close, never after');
+          throw conflict('stay_not_open', STAY_NOT_OPEN);
         }
         if (stay.validation?.state !== 'claiming' || stay.validation.attempt !== pre.attempt) {
           throw conflict('claim_superseded', 'another claim or a release for this stay came first; nothing was asked');
@@ -2069,7 +2139,19 @@ export function createApp() {
   app.use('/api/v1/lane', lane);
   app.use('/api/v1', operator);
 
-  app.use((err, _req, res, _next) => {
+  app.use((err, req, res, _next) => {
+    // A request whose body could not be read: one fixed sentence, never the
+    // parser's, which quotes what was sent; and never stored or sniffed. For
+    // EVERY request, not for a path prefix: routing ignores the letter case of
+    // the path and a prefix test does not, so `/API/V1/garages` was routed as
+    // an operator request and answered in the parser's words. The parser runs
+    // before any router, so no path here is known to be anyone's. The lane is
+    // answered the same way: still a 4xx, without the parser's text.
+    if (err.bodyUnreadable) {
+      res.set('Cache-Control', 'no-store');
+      res.set('X-Content-Type-Options', 'nosniff');
+      return err.status === 413 ? res.status(413).json(BODY_TOO_LARGE) : res.status(400).json(BODY_UNREADABLE);
+    }
     const status = err.status ?? 500;
     // A NAMED 5xx is ours and says what failed upstream -- Stripe refused, or
     // could not be reached -- and the operator needs that sentence. Anything

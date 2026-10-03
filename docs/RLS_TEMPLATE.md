@@ -57,8 +57,10 @@ correcting the schema, which invites someone to weaken the assertion instead.
 
 ## The one sanctioned exception: authentication
 
-Every tenant-owned table follows the template above. Exactly one does not, and
-this section is the standard for it rather than a note about a special case.
+Every tenant-owned table follows the template above. The credential tables do
+not — `lane_devices` (0002), `operator_tokens` (0003) and `operator_users`
+(0024) — and this section is the standard for them rather than a note about a
+special case.
 
 **The problem the template cannot express.** A lane controller presents a token.
 The tenant that token belongs to is *precisely what the lookup exists to
@@ -106,9 +108,10 @@ which is what a definer function needs.
 - `openparking_app` still cannot read the table with no tenant context.
 - `openparking_app` still cannot see another tenant's devices with one.
 - The resolver returns nothing for an unknown or revoked token.
-- `test/rls-coverage.test.js` asserts this is the **only** non-forced table in
-  the schema, so the exception cannot quietly spread. Adding a second one fails
-  CI until somebody writes down why.
+- `test/rls-coverage.test.js` asserts these are the **only** non-forced tables
+  in the schema (`NOT_FORCED_BY_DESIGN` in `test/tenant-tables.js`), so the
+  exception cannot quietly spread. Adding another fails CI until somebody
+  writes down why.
 
 Anything else that needs to resolve a credential before a tenant is known
 follows this shape. Anything that does not need to resolve a credential uses the
