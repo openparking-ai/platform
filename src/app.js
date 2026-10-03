@@ -309,17 +309,15 @@ const PLATE_MAX = 32;
  *
  * A descriptor is the identity service's opaque, versioned, compact string
  * (`opvid-fp/<version>:…`), and this platform does not parse it -- migration
- * 0009 says what it is and why it lives on the session. What this side CAN
+ * 0009 says why it lives on the session. What this side CAN
  * stand behind is that it is a string, that it is not blank, and that it is not
  * a device token's worth of text: it is stored per stay and compared against
  * every open stay in a garage at the exit, so an unbounded one is a row an
  * attacker chooses the size of.
  *
- * The bound is a DECISION with a measurement behind it: the identity service
- * caps ORB at 256 keypoints and SIFT at 128, and an INCOMPRESSIBLE (random)
- * payload of that size encodes to 12,333 characters (ORB) and 23,262 (SIFT),
- * measured 2026-09-20 against vehicle-id f29f64f. Sixty-four KiB is more than
- * twice the worst case, with room for the descriptor's own version to grow.
+ * The bound is a DECISION: sixty-four KiB is more than twice the longest
+ * descriptor the identity service produces, with room for the descriptor's
+ * own version to grow.
  */
 const DESCRIPTOR_MAX = 65536;
 

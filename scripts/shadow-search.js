@@ -44,7 +44,7 @@ for (const tenantId of tenants) {
 }
 console.log(
   `${tenants.length} tenant(s); ${searched} shadow search(es) recorded, ${failed} left pending; ` +
-    `thresholds structure=${thresholds.structure} colour=${thresholds.colour_bhattacharyya}`,
+    `thresholds structure=${thresholds.structure} colour=${thresholds.colour}`,
 );
 await pool.end();
 process.exit(failed ? 1 : 0);

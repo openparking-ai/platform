@@ -83,7 +83,7 @@ export function thresholdsFromEnv(env = process.env) {
   };
   return {
     structure: read('SHADOW_THRESHOLD_STRUCTURE'),
-    colour_bhattacharyya: read('SHADOW_THRESHOLD_COLOUR'),
+    colour: read('SHADOW_THRESHOLD_COLOUR'),
   };
 }
 
