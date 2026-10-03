@@ -52,6 +52,8 @@
  *   password_file_writable_taken  a password file others can write is taken (R6).
  *   password_folder_writable_taken  a password file in a folder others can write is taken (round 3, F1).
  *   lock_count_never_restarts  after a lock ends the count goes on, so one wrong password locks again (round 3, F3).
+ *   minted_after_password_change  a sign-in that checked the old password gets a session after the change (round 4, F6).
+ *   user_row_not_held        the hash is read again but the row is not held, so a change lands before the session (round 4, F6).
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0024, so the property genuinely never existed:
@@ -59,6 +61,7 @@
  *   session_is_a_key         a session token is accepted as a Bearer key.
  *   public_execute_restored  resolve_operator_user is executable by PUBLIC again (F2).
  *   session_outlives_password_change  a session from before a password change is still found (round 3, F2).
+ *   hash_change_moves_no_time  a change of the hash alone leaves password_changed_at, so sessions live on (round 4, F5).
  *
  * Needs the same environment as the suite.
  */
@@ -440,6 +443,22 @@ const SOURCE_BREAKS = [
     to: '           failed_count = l.failed_count + 1,\n' +
       '           locked_until = CASE WHEN l.failed_count + 1 >= $4 THEN now() + make_interval(mins => $5) ELSE l.locked_until END,\n',
   },
+  {
+    name: 'minted_after_password_change',
+    why: 'a sign-in that checked the old password gets a session after the change',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      if (still.rowCount !== 1) return null;\n',
+    to: '',
+  },
+  {
+    name: 'user_row_not_held',
+    why: 'the hash is read again but the row is not held, so a change lands before the session',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: ' AND password_hash = $2 FOR SHARE\'',
+    to: ' AND password_hash = $2\'',
+  },
 ];
 
 const SCHEMA_BREAKS = [
@@ -466,6 +485,20 @@ const SCHEMA_BREAKS = [
     why: 'a session from before a password change is still found',
     suite: SIGN_IN,
     edits: [{ file: '0024_operator_sign_in.sql', from: '         AND t.created_at >= u.password_changed_at\n', to: '' }],
+  },
+  {
+    name: 'hash_change_moves_no_time',
+    why: 'a change of the hash alone leaves password_changed_at, so sessions live on',
+    suite: SIGN_IN,
+    edits: [{
+      file: '0024_operator_sign_in.sql',
+      from: 'CREATE TRIGGER operator_users_password_changed\n' +
+        '  BEFORE UPDATE OF password_hash ON operator_users\n' +
+        '  FOR EACH ROW\n' +
+        '  WHEN (NEW.password_hash IS DISTINCT FROM OLD.password_hash)\n' +
+        '  EXECUTE FUNCTION operator_users_password_changed();\n',
+      to: '',
+    }],
   },
 ];
 

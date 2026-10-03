@@ -316,8 +316,13 @@ list — and a password argument, in any spelling, is refused by name. It is at
 least 12 characters; length is the one rule. A reset revokes every session of
 that admin and clears every lock on it. Apart from the revoke, a session issued
 before the admin's password last changed (`password_changed_at`) is never found
-again, revoked or not, so a password changed in the database by hand ends the
-sessions signed in with the old one too. There is no change-password route yet;
+again, revoked or not. The database sets `password_changed_at` itself whenever
+the hash changes, so **any change of the hash, by any path** — the reset
+command, or SQL by hand that sets the hash alone — ends every session signed in
+before it. A sign-in still checking the old password when the change lands is
+refused like any refusal and gets no session: one is made only while the hash it
+checked is still the admin's, with the admin's row held from that reading until
+the session is written. There is no change-password route yet;
 that comes with the account page.
 
 **The cookie** is `op_session`: `HttpOnly` (page script can never read it),

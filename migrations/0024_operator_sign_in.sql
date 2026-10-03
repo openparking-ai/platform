@@ -46,6 +46,29 @@ CREATE POLICY operator_users_tenant_isolation ON operator_users
   USING      (tenant_id = current_tenant_id())
   WITH CHECK (tenant_id = current_tenant_id());
 
+-- Any change of the hash, by any path -- the reset command or SQL by hand,
+-- with `password_changed_at` set or not -- moves `password_changed_at` to the
+-- moment of the change, so it ends every session signed in before it (the
+-- session resolver below). The moment is the clock's when the row is changed,
+-- not the transaction's start: a change whose transaction began before a
+-- sign-in, or that waited for a sign-in to finish with the row, is still later
+-- than that sign-in's session. Never earlier than a time the change itself set.
+CREATE FUNCTION operator_users_password_changed() RETURNS trigger
+  LANGUAGE plpgsql
+  SET search_path = pg_catalog, public
+  AS $$
+  BEGIN
+    NEW.password_changed_at := greatest(NEW.password_changed_at, clock_timestamp());
+    RETURN NEW;
+  END
+  $$;
+
+CREATE TRIGGER operator_users_password_changed
+  BEFORE UPDATE OF password_hash ON operator_users
+  FOR EACH ROW
+  WHEN (NEW.password_hash IS DISTINCT FROM OLD.password_hash)
+  EXECUTE FUNCTION operator_users_password_changed();
+
 CREATE FUNCTION resolve_operator_user(p_email text)
   RETURNS TABLE (user_id uuid, tenant_id uuid, password_hash text)
   LANGUAGE sql
@@ -129,8 +152,11 @@ CREATE OR REPLACE FUNCTION resolve_operator_token(p_token_hash text)
 -- not found, so it is not touched.
 --
 -- Nor is a session issued before the admin's password last changed, revoked
--- or not: a password changed by any route, the reset command or SQL by hand,
--- ends every session signed in with the one before it.
+-- or not: any change of the hash, by any path, moves `password_changed_at`
+-- (the trigger above), and so ends every session signed in before it. A
+-- sign-in still checking the old password when the change lands gets no
+-- session at all: src/signIn.js makes one only while the hash it checked is
+-- still the admin's, with the row held until the session is written.
 CREATE FUNCTION resolve_operator_session(p_token_hash text, p_idle_seconds integer)
   RETURNS TABLE (token_id uuid, tenant_id uuid, user_id uuid, email text, expires_at timestamptz, idle_ends_at timestamptz)
   LANGUAGE sql

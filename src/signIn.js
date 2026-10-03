@@ -357,9 +357,18 @@ export const internals = {
       ));
   },
 
+  /**
+   * A session for `user`, whose `password_hash` is the hash the password was
+   * checked against -- or null when that is no longer the admin's: the
+   * password changed while it was being checked. The row is held from that
+   * reading until the session is written, so a change cannot land between
+   * them; a change that waits for it is later than the session, and ends it.
+   */
   async mintSession(user, address, settings) {
     const token = generateDeviceToken();
     const row = await withTenant(user.tenant_id, async (c) => {
+      const still = await c.query('SELECT 1 FROM operator_users WHERE id = $1 AND password_hash = $2 FOR SHARE', [user.user_id, user.password_hash]);
+      if (still.rowCount !== 1) return null;
       await c.query('DELETE FROM operator_sign_in_locks WHERE user_id = $1 AND address = $2', [user.user_id, address]);
       // This user's ended sessions are of no further use to anyone.
       await c.query(
@@ -374,7 +383,7 @@ export const internals = {
         [user.tenant_id, hashToken(token), user.user_id, settings.maxSeconds, settings.idleSeconds],
       )).rows[0];
     });
-    return { token, row };
+    return row ? { token, row } : null;
   },
 };
 
@@ -452,7 +461,14 @@ export function createAuthRouter(settings) {
         return await refuse(req, res, 401, REFUSED);
       }
 
-      const { token, row } = await internals.mintSession(found, address, settings);
+      const minted = await internals.mintSession(found, address, settings);
+      if (!minted) {
+        // The password changed while this one was being checked: refused like
+        // any refusal, through the same failure write, which counts nothing.
+        await internals.recordFailure(user, address, false);
+        return await refuse(req, res, 401, REFUSED);
+      }
+      const { token, row } = minted;
       setCookie(res, settings, token);
       return res.status(200).json({
         email: body.email,
