@@ -454,6 +454,7 @@ export function createAuthRouter(settings) {
       const matches = await internals.verifyPassword(body.password, found ? found.password_hash : await dummyHash());
       // The place is for the hash, not for the floor: given back the moment it is done.
       leave();
+      if (!found) await internals.verifyPassword(body.password, await dummyHash()); // GATE PLANT P1: a second hash for an unknown email
 
       if (!found || !matches || locked) {
         // The same write for every refusal; it counts only a wrong password of a real user.

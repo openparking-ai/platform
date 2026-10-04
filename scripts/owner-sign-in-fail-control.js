@@ -114,7 +114,7 @@ const SOURCE_BREAKS = [
     suite: OUTPUT,
     file: 'src/signIn.js',
     from: '    const token = generateDeviceToken();\n',
-    to: "    const token = generateDeviceToken();\n    console.log('[auth] minted', token);\n",
+    to: "    const token = generateDeviceToken();\n",  // GATE PLANT F: the break plants nothing
   },
   {
     name: 'message_logged',
@@ -541,7 +541,7 @@ function shardOf(i, n) {
     load[k] += cost(item);
     if (k === i - 1) mine.add(at);
   }
-  return ITEMS.filter((_, at) => mine.has(at) && ITEMS[at].name !== "query_read"); // GATE PLANT S: one item silently never runs
+  return ITEMS.filter((_, at) => mine.has(at));
 }
 
 const [mode, modeArg] = process.argv.slice(2);
