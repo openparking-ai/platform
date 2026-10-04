@@ -299,9 +299,21 @@ sign-in **is a session token**, minted the way operator tokens are (random 32
 bytes, only its SHA-256 stored), so every operator route works unchanged behind
 it (migration 0024).
 
-    POST /api/v1/auth/sign-in    {email, password}  ->  200 {email, tenant_id, session_ends_at} and the cookie
+    POST /api/v1/auth/sign-in    {email, password}  ->  200 {email, tenant_id, session_ends_at, language} and the cookie
     POST /api/v1/auth/sign-out   revokes the session row                 ->  204
-    GET  /api/v1/auth/me         {email, tenant_id, session_ends_at}
+    GET  /api/v1/auth/me         {email, tenant_id, session_ends_at, language}
+    PUT  /api/v1/auth/language   {language}         ->  200 {language}
+
+**The owner's language** (migration 0025) is kept on the admin's own row:
+`en` unless the owner chose `es`, and every admin made before 0025 is `en`. The
+database refuses any other value. `PUT /api/v1/auth/language` changes it for the
+signed-in admin only: the admin and the tenant are the session's, and nothing
+else in the body is read, nor the query: `?language=es` never stands in for a
+body that names no language. It follows the cookie's rules below
+(the `Origin` must be `ADMIN_ORIGIN`), and anything but `{"language": "en"}` or
+`{"language": "es"}` sent as JSON is refused `400 language_refused` and changes
+nothing. The admin screens read it from sign-in's answer, so the owner's screens
+speak their language on any computer.
 
 **The admin is made at the database, never over HTTP**, as an operator token is:
 

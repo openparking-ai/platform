@@ -6,9 +6,10 @@
  * every operator route works unchanged behind it. The session travels in a
  * cookie page script can never read.
  *
- *   POST /api/v1/auth/sign-in    {email, password} -> the cookie, and who and until when
+ *   POST /api/v1/auth/sign-in    {email, password} -> the cookie, and who, until when, and their language
  *   POST /api/v1/auth/sign-out   revokes the session row
- *   GET  /api/v1/auth/me         email, tenant, when the session ends
+ *   GET  /api/v1/auth/me         email, tenant, when the session ends, language
+ *   PUT  /api/v1/auth/language   {language} -> the signed-in admin's own language (0025)
  *
  * What each rule is for, because each is one of the ways sign-in went wrong on
  * the maintainer's other systems:
@@ -46,6 +47,10 @@
  * NO CREDENTIAL IN A URL. No route here has a path parameter or reads the
  * query.
  *
+ * ONLY YOUR OWN ROW. The language route changes the admin the SESSION names,
+ * in that session's tenant, and nobody else: a user or tenant named in the
+ * body is never read. It writes one column of one row, and only `en` or `es`.
+ *
  * CROSS-SITE. The cookie is `SameSite=Strict`, and a request that CHANGES
  * something and is authenticated by the cookie must carry an `Origin` equal
  * to ADMIN_ORIGIN, or it is refused. A sign-in carrying a foreign Origin is
@@ -74,6 +79,11 @@ export const SESSION_ENDED = Object.freeze({ error: 'The session has ended. Sign
 export const SIGN_IN_REQUIRED = Object.freeze({ error: 'Sign in first.', code: 'sign_in_required' });
 //: The hash line is full. Decided before the email is read, so the same for every email.
 export const BUSY = Object.freeze({ error: 'Sign-in is busy. Try again in a moment.', code: 'sign_in_busy' });
+//: Anything but {"language": "en" | "es"}, sent as JSON: one refusal, whatever was wrong with it.
+export const LANGUAGE_REFUSED = Object.freeze({ error: 'The language must be "en" or "es", sent as JSON: {"language"}.', code: 'language_refused' });
+
+//: The languages the admin screens have words for (0025's check holds the same two).
+export const LANGUAGES = Object.freeze(['en', 'es']);
 
 //: Who an unknown email is: no user and no tenant, so the lock lookup and the
 //: failure write run as they do for a known email and find and write nothing.
@@ -367,7 +377,7 @@ export const internals = {
   async mintSession(user, address, settings) {
     const token = generateDeviceToken();
     const row = await withTenant(user.tenant_id, async (c) => {
-      const still = await c.query('SELECT 1 FROM operator_users WHERE id = $1 AND password_hash = $2 FOR SHARE', [user.user_id, user.password_hash]);
+      const still = await c.query('SELECT language FROM operator_users WHERE id = $1 AND password_hash = $2 FOR SHARE', [user.user_id, user.password_hash]);
       if (still.rowCount !== 1) return null;
       await c.query('DELETE FROM operator_sign_in_locks WHERE user_id = $1 AND address = $2', [user.user_id, address]);
       // This user's ended sessions are of no further use to anyone.
@@ -376,14 +386,30 @@ export const internals = {
            AND (revoked_at IS NOT NULL OR expires_at <= now() OR last_seen_at <= now() - make_interval(secs => $2))`,
         [user.user_id, settings.idleSeconds],
       );
-      return (await c.query(
+      const session = (await c.query(
         `INSERT INTO operator_tokens (tenant_id, name, token_hash, kind, user_id, expires_at, last_seen_at)
          VALUES ($1, 'sign-in', $2, 'session', $3, now() + make_interval(secs => $4), now())
          RETURNING id, expires_at, last_seen_at + make_interval(secs => $5) AS idle_ends_at`,
         [user.tenant_id, hashToken(token), user.user_id, settings.maxSeconds, settings.idleSeconds],
       )).rows[0];
+      return { ...session, language: still.rows[0].language };
     });
     return row ? { token, row } : null;
+  },
+
+  /** The language of the admin a session names, read in that session's tenant. */
+  async languageOf(session) {
+    return withTenant(session.tenant_id, async (c) =>
+      (await c.query('SELECT language FROM operator_users WHERE id = $1', [session.user_id])).rows[0]?.language ?? null);
+  },
+
+  /**
+   * The language of the admin a session names: the user and the tenant are the
+   * SESSION's, never the request's. One column of one row.
+   */
+  async setLanguage(session, language) {
+    return withTenant(session.tenant_id, async (c) =>
+      (await c.query('UPDATE operator_users SET language = $1 WHERE id = $2 AND tenant_id = $3', [language, session.user_id, session.tenant_id])).rowCount);
   },
 };
 
@@ -409,6 +435,23 @@ function logFailure(where, err) {
 const jsonBody = express.json({ limit: '4kb' });
 function readSignInBody(req, res, next) {
   jsonBody(req, res, (err) => next(err ? Object.assign(new Error('the sign-in body could not be read', { cause: err }), { unreadable: true }) : undefined));
+}
+
+/**
+ * The language route's body, read after the session is known: any failure to
+ * read it -- not JSON, too long, broken -- is the one language refusal. Nothing
+ * longer than a language and its key is ever a language, so the limit is small.
+ */
+const languageJson = express.json({ limit: '256b', strict: true });
+function readLanguageBody(req, res, next) {
+  languageJson(req, res, (err) => next(err ? Object.assign(new Error('the language body could not be read', { cause: err }), { languageRefused: true }) : undefined));
+}
+
+/** The language in the body, or null. Only `language` is read: nothing else in the body names anyone. */
+function languageBody(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const { language } = body;
+  return typeof language === 'string' && LANGUAGES.includes(language) ? language : null;
 }
 
 export function createAuthRouter(settings) {
@@ -474,6 +517,7 @@ export function createAuthRouter(settings) {
         email: body.email,
         tenant_id: found.tenant_id,
         session_ends_at: endsAt({ expires_at: row.expires_at, idle_ends_at: row.idle_ends_at }).toISOString(),
+        language: row.language,
       });
     } catch (err) {
       return next(err);
@@ -511,8 +555,33 @@ export function createAuthRouter(settings) {
     }
   });
 
-  router.get('/me', session, (req, res) => {
-    res.json({ email: req.session.email, tenant_id: req.session.tenant_id, session_ends_at: endsAt(req.session).toISOString() });
+  router.get('/me', session, async (req, res, next) => {
+    try {
+      const language = await internals.languageOf(req.session);
+      res.json({ email: req.session.email, tenant_id: req.session.tenant_id, session_ends_at: endsAt(req.session).toISOString(), language });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * The signed-in admin's own language. The session -- cookie, Origin, live --
+   * is settled before the body is read; the admin and the tenant are the
+   * session's. Anything but `en` or `es` is refused and writes nothing.
+   */
+  router.put('/language', session, (req, res, next) => {
+    if (!req.is('application/json')) return res.status(400).json(LANGUAGE_REFUSED);
+    next();
+  }, readLanguageBody, async (req, res, next) => {
+    try {
+      const language = languageBody(req.body);
+      if (!language) return res.status(400).json(LANGUAGE_REFUSED);
+      const changed = await internals.setLanguage(req.session, language);
+      if (changed !== 1) throw new Error('the signed-in admin has no row to change');
+      return res.status(200).json({ language });
+    } catch (err) {
+      return next(err);
+    }
   });
 
   // Anything else under /auth is not a route.
@@ -523,6 +592,7 @@ export function createAuthRouter(settings) {
   // what it is, never by what it says. On sign-in, neither comes before the floor.
   router.use(async (err, req, res, _next) => {
     const onSignIn = req.method === 'POST' && req.path === '/sign-in';
+    if (err?.languageRefused) return res.status(400).json(LANGUAGE_REFUSED);
     if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);
     // A stored hash this code does not know is named here, PasswordHashUnrecognised.
     logFailure(req.path.replace(/^\//, ''), err);

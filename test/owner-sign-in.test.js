@@ -159,7 +159,7 @@ test('a sign-in sets the cookie with all five properties, answers who and until 
   assert.ok(!attrs.includes('domain'), 'no Domain');
   const token = tokenOf(r);
   assert.match(token, /^opl_[A-Za-z0-9_-]{43}$/);
-  assert.deepEqual(Object.keys(r.json).sort(), ['email', 'session_ends_at', 'tenant_id']);
+  assert.deepEqual(Object.keys(r.json).sort(), ['email', 'language', 'session_ends_at', 'tenant_id']);
   assert.equal(r.json.email, who.email);
   assert.equal(r.json.tenant_id, who.tenant);
   assert.equal(r.text.includes(token), false);
@@ -609,7 +609,7 @@ test('A GET never changes anything: every operator GET, cookie-authenticated fro
 
 test('NO CREDENTIAL IN A URL: no auth route has a path parameter, and the auth code reads no query', async () => {
   const auth = routeTable(main.app).filter((r) => r.base === '/api/v1/auth');
-  assert.deepEqual(auth.map((r) => `${r.method} ${r.path}`).sort(), ['GET /me', 'POST /sign-in', 'POST /sign-out']);
+  assert.deepEqual(auth.map((r) => `${r.method} ${r.path}`).sort(), ['GET /me', 'POST /sign-in', 'POST /sign-out', 'PUT /language']);
   for (const r of auth) assert.equal(r.path.includes(':'), false, `${r.method} ${r.path}`);
   const source = readFileSync(new URL('../src/signIn.js', import.meta.url), 'utf8');
   assert.equal(/req\.(query|params)\b/.test(source), false, 'src/signIn.js reads req.query or req.params');
@@ -760,7 +760,9 @@ test('NO ORACLE, IN WORK: unknown email, wrong password and locked address run t
   // files in the suite write lock rows while this runs, but none for these
   // users. A lock row needs a real user, so an unknown email could only ever
   // be charged to one: at the caller's address, or somewhere else. The
-  // controls show each count sees a row when one is written.
+  // controls show each count sees a row when one is written. Each address is
+  // counted before and after, never against zero: a test database that is
+  // used again still holds the lock rows earlier runs wrote at these addresses.
   const locksAt = async (address) => Number((await admin.query('SELECT count(*) FROM operator_sign_in_locks WHERE address = $1', [address])).rows[0].count);
   const ownLocks = async () => (await admin.query(
     `SELECT count(*)::int AS rows, coalesce(sum(l.failed_count), 0)::int AS failed
@@ -770,11 +772,12 @@ test('NO ORACLE, IN WORK: unknown email, wrong password and locked address run t
   const salt = Math.floor(Math.random() * 250) + 1;
   const [nobodyAt, controlAt] = [`203.0.113.${salt}`, `198.18.200.${salt}`];
   const ownBefore = await ownLocks();
+  const [nobodyBefore, controlBefore] = [await locksAt(nobodyAt), await locksAt(controlAt)];
   await call(trusted.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG }, headers: { 'x-forwarded-for': nobodyAt } });
-  assert.equal(await locksAt(nobodyAt), 0, 'an unknown email makes no lock row');
+  assert.equal(await locksAt(nobodyAt), nobodyBefore, 'an unknown email makes no lock row');
   assert.deepEqual(await ownLocks(), ownBefore, "an unknown email is charged to none of this test's users, at any address");
   await call(trusted.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG }, headers: { 'x-forwarded-for': controlAt } });
-  assert.equal(await locksAt(controlAt), 1, 'CONTROL: a wrong password from that kind of address makes one');
+  assert.equal(await locksAt(controlAt), controlBefore + 1, 'CONTROL: a wrong password from that kind of address makes one');
   assert.deepEqual(await ownLocks(), { rows: ownBefore.rows + 1, failed: ownBefore.failed + 1 }, "CONTROL: and this test's users' count sees it");
   const unknown = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG } }));
   const wrong = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG } }));
