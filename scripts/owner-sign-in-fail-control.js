@@ -64,6 +64,20 @@
  *   hash_change_moves_no_time  a change of the hash alone leaves password_changed_at, so sessions live on (round 4, F5).
  *
  * Needs the same environment as the suite.
+ *
+ * SHARDS. Every suite-runs-intact check and every break above is one ITEM. With
+ * no argument all items run, in order, as they always have. CI spreads them
+ * over parallel jobs, each with its own database, and then proves the spread
+ * left nothing out:
+ *   --plan               print every item's name, one per line
+ *   --shard i/N          run the items of shard i of N; write what ran and what
+ *                        failed to sign-in-control-shard-<i>.json
+ *   --verify <dir>       read the shard files in <dir>: shards 1..N each exactly
+ *                        once, every item of the plan run exactly once and none
+ *                        else, no control failed -- or exit 1, naming what is wrong
+ * Which shard an item lands in is chosen by a rough cost (a run of the sign-in
+ * suite takes about a minute on CI, the others seconds) so the shards end
+ * together. The cost only balances; it never decides whether an item runs.
  */
 import { spawnSync } from 'node:child_process';
 import {
@@ -502,6 +516,87 @@ const SCHEMA_BREAKS = [
   },
 ];
 
+const CONTROL_A_SUITES = [SIGN_IN, CLI, OUTPUT, DEFINERS, IDS, COLD_START, START];
+
+//: Every item, in the order a full run takes them.
+const ITEMS = [
+  ...CONTROL_A_SUITES.map((suite) => ({ kind: 'intact', name: `intact ${suite.join(' ')}`, suite })),
+  ...SOURCE_BREAKS.map((brk) => ({ kind: 'source', name: brk.name, brk })),
+  ...SCHEMA_BREAKS.map((brk) => ({ kind: 'schema', name: brk.name, brk })),
+];
+
+/** Roughly how long an item takes on CI, in seconds: for balancing the shards, nothing else. */
+function cost(item) {
+  const suite = item.kind === 'intact' ? item.suite : item.brk.suite;
+  return suite.some((f) => SIGN_IN.includes(f) || OUTPUT.includes(f)) ? 65 : 5;
+}
+
+/** The items of shard `i` of `n`: longest first, each to the shard with the least so far. */
+function shardOf(i, n) {
+  const load = Array(n).fill(0);
+  const mine = new Set();
+  const order = ITEMS.map((item, at) => ({ item, at })).sort((a, b) => cost(b.item) - cost(a.item) || a.at - b.at);
+  for (const { item, at } of order) {
+    const k = load.indexOf(Math.min(...load));
+    load[k] += cost(item);
+    if (k === i - 1) mine.add(at);
+  }
+  return ITEMS.filter((_, at) => mine.has(at));
+}
+
+const [mode, modeArg] = process.argv.slice(2);
+if (mode !== undefined && !['--plan', '--shard', '--verify'].includes(mode)) {
+  console.error(`unknown argument ${JSON.stringify(mode)}: --plan, --shard i/N, --verify <dir>, or nothing`);
+  process.exit(2);
+}
+if (new Set(ITEMS.map((item) => item.name)).size !== ITEMS.length) {
+  console.error('two items share a name; a shard report could not tell them apart');
+  process.exit(2);
+}
+if (mode === '--plan') {
+  for (const item of ITEMS) console.log(item.name);
+  process.exit(0);
+}
+if (mode === '--verify') {
+  const dir = modeArg;
+  const files = dir ? readdirSync(dir).filter((f) => /^sign-in-control-shard-\d+\.json$/.test(f)) : [];
+  const reports = files.map((f) => JSON.parse(readFileSync(join(dir, f), 'utf8')));
+  const wrong = [];
+  const of = new Set(reports.map((r) => r.of));
+  if (reports.length === 0) wrong.push(`no shard report in ${dir}`);
+  if (of.size > 1) wrong.push(`shard reports disagree on the shard count: ${[...of].join(', ')}`);
+  const n = [...of][0];
+  for (let i = 1; i <= n; i += 1) {
+    const count = reports.filter((r) => r.shard === i).length;
+    if (count !== 1) wrong.push(`shard ${i}/${n} reported ${count} times`);
+  }
+  for (const r of reports) if (!(r.shard >= 1 && r.shard <= n)) wrong.push(`a report from shard ${r.shard} of ${n}`);
+  const ran = reports.flatMap((r) => r.ran);
+  for (const item of ITEMS) {
+    const times = ran.filter((name) => name === item.name).length;
+    if (times !== 1) wrong.push(`${item.name} ran ${times} times`);
+  }
+  for (const name of new Set(ran)) if (!ITEMS.some((item) => item.name === name)) wrong.push(`${name} ran but is not in the plan`);
+  for (const r of reports) if (r.failures !== 0) wrong.push(`shard ${r.shard}/${r.of}: ${r.failures} control(s) failed`);
+  if (wrong.length) {
+    for (const w of wrong) console.error(`  ${w}`);
+    console.error(`\nthe sign-in control's shards do not add up to one whole run (${wrong.length} problem(s)).`);
+    process.exit(1);
+  }
+  console.log(`all ${ITEMS.length} items ran exactly once over ${n} shards, every control OK.`);
+  process.exit(0);
+}
+let shard = null;
+if (mode === '--shard') {
+  const m = /^([0-9]{1,2})\/([0-9]{1,2})$/.exec(modeArg ?? '');
+  if (!m || Number(m[1]) < 1 || Number(m[1]) > Number(m[2])) {
+    console.error(`--shard takes i/N with 1 <= i <= N, not ${JSON.stringify(modeArg)}`);
+    process.exit(2);
+  }
+  shard = { i: Number(m[1]), n: Number(m[2]) };
+}
+const RUN = shard ? shardOf(shard.i, shard.n) : ITEMS;
+
 function stage() {
   const dir = mkdtempSync(join(tmpdir(), 'openparking-sign-in-control-'));
   for (const entry of ['src', 'test', 'scripts', 'migrations', 'package.json']) {
@@ -599,6 +694,7 @@ async function buildScratch(dir, brk) {
 }
 
 let failures = 0;
+const ran = [];
 const report = (brk, broken) => {
   if (broken.status === 0) {
     console.error(`  ${brk.name.padEnd(24)} *** PASSED WHEN ${brk.why.toUpperCase()} — the suite is not measuring this ***`);
@@ -608,26 +704,34 @@ const report = (brk, broken) => {
   }
 };
 
-const intactDir = stage();
-try {
-  console.log('== control A: the suites must PASS intact ==');
-  for (const suite of [SIGN_IN, CLI, OUTPUT, DEFINERS, IDS, COLD_START, START]) {
-    const intact = run(intactDir, suite);
-    if (intact.status === 0) {
-      console.log(`  control A OK — ${suite.join(' ')}: ${summarise(intact)}`);
-    } else {
-      console.error(`  CONTROL A FAILED — ${suite.join(' ')} does not pass even intact: ${summarise(intact)}`);
-      console.error(intact.stdout.slice(-4000));
-      console.error(intact.stderr.slice(-4000));
-      failures += 1;
+if (shard) console.log(`== shard ${shard.i} of ${shard.n}: ${RUN.length} of ${ITEMS.length} items ==\n`);
+
+const intact = RUN.filter((item) => item.kind === 'intact');
+if (intact.length) {
+  const intactDir = stage();
+  try {
+    console.log('== control A: the suites must PASS intact ==');
+    for (const { name, suite } of intact) {
+      ran.push(name);
+      const result = run(intactDir, suite);
+      if (result.status === 0) {
+        console.log(`  control A OK — ${suite.join(' ')}: ${summarise(result)}`);
+      } else {
+        console.error(`  CONTROL A FAILED — ${suite.join(' ')} does not pass even intact: ${summarise(result)}`);
+        console.error(result.stdout.slice(-4000));
+        console.error(result.stderr.slice(-4000));
+        failures += 1;
+      }
     }
+  } finally {
+    rmSync(intactDir, { recursive: true, force: true });
   }
-} finally {
-  rmSync(intactDir, { recursive: true, force: true });
 }
 
-console.log('\n== control B: each SOURCE break must make it FAIL ==');
-for (const brk of SOURCE_BREAKS) {
+const sources = RUN.filter((item) => item.kind === 'source');
+if (sources.length) console.log('\n== control B: each SOURCE break must make it FAIL ==');
+for (const { brk } of sources) {
+  ran.push(brk.name);
   const dir = stage();
   try {
     if (!plant(dir, brk)) {
@@ -641,8 +745,10 @@ for (const brk of SOURCE_BREAKS) {
   }
 }
 
-console.log('\n== control C: each SCHEMA break must make it FAIL ==');
-for (const brk of SCHEMA_BREAKS) {
+const schemas = RUN.filter((item) => item.kind === 'schema');
+if (schemas.length) console.log('\n== control C: each SCHEMA break must make it FAIL ==');
+for (const { brk } of schemas) {
+  ran.push(brk.name);
   const dir = stage();
   try {
     const built = await buildScratch(dir, brk);
@@ -657,10 +763,15 @@ for (const brk of SCHEMA_BREAKS) {
   }
 }
 
-await withAdmin(maintenance.toString(), (c) => c.query(`DROP DATABASE IF EXISTS ${pg.escapeIdentifier(SCRATCH)}`));
+if (schemas.length) await withAdmin(maintenance.toString(), (c) => c.query(`DROP DATABASE IF EXISTS ${pg.escapeIdentifier(SCRATCH)}`));
 
+if (shard) {
+  writeFileSync(`sign-in-control-shard-${shard.i}.json`, `${JSON.stringify({ shard: shard.i, of: shard.n, ran, failures })}\n`);
+}
 if (failures) {
   console.error(`\n${failures} control(s) failed. Do not trust this round's sign-in tests.`);
   process.exit(1);
 }
-console.log('\nall controls OK — the suites fail on every property owner sign-in rests on.');
+console.log(shard
+  ? `\nshard ${shard.i} of ${shard.n}: all ${ran.length} controls OK.`
+  : '\nall controls OK — the suites fail on every property owner sign-in rests on.');
