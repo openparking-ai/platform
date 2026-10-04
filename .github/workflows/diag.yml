@@ -1,0 +1,73 @@
+name: DIAG cold-start (not for merge)
+on: pull_request
+permissions:
+  contents: read
+env:
+  PGPASSWORD: postgres
+  ADMIN_URL: postgres://postgres:postgres@localhost:5432
+  DATABASE_URL: postgres://postgres:postgres@localhost:5432/openparking_test
+  APP_DATABASE_URL: postgres://openparking_app:ci_password@localhost:5432/openparking_test
+  APP_DB_PASSWORD: ci_password
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [a, b]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install --quiet "git+https://github.com/openparking-ai/rate-engine@$(cat rate-engine.pin)"
+      - run: |
+          python3 -m pip install --quiet \
+            "openparking-garage-pass[store] @ git+https://github.com/openparking-ai/garage-pass@$(cat garage-pass.pin)" \
+            "openparking-monthly-billing[store] @ git+https://github.com/openparking-ai/monthly-billing@$(cat monthly-billing.pin)"
+          for m in garage-pass monthly-billing; do
+            git init -q "$RUNNER_TEMP/$m"
+            git -C "$RUNNER_TEMP/$m" fetch -q --depth 1 "https://github.com/openparking-ai/$m" "$(cat $m.pin)"
+            git -C "$RUNNER_TEMP/$m" checkout -q FETCH_HEAD
+          done
+          echo "GARAGE_PASS_SRC=$RUNNER_TEMP/garage-pass" >> "$GITHUB_ENV"
+          echo "MONTHLY_BILLING_SRC=$RUNNER_TEMP/monthly-billing" >> "$GITHUB_ENV"
+      - run: psql "$ADMIN_URL/postgres" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE openparking_test'
+      - run: npm run migrate
+      - run: npm run ensure-app-role
+      - name: machine
+        run: nproc; lscpu | grep -E 'Model name|^CPU\(s\)'; free -m | head -2
+      - name: harness, base vs planted late decoy, under the suite's load
+        run: |
+          ( while true; do node --test $(ls test/*.test.js | grep -v sign-in-cold-start) >/dev/null 2>&1; done ) & L=$!; sleep 20
+          ROUNDS=60 VARIANTS=base,decoy_late LABEL=load-${{ matrix.leg }} node diag-cold-start.mjs
+          kill $L; pkill -f 'node --test' || true; sleep 2
+      - name: the real test as it is, 20 runs under the suite's load
+        run: |
+          ( while true; do node --test $(ls test/*.test.js | grep -v sign-in-cold-start) >/dev/null 2>&1; done ) & L=$!; sleep 20
+          fails=0
+          for i in $(seq 1 20); do node --test test/sign-in-cold-start.test.js > o.txt 2>&1 || { fails=$((fails+1)); grep -m1 'fastest unknown' o.txt; }; done
+          echo "REAL TEST AS IS under load: $fails of 20 failed"
+          kill $L; pkill -f 'node --test' || true; sleep 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diag-${{ matrix.leg }}
+          path: diag-*.json
