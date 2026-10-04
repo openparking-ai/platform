@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        leg: [a, b]
+        leg: [a, b, c]
     services:
       postgres:
         image: postgres:16
@@ -55,18 +55,24 @@ jobs:
       - run: npm run ensure-app-role
       - name: machine
         run: nproc; lscpu | grep -E 'Model name|^CPU\(s\)'; free -m | head -2
-      - name: harness, base vs planted late decoy, under the suite's load
+      - name: the real test with 25 starts each, 20 runs under the suite's load
         run: |
-          ( while true; do node --test $(ls test/*.test.js | grep -v sign-in-cold-start) >/dev/null 2>&1; done ) & L=$!; sleep 20
-          ROUNDS=60 VARIANTS=base,decoy_late LABEL=load-${{ matrix.leg }} node diag-cold-start.mjs
-          kill $L; pkill -f 'node --test' || true; sleep 2
-      - name: the real test as it is, 20 runs under the suite's load
-        run: |
+          sed -i 's/^const STARTS_EACH = 7;$/const STARTS_EACH = 25;/' test/sign-in-cold-start.test.js
+          grep -n '^const STARTS_EACH' test/sign-in-cold-start.test.js
           ( while true; do node --test $(ls test/*.test.js | grep -v sign-in-cold-start) >/dev/null 2>&1; done ) & L=$!; sleep 20
           fails=0
-          for i in $(seq 1 20); do node --test test/sign-in-cold-start.test.js > o.txt 2>&1 || { fails=$((fails+1)); grep -m1 'fastest unknown' o.txt; }; done
-          echo "REAL TEST AS IS under load: $fails of 20 failed"
-          kill $L; pkill -f 'node --test' || true; sleep 2
+          for i in $(seq 1 20); do s=$(date +%s); node --test test/sign-in-cold-start.test.js > o.txt 2>&1 || { fails=$((fails+1)); grep -m1 'fastest unknown' o.txt; }; echo "run $i $(( $(date +%s)-s ))s"; done
+          echo "25 STARTS EACH, under load: $fails of 20 failed"
+          kill $L || true; pkill -f 'node --test' || true; sleep 2
+      - name: the same, the late decoy planted, 10 runs under the suite's load
+        run: |
+          sed -i 's/^  await dummyHash();$/  void dummyHash;/' src/server.js
+          grep -n 'void dummyHash' src/server.js
+          ( while true; do node --test $(ls test/*.test.js | grep -v sign-in-cold-start) >/dev/null 2>&1; done ) & L=$!; sleep 20
+          caught=0
+          for i in $(seq 1 10); do if node --test test/sign-in-cold-start.test.js > o.txt 2>&1; then echo "run $i PASSED with the plant"; else caught=$((caught+1)); grep -m1 -o 'fastest unknown minus fastest known [-0-9.]* ms' o.txt; fi; done
+          echo "PLANTED, 25 starts each, under load: caught $caught of 10"
+          kill $L || true; pkill -f 'node --test' || true; sleep 2
       - uses: actions/upload-artifact@v4
         with:
           name: diag-${{ matrix.leg }}
