@@ -33,6 +33,7 @@ function stage(variant) {
       : "        await internals.recordFailure(user, address, Boolean(found) && !matches); req.m.write = performance.now();\n");
   patch(dir, 'src/signIn.js', "    if (wait > 0) await sleep(wait);\n",
     "    if (req.m) { const a = req.arrivedAt; console.error('[diag] ' + JSON.stringify({ found: req.m.found - a, lock: req.m.lock - req.m.found, verify: req.m.verify - req.m.lock, write: req.m.write - req.m.verify, work: performance.now() - a })); }\n    if (wait > 0) await sleep(wait);\n");
+  if (variant === 'decoy_late') patch(dir, 'src/server.js', '  await dummyHash();\n', '  void dummyHash;\n');
   return dir;
 }
 

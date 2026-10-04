@@ -55,20 +55,18 @@ jobs:
       - run: npm run ensure-app-role
       - name: machine
         run: nproc; lscpu | grep -E 'Model name|^CPU\(s\)'; free -m | head -2
-      - name: idle
-        run: ROUNDS=15 LABEL=idle node diag-cold-start.mjs
-      - name: under the suite's load
+      - name: harness, base vs planted late decoy, under the suite's load
         run: |
-          ( while true; do node --test $(ls test/*.test.js | grep -v sign-in-cold-start) >/dev/null 2>&1; done ) &
-          sleep 20
-          ROUNDS=40 LABEL=load node diag-cold-start.mjs
-      - name: the real test, 20 times under load
+          ( while true; do node --test $(ls test/*.test.js | grep -v sign-in-cold-start) >/dev/null 2>&1; done ) & L=$!; sleep 20
+          ROUNDS=60 VARIANTS=base,decoy_late LABEL=load-${{ matrix.leg }} node diag-cold-start.mjs
+          kill $L; pkill -f 'node --test' || true; sleep 2
+      - name: the real test as it is, 20 runs under the suite's load
         run: |
-          ( while true; do node --test $(ls test/*.test.js | grep -v sign-in-cold-start) >/dev/null 2>&1; done ) &
-          sleep 20
+          ( while true; do node --test $(ls test/*.test.js | grep -v sign-in-cold-start) >/dev/null 2>&1; done ) & L=$!; sleep 20
           fails=0
           for i in $(seq 1 20); do node --test test/sign-in-cold-start.test.js > o.txt 2>&1 || { fails=$((fails+1)); grep -m1 'fastest unknown' o.txt; }; done
-          echo "real test under load: $fails of 20 failed"
+          echo "REAL TEST AS IS under load: $fails of 20 failed"
+          kill $L; pkill -f 'node --test' || true; sleep 2
       - uses: actions/upload-artifact@v4
         with:
           name: diag-${{ matrix.leg }}
