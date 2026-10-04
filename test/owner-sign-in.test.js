@@ -159,7 +159,7 @@ test('a sign-in sets the cookie with all five properties, answers who and until 
   assert.ok(!attrs.includes('domain'), 'no Domain');
   const token = tokenOf(r);
   assert.match(token, /^opl_[A-Za-z0-9_-]{43}$/);
-  assert.deepEqual(Object.keys(r.json).sort(), ['email', 'session_ends_at', 'tenant_id']);
+  assert.deepEqual(Object.keys(r.json).sort(), ['email', 'language', 'session_ends_at', 'tenant_id']);
   assert.equal(r.json.email, who.email);
   assert.equal(r.json.tenant_id, who.tenant);
   assert.equal(r.text.includes(token), false);
@@ -609,7 +609,7 @@ test('A GET never changes anything: every operator GET, cookie-authenticated fro
 
 test('NO CREDENTIAL IN A URL: no auth route has a path parameter, and the auth code reads no query', async () => {
   const auth = routeTable(main.app).filter((r) => r.base === '/api/v1/auth');
-  assert.deepEqual(auth.map((r) => `${r.method} ${r.path}`).sort(), ['GET /me', 'POST /sign-in', 'POST /sign-out']);
+  assert.deepEqual(auth.map((r) => `${r.method} ${r.path}`).sort(), ['GET /me', 'POST /sign-in', 'POST /sign-out', 'PUT /language']);
   for (const r of auth) assert.equal(r.path.includes(':'), false, `${r.method} ${r.path}`);
   const source = readFileSync(new URL('../src/signIn.js', import.meta.url), 'utf8');
   assert.equal(/req\.(query|params)\b/.test(source), false, 'src/signIn.js reads req.query or req.params');

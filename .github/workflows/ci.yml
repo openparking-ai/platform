@@ -271,6 +271,14 @@ jobs:
         # suite and the isolation suite to go red.
         run: npm run garage-reads-fail-control
 
+      - name: Owner-language fail-control
+        # The owner's language (0025). Each break removes one property -- the
+        # admin taken from the session, never the body; only "en" or "es"; the
+        # query not read; the Origin rule; the language on sign-in and on
+        # /auth/me; the column's check and its English default -- and requires
+        # test/owner-language.test.js to go red.
+        run: npm run owner-language-fail-control
+
       - name: Lane-reader fail-control
         # A garage's Location and each reader (0021) are registered ON the
         # garage's own account, refused while Stripe -- asked now, not an old
