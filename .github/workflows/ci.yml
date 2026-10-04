@@ -274,7 +274,7 @@ jobs:
       - name: Owner-language fail-control
         # The owner's language (0025). Each break removes one property -- the
         # admin taken from the session, never the body; only "en" or "es"; the
-        # query not read; the Origin rule; the language on sign-in and on
+        # query not read, in either spelling; the Origin rule; the language on sign-in and on
         # /auth/me; the column's check and its English default -- and requires
         # test/owner-language.test.js to go red.
         run: npm run owner-language-fail-control

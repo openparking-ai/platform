@@ -308,7 +308,8 @@ it (migration 0024).
 `en` unless the owner chose `es`, and every admin made before 0025 is `en`. The
 database refuses any other value. `PUT /api/v1/auth/language` changes it for the
 signed-in admin only: the admin and the tenant are the session's, and nothing
-else in the body is read, nor the query. It follows the cookie's rules below
+else in the body is read, nor the query: `?language=es` never stands in for a
+body that names no language. It follows the cookie's rules below
 (the `Origin` must be `ADMIN_ORIGIN`), and anything but `{"language": "en"}` or
 `{"language": "es"}` sent as JSON is refused `400 language_refused` and changes
 nothing. The admin screens read it from sign-in's answer, so the owner's screens

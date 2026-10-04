@@ -154,6 +154,24 @@ test('the query is not read', async () => {
   assert.equal(await languageOf(a), 'en');
 });
 
+test('a language in the query does not stand in for a body that is not one: refused by name, the row unchanged', async () => {
+  const a = await owner('lang-query-only');
+  const { token } = await signInAs(a);
+  const notALanguage = [
+    ['no body', { raw: '' }],
+    ['an empty object', { body: {} }],
+    ['"fr"', { body: { language: 'fr' } }],
+    ['null', { body: { language: null } }],
+    ['a body that is not JSON', { raw: 'language=es', headers: { 'content-type': 'application/x-www-form-urlencoded' } }],
+  ];
+  for (const [what, extra] of notALanguage) {
+    const r = await call('PUT', '/api/v1/auth/language?language=es', { cookie: token, origin: ADMIN_ORIGIN, ...extra });
+    assert.equal(r.status, 400, `${what}, with ?language=es: ${r.status} ${r.text.slice(0, 200)}`);
+    assert.deepEqual(r.json, signIn.LANGUAGE_REFUSED, what);
+    assert.equal(await languageOf(a), 'en', `${what}, with ?language=es: the row changed`);
+  }
+});
+
 // --- only the two values ----------------------------------------------------------------
 
 test('anything but "en" or "es" is refused by name, and the row is unchanged', async () => {

@@ -13,6 +13,8 @@
  *   user_from_body          the admin and tenant changed are taken from the body.
  *   any_language_taken      any string is taken as a language.
  *   query_read              the language is read from the query too.
+ *   query_fallback          the query's language is taken when the body has none
+ *                           (spelled `req['query']`, which the static test does not see).
  *   origin_unchecked        the language route takes a change from any Origin.
  *   sign_in_without_language  sign-in's answer carries no language.
  *   me_without_language     /auth/me carries no language.
@@ -51,6 +53,13 @@ const BREAKS = [
     file: 'src/signIn.js',
     from: 'const language = languageBody(req.body);',
     to: 'const language = languageBody({ ...req.body, ...req.query });',
+  },
+  {
+    name: 'query_fallback',
+    why: "the query's language is taken when the body has none",
+    file: 'src/signIn.js',
+    from: 'const language = languageBody(req.body);',
+    to: "const language = languageBody(req.body) ?? languageBody(req['query']);",
   },
   {
     name: 'origin_unchecked',

@@ -760,7 +760,9 @@ test('NO ORACLE, IN WORK: unknown email, wrong password and locked address run t
   // files in the suite write lock rows while this runs, but none for these
   // users. A lock row needs a real user, so an unknown email could only ever
   // be charged to one: at the caller's address, or somewhere else. The
-  // controls show each count sees a row when one is written.
+  // controls show each count sees a row when one is written. Each address is
+  // counted before and after, never against zero: a test database that is
+  // used again still holds the lock rows earlier runs wrote at these addresses.
   const locksAt = async (address) => Number((await admin.query('SELECT count(*) FROM operator_sign_in_locks WHERE address = $1', [address])).rows[0].count);
   const ownLocks = async () => (await admin.query(
     `SELECT count(*)::int AS rows, coalesce(sum(l.failed_count), 0)::int AS failed
@@ -770,11 +772,12 @@ test('NO ORACLE, IN WORK: unknown email, wrong password and locked address run t
   const salt = Math.floor(Math.random() * 250) + 1;
   const [nobodyAt, controlAt] = [`203.0.113.${salt}`, `198.18.200.${salt}`];
   const ownBefore = await ownLocks();
+  const [nobodyBefore, controlBefore] = [await locksAt(nobodyAt), await locksAt(controlAt)];
   await call(trusted.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG }, headers: { 'x-forwarded-for': nobodyAt } });
-  assert.equal(await locksAt(nobodyAt), 0, 'an unknown email makes no lock row');
+  assert.equal(await locksAt(nobodyAt), nobodyBefore, 'an unknown email makes no lock row');
   assert.deepEqual(await ownLocks(), ownBefore, "an unknown email is charged to none of this test's users, at any address");
   await call(trusted.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG }, headers: { 'x-forwarded-for': controlAt } });
-  assert.equal(await locksAt(controlAt), 1, 'CONTROL: a wrong password from that kind of address makes one');
+  assert.equal(await locksAt(controlAt), controlBefore + 1, 'CONTROL: a wrong password from that kind of address makes one');
   assert.deepEqual(await ownLocks(), { rows: ownBefore.rows + 1, failed: ownBefore.failed + 1 }, "CONTROL: and this test's users' count sees it");
   const unknown = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: 'nobody-same@example.com', password: WRONG } }));
   const wrong = await statementsDuring(() => call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: WRONG } }));
