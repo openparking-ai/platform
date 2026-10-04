@@ -11,14 +11,24 @@
  *
  * This starts the REAL `src/server.js` once per sign-in and sends ONE request
  * the moment it says it is listening: a real admin's email with a wrong
- * password, or an email nobody has, alternately. At the lowest floor the
- * FASTEST of each must sit within TOLERANCE_MS of the other. The fastest, not
- * the median: the rest of the suite runs beside this file, and load only ever
- * adds time -- a median here swung by 200 ms under a full suite -- while the
- * failure this guards against puts a whole second hash under EVERY unknown
- * sign-in (about 110 ms here at this floor, more on a slower machine), the
- * fastest one included. The receipt's measurement is the finer instrument:
- * this is the tripwire.
+ * password, or an email nobody has. They come in PAIRS, one straight after the
+ * other, the order alternating, and at the lowest floor the MEDIAN of the
+ * pairs' differences must sit within TOLERANCE_MS of zero. The failure this
+ * guards against puts a whole second hash under EVERY unknown sign-in (about
+ * 110 ms here at this floor, 170-420 ms on CI's runners under load), so it
+ * moves every pair and so the median. The rest of the suite runs beside this
+ * file, and its load comes in waves: the two halves of a pair, a second apart,
+ * share the wave they ran in, so it cancels in their difference. The
+ * receipt's measurement is the finer instrument: this is the tripwire.
+ *
+ * WHY NOT THE FASTEST OF EACH, as this test first compared: it failed on CI
+ * now and then with nothing wrong. Measured on GitHub's runners under the
+ * suite's load (2026-10-04): the sign-in's own work differs by about 1 ms
+ * between the two emails (the failure write, which counts for a real admin
+ * only), yet the fastest of 7 of each missed by up to 160 ms in EITHER
+ * direction, and the fastest of 25 still by up to 95 ms: one quiet moment
+ * lands on one side. In those same runs the median paired difference was
+ * within 16 ms at 25 pairs.
  */
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -32,7 +42,7 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ADMIN_ORIGIN = 'https://admin.example.test';
 const PASSWORD = 'correct horse battery staple';
 const WRONG = 'incorrect horse battery staple';
-const STARTS_EACH = 7;
+const STARTS_EACH = 25;
 const TOLERANCE_MS = 60;
 
 after(() => pool.end());
@@ -88,13 +98,23 @@ test('THE FIRST SIGN-IN AFTER A START: a real admin\'s email and an unknown one 
   const tenant = await createTenant('cold-start');
   const known = `cold-start-${tenant.slice(0, 8)}@example.com`;
   await createAdmin({ tenantId: tenant, email: known, password: PASSWORD });
-  const times = { known: [], unknown: [] };
+  const pairs = [];
   for (let i = 0; i < STARTS_EACH; i += 1) {
     // A fresh address each time: the wrong passwords never reach the lock.
-    times.known.push(await firstSignIn(known, `198.51.100.${2 * i + 1}`));
-    times.unknown.push(await firstSignIn(`nobody-${tenant.slice(0, 8)}-${i}@example.com`, `198.51.100.${2 * i + 2}`));
+    const signInKnown = () => firstSignIn(known, `198.51.100.${2 * i + 1}`);
+    const signInUnknown = () => firstSignIn(`nobody-${tenant.slice(0, 8)}-${i}@example.com`, `198.51.100.${2 * i + 2}`);
+    if (i % 2 === 0) {
+      const k = await signInKnown();
+      pairs.push({ known: k, unknown: await signInUnknown() });
+    } else {
+      const u = await signInUnknown();
+      pairs.push({ known: await signInKnown(), unknown: u });
+    }
   }
-  const gap = Math.min(...times.unknown) - Math.min(...times.known);
-  const shown = `known ${times.known.map((t) => t.toFixed(0)).join(',')} | unknown ${times.unknown.map((t) => t.toFixed(0)).join(',')}`;
-  assert.ok(Math.abs(gap) < TOLERANCE_MS, `fastest unknown minus fastest known ${gap.toFixed(1)} ms: ${shown}`);
+  const differences = pairs.map((p) => p.unknown - p.known).sort((x, y) => x - y);
+  const mid = differences.length >> 1;
+  const median = differences.length % 2 ? differences[mid] : (differences[mid - 1] + differences[mid]) / 2;
+  const shown = pairs.map((p) => `${p.known.toFixed(0)}/${p.unknown.toFixed(0)}`).join(' ');
+  console.log(`PAIRED_MEDIAN ${median.toFixed(1)} MINGAP ${(Math.min(...pairs.map((p) => p.unknown)) - Math.min(...pairs.map((p) => p.known))).toFixed(1)}`);
+  assert.ok(Math.abs(median) < TOLERANCE_MS, `median of (unknown - known) over ${pairs.length} pairs ${median.toFixed(1)} ms; known/unknown: ${shown}`);
 });
