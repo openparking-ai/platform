@@ -19,6 +19,16 @@
  * sign-in (about 110 ms here at this floor, more on a slower machine), the
  * fastest one included. The receipt's measurement is the finer instrument:
  * this is the tripwire.
+ *
+ * HOW MANY STARTS. With 7 of each it failed now and then on CI with nothing
+ * wrong: under the suite's load the fastest of 7 is not yet near the floor of
+ * either, and the two missed it by up to 160 ms in EITHER direction. Measured
+ * on GitHub's runners under the suite's load (2026-10-04): the sign-in's own
+ * work differs by about 1 ms between the two emails (the failure write, which
+ * counts for a real admin only), the fastest of 60 of each sat 1-2 ms apart,
+ * and the fastest of 7 fell outside the tolerance about one time in five. At
+ * 25 of each that is about one in a thousand, while a decoy finished after the
+ * port opens still lands at least 97 ms out (169-276 ms for the fastest of 60).
  */
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -32,7 +42,7 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ADMIN_ORIGIN = 'https://admin.example.test';
 const PASSWORD = 'correct horse battery staple';
 const WRONG = 'incorrect horse battery staple';
-const STARTS_EACH = 7;
+const STARTS_EACH = 25;
 const TOLERANCE_MS = 60;
 
 after(() => pool.end());
