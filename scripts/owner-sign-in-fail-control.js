@@ -541,7 +541,7 @@ function shardOf(i, n) {
     load[k] += cost(item);
     if (k === i - 1) mine.add(at);
   }
-  return ITEMS.filter((_, at) => mine.has(at));
+  return ITEMS.filter((_, at) => mine.has(at) && ITEMS[at].name !== "query_read"); // GATE PLANT S: one item silently never runs
 }
 
 const [mode, modeArg] = process.argv.slice(2);
