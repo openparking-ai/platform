@@ -813,6 +813,10 @@ test('THE FLOOR: no sign-in refusal of any kind is answered sooner than SIGN_IN_
   // The line holds one: an attempt held at its hash keeps it full while the busy one is timed.
   let release;
   const held = new Promise((r) => { release = r; });
+  // Under a break a probe below can itself be held at its hash, and then it
+  // is never answered: let every hash go after a while, so the test fails on
+  // what the probe was answered rather than on the client's five-minute timeout.
+  const letGo = setTimeout(() => release(), 30_000);
   const realVerify = signIn.internals.verifyPassword;
   signIn.internals.verifyPassword = async (...a) => {
     await held;
@@ -825,6 +829,7 @@ test('THE FLOOR: no sign-in refusal of any kind is answered sooner than SIGN_IN_
     release();
     await holding;
   } finally {
+    clearTimeout(letGo);
     signIn.internals.verifyPassword = realVerify;
   }
   const statuses = Object.fromEntries(Object.entries(seen).map(([k, r]) => [k, r.status]));
@@ -861,6 +866,10 @@ test('THE LINE: a full line answers busy before the email is looked at -- the sa
   const who = await owner('si-line');
   let release;
   const held = new Promise((r) => { release = r; });
+  // Under a break a probe below can itself be held at its hash, and then it
+  // is never answered: let every hash go after a while, so the test fails on
+  // what the probe was answered rather than on the client's five-minute timeout.
+  const letGo = setTimeout(() => release(), 30_000);
   const realVerify = signIn.internals.verifyPassword;
   signIn.internals.verifyPassword = async (...a) => {
     await held;
@@ -881,6 +890,7 @@ test('THE LINE: a full line answers busy before the email is looked at -- the sa
     busy.push(await at('198.51.100.4', who.email, PASSWORD));
     busy.push(await at('198.51.100.5', who.email, WRONG));
   } finally {
+    clearTimeout(letGo);
     release();
     signIn.internals.verifyPassword = realVerify;
   }
