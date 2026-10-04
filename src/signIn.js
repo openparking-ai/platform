@@ -592,8 +592,8 @@ export function createAuthRouter(settings) {
   // what it is, never by what it says. On sign-in, neither comes before the floor.
   router.use(async (err, req, res, _next) => {
     const onSignIn = req.method === 'POST' && req.path === '/sign-in';
-    if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);
     if (err?.languageRefused) return res.status(400).json(LANGUAGE_REFUSED);
+    if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);
     // A stored hash this code does not know is named here, PasswordHashUnrecognised.
     logFailure(req.path.replace(/^\//, ''), err);
     if (onSignIn) return refuse(req, res, 500, { error: 'internal error' });
