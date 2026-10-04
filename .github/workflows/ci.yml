@@ -86,8 +86,11 @@ jobs:
         # everywhere it will ever be applied.
         run: bash scripts/assert-0002-sql-unchanged.sh
 
-  test:
-    name: test
+  suite:
+    name: suite
+    # The suite and the fail-controls that take seconds. The ones that take
+    # minutes run beside it in `controls` and `sign-in-control`; `test` below
+    # is green only when all three are.
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -103,54 +106,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-      - run: npm ci
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install the rate engine at its pin
-        # test/rate-plans.test.js starts the REAL engine, because the plan
-        # store's claims -- an unknown key refused and named, a gap refused
-        # and listed -- are the engine's sentences, and a stand-in would test
-        # this platform against itself. The commit is `rate-engine.pin`, one
-        # place, read here and nowhere else.
-        run: python3 -m pip install --quiet "git+https://github.com/openparking-ai/rate-engine@$(cat rate-engine.pin)"
-
-      - name: Install the two entitlement modules at their pins, and check out their migrations
-        # test/exit-outcomes.test.js consults the REAL garage-pass and
-        # monthly-billing through their command lines, each against a
-        # database built from its own migrations (0015). The commits are
-        # `garage-pass.pin` and `monthly-billing.pin`; the checkouts are only
-        # for the migrations, which the installed packages do not ship.
-        run: |
-          python3 -m pip install --quiet \
-            "openparking-garage-pass[store] @ git+https://github.com/openparking-ai/garage-pass@$(cat garage-pass.pin)" \
-            "openparking-monthly-billing[store] @ git+https://github.com/openparking-ai/monthly-billing@$(cat monthly-billing.pin)"
-          for m in garage-pass monthly-billing; do
-            git init -q "$RUNNER_TEMP/$m"
-            git -C "$RUNNER_TEMP/$m" fetch -q --depth 1 "https://github.com/openparking-ai/$m" "$(cat $m.pin)"
-            git -C "$RUNNER_TEMP/$m" checkout -q FETCH_HEAD
-          done
-          echo "GARAGE_PASS_SRC=$RUNNER_TEMP/garage-pass" >> "$GITHUB_ENV"
-          echo "MONTHLY_BILLING_SRC=$RUNNER_TEMP/monthly-billing" >> "$GITHUB_ENV"
-
-      - name: Create the test database
-        run: psql "$ADMIN_URL/postgres" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE openparking_test'
-
-      - name: Migrate
-        run: npm run migrate
-
-      - name: Create the application role
-        # NOSUPERUSER, NOBYPASSRLS. The service container hands out a superuser
-        # by default, and a superuser bypasses row-level security
-        # unconditionally -- running the isolation suite as one would make every
-        # assertion in it meaningless.
-        run: npm run ensure-app-role
+      - uses: ./.github/actions/test-environment
 
       - name: The suite runs with no Stripe Connect configured
         # The standalone arm: a self-hoster with no Connect -- or no Stripe --
@@ -282,17 +238,6 @@ jobs:
         # suite must go red.
         run: npm run activation-fail-control
 
-      - name: Exit-outcomes fail-control
-        # The exit has three named outcomes and two modules are consulted
-        # through their own doors before pricing. Each property is broken in
-        # turn -- covered still priced, not-covered counted as covered, one
-        # module skipped either way, could-not-decide recorded as transient,
-        # a link stored unprobed, a covered exit unrecorded, the answers
-        # dropped, the third outcome produced, the purge keeping the record,
-        # a ticket stay consulted without its ticket, and two schema
-        # statements never created -- and the suite must go red.
-        run: npm run exit-outcomes-fail-control
-
       - name: Rules-payload fail-control
         # The rules payload carries the plans whole, the space class, each
         # linked module's register verbatim (an outage said, never filled
@@ -318,6 +263,99 @@ jobs:
         # constraint never created, and the suite must go red.
         run: npm run lane-decision-sweep-fail-control
 
+      - name: Garage-reads fail-control
+        # The owner's three reads. Each break removes one property -- a tenant
+        # predicate (list, garage, lanes), the 404 for another tenant's garage,
+        # "live", the exact garage shape, revoked_at on a device, the unbound
+        # reader hidden, the credential hash kept out -- and requires the reads
+        # suite and the isolation suite to go red.
+        run: npm run garage-reads-fail-control
+
+      - name: Lane-reader fail-control
+        # A garage's Location and each reader (0021) are registered ON the
+        # garage's own account, refused while Stripe -- asked now, not an old
+        # read -- says it cannot take a card; a lane holds one reader and a
+        # reader one lane, at the route and at the table; ending a binding is
+        # recorded, never deleted, and the history is listed. Each property
+        # is broken in turn, plus three schema statements never created, and
+        # the suite must go red.
+        run: npm run lane-reader-fail-control
+
+      - name: Standalone-arm fail-control
+        # With no Connect configured the real entrypoint starts, ordinary
+        # routes behave as before, and each Connect route answers one
+        # sentence. Each property is broken in turn -- a key demanded at boot,
+        # Connect assumed, the sentence reworded -- and the suite must go red.
+        run: npm run standalone-arm-fail-control
+
+      - name: Tax-on-the-stay fail-control
+        # Tax on what the driver pays (0023): base lines, the validation, then
+        # the tax, taken on the subtotal after the validation at the stay's
+        # exit instant; a lane decision taxed with a set it did not hold is not
+        # written; the table refuses a subtotal and tax lines that do not make
+        # the fee. Each is broken on a copy of the tree (one on a scratch
+        # database) and test/tax-on-paid.test.js must go red every time.
+        run: npm run tax-on-paid-fail-control
+
+      - name: A test file whose before throws ends red, not hung
+        # Each file that once closed `server` unguarded in its `after` is run
+        # with a throw planted in its `before`, and must exit non-zero inside a
+        # minute. The positive control puts one unguarded close back and
+        # requires a HANG, so this step can see the failure it exists for.
+        run: npm run hanging-hooks-control
+
+  controls:
+    name: controls
+    # The fail-controls that take minutes each, beside `suite`.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: ./.github/actions/test-environment
+
+      - name: The suite runs with no Stripe Connect configured
+        # The standalone arm: a self-hoster with no Connect -- or no Stripe --
+        # gets a platform that behaves exactly as it did before Connect code
+        # existed. Every test below runs in this environment, so this is
+        # asserted rather than assumed; test/standalone-arm.test.js boots the
+        # real entrypoint the same way.
+        run: |
+          for v in STRIPE_API_KEY STRIPE_API_BASE CONNECT_RETURN_URL CONNECT_REFRESH_URL; do
+            if [ -n "$(printenv "$v")" ]; then echo "$v is set; the suite must run without Connect"; exit 1; fi
+          done
+          echo "no Connect setting present"
+
+      - name: The suite runs with no validations door named
+        # This repository names no validations module: VALIDATIONS_DOOR has no
+        # default, and unset means the deployment has none. The tests that need
+        # the door name the stand-in themselves; everything else runs as a
+        # deployment without one.
+        run: |
+          if [ -n "$(printenv VALIDATIONS_DOOR)" ]; then echo "VALIDATIONS_DOOR is set; the suite must run without it"; exit 1; fi
+          echo "no validations door named"
+
+      - name: Exit-outcomes fail-control
+        # The exit has three named outcomes and two modules are consulted
+        # through their own doors before pricing. Each property is broken in
+        # turn -- covered still priced, not-covered counted as covered, one
+        # module skipped either way, could-not-decide recorded as transient,
+        # a link stored unprobed, a covered exit unrecorded, the answers
+        # dropped, the third outcome produced, the purge keeping the record,
+        # a ticket stay consulted without its ticket, and two schema
+        # statements never created -- and the suite must go red.
+        run: npm run exit-outcomes-fail-control
+
       - name: Validations fail-control
         # A validation at the exit (0019, amendment A1): the claim made at the
         # reader on the fee the close will write and held on the open stay;
@@ -337,25 +375,6 @@ jobs:
         # test/validations-door.test.js to go red.
         run: npm run validations-door-fail-control
 
-      - name: Owner sign-in fail-control
-        # The owner's sign-in (0024). Each break removes one property -- the
-        # mount order, a token or a message in the log, the parser's text in
-        # a response, a credential read from the query, the unknown email's
-        # hash, the lock's count, its address, the header it must not trust,
-        # the idle and absolute ends, sign-out and reset revoking, the cookie's
-        # HttpOnly and Secure, the Origin rule, the password argument refused,
-        # no-store, the length rule, and a session accepted as a key -- and
-        # requires the sign-in suites to go red.
-        run: npm run owner-sign-in-fail-control
-
-      - name: Garage-reads fail-control
-        # The owner's three reads. Each break removes one property -- a tenant
-        # predicate (list, garage, lanes), the 404 for another tenant's garage,
-        # "live", the exact garage shape, revoked_at on a device, the unbound
-        # reader hidden, the credential hash kept out -- and requires the reads
-        # suite and the isolation suite to go red.
-        run: npm run garage-reads-fail-control
-
       - name: Stripe-account fail-control
         # A garage's own Stripe account (0020): created only on the operator's
         # request, as the garage's -- no Stripe dashboard, its own Stripe
@@ -370,23 +389,6 @@ jobs:
         # never created, and the suite must go red.
         run: npm run stripe-account-fail-control
 
-      - name: Lane-reader fail-control
-        # A garage's Location and each reader (0021) are registered ON the
-        # garage's own account, refused while Stripe -- asked now, not an old
-        # read -- says it cannot take a card; a lane holds one reader and a
-        # reader one lane, at the route and at the table; ending a binding is
-        # recorded, never deleted, and the history is listed. Each property
-        # is broken in turn, plus three schema statements never created, and
-        # the suite must go red.
-        run: npm run lane-reader-fail-control
-
-      - name: Standalone-arm fail-control
-        # With no Connect configured the real entrypoint starts, ordinary
-        # routes behave as before, and each Connect route answers one
-        # sentence. Each property is broken in turn -- a key demanded at boot,
-        # Connect assumed, the sentence reworded -- and the suite must go red.
-        run: npm run standalone-arm-fail-control
-
       - name: Taxes fail-control
         # A garage's taxes (0022): a set judged by the engine's own door and by
         # nothing here, before anything reads it; stored as the engine read it;
@@ -399,18 +401,109 @@ jobs:
         # statements never created, and the suite must go red.
         run: npm run taxes-fail-control
 
-      - name: Tax-on-the-stay fail-control
-        # Tax on what the driver pays (0023): base lines, the validation, then
-        # the tax, taken on the subtotal after the validation at the stay's
-        # exit instant; a lane decision taxed with a set it did not hold is not
-        # written; the table refuses a subtotal and tax lines that do not make
-        # the fee. Each is broken on a copy of the tree (one on a scratch
-        # database) and test/tax-on-paid.test.js must go red every time.
-        run: npm run tax-on-paid-fail-control
 
-      - name: A test file whose before throws ends red, not hung
-        # Each file that once closed `server` unguarded in its `after` is run
-        # with a throw planted in its `before`, and must exit non-zero inside a
-        # minute. The positive control puts one unguarded close back and
-        # requires a HANG, so this step can see the failure it exists for.
-        run: npm run hanging-hooks-control
+  sign-in-control:
+    name: sign-in-control (${{ matrix.shard }}/8)
+    # The owner sign-in fail-control, which alone took most of an hour in one
+    # job: a run of the sign-in suite per break. Each shard has its own runner
+    # and database.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: ./.github/actions/test-environment
+
+      - name: The suite runs with no Stripe Connect configured
+        # The standalone arm: a self-hoster with no Connect -- or no Stripe --
+        # gets a platform that behaves exactly as it did before Connect code
+        # existed. Every test below runs in this environment, so this is
+        # asserted rather than assumed; test/standalone-arm.test.js boots the
+        # real entrypoint the same way.
+        run: |
+          for v in STRIPE_API_KEY STRIPE_API_BASE CONNECT_RETURN_URL CONNECT_REFRESH_URL; do
+            if [ -n "$(printenv "$v")" ]; then echo "$v is set; the suite must run without Connect"; exit 1; fi
+          done
+          echo "no Connect setting present"
+
+      - name: The suite runs with no validations door named
+        # This repository names no validations module: VALIDATIONS_DOOR has no
+        # default, and unset means the deployment has none. The tests that need
+        # the door name the stand-in themselves; everything else runs as a
+        # deployment without one.
+        run: |
+          if [ -n "$(printenv VALIDATIONS_DOOR)" ]; then echo "VALIDATIONS_DOOR is set; the suite must run without it"; exit 1; fi
+          echo "no validations door named"
+
+      - name: Owner sign-in fail-control
+        # The owner's sign-in (0024). Each break removes one property -- the
+        # mount order, a token or a message in the log, the parser's text in
+        # a response, a credential read from the query, the unknown email's
+        # hash, the lock's count, its address, the header it must not trust,
+        # the idle and absolute ends, sign-out and reset revoking, the cookie's
+        # HttpOnly and Secure, the Origin rule, the password argument refused,
+        # no-store, the length rule, and a session accepted as a key -- and
+        # requires the sign-in suites to go red.
+        #
+        # The breaks are spread over 8 jobs (the matrix above); `test` below
+        # proves the shards add up to one whole run: every break exactly once.
+        run: npm run owner-sign-in-fail-control -- --shard ${{ matrix.shard }}/8
+
+      - name: Owner sign-in fail-control, this shard's report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sign-in-control-shard-${{ matrix.shard }}
+          path: sign-in-control-shard-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+          overwrite: true
+
+
+  test:
+    # The name branch protection requires. It runs whatever happened above, and
+    # is green only when every job it needs is: a job that failed, was
+    # cancelled or was skipped makes it red. Then it requires the sign-in
+    # shards to add up to one whole run.
+    name: test
+    if: always()
+    needs: [suite, controls, sign-in-control]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every part of the tests passed
+        env:
+          SUITE: ${{ needs.suite.result }}
+          CONTROLS: ${{ needs.controls.result }}
+          SIGN_IN_CONTROL: ${{ needs.sign-in-control.result }}
+        run: |
+          echo "suite: $SUITE, controls: $CONTROLS, sign-in-control: $SIGN_IN_CONTROL"
+          [ "$SUITE" = success ] && [ "$CONTROLS" = success ] && [ "$SIGN_IN_CONTROL" = success ]
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sign-in-control-shard-*
+          merge-multiple: true
+          path: sign-in-control-shards
+      - name: Owner sign-in fail-control, every break exactly once
+        # Shards 1..N each reported once, every item of `--plan` ran in exactly
+        # one of them and nothing else did, and no control failed.
+        run: node scripts/owner-sign-in-fail-control.js --verify sign-in-control-shards

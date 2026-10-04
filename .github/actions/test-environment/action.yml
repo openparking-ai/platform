@@ -1,0 +1,58 @@
+name: The test environment
+description: >-
+  Node, the npm packages, the rate engine and the two entitlement modules at
+  their pins, and a migrated test database with its application role. Every
+  job that runs tests or fail-controls starts here, so each runs in the
+  environment the suite always ran in. Needs the Postgres service and the
+  workflow's database settings.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: npm
+    - shell: bash
+      run: npm ci
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install the rate engine at its pin
+      # test/rate-plans.test.js starts the REAL engine, because the plan
+      # store's claims -- an unknown key refused and named, a gap refused
+      # and listed -- are the engine's sentences, and a stand-in would test
+      # this platform against itself. The commit is `rate-engine.pin`, one
+      # place, read here and nowhere else.
+      shell: bash
+      run: python3 -m pip install --quiet "git+https://github.com/openparking-ai/rate-engine@$(cat rate-engine.pin)"
+    - name: Install the two entitlement modules at their pins, and check out their migrations
+      # test/exit-outcomes.test.js consults the REAL garage-pass and
+      # monthly-billing through their command lines, each against a
+      # database built from its own migrations (0015). The commits are
+      # `garage-pass.pin` and `monthly-billing.pin`; the checkouts are only
+      # for the migrations, which the installed packages do not ship.
+      shell: bash
+      run: |
+        python3 -m pip install --quiet \
+          "openparking-garage-pass[store] @ git+https://github.com/openparking-ai/garage-pass@$(cat garage-pass.pin)" \
+          "openparking-monthly-billing[store] @ git+https://github.com/openparking-ai/monthly-billing@$(cat monthly-billing.pin)"
+        for m in garage-pass monthly-billing; do
+          git init -q "$RUNNER_TEMP/$m"
+          git -C "$RUNNER_TEMP/$m" fetch -q --depth 1 "https://github.com/openparking-ai/$m" "$(cat $m.pin)"
+          git -C "$RUNNER_TEMP/$m" checkout -q FETCH_HEAD
+        done
+        echo "GARAGE_PASS_SRC=$RUNNER_TEMP/garage-pass" >> "$GITHUB_ENV"
+        echo "MONTHLY_BILLING_SRC=$RUNNER_TEMP/monthly-billing" >> "$GITHUB_ENV"
+    - name: Create the test database
+      shell: bash
+      run: psql "$ADMIN_URL/postgres" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE openparking_test'
+    - name: Migrate
+      shell: bash
+      run: npm run migrate
+    - name: Create the application role
+      # NOSUPERUSER, NOBYPASSRLS. The service container hands out a superuser
+      # by default, and a superuser bypasses row-level security
+      # unconditionally -- running the isolation suite as one would make every
+      # assertion in it meaningless.
+      shell: bash
+      run: npm run ensure-app-role
