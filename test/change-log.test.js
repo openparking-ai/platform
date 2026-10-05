@@ -9,8 +9,9 @@
  *     the change does not happen.
  *   - Refused attempts land in the right log: with a working sign-in or key,
  *     the garage aimed at (another account's attempt as "outside") and the
- *     caller's own; with none -- no sign-in, an ended one, a cancelled key --
- *     the platform's own security log only, whatever it names.
+ *     caller's own; this account's own cancelled key or ended sign-in, in
+ *     this account's log only, named; with no credential, or one that is no
+ *     account's, the platform's own security log only, whatever it names.
  *   - Every line names who: an owner by email, a key by its name.
  *   - UPDATE, DELETE and TRUNCATE of either log are refused for the
  *     application's role and for the owner of the tables.
@@ -458,14 +459,33 @@ test("REFUSED ATTEMPTS land in the right log: the wrong site, an ended session, 
   assert.deepEqual((await refusedSince(a.tenant, sinceA)).map((l) => [l.garage_id, l.refusal, l.actor_kind, l.actor_id, l.actor_name]),
     [[g.id, 'last_open_lane', 'key', a.keyId, 'Front desk key']]);
 
-  // No working sign-in or key -- nobody at all, an ended session, a cancelled
-  // key -- naming this garage: the platform's own log, never the owner's.
+  // This account's own key, cancelled, and its own sign-in, ended, used again:
+  // in THIS account's log, named, and in no other's -- a cancelled key used
+  // again may be a stolen one. Aimed at another account's lane, it is still
+  // only this account's line.
   const cookie = await signIn(base, a.email);
   const ended = { ...a, cookie };
   assert.equal((await call(base, 'POST', '/auth/sign-out', { as: ended })).status, 204);
   const old = generateDeviceToken();
   secrets.add(old);
-  await one(a.tenant, `INSERT INTO operator_tokens (tenant_id, name, token_hash, revoked_at) VALUES ($1,'Lost key',$2, now()) RETURNING id`, [a.tenant, hashToken(old)]);
+  const oldId = (await one(a.tenant, `INSERT INTO operator_tokens (tenant_id, name, token_hash, revoked_at) VALUES ($1,'Lost key',$2, now()) RETURNING id`, [a.tenant, hashToken(old)])).id;
+  sinceA = await idsOf(a.tenant);
+  sinceB = await idsOf(b.tenant);
+  const endedR = await call(base, 'PATCH', `/garages/${g.id}`, { as: ended, body: { transient_available: true } });
+  assert.deepEqual([endedR.status, endedR.json.code], [401, 'session_ended']);
+  assert.equal((await call(base, 'DELETE', `/lanes/${exit.id}`, { as: { key: old }, via: 'key' })).status, 401);
+  assert.equal((await call(base, 'PATCH', `/lanes/${theirLane.id}`, { as: { key: old }, via: 'key', body: { name: 'Mine' } })).status, 401);
+  assert.equal((await call(base, 'PUT', '/auth/language', { as: ended, body: { language: 'es' } })).status, 401);
+  assert.deepEqual((await refusedSince(a.tenant, sinceA)).map((l) => [l.garage_id, l.action, l.refusal, l.actor_kind, l.actor_id, l.actor_name, l.subject_name]), [
+    [g.id, 'garage.update', 'session_ended', 'owner', a.userId, a.email, 'Harbor Garage'],
+    [g.id, 'lane.remove', 'key_cancelled', 'key', oldId, 'Lost key', 'Only way out'],
+    [null, 'lane.rename', 'key_cancelled', 'key', oldId, 'Lost key', null],
+    [null, 'language.change', 'session_ended', 'owner', a.userId, a.email, null],
+  ]);
+  assert.deepEqual(await refusedSince(b.tenant, sinceB), [], "never in the other account's log");
+
+  // No credential at all, or one that is no account's, naming this garage: the
+  // platform's own log, never an owner's.
   {
     const client = securityRows();
     await client.connect();
@@ -475,18 +495,14 @@ test("REFUSED ATTEMPTS land in the right log: the wrong site, an ended session, 
       const t0 = (await client.query('SELECT clock_timestamp() AS t')).rows[0].t;
       sinceA = await idsOf(a.tenant);
       assert.equal((await call(base, 'POST', `/lanes/${exit.id}/reopen`)).status, 401);
-      const endedR = await call(base, 'PATCH', `/garages/${g.id}`, { as: ended, body: { transient_available: true } });
-      assert.deepEqual([endedR.status, endedR.json.code], [401, 'session_ended']);
-      assert.equal((await call(base, 'DELETE', `/lanes/${exit.id}`, { as: { key: old }, via: 'key' })).status, 401);
-      assert.equal((await call(base, 'PUT', '/auth/language', { as: ended, body: { language: 'es' } })).status, 401);
+      assert.equal((await call(base, 'DELETE', `/lanes/${exit.id}`, { as: { key: generateDeviceToken() }, via: 'key' })).status, 401);
       assert.deepEqual(await refusedSince(a.tenant, sinceA), [], "no line in the owner's log");
       // Other suites run beside this one from the same address, so the
-      // security log is read for what these four did, not as a whole: each
-      // is on a line of its own kind, or counted on the source's
-      // too-many line when that address is over its minute (0028).
-      assert.ok(await count() >= was + 4);
+      // security log is read for what these did: each on a line of its own
+      // kind, or counted on the source's too-many line (0028).
+      assert.ok(await count() >= was + 2);
       const touched = (await client.query('SELECT refusal, credential FROM platform_security_log WHERE coalesce(last_at, at) >= $1', [t0])).rows;
-      for (const [refusal, credential] of [['not_signed_in', 'none'], ['session_ended', 'session'], ['not_signed_in', 'key']]) {
+      for (const [refusal, credential] of [['not_signed_in', 'none'], ['not_signed_in', 'key']]) {
         assert.ok(touched.some((r) => (r.credential === credential && r.refusal === refusal) || r.refusal === 'too_many_refused'), `${refusal}/${credential} in the security log`);
       }
     } finally {

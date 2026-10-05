@@ -9,9 +9,16 @@
 --                              "someone from another account" when it is not
 --                              theirs) and, when that is not its own, its own
 --                              account's log too -- as before;
+--   this account's own sign-in   this account's log only -- never another's:
+--   or key that no longer works  a cancelled key used again may be a stolen
+--                              one, and an ended sign-in replayed is this
+--                              owner's to see. The line names the key, or
+--                              the owner whose sign-in it was, and says why
+--                              (`key_cancelled`, `key_expired`,
+--                              `session_ended`).
 --   anything else              the platform's security log only, whatever
---                              garage or id it names: no sign-in, an ended
---                              one, a cancelled or unknown key.
+--                              garage or id it names: no credential at all,
+--                              or one that is no account's.
 --
 -- A credential is read here only to see whether it works NOW -- unrevoked,
 -- unexpired, and for a session inside its idle window and signed in after the
@@ -199,6 +206,8 @@ CREATE FUNCTION record_refused_change(
     v_t_name    text;
     v_subject   text;
     v_source    text;
+    v_old_tenant  uuid;
+    v_old_refusal text;
     v_was       text := current_setting('openparking.tenant_id', true);
     v_went      text := NULL;
     v_now       timestamptz := clock_timestamp();
@@ -224,7 +233,59 @@ CREATE FUNCTION record_refused_change(
                   AND t.created_at >= u.password_changed_at));
     END IF;
 
-    -- No working sign-in or key: the platform's log, and no owner's.
+    -- A credential that is this platform's but no longer works -- a
+    -- cancelled or expired key, an ended sign-in -- is its own account's to
+    -- see, and no one else's. Read, never touched.
+    IF v_caller IS NULL AND p_credential_hash IS NOT NULL THEN
+      SELECT t.tenant_id,
+             CASE WHEN t.kind = 'session' THEN 'owner' ELSE 'key' END,
+             CASE WHEN t.kind = 'session' THEN t.user_id ELSE t.id END,
+             CASE WHEN t.kind = 'session' THEN u.email ELSE t.name END,
+             CASE WHEN t.kind = 'session' THEN 'session_ended'
+                  WHEN t.revoked_at IS NOT NULL THEN 'key_cancelled'
+                  ELSE 'key_expired' END
+        INTO v_old_tenant, v_kind, v_actor, v_name, v_old_refusal
+        FROM operator_tokens t
+        LEFT JOIN operator_users u ON u.id = t.user_id AND u.tenant_id = t.tenant_id
+       WHERE t.token_hash = p_credential_hash
+         AND (t.kind = 'key' OR u.id IS NOT NULL);
+      IF v_old_tenant IS NOT NULL THEN
+        v_source := md5(concat_ws('|', 'actor', v_old_tenant, v_kind, v_actor));
+        PERFORM set_config('openparking.tenant_id', v_old_tenant::text, true);
+        -- What it aimed at, when that is this same account's: on its garage.
+        IF p_target_id IS NOT NULL THEN
+          IF p_target_kind = 'garage' THEN
+            SELECT g.tenant_id, g.id, g.name INTO v_t_tenant, v_t_garage, v_t_name FROM garages g WHERE g.id = p_target_id;
+            v_subject := 'garage';
+          ELSIF p_target_kind = 'lane' THEN
+            SELECT l.tenant_id, l.garage_id, l.name INTO v_t_tenant, v_t_garage, v_t_name FROM lanes l WHERE l.id = p_target_id;
+            v_subject := 'lane';
+          ELSIF p_target_kind = 'computer' THEN
+            SELECT d.tenant_id, l.garage_id, d.name INTO v_t_tenant, v_t_garage, v_t_name
+              FROM lane_devices d JOIN lanes l ON l.id = d.lane_id AND l.tenant_id = d.tenant_id
+             WHERE d.id = p_target_id;
+            v_subject := 'computer';
+          ELSIF p_target_kind = 'key' THEN
+            SELECT t.tenant_id, NULL, t.name INTO v_t_tenant, v_t_garage, v_t_name
+              FROM operator_tokens t WHERE t.id = p_target_id AND t.kind = 'key';
+            v_subject := 'key';
+          END IF;
+        END IF;
+        IF v_t_tenant = v_old_tenant THEN
+          PERFORM write_refused_line(v_old_tenant, v_t_garage, v_kind, v_actor, v_name,
+                                     p_action, v_subject, p_target_id, v_t_name, v_old_refusal, p_request, v_source, v_now);
+        ELSE
+          -- Another account's, or nothing: named by kind only.
+          PERFORM write_refused_line(v_old_tenant, NULL, v_kind, v_actor, v_name,
+                                     p_action, 'unknown', NULL, NULL, v_old_refusal,
+                                     CASE WHEN v_t_tenant IS NULL THEN p_request END, v_source, v_now);
+        END IF;
+        PERFORM set_config('openparking.tenant_id', coalesce(v_was, ''), true);
+        RETURN 'own';
+      END IF;
+    END IF;
+
+    -- No credential, or one that is no account's: the platform's log, and no owner's.
     IF v_caller IS NULL THEN
       PERFORM write_refused_security(p_refusal, p_request, p_credential, coalesce(p_source_key, md5('no address')), v_now);
       RETURN 'security';

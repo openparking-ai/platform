@@ -32,6 +32,7 @@
  *   refusals_unbounded        one source may write any number of refused lines a minute (0028)
  *   unsigned_to_owner_log     a refused attempt with no working sign-in or key lands in the garage's log (0028)
  *   key_unnamed               a key's refused line does not name the key (0028)
+ *   own_key_to_security       this account's cancelled key or ended sign-in goes to the security log, not its own log (0028)
  *
  * Needs the same environment as the suite (the rate engine, a Postgres it may
  * make a scratch database on).
@@ -213,6 +214,13 @@ const SCHEMA_BREAKS = [
       { file: '0028_refusals_by_source.sql', from: '    IF v_caller IS DISTINCT FROM v_t_tenant THEN', to: '    IF v_caller IS NOT NULL AND v_caller IS DISTINCT FROM v_t_tenant THEN' },
       { file: '0028_refusals_by_source.sql', from: "    v_source := md5(concat_ws('|', 'actor', v_caller, v_kind, v_actor));", to: "    v_source := coalesce(p_source_key, md5(concat_ws('|', 'actor', v_caller, v_kind, v_actor)));\n    IF v_caller IS NULL THEN v_kind := 'nobody'; v_actor := NULL; v_name := NULL; END IF;" },
     ],
+  },
+  {
+    name: 'own_key_to_security',
+    why: "this account's cancelled key or ended sign-in goes to the security log, not its own log",
+    suite: LOG,
+    red: ['REFUSED ATTEMPTS land in the right log'],
+    edits: [{ file: '0028_refusals_by_source.sql', from: '      IF v_old_tenant IS NOT NULL THEN', to: '      IF false THEN' }],
   },
   {
     name: 'key_unnamed',

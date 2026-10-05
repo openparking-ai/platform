@@ -507,10 +507,14 @@ writes no line, on every route. A refused write is a line too, through
 in the log of the account whose garage, lane, computer or key the path names
 (someone from another account is never named there, and a "not found" says
 what was not found: `garage_not_found`) and, when that is not the caller's own,
-in the caller's account's log too; a key is named by its name. With none -- no
-sign-in, an ended one, a cancelled or unknown key -- it goes only to
-`platform_security_log`, whatever it names: the owner can do nothing about it,
-and it is the easiest thing to send in bulk. That log no owner reads and the
+in the caller's account's log too; a key is named by its name. With this
+account's own sign-in or key that no longer works -- a cancelled or expired
+key used again, which may be a stolen one, or an ended sign-in replayed -- it
+goes in THIS account's log only, never another's, naming the key or the owner
+and why (`key_cancelled`, `key_expired`, `session_ended`). With no credential,
+or one that is no account's, it goes only to `platform_security_log`, whatever
+it names: the owner can do nothing about it, and it is the easiest thing to
+send in bulk. That log no owner reads and the
 application holds no grant on. The bound is per source -- the caller's account
 and person or key, or, for nobody, the address (kept only as a hash): one
 source gets 20 refused lines a minute in a log, across every route and id; the
@@ -519,7 +523,7 @@ the 20 one more line, `too_many_refused`, carries the count of the rest. So
 hammering any route, with any ids, cannot fill a log, and the changes made are
 read apart from the refused attempts (`/refused-attempts`), so no number of
 them can push a change off the owner's page. Behind a proxy, `TRUST_PROXY`
-must be set, or every unsigned caller is one source. Changes that were made
+must be set, or every unsigned caller is one source (see "Deploying"). Changes that were made
 are never counted together. A malformed id is refused
 before the database, as before, and writes no line. The log is append-only:
 the application may `SELECT` and `INSERT`, and a trigger refuses `UPDATE`,
@@ -1143,6 +1147,16 @@ Each create is **refused while the account cannot take a card**. Stripe is
 asked for `card_payments` at the moment of the request, and the read is kept
 like any other. A lane holds one reader at a time, and a reader serves one
 lane at a time, at the route and at the table.
+
+## Deploying
+
+⚠ **Behind a proxy, declare `TRUST_PROXY`** (see "The owner signs in" for its
+forms). Without it the platform sees every caller as the proxy's one address:
+the sign-in lock and the attempt limit become one for everyone, and the
+change log's bound on refused attempts (0028) counts every caller with no
+sign-in as ONE source -- so one caller's flood takes everyone's refused
+attempts onto a single too-many line. The bound still holds; it can no longer
+tell callers apart.
 
 ## Vehicle identity and retention
 

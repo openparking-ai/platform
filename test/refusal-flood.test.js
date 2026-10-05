@@ -143,6 +143,21 @@ test("a signed-in caller's refused attempts are bounded the same way: in its own
   assert.ok(inB.every((l) => l.actor_kind === 'outside' && l.actor_name === null && l.garage_id === theirs.id));
 });
 
+test("this account's own cancelled key, used again and again: in this account's log, named, bounded the same way; never in another's", async () => {
+  const { generateDeviceToken, hashToken } = await import('../src/auth.js');
+  const { withTenant } = await import('./helpers.js');
+  const old = generateDeviceToken();
+  await withTenant(a.tenant, (c) => c.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash, revoked_at) VALUES ($1, 'Stolen key', $2, now())`, [a.tenant, hashToken(old)]));
+  const sinceA = new Set((await linesOf(a.tenant)).map((l) => l.id));
+  const sinceB = new Set((await linesOf(b.tenant)).map((l) => l.id));
+  const ms = await hammer(1_000, () => send('POST', `/lanes/${randomUUID()}/close`, { reason: 'full', message: 'x' }, '203.0.113.10', old).then((s) => assert.equal(s, 401)));
+  const inA = (await linesOf(a.tenant)).filter((l) => !sinceA.has(l.id));
+  assert.equal(inA.reduce((n, l) => n + l.attempts, 0), 1_000);
+  assert.ok(inA.length <= bound(ms), `${inA.length} lines`);
+  assert.ok(inA.every((l) => l.actor_kind === 'key' && l.actor_name === 'Stolen key' && ['key_cancelled', 'too_many_refused'].includes(l.refusal)));
+  assert.equal((await linesOf(b.tenant)).filter((l) => !sinceB.has(l.id)).length, 0);
+});
+
 test('the same refused attempt repeated is still one line, counted', async () => {
   const SOURCE = '203.0.113.9';
   const since = new Date();
