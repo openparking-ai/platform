@@ -663,7 +663,9 @@ test('NO SECRET IN THE LOG OR THE OUTPUT: no password, key, connection code, coo
     // suites run beside this one and their lines are theirs to answer for.
     const lines = (await owner.query('SELECT * FROM garage_changes WHERE tenant_id = ANY($1)', [[a.tenant, b.tenant]])).rows;
     const security = (await owner.query('SELECT * FROM platform_security_log WHERE coalesce(last_at, at) >= $1', [STARTED])).rows;
-    assert.ok(security.length >= 2, `a scan of ${security.length} security lines`);
+    // One line or more: with every suite's unsigned requests from one address,
+    // they may all be counted on that source's one too-many line (0028).
+    assert.ok(security.length >= 1, `a scan of ${security.length} security lines`);
     assert.ok(lines.length > 30, `a scan of ${lines.length} lines`);
     text = JSON.stringify([lines, security]);
   } finally {
