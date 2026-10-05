@@ -47,6 +47,7 @@
     "owner-sign-in-fail-control": "node scripts/owner-sign-in-fail-control.js",
     "garage-reads-fail-control": "node scripts/garage-reads-fail-control.js",
     "owner-language-fail-control": "node scripts/owner-language-fail-control.js",
+    "setup-fail-control": "node scripts/setup-fail-control.js",
     "check-no-real-data": "node .github/scripts/check-no-real-data.js",
     "check-no-commercial-values": "node .github/scripts/check-no-commercial-values.js",
     "check-no-sibling-names": "node .github/scripts/check-no-sibling-names.js"

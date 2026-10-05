@@ -396,9 +396,20 @@ export async function garagesForTenant(client, tenantId) {
  * unbound reader is no longer the lane's reader and is not shown.
  * `token_hash` is never selected. Every query carries the tenant.
  */
+/**
+ * Who closed or reopened a lane, as stored on it (src/lanes.js `whoLabel`):
+ * `owner:<email>` or `key:<name>`.
+ */
+export function whoSaid(label) {
+  if (label === null || label === undefined) return null;
+  const at = label.indexOf(':');
+  return { kind: label.slice(0, at), name: label.slice(at + 1) || null };
+}
+
 export async function lanesForGarage(client, tenantId, garageId) {
   const lanes = (await client.query(
-    'SELECT id, name, direction FROM lanes WHERE tenant_id = $1 AND garage_id = $2 ORDER BY created_at, id',
+    `SELECT id, name, direction, closed_reason, closed_message, closed_by, closed_at, reopened_by, reopened_at
+       FROM lanes WHERE tenant_id = $1 AND garage_id = $2 ORDER BY created_at, id`,
     [tenantId, garageId],
   )).rows;
   const devices = (await client.query(
@@ -413,10 +424,13 @@ export async function lanesForGarage(client, tenantId, garageId) {
       WHERE tenant_id = $1 AND garage_id = $2 AND unbound_at IS NULL`,
     [tenantId, garageId],
   )).rows;
-  return lanes.map((lane) => {
+  return lanes.map(({ closed_reason, closed_message, closed_by, closed_at, reopened_by, reopened_at, ...lane }) => {
     const reader = readers.find((r) => r.lane_id === lane.id);
     return {
       ...lane,
+      // Open (null), or closed with its reason and message, and who said so.
+      closed: closed_reason === null ? null : { reason: closed_reason, message: closed_message, by: whoSaid(closed_by), at: closed_at },
+      reopened: reopened_at === null ? null : { by: whoSaid(reopened_by), at: reopened_at },
       devices: devices.filter((d) => d.lane_id === lane.id).map(({ id, name, last_seen_at, revoked_at }) => ({ id, name, last_seen_at, revoked_at })),
       reader: reader ? { reader_id: reader.reader_id, label: reader.label, bound_at: reader.bound_at } : null,
     };

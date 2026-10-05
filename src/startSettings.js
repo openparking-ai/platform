@@ -19,6 +19,9 @@ export const START_SETTINGS = Object.freeze({
   PG_POOL_MAX: { min: 1, max: 100, fallback: 10 },
   // An hour at most: a tolerance much past that is the check switched off.
   MAX_CLOCK_SKEW_SECONDS: { min: 0, max: 3600, fallback: 120 },
+  // How long a lane computer may go unheard before its lane counts as not
+  // connected: the one place this is set (src/setup.js). A day at most.
+  LANE_QUIET_MINUTES: { min: 1, max: 1440, fallback: 5 },
 });
 
 /** The value, or `why` it is not one. Unset is the default. */

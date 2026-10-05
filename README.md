@@ -452,7 +452,7 @@ each query as well as by row-level security; another tenant's garage is `404`.
 
     GET /api/v1/garages                     {garages: [{id, name, timezone, currency, live}]}
     GET /api/v1/garages/<id>                {garage: {id, name, timezone, currency, live}}
-    GET /api/v1/garages/<id>/lanes          {lanes: [{id, name, direction,
+    GET /api/v1/garages/<id>/lanes          {quiet_minutes, lanes: [{id, name, direction,
                                                       devices: [{id, name, last_seen_at, revoked_at}],
                                                       reader: {reader_id, label, bound_at} | null}]}
 
@@ -461,6 +461,77 @@ each query as well as by row-level security; another tenant's garage is `404`.
 credential hash is ever in an answer. `npm run garage-reads-fail-control`
 breaks each property in turn.
 
+### Setup: the checklist, lane setup and closing, and the change log
+
+    GET    /api/v1/garages/<id>/setup     {setup: {garage_id, open, takes_any_driver, steps: [{key, done, facts}]}}
+    PATCH  /api/v1/lanes/<id>             {name}                         rename
+    DELETE /api/v1/lanes/<id>                                            only a lane never used
+    POST   /api/v1/lanes/<id>/close       {reason, message, override?}   full | everyone
+    POST   /api/v1/lanes/<id>/reopen
+    GET    /api/v1/garages/<id>/changes[/<line id>]           {changes: [...], next}            the changes made, newest first, 50 a page
+    GET    /api/v1/garages/<id>/refused-attempts[/<line id>]  {refused: [...], next, count}     refused attempts, apart; count = {lines, attempts}
+
+**The checklist** is worked out in one place, `src/setup.js`, from the reads
+that already exist -- the activation readout, the recorded payment account, the
+lanes with their computers and readers -- and nothing is ticked by hand. Steps,
+in order: `garage_details`, `drivers`, `lanes` (a way in and a way out),
+`lane_computers`, `rates`, `taxes`, `getting_paid` and `card_readers` (only for
+a garage that takes any driver), `open` (and what is still missing). A lane
+computer counts as connected when it was heard from within
+`LANE_QUIET_MINUTES` minutes: a start setting (5 unless the deployment sets
+it), declared once in `src/startSettings.js`. It is the platform's one verdict
+on a quiet lane: the setup read and the lanes read (`quiet_minutes`) return
+the value they used, and the admin reads it from them and keeps no copy. The
+devices route below still publishes the timestamp alone.
+
+**A lane** is renamed, or removed only if it never had a stay, a computer, a
+card reader or an event (`409 lane_has_history`, with what it has in
+`details`). It is **closed by hand** with a reason -- `full` (pass and monthly
+holders still get in) or `everyone` -- and the owner's message, and who closed
+it and when are kept on it; reopening keeps the same (0026). Closing the last
+open lane of a direction is `409 last_open_lane` unless the request says
+`override: true`. A closing locks every lane of the garage, in one order, by
+id, before it reads any of them, so two closings at once queue rather than
+deadlock, and the second sees the first; connecting a computer holds its lane
+(`FOR KEY SHARE`), so a removal at the same moment either refuses it or comes
+second (`test/races.test.js`). `/lane/rules` carries the lane's state and
+message; nothing at the lane acts on it yet.
+
+**The change log** (`garage_changes`, 0026). Every operator write route --
+`WRITE_ROUTES` in `src/app.js`, 22, checked against the router -- and the
+owner's language write one line each, in the same transaction as the change:
+who (the signed-in owner by email, or the key by its name), what, before and
+after, when. A request that changed nothing -- the same before and after --
+writes no line, on every route. A refused write is a line too, through
+`record_refused_change()` (0028). With a sign-in or key that works NOW, it goes
+in the log of the account whose garage, lane, computer or key the path names
+(someone from another account is never named there, and a "not found" says
+what was not found: `garage_not_found`) and, when that is not the caller's own,
+in the caller's account's log too; a key is named by its name. With this
+account's own sign-in or key that no longer works -- a cancelled or expired
+key used again, which may be a stolen one, or an ended sign-in replayed -- it
+goes in THIS account's log only, never another's, naming the key or the owner
+and why (`key_cancelled`, `key_expired`, `session_ended`). With no credential,
+or one that is no account's, it goes only to `platform_security_log`, whatever
+it names: the owner can do nothing about it, and it is the easiest thing to
+send in bulk. That log no owner reads and the
+application holds no grant on. The bound is per source -- the caller's account
+and person or key, or, for nobody, the address (kept only as a hash): one
+source gets 20 refused lines a minute in a log, across every route and id; the
+same attempt again is counted on its line (`attempts`, `last_at`), and beyond
+the 20 one more line, `too_many_refused`, carries the count of the rest. So
+hammering any route, with any ids, cannot fill a log, and the changes made are
+read apart from the refused attempts (`/refused-attempts`), so no number of
+them can push a change off the owner's page. Behind a proxy, `TRUST_PROXY`
+must be set, or every unsigned caller is one source (see "Deploying"). Changes that were made
+are never counted together. A malformed id is refused
+before the database, as before, and writes no line. The log is append-only:
+the application may `SELECT` and `INSERT`, and a trigger refuses `UPDATE`,
+`DELETE` and `TRUNCATE` for every role, the table's owner included. No line
+holds a password, key, lane computer code, cookie or session value: a line is
+built from named fields, and `src/changes.js` refuses one that holds a
+credential. `npm run setup-fail-control` breaks each property in turn.
+
 ### A lane that has gone quiet
 
 `GET /api/v1/garages/<id>/devices` lists the devices on that garage's lanes with
@@ -468,9 +539,9 @@ breaks each property in turn.
 the only place anything can see that a lane has stopped reporting, because a
 lane that is switched off cannot report that it is switched off.
 
-The platform publishes the timestamp and **no verdict**. How long is too long is
-a per-site assumption, and a threshold chosen here would be one nobody measured,
-applied to every site. `revoked_at` is in the listing beside it, because a
+This route publishes the timestamp and **no verdict**. How long is too long is a
+per-site assumption: the one place it is set is `LANE_QUIET_MINUTES`, which the
+deployment declares, and only the setup and lanes reads apply it. `revoked_at` is in the listing beside it, because a
 revoked device that stops being seen is not a fault. `token_hash` is not.
 
 ### Every conflict names itself
@@ -1076,6 +1147,16 @@ Each create is **refused while the account cannot take a card**. Stripe is
 asked for `card_payments` at the moment of the request, and the read is kept
 like any other. A lane holds one reader at a time, and a reader serves one
 lane at a time, at the route and at the table.
+
+## Deploying
+
+⚠ **Behind a proxy, declare `TRUST_PROXY`** (see "The owner signs in" for its
+forms). Without it the platform sees every caller as the proxy's one address:
+the sign-in lock and the attempt limit become one for everyone, and the
+change log's bound on refused attempts (0028) counts every caller with no
+sign-in as ONE source -- so one caller's flood takes everyone's refused
+attempts onto a single too-many line. The bound still holds; it can no longer
+tell callers apart.
 
 ## Vehicle identity and retention
 

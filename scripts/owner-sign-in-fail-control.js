@@ -385,7 +385,7 @@ const SOURCE_BREAKS = [
     why: 'an id that is not a uuid reaches the handler and the database',
     suite: IDS,
     file: 'src/app.js',
-    from: '    router.param(name, (req, _res, next, value) => next(UUID.test(value) ? undefined : notFound(req.route.path)));\n',
+    from: '    router.param(name, (req, _res, next, value) => next(UUID.test(value) ? undefined : Object.assign(notFound(req.route.path), { malformedId: true })));\n',
     to: '    router.param(name, (_req, _res, next) => next());\n',
   },
   {

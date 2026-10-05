@@ -64,6 +64,15 @@ export function requireConnect() {
   return config;
 }
 
+/**
+ * The garage's account row as this platform last recorded it, on the caller's
+ * transaction, and whether this deployment has Connect at all. For readers
+ * that need the recorded facts without asking Stripe (the setup checklist).
+ */
+export async function recordedFacts(client, tenantId, garageId) {
+  return { configured: connectConfig().configured, row: await readRow(client, tenantId, garageId) };
+}
+
 async function readRow(client, tenantId, garageId) {
   const { rows } = await client.query(
     'SELECT * FROM garage_stripe_accounts WHERE tenant_id = $1 AND garage_id = $2',
@@ -165,7 +174,7 @@ export async function accountsNamingGarage(tenantId, garageId, config) {
 }
 
 /** Record an account found at Stripe for a reservation that never heard its answer. */
-async function attachFound(tenantId, garageId, accountId, { actor }) {
+async function attachFound(tenantId, garageId, accountId, { actor, record = null }) {
   return withTenant(tenantId, async (client) => {
     const { rows } = await client.query(
       `UPDATE garage_stripe_accounts
@@ -183,6 +192,11 @@ async function attachFound(tenantId, garageId, accountId, { actor }) {
         occurredAt: new Date().toISOString(),
         detail: { account_id: accountId, actor, found_at_stripe: true },
       }]);
+      await record?.(client, {
+        garageId, action: 'payment_account.create',
+        subject: { kind: 'payment_account', id: null, name: null },
+        before: { account: false }, after: { account: true },
+      });
     }
     return rows[0] ?? (await readRow(client, tenantId, garageId));
   });
@@ -215,7 +229,7 @@ async function startOver(tenantId, garageId, staleKey, { actor, hours }) {
   });
 }
 
-export async function createAccount(tenantId, garageId, { actor, country: rawCountry }) {
+export async function createAccount(tenantId, garageId, { actor, country: rawCountry, record = null }) {
   const config = requireConnect();
 
   // 1. Reserve, committed, before Stripe is asked.
@@ -264,7 +278,7 @@ export async function createAccount(tenantId, garageId, { actor, country: rawCou
       );
     }
     if (found.length === 1) {
-      return { account: await attachFound(tenantId, garageId, found[0], { actor }), created: false };
+      return { account: await attachFound(tenantId, garageId, found[0], { actor, record }), created: false };
     }
     const fresh = await startOver(tenantId, garageId, reserved.row.create_idempotency_key, {
       actor, hours: Math.floor(ageHours),
@@ -323,6 +337,11 @@ export async function createAccount(tenantId, garageId, { actor, country: rawCou
           detail: { account_id: account.id, actor },
         },
       ]);
+      await record?.(client, {
+        garageId, action: 'payment_account.create',
+        subject: { kind: 'payment_account', id: null, name: null },
+        before: { account: false }, after: { account: true },
+      });
       return { row: rows[0], created: true };
     }
     return { row: await readRow(client, tenantId, garageId), created: false };
@@ -375,7 +394,7 @@ export function readFacts(account) {
   };
 }
 
-export async function refreshAccount(tenantId, garageId, { actor }) {
+export async function refreshAccount(tenantId, garageId, { actor, record = null }) {
   const config = requireConnect();
   const row = await recordedAccount(tenantId, garageId);
   // One read reports all three facts the platform keeps.
@@ -402,6 +421,12 @@ export async function refreshAccount(tenantId, garageId, { actor }) {
         detail: { account_id: row.account_id, ...facts, actor },
       },
     ]);
+    const shown = (r) => ({ card_payments: r.card_payments, charges_enabled: r.charges_enabled, details_submitted: r.details_submitted });
+    await record?.(client, {
+      garageId, action: 'payment_account.read',
+      subject: { kind: 'payment_account', id: null, name: null },
+      before: shown(row), after: shown(rows[0]),
+    });
     return rows[0];
   });
 }

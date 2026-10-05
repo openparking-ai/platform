@@ -45,8 +45,8 @@ const SOURCE_BREAKS = [
     name: 'lanes_predicate_removed',
     why: 'a garage\'s lanes are read by garage id alone',
     file: 'src/repository.js',
-    from: "'SELECT id, name, direction FROM lanes WHERE tenant_id = $1 AND garage_id = $2 ORDER BY created_at, id'",
-    to: "'SELECT id, name, direction FROM lanes WHERE $1::uuid IS NOT NULL AND garage_id = $2 ORDER BY created_at, id'",
+    from: 'FROM lanes WHERE tenant_id = $1 AND garage_id = $2 ORDER BY created_at, id`',
+    to: 'FROM lanes WHERE $1::uuid IS NOT NULL AND garage_id = $2 ORDER BY created_at, id`',
   },
   {
     name: 'lanes_not_404',

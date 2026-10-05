@@ -942,7 +942,7 @@ test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, not JSON, oversized or
   secrets.add(key);
   await withTenant(who.tenant, (c) => c.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'ops',$2)`, [who.tenant, hashToken(key)]));
   const changing = routeTable(main.app).filter((r) => r.base === '/api/v1' && r.method !== 'GET');
-  assert.equal(changing.length, 18, `the walk found ${changing.length} changing operator routes`);
+  assert.equal(changing.length, 22, `the walk found ${changing.length} changing operator routes`);
   const cases = [
     { name: 'malformed', raw: '{"name": "Echo-Me-Back", oops', headers: {}, status: 400, body: BODY_UNREADABLE },
     // The parser's own text for this one quotes what was sent.
@@ -977,7 +977,7 @@ test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, not JSON, oversized or
       }
     }
   }
-  assert.equal(answers, 18 * spellings.length * cases.length * 2);
+  assert.equal(answers, 22 * spellings.length * cases.length * 2);
   assert.deepEqual(wrong, []);
 });
 
