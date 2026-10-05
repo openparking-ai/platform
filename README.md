@@ -468,7 +468,8 @@ breaks each property in turn.
     DELETE /api/v1/lanes/<id>                                            only a lane never used
     POST   /api/v1/lanes/<id>/close       {reason, message, override?}   full | everyone
     POST   /api/v1/lanes/<id>/reopen
-    GET    /api/v1/garages/<id>/changes[/<line id>]  {changes: [...], next}   newest first, 50 a page
+    GET    /api/v1/garages/<id>/changes[/<line id>]           {changes: [...], next}            the changes made, newest first, 50 a page
+    GET    /api/v1/garages/<id>/refused-attempts[/<line id>]  {refused: [...], next, count}     refused attempts, apart; count = {lines, attempts}
 
 **The checklist** is worked out in one place, `src/setup.js`, from the reads
 that already exist -- the activation readout, the recorded payment account, the
@@ -489,24 +490,37 @@ card reader or an event (`409 lane_has_history`, with what it has in
 holders still get in) or `everyone` -- and the owner's message, and who closed
 it and when are kept on it; reopening keeps the same (0026). Closing the last
 open lane of a direction is `409 last_open_lane` unless the request says
-`override: true`. `/lane/rules` carries the lane's state and message; nothing
-at the lane acts on it yet.
+`override: true`. A closing locks every lane of the garage, in one order, by
+id, before it reads any of them, so two closings at once queue rather than
+deadlock, and the second sees the first; connecting a computer holds its lane
+(`FOR KEY SHARE`), so a removal at the same moment either refuses it or comes
+second (`test/races.test.js`). `/lane/rules` carries the lane's state and
+message; nothing at the lane acts on it yet.
 
 **The change log** (`garage_changes`, 0026). Every operator write route --
 `WRITE_ROUTES` in `src/app.js`, 22, checked against the router -- and the
 owner's language write one line each, in the same transaction as the change:
 who (the signed-in owner by email, or the key by its name), what, before and
-after, when. A write that changed nothing writes a line saying so. A refused
-write is a line too, through `record_refused_change()`: in the log of the
-account whose garage, lane, computer or key the path names (someone from
-another account is never named there), in the caller's own account's log, or,
-naming nothing and coming with nothing, in `platform_security_log`, which no
-owner reads and the application holds no grant on. A refused attempt repeated
--- the same caller, from the same address (kept only as a hash), the same
-request and refusal -- within a minute of its line's first attempt is counted
-on that line (`attempts`, `last_at`; 0027) instead of written again, so
-hammering a route cannot fill the log. Changes that were made are never
-counted together. A malformed id is refused
+after, when. A request that changed nothing -- the same before and after --
+writes no line, on every route. A refused write is a line too, through
+`record_refused_change()` (0028). With a sign-in or key that works NOW, it goes
+in the log of the account whose garage, lane, computer or key the path names
+(someone from another account is never named there, and a "not found" says
+what was not found: `garage_not_found`) and, when that is not the caller's own,
+in the caller's account's log too; a key is named by its name. With none -- no
+sign-in, an ended one, a cancelled or unknown key -- it goes only to
+`platform_security_log`, whatever it names: the owner can do nothing about it,
+and it is the easiest thing to send in bulk. That log no owner reads and the
+application holds no grant on. The bound is per source -- the caller's account
+and person or key, or, for nobody, the address (kept only as a hash): one
+source gets 20 refused lines a minute in a log, across every route and id; the
+same attempt again is counted on its line (`attempts`, `last_at`), and beyond
+the 20 one more line, `too_many_refused`, carries the count of the rest. So
+hammering any route, with any ids, cannot fill a log, and the changes made are
+read apart from the refused attempts (`/refused-attempts`), so no number of
+them can push a change off the owner's page. Behind a proxy, `TRUST_PROXY`
+must be set, or every unsigned caller is one source. Changes that were made
+are never counted together. A malformed id is refused
 before the database, as before, and writes no line. The log is append-only:
 the application may `SELECT` and `INSERT`, and a trigger refuses `UPDATE`,
 `DELETE` and `TRUNCATE` for every role, the table's owner included. No line

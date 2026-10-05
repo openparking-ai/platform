@@ -64,6 +64,28 @@ async function lockedLane(client, tenantId, laneId) {
   return rows[0];
 }
 
+/**
+ * The lane, with every lane of its garage, all locked -- and locked in ONE
+ * order, by id, before any of them is read for a decision. Two closings at
+ * once then queue one behind the other: neither can see the other's lane
+ * still open, and neither holds a lane the other is waiting for, so they
+ * cannot deadlock. (Locking the asked-for lane first, then the rest, did:
+ * two closings each held one lane and waited for the other's.) A lane that
+ * is gone by the time the locks are held is a 404.
+ */
+async function lockedGarageLanes(client, tenantId, laneId) {
+  const { rows: found } = await client.query('SELECT garage_id FROM lanes WHERE tenant_id = $1 AND id = $2', [tenantId, laneId]);
+  if (!found[0]) throw new HttpError(404, 'lane not found', 'lane_not_found');
+  const { rows: all } = await client.query(
+    `SELECT id, garage_id, name, direction, closed_reason, closed_message, closed_at
+       FROM lanes WHERE tenant_id = $1 AND garage_id = $2 ORDER BY id FOR UPDATE`,
+    [tenantId, found[0].garage_id],
+  );
+  const lane = all.find((l) => l.id === laneId);
+  if (!lane) throw new HttpError(404, 'lane not found', 'lane_not_found');
+  return { ...lane, all };
+}
+
 const subjectOf = (lane, name = lane.name) => ({ kind: 'lane', id: lane.id, name });
 const stateOf = (lane) =>
   lane.closed_reason === null ? { state: 'open' } : { state: 'closed', reason: lane.closed_reason, message: lane.closed_message };
@@ -125,13 +147,8 @@ export async function close(client, tenantId, laneId, body, ctx) {
   }
   const message = messageField(body.message);
   if (body.override !== undefined && body.override !== true) throw bad('override, when sent, is true', 'lane_override_refused');
-  const lane = await lockedLane(client, tenantId, laneId);
-  // Every lane of the garage, locked in one order, so two closings at once
-  // cannot each see the other lane still open.
-  const { rows: lanes } = await client.query(
-    `SELECT id, direction, closed_reason FROM lanes WHERE tenant_id = $1 AND garage_id = $2 ORDER BY id FOR UPDATE`,
-    [tenantId, lane.garage_id],
-  );
+  const lane = await lockedGarageLanes(client, tenantId, laneId);
+  const lanes = lane.all;
   const openOthers = lanes.filter((l) => l.id !== lane.id && l.direction === lane.direction && l.closed_reason === null);
   if (lane.closed_reason === null && openOthers.length === 0 && body.override !== true) {
     throw conflict(

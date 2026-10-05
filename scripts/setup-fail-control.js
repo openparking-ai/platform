@@ -19,12 +19,19 @@
  *   guard_off_key_in_line     the guard is switched off and the code put in the line
  *   quiet_minutes_fixed       the quiet setting is a number in the code, not the declared one
  *   drivers_unanswerable      the drivers answer can be taken back to unanswered
+ *   unchanged_lines_written   a request that changes nothing writes a line anyway
+ *   refused_read_mixed        refused attempts are read with the changes, and can push them off a page
+ *   not_found_unnamed         a "not found" refusal does not say what was not found
+ *   lanes_locked_target_first a closing locks its own lane before the rest: two closings deadlock
+ *   connect_lane_unheld       connecting a computer does not hold its lane against a removal
  *
- * Schema breaks (the copy's migration 0026 edited; a scratch database built
- * from it):
+ * Schema breaks (the copy's migrations edited; a scratch database built from
+ * them):
  *   update_granted            the application may UPDATE and DELETE the log
  *   trigger_dropped           nothing stops the owner of the table rewriting it
- *   refusals_unbounded        every refused attempt writes a line of its own (0027)
+ *   refusals_unbounded        one source may write any number of refused lines a minute (0028)
+ *   unsigned_to_owner_log     a refused attempt with no working sign-in or key lands in the garage's log (0028)
+ *   key_unnamed               a key's refused line does not name the key (0028)
  *
  * Needs the same environment as the suite (the rate engine, a Postgres it may
  * make a scratch database on).
@@ -42,6 +49,7 @@ const SETUP = 'test/setup.test.js';
 const LANES = 'test/lane-setup.test.js';
 const LOG = 'test/change-log.test.js';
 const FLOOD = 'test/refusal-flood.test.js';
+const RACES = 'test/races.test.js';
 
 const SOURCE_BREAKS = [
   {
@@ -103,7 +111,7 @@ const SOURCE_BREAKS = [
     red: ['EVERY WRITE'],
     edits: [
       { file: 'src/app.js', from: "        await changes.record(client, req.change, {\n          garageId: rows[0].garage_id, action: 'lane.add',", to: "        if (false) await changes.record(client, req.change, {\n          garageId: rows[0].garage_id, action: 'lane.add'," },
-      { file: 'src/app.js', from: '      if (req.change.count !== before + 1) {', to: '      if (false) {' },
+      { file: 'src/app.js', from: '      if (lines !== 1 && !(lines === 0 && req.change.unchanged)) {', to: '      if (false) {' },
     ],
   },
   {
@@ -147,15 +155,71 @@ const SOURCE_BREAKS = [
     red: ['the drivers answer'],
     edits: [{ file: 'src/activation.js', from: '  if (raw !== true && raw !== false) {', to: '  if (raw !== true && raw !== false && raw !== null) {' }],
   },
+  {
+    name: 'unchanged_lines_written',
+    why: 'a request that changes nothing writes a line anyway',
+    suite: LOG,
+    red: ['NOTHING CHANGED, NO LINE'],
+    edits: [{ file: 'src/changes.js', from: 'export const nothingChanged = (before, after) => before !== null && after !== null && canonical(before) === canonical(after);', to: 'export const nothingChanged = () => false;' }],
+  },
+  {
+    name: 'refused_read_mixed',
+    why: 'refused attempts are read with the changes',
+    suite: LOG,
+    red: ['THE READ'],
+    edits: [{ file: 'src/changes.js', from: "      WHERE tenant_id = $1 AND (garage_id = $2 OR garage_id IS NULL) AND outcome = $4 ${older}", to: "      WHERE tenant_id = $1 AND (garage_id = $2 OR garage_id IS NULL) AND $4::text IS NOT NULL ${older}" }],
+  },
+  {
+    name: 'not_found_unnamed',
+    why: 'a "not found" refusal does not say what was not found',
+    suite: LOG,
+    red: ['REFUSED ATTEMPTS land in the right log'],
+    edits: [{ file: 'src/changes.js', from: '  if (status === 404 && target?.kind) return `${target.kind}_not_found`;', to: '' }],
+  },
+  {
+    name: 'lanes_locked_target_first',
+    why: 'a closing locks its own lane before the rest',
+    suite: RACES,
+    red: ['the last two ways out closed at once'],
+    edits: [{ file: 'src/lanes.js', from: "  const { rows: found } = await client.query('SELECT garage_id FROM lanes WHERE tenant_id = $1 AND id = $2', [tenantId, laneId]);", to: "  const { rows: found } = await client.query('SELECT garage_id FROM lanes WHERE tenant_id = $1 AND id = $2 FOR UPDATE', [tenantId, laneId]);" }],
+  },
+  {
+    name: 'connect_lane_unheld',
+    why: 'connecting a computer does not hold its lane against a removal',
+    suite: RACES,
+    red: ['a lane removed while a computer is connected'],
+    edits: [{ file: 'src/app.js', from: "WHERE tenant_id = $1 AND id = $2 FOR KEY SHARE'", to: "WHERE tenant_id = $1 AND id = $2'" }],
+  },
 ];
 
 const SCHEMA_BREAKS = [
   {
     name: 'refusals_unbounded',
-    why: 'every refused attempt writes a line of its own',
+    why: 'one source may write any number of refused lines a minute',
     suite: FLOOD,
-    red: ['10,000 refused attempts from one source'],
-    edits: [{ file: '0027_refusals_counted.sql', from: "v_window    constant interval := interval '60 seconds';", to: "v_window    constant interval := interval '0 seconds';" }],
+    red: ['2,000 refused requests from one unsigned sender', "a signed-in caller's refused attempts are bounded"],
+    edits: [
+      { file: '0028_refusals_by_source.sql', from: "    v_limit  constant integer  := 20;   -- REFUSED_PER_MINUTE\n    v_lines  integer;\n  BEGIN\n    -- One source at a time in this log", to: "    v_limit  constant integer  := 1000000;   -- REFUSED_PER_MINUTE\n    v_lines  integer;\n  BEGIN\n    -- One source at a time in this log" },
+      { file: '0028_refusals_by_source.sql', from: "    v_limit  constant integer  := 20;   -- REFUSED_PER_MINUTE\n    v_lines  integer;\n  BEGIN\n    PERFORM pg_advisory_xact_lock(hashtextextended(concat_ws('|', 'refused-security'", to: "    v_limit  constant integer  := 1000000;   -- REFUSED_PER_MINUTE\n    v_lines  integer;\n  BEGIN\n    PERFORM pg_advisory_xact_lock(hashtextextended(concat_ws('|', 'refused-security'" },
+    ],
+  },
+  {
+    name: 'unsigned_to_owner_log',
+    why: 'a refused attempt with no working sign-in or key lands in the garage it names',
+    suite: FLOOD,
+    red: ['2,000 refused requests from one unsigned sender'],
+    edits: [
+      { file: '0028_refusals_by_source.sql', from: '    IF v_caller IS NULL THEN\n      PERFORM write_refused_security', to: '    IF v_caller IS NULL AND p_target_id IS NULL THEN\n      PERFORM write_refused_security' },
+      { file: '0028_refusals_by_source.sql', from: '    IF v_caller IS DISTINCT FROM v_t_tenant THEN', to: '    IF v_caller IS NOT NULL AND v_caller IS DISTINCT FROM v_t_tenant THEN' },
+      { file: '0028_refusals_by_source.sql', from: "    v_source := md5(concat_ws('|', 'actor', v_caller, v_kind, v_actor));", to: "    v_source := coalesce(p_source_key, md5(concat_ws('|', 'actor', v_caller, v_kind, v_actor)));\n    IF v_caller IS NULL THEN v_kind := 'nobody'; v_actor := NULL; v_name := NULL; END IF;" },
+    ],
+  },
+  {
+    name: 'key_unnamed',
+    why: "a key's refused line does not name the key",
+    suite: LOG,
+    red: ['EVERY LINE NAMES WHO'],
+    edits: [{ file: '0028_refusals_by_source.sql', from: "    IF v_kind = 'key' AND v_name IS NULL THEN", to: '    IF false THEN' }],
   },
   {
     name: 'update_granted',
@@ -250,7 +314,7 @@ async function buildScratch(dir, edits) {
 let failures = 0;
 
 console.log('== control A: each suite must PASS intact ==');
-for (const suite of [SETUP, LANES, LOG, FLOOD]) {
+for (const suite of [SETUP, LANES, LOG, FLOOD, RACES]) {
   const dir = stage();
   try {
     const intact = run(dir, suite);

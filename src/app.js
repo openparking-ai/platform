@@ -747,14 +747,16 @@ export function createApp() {
    * A write in one transaction with its change-log line (src/changes.js): `fn`
    * makes the change and records its line on the same client, and a request
    * that recorded no line, or more than one, rolls back. A change without its
-   * line cannot commit.
+   * line cannot commit. The one request with no line is one `record` found
+   * changed nothing (the same before and after): it writes no line at all.
    */
   const changeTx = (req, fn) =>
     withTenant(req.tenantId, async (client) => {
       const before = req.change.count;
       const out = await fn(client);
-      if (req.change.count !== before + 1) {
-        throw new Error(`a write recorded ${req.change.count - before} change-log lines, not one`);
+      const lines = req.change.count - before;
+      if (lines !== 1 && !(lines === 0 && req.change.unchanged)) {
+        throw new Error(`a write recorded ${lines} change-log lines, not one`);
       }
       return out;
     });
@@ -763,14 +765,9 @@ export function createApp() {
    * A write whose change ran in a module's own transactions (the payment
    * account and card readers, which ask Stripe between them): the module
    * records the line in the transaction that changed something. When nothing
-   * changed -- asked again, answered with what was there -- the request still
-   * gets its one line, saying so, on its own.
+   * changed -- asked again, answered with what was there -- there is no line.
    */
   const recorder = (req) => (client, line) => changes.record(client, req.change, line);
-  const lineIfNothingChanged = async (req, line) => {
-    if (req.change.count > 0) return;
-    await withTenant(req.tenantId, (client) => changes.record(client, req.change, line));
-  };
 
   operator.post('/garages', async (req, res, next) => {
     try {
@@ -946,7 +943,7 @@ export function createApp() {
         });
         await changes.record(client, req.change, {
           garageId: garage.id,
-          action: done.activated ? 'garage.open' : 'garage.open_again',
+          action: 'garage.open',
           subject: { kind: 'garage', id: garage.id, name: garage.name },
           before: { open: garage.activated_at !== null },
           after: { open: true },
@@ -1073,10 +1070,6 @@ export function createApp() {
       country: req.body?.country,
       record: recorder(req),
     });
-    await lineIfNothingChanged(req, {
-      garageId: req.params.garageId, action: 'payment_account.create_again',
-      subject: { kind: 'payment_account', id: null, name: null }, before: null, after: null,
-    });
     res.status(created ? 201 : 200).json({ stripe_account: stripeAccount.presentAccount(account) });
   }));
 
@@ -1089,12 +1082,7 @@ export function createApp() {
   /** Stripe's onboarding link, for the operator to open. */
   operator.post('/garages/:garageId/stripe-account/onboarding-link', connectRoute(async (req, res) => {
     const link = await stripeAccount.onboardingLink(req.tenantId, req.params.garageId);
-    // Nothing here is changed: Stripe made a link. The line says one was
-    // asked for, never the link itself.
-    await lineIfNothingChanged(req, {
-      garageId: req.params.garageId, action: 'payment_account.setup_link',
-      subject: { kind: 'payment_account', id: null, name: null }, before: null, after: null,
-    });
+    // Nothing of this platform's is changed: Stripe made a link. So no line.
     res.status(201).json({ onboarding_link: link });
   }));
 
@@ -1115,10 +1103,6 @@ export function createApp() {
     const { location, created } = await terminal.createLocation(req.tenantId, req.params.garageId, req.body ?? {}, {
       actor: `operator_token:${req.operatorTokenId}`,
       record: recorder(req),
-    });
-    await lineIfNothingChanged(req, {
-      garageId: req.params.garageId, action: 'payment_account.reader_place_again',
-      subject: { kind: 'payment_account', id: null, name: null }, before: null, after: null,
     });
     res.status(created ? 201 : 200).json({ location: terminal.presentLocation(location) });
   }));
@@ -1271,8 +1255,9 @@ export function createApp() {
       // and its lane, and `record` refuses any line that holds the code.
       req.change.secrets.push(token);
       const device = await changeTx(req, async (client) => {
-        // Asked first: a lane that is not there is a 404, not a foreign-key violation.
-        const lane = await client.query('SELECT garage_id, name FROM lanes WHERE tenant_id = $1 AND id = $2', [req.tenantId, req.params.laneId]);
+        // Asked first, and held: a lane that is not there -- or is being
+        // removed at this moment -- is a 404, not a foreign-key violation.
+        const lane = await client.query('SELECT garage_id, name FROM lanes WHERE tenant_id = $1 AND id = $2 FOR KEY SHARE', [req.tenantId, req.params.laneId]);
         if (lane.rowCount === 0) throw new HttpError(404, 'lane not found');
         const { rows } = await client.query(
           `INSERT INTO lane_devices (tenant_id, lane_id, name, token_hash) VALUES ($1,$2,$3,$4)
@@ -1333,7 +1318,7 @@ export function createApp() {
         );
         await changes.record(client, req.change, {
           garageId: was[0].garage_id,
-          action: was[0].revoked_at === null ? 'computer.cancel' : 'computer.cancel_again',
+          action: 'computer.cancel',
           subject: { kind: 'computer', id: rows[0].id, name: rows[0].name },
           before: { access: was[0].revoked_at === null ? 'connected' : 'cancelled', lane: was[0].lane },
           after: { access: 'cancelled', lane: was[0].lane },
@@ -1388,7 +1373,7 @@ export function createApp() {
         );
         await changes.record(client, req.change, {
           garageId: null,
-          action: was[0].revoked_at === null ? 'key.cancel' : 'key.cancel_again',
+          action: 'key.cancel',
           subject: { kind: 'key', id: rows[0].id, name: was[0].kind === 'key' ? rows[0].name : 'a sign-in' },
           before: { access: was[0].revoked_at === null ? 'active' : 'cancelled' },
           after: { access: 'cancelled' },
@@ -2397,27 +2382,33 @@ export function createApp() {
 
   /**
    * The garage's change log, newest first: its own lines and the account's.
-   * `/changes/<id>` continues after that line: `next` is the id of the last
-   * line of the page, or null on the last page. An id in the path, checked as
-   * every id is, and no query: the owner's screens build no query string, so
-   * an address carries ids only. A line not in this garage's log is 404.
+   * The changes made and the refused attempts are read apart, so no number
+   * of refused attempts can push a change out of sight. `/changes/<id>` (or
+   * `/refused-attempts/<id>`) continues after that line: `next` is the id of
+   * the last line of the page, or null on the last page. An id in the path,
+   * checked as every id is, and no query: the owner's screens build no query
+   * string, so an address carries ids only. A line not in this garage's log
+   * is 404. The refused attempts also say how many there are.
    */
-  const changesRead = async (req, res, next) => {
+  const logRead = (outcome) => async (req, res, next) => {
     try {
-      const page = await withTenant(req.tenantId, async (client) => {
+      const out = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
-        const out = await changes.linesForGarage(client, req.tenantId, garage.id, { after: req.params.changeId ?? null });
-        if (!out) throw new HttpError(404, 'change not found');
-        return out;
+        const page = await changes.linesForGarage(client, req.tenantId, garage.id, { outcome, after: req.params.changeId ?? null });
+        if (!page) throw new HttpError(404, 'change not found');
+        return { page, count: outcome === 'refused' ? await changes.refusedCount(client, req.tenantId, garage.id) : null };
       });
-      res.json({ changes: page.lines.map(presentChange), next: page.next });
+      if (outcome === 'done') res.json({ changes: out.page.lines.map(presentChange), next: out.page.next });
+      else res.json({ refused: out.page.lines.map(presentChange), next: out.page.next, count: out.count });
     } catch (err) {
       next(err);
     }
   };
-  operator.get('/garages/:garageId/changes', changesRead);
-  operator.get('/garages/:garageId/changes/:changeId', changesRead);
+  operator.get('/garages/:garageId/changes', logRead('done'));
+  operator.get('/garages/:garageId/changes/:changeId', logRead('done'));
+  operator.get('/garages/:garageId/refused-attempts', logRead('refused'));
+  operator.get('/garages/:garageId/refused-attempts/:changeId', logRead('refused'));
 
   /**
    * A refused write is a line in the change log (src/changes.js): in the log
@@ -2432,6 +2423,7 @@ export function createApp() {
         credential: req.credential?.kind ?? 'none',
         credentialToken: req.credential?.token ?? null,
         address: signIn.callerAddress(req, authSettings),
+        idleSeconds: authSettings.idleSeconds,
       });
     }
     next(err);

@@ -551,6 +551,7 @@ export function createAuthRouter(settings) {
       credential: token ? 'session' : 'none',
       credentialToken: token || null,
       address: callerAddress(req, settings),
+      idleSeconds: settings.idleSeconds,
     });
   };
 

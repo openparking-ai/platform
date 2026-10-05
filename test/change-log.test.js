@@ -3,13 +3,15 @@
  *
  *   - The router's write routes are exactly WRITE_ROUTES (22), and with the
  *     owner's language that is 23 writes. For EVERY one: one change makes
- *     exactly one line, naming who, what, before and after.
+ *     exactly one line, naming who, what, before and after; a request that
+ *     changes nothing makes none, on every route that can be asked again.
  *   - For every one that changes something: when its line cannot be written,
  *     the change does not happen.
- *   - Refused attempts land in the right log: the wrong site, an ended
- *     session, a cancelled key, another owner's garage, a forbidden change,
- *     nobody at all -- and one naming nothing goes to the platform's own
- *     security log, never shown to an owner.
+ *   - Refused attempts land in the right log: with a working sign-in or key,
+ *     the garage aimed at (another account's attempt as "outside") and the
+ *     caller's own; with none -- no sign-in, an ended one, a cancelled key --
+ *     the platform's own security log only, whatever it names.
+ *   - Every line names who: an owner by email, a key by its name.
  *   - UPDATE, DELETE and TRUNCATE of either log are refused for the
  *     application's role and for the owner of the tables.
  *   - No password, key, connection code, cookie or session value is in any
@@ -135,15 +137,14 @@ const WRITES = [
     action: 'garage.pass_links',
     setup: async () => ({ g: await newGarage(base, a) }),
     run: (s) => call(base, 'PUT', `/garages/${s.g.id}/entitlement-links`, { as: a, body: { garage_pass: null, monthly_billing: null } }),
-    line: (l) => assert.deepEqual([l.before, l.after], [{ garage_pass: null, monthly_billing: null }, { garage_pass: null, monthly_billing: null }]),
-    state: (s) => one(a.tenant, "SELECT count(*)::int AS n FROM events WHERE garage_id = $1", [s.g.id]),
+    // Stated as it already was -- linked to neither -- so nothing changed: no line.
+    noop: true,
   },
   {
     action: 'garage.validations_link',
     setup: async () => ({ g: await newGarage(base, a) }),
     run: (s) => call(base, 'PUT', `/garages/${s.g.id}/validations-link`, { as: a, body: { validations: null } }),
-    line: (l) => assert.deepEqual([l.before, l.after], [{ validations: null }, { validations: null }]),
-    state: (s) => one(a.tenant, "SELECT count(*)::int AS n FROM events WHERE garage_id = $1", [s.g.id]),
+    noop: true,
   },
   {
     action: 'payment_account.create',
@@ -156,9 +157,8 @@ const WRITES = [
     action: 'payment_account.setup_link',
     setup: paidGarage,
     run: (s) => call(base, 'POST', `/garages/${s.g.id}/stripe-account/onboarding-link`, { as: a }),
-    line: (l) => assert.deepEqual([l.before, l.after], [null, null], 'the link itself is never kept'),
-    // Nothing of the platform's changes: Stripe made a link.
-    state: null,
+    // Nothing of the platform's changes -- Stripe made a link -- so no line.
+    noop: true,
   },
   {
     action: 'payment_account.read',
@@ -359,6 +359,10 @@ test('EVERY WRITE: one change, exactly one line -- who, what, before and after -
     const r = await w.run(s);
     assert.ok(r.status >= 200 && r.status < 300, `${w.action}: ${r.status} ${r.text}`);
     const lines = await newLines(since);
+    if (w.noop) {
+      assert.equal(lines.length, 0, `${w.action}: it changed nothing, and wrote ${lines.length} lines`);
+      continue;
+    }
     assert.equal(lines.length, 1, `${w.action}: ${lines.length} lines`);
     const [l] = lines;
     assert.deepEqual([l.outcome, l.action, l.actor_kind, l.actor_id, l.actor_name, l.refusal], ['done', w.action, 'owner', a.userId, a.email, null], w.action);
@@ -377,7 +381,7 @@ test('EVERY WRITE: one change, exactly one line -- who, what, before and after -
 test('A CHANGE WITHOUT ITS LINE CANNOT HAPPEN: with the line made to fail, every write that changes something answers 500 and changes nothing', async () => {
   const real = changes.internals.insert;
   try {
-    for (const w of WRITES.filter((x) => x.state)) {
+    for (const w of WRITES.filter((x) => x.state && !x.noop)) {
       const s = await w.setup();
       const before = JSON.stringify(await w.state(s));
       changes.internals.insert = async () => { throw new Error('the change log is unavailable'); };
@@ -438,28 +442,57 @@ test("REFUSED ATTEMPTS land in the right log: the wrong site, an ended session, 
   assert.deepEqual(inMine.map((l) => [l.garage_id, l.action, l.actor_name, l.subject_kind, l.subject_id, l.subject_name]),
     [[null, 'lane.rename', a.email, 'unknown', null, null]], "the asker's log never names the other account's lane");
 
-  // Nobody at all, naming this garage.
+  // Another owner's garage, by session and by key: "garage_not_found", and the key named in its own log.
   sinceA = await idsOf(a.tenant);
-  assert.equal((await call(base, 'POST', `/lanes/${exit.id}/reopen`)).status, 401);
-  got = await refusedSince(a.tenant, sinceA);
-  assert.deepEqual(got.map((l) => [l.garage_id, l.action, l.actor_kind, l.refusal]), [[g.id, 'lane.reopen', 'nobody', 'not_signed_in']]);
+  sinceB = await idsOf(b.tenant);
+  assert.equal((await call(base, 'PATCH', `/garages/${theirs.id}`, { as: a, body: { transient_available: true } })).status, 404);
+  assert.equal((await call(base, 'PATCH', `/garages/${theirs.id}`, { as: a, via: 'key', body: { transient_available: false } })).status, 404);
+  assert.deepEqual((await refusedSince(b.tenant, sinceB)).map((l) => [l.garage_id, l.refusal, l.actor_kind, l.actor_name, l.subject_name]),
+    [[theirs.id, 'garage_not_found', 'outside', null, 'Harbor Garage'], [theirs.id, 'garage_not_found', 'outside', null, 'Harbor Garage']]);
+  assert.deepEqual((await refusedSince(a.tenant, sinceA)).map((l) => [l.garage_id, l.refusal, l.actor_kind, l.actor_name]),
+    [[null, 'garage_not_found', 'owner', a.email], [null, 'garage_not_found', 'key', 'Front desk key']]);
 
-  // An ended session, and a cancelled key: still that owner's.
+  // A key refused in its own garage: named by the name it was issued under.
+  sinceA = await idsOf(a.tenant);
+  assert.equal((await call(base, 'POST', `/lanes/${exit.id}/close`, { as: a, via: 'key', body: { reason: 'full', message: 'Full' } })).status, 409);
+  assert.deepEqual((await refusedSince(a.tenant, sinceA)).map((l) => [l.garage_id, l.refusal, l.actor_kind, l.actor_id, l.actor_name]),
+    [[g.id, 'last_open_lane', 'key', a.keyId, 'Front desk key']]);
+
+  // No working sign-in or key -- nobody at all, an ended session, a cancelled
+  // key -- naming this garage: the platform's own log, never the owner's.
   const cookie = await signIn(base, a.email);
   const ended = { ...a, cookie };
   assert.equal((await call(base, 'POST', '/auth/sign-out', { as: ended })).status, 204);
-  sinceA = await idsOf(a.tenant);
-  const endedR = await call(base, 'PATCH', `/garages/${g.id}`, { as: ended, body: { transient_available: true } });
-  assert.deepEqual([endedR.status, endedR.json.code], [401, 'session_ended']);
   const old = generateDeviceToken();
   secrets.add(old);
-  const oldId = (await one(a.tenant, `INSERT INTO operator_tokens (tenant_id, name, token_hash, revoked_at) VALUES ($1,'Lost key',$2, now()) RETURNING id`, [a.tenant, hashToken(old)])).id;
-  assert.equal((await call(base, 'DELETE', `/lanes/${exit.id}`, { as: { key: old }, via: 'key' })).status, 401);
-  got = await refusedSince(a.tenant, sinceA);
-  assert.deepEqual(got.map((l) => [l.garage_id, l.action, l.refusal, l.actor_kind, l.actor_id, l.actor_name]), [
-    [g.id, 'garage.update', 'session_ended', 'owner', a.userId, a.email],
-    [g.id, 'lane.remove', 'not_signed_in', 'key', oldId, 'Lost key'],
-  ]);
+  await one(a.tenant, `INSERT INTO operator_tokens (tenant_id, name, token_hash, revoked_at) VALUES ($1,'Lost key',$2, now()) RETURNING id`, [a.tenant, hashToken(old)]);
+  {
+    const client = securityRows();
+    await client.connect();
+    try {
+      const count = async () => (await client.query('SELECT coalesce(sum(attempts), 0)::int AS n FROM platform_security_log')).rows[0].n;
+      const was = await count();
+      const t0 = (await client.query('SELECT clock_timestamp() AS t')).rows[0].t;
+      sinceA = await idsOf(a.tenant);
+      assert.equal((await call(base, 'POST', `/lanes/${exit.id}/reopen`)).status, 401);
+      const endedR = await call(base, 'PATCH', `/garages/${g.id}`, { as: ended, body: { transient_available: true } });
+      assert.deepEqual([endedR.status, endedR.json.code], [401, 'session_ended']);
+      assert.equal((await call(base, 'DELETE', `/lanes/${exit.id}`, { as: { key: old }, via: 'key' })).status, 401);
+      assert.equal((await call(base, 'PUT', '/auth/language', { as: ended, body: { language: 'es' } })).status, 401);
+      assert.deepEqual(await refusedSince(a.tenant, sinceA), [], "no line in the owner's log");
+      // Other suites run beside this one from the same address, so the
+      // security log is read for what these four did, not as a whole: each
+      // is on a line of its own kind, or counted on the source's
+      // too-many line when that address is over its minute (0028).
+      assert.ok(await count() >= was + 4);
+      const touched = (await client.query('SELECT refusal, credential FROM platform_security_log WHERE coalesce(last_at, at) >= $1', [t0])).rows;
+      for (const [refusal, credential] of [['not_signed_in', 'none'], ['session_ended', 'session'], ['not_signed_in', 'key']]) {
+        assert.ok(touched.some((r) => (r.credential === credential && r.refusal === refusal) || r.refusal === 'too_many_refused'), `${refusal}/${credential} in the security log`);
+      }
+    } finally {
+      await client.end();
+    }
+  }
 
   // The owner's language, refused: the account's log.
   sinceA = await idsOf(a.tenant);
@@ -485,16 +518,14 @@ test("REFUSED ATTEMPTS land in the right log: the wrong site, an ended session, 
     sinceB = await idsOf(b.tenant);
     assert.equal((await call(base, 'POST', '/garages', { body: { name: 'Nobody', timezone: 'UTC', currency: 'USD' } })).status, 401);
     assert.equal((await call(base, 'DELETE', '/lanes/00000000-0000-4000-8000-000000000000', { body: {} })).status, 401);
-    assert.equal(await count(), was + 2);
-    const last = (await client.query('SELECT refusal, request, credential FROM platform_security_log ORDER BY coalesce(last_at, at) DESC LIMIT 2')).rows;
-    assert.deepEqual(last.map((r) => [r.refusal, r.credential]).sort(), [['not_signed_in', 'none'], ['not_signed_in', 'none']]);
+    assert.ok(await count() >= was + 2);
     assert.deepEqual([(await refusedSince(a.tenant, sinceA)).length, (await refusedSince(b.tenant, sinceB)).length], [0, 0]);
   } finally {
     await client.end();
   }
 });
 
-test('THE READ: newest first, the garage and the account, paged; another owner cannot read it; a refused line is marked', async () => {
+test('THE READ: changes newest first, the garage and the account, paged; refused attempts apart, with their count; another owner cannot read it', async () => {
   const g = await newGarage(base, a);
   const lane = await newLane(base, a, g.id, 'Paged lane', 'entry');
   for (let i = 0; i < 55; i += 1) assert.equal((await call(base, 'PATCH', `/lanes/${lane.id}`, { as: a, body: { name: `Paged ${i}` } })).status, 200);
@@ -520,9 +551,77 @@ test('THE READ: newest first, the garage and the account, paged; another owner c
   const theirs = (await linesOf(b.tenant))[0];
   assert.equal((await call(base, 'GET', `/garages/${g.id}/changes/${theirs.id}`, { as: a })).status, 404);
   assert.equal((await call(base, 'GET', `/garages/${g.id}/changes`, { as: b })).status, 404);
-  assert.equal((await call(base, 'PATCH', `/lanes/${lane.id}`, { as: a, body: { name: '' } })).status, 400);
-  const latest = (await call(base, 'GET', `/garages/${g.id}/changes`, { as: a })).json.changes[0];
-  assert.deepEqual([latest.outcome, latest.refusal, latest.action], ['refused', 'lane_name_refused', 'lane.rename']);
+  const countWas = (await call(base, 'GET', `/garages/${g.id}/refused-attempts`, { as: a })).json.count;
+  for (let i = 0; i < 3; i += 1) assert.equal((await call(base, 'PATCH', `/lanes/${lane.id}`, { as: a, body: { name: '' } })).status, 400);
+  // A refused attempt is never on the changes page: it cannot push a change out of sight.
+  const changesNow = (await call(base, 'GET', `/garages/${g.id}/changes`, { as: a })).json.changes;
+  assert.ok(changesNow.every((c) => c.outcome === 'done'));
+  assert.deepEqual(changesNow[0].after, { name: 'Paged 54' });
+  const refusedNow = await call(base, 'GET', `/garages/${g.id}/refused-attempts`, { as: a });
+  assert.equal(refusedNow.status, 200);
+  assert.deepEqual(Object.keys(refusedNow.json).sort(), ['count', 'next', 'refused']);
+  const latest = refusedNow.json.refused[0];
+  assert.deepEqual([latest.outcome, latest.refusal, latest.action, latest.attempts], ['refused', 'lane_name_refused', 'lane.rename', 3]);
+  assert.ok(refusedNow.json.refused.every((c) => c.outcome === 'refused'));
+  assert.deepEqual(refusedNow.json.count, { lines: countWas.lines + 1, attempts: countWas.attempts + 3 });
+  assert.equal((await call(base, 'GET', `/garages/${g.id}/refused-attempts/${first.json.changes[0].id}`, { as: a })).status, 404, 'a change is not a page of the refused attempts');
+  assert.equal((await call(base, 'GET', `/garages/${g.id}/refused-attempts`, { as: b })).status, 404);
+});
+
+/**
+ * Every request that can be asked again and change nothing: it writes no
+ * line. Each is set up so the thing is already as asked, then asked.
+ */
+test('NOTHING CHANGED, NO LINE: every route asked for what is already so writes nothing', async () => {
+  const g = await newGarage(base, a, { transient_available: true });
+  const lane = await newLane(base, a, g.id, 'Same name', 'entry');
+  await newLane(base, a, g.id, 'Other way in', 'entry');
+  assert.equal((await call(base, 'POST', `/lanes/${lane.id}/close`, { as: a, body: { reason: 'full', message: 'Full' } })).status, 200);
+  const dev = await call(base, 'POST', `/lanes/${lane.id}/devices`, { as: a, body: { name: 'Pi' } });
+  secrets.add(dev.json.token);
+  assert.equal((await call(base, 'POST', `/devices/${dev.json.device.id}/revoke`, { as: a })).status, 200);
+  const k = generateDeviceToken();
+  secrets.add(k);
+  const kid = (await one(a.tenant, `INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'Spare key',$2) RETURNING id`, [a.tenant, hashToken(k)])).id;
+  assert.equal((await call(base, 'POST', `/operator-tokens/${kid}/revoke`, { as: a })).status, 200);
+  const open = await newGarage(base, a, { transient_available: false, name: 'Open Garage' });
+  await withTenant(a.tenant, async (c) => { await storePlan(c, a.tenant, open.id, flatHourlyPlan()); await stateTaxes(c, a.tenant, open.id); });
+  assert.equal((await call(base, 'POST', `/garages/${open.id}/activate`, { as: a })).status, 201);
+  const paid = await paidGarage();
+  assert.equal((await call(base, 'POST', `/garages/${paid.g.id}/stripe-account/refresh`, { as: a })).status, 200);
+  assert.equal((await call(base, 'POST', `/garages/${paid.g.id}/stripe-account/location`, { as: a, body: { display_name: 'Paid Garage', address: ADDRESS } })).status, 201);
+
+  const again = [
+    ['the drivers answer, the same', () => call(base, 'PATCH', `/garages/${g.id}`, { as: a, body: { transient_available: true } }), 200],
+    ['a rename to the name it has', () => call(base, 'PATCH', `/lanes/${lane.id}`, { as: a, body: { name: 'Same name' } }), 200],
+    ['a closing with the same reason and message', () => call(base, 'POST', `/lanes/${lane.id}/close`, { as: a, body: { reason: 'full', message: 'Full' } }), 200],
+    ['a cancelled computer cancelled again', () => call(base, 'POST', `/devices/${dev.json.device.id}/revoke`, { as: a }), 200],
+    ['a cancelled key cancelled again', () => call(base, 'POST', `/operator-tokens/${kid}/revoke`, { as: a }), 200],
+    ['an open garage opened again', () => call(base, 'POST', `/garages/${open.id}/activate`, { as: a }), 200],
+    ['the pass links, as they are', () => call(base, 'PUT', `/garages/${g.id}/entitlement-links`, { as: a, body: { garage_pass: null, monthly_billing: null } }), 200],
+    ['the validations link, as it is', () => call(base, 'PUT', `/garages/${g.id}/validations-link`, { as: a, body: { validations: null } }), 200],
+    ['the payment account asked for again', () => call(base, 'POST', `/garages/${paid.g.id}/stripe-account`, { as: a, body: { country: 'US' } }), 200],
+    ['a setup link', () => call(base, 'POST', `/garages/${paid.g.id}/stripe-account/onboarding-link`, { as: a }), 201],
+    ['the payment account read again, unchanged', () => call(base, 'POST', `/garages/${paid.g.id}/stripe-account/refresh`, { as: a }), 200],
+    ['the reader place asked for again', () => call(base, 'POST', `/garages/${paid.g.id}/stripe-account/location`, { as: a, body: { display_name: 'Paid Garage', address: ADDRESS } }), 200],
+    ['the language it already is', () => call(base, 'PUT', '/auth/language', { as: a, body: { language: 'en' } }), 200],
+  ];
+  for (const [what, run, status] of again) {
+    const since = await ids();
+    const r = await run();
+    assert.equal(r.status, status, `${what}: ${r.status} ${r.text}`);
+    assert.deepEqual((await newLines(since)).map((l) => l.action), [], `${what} wrote a line`);
+  }
+});
+
+test('EVERY LINE NAMES WHO: an owner by email, a key by its name; only another account goes unnamed', async () => {
+  const lines = [...(await linesOf(a.tenant)), ...(await linesOf(b.tenant))];
+  assert.ok(lines.some((l) => l.actor_kind === 'key' && l.outcome === 'refused'), 'a refused line by a key is among them');
+  for (const l of lines) {
+    if (l.actor_kind === 'owner') assert.ok(l.actor_name && l.actor_name.includes('@'), `an owner line with no email: ${l.id}`);
+    else if (l.actor_kind === 'key') assert.ok(l.actor_name, `a key line with no key name: ${l.id} ${l.outcome} ${l.action}`);
+    else assert.deepEqual([l.actor_kind, l.actor_id, l.actor_name], ['outside', null, null], `${l.id}`);
+  }
 });
 
 test('THE LOG CANNOT BE CHANGED: UPDATE, DELETE and TRUNCATE are refused for the application and for the owner of the tables; the security log is not the application\'s to read', async () => {
