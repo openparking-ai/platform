@@ -506,14 +506,18 @@ test('THE READ: newest first, the garage and the account, paged; another owner c
   assert.deepEqual(first.json.changes[0].after, { name: 'Paged 54' });
   assert.deepEqual(Object.keys(first.json.changes[0]).sort(), ['action', 'after', 'at', 'before', 'garage_id', 'id', 'outcome', 'refusal', 'subject', 'who']);
   assert.deepEqual(first.json.changes[0].who, { kind: 'owner', name: a.email });
-  const second = await call(base, 'GET', `/garages/${g.id}/changes?before=${first.json.next}`, { as: a });
+  const second = await call(base, 'GET', `/garages/${g.id}/changes/${first.json.next}`, { as: a });
   assert.equal(second.status, 200);
   const seen = new Set(first.json.changes.map((c) => c.id));
   assert.ok(second.json.changes.every((c) => !seen.has(c.id)), 'no line twice');
   assert.ok(second.json.changes.some((c) => c.action === 'garage.create' && c.garage_id === g.id));
   // The account's own lines (the language) are in every garage's log.
   assert.ok([...first.json.changes, ...second.json.changes].every((c) => c.garage_id === g.id || c.garage_id === null));
-  assert.equal((await call(base, 'GET', `/garages/${g.id}/changes?before=not-a-cursor`, { as: a })).status, 400);
+  assert.deepEqual((await call(base, 'GET', `/garages/${g.id}/changes/00000000-0000-4000-8000-000000000000`, { as: a })).json, { error: 'change not found' });
+  assert.equal((await call(base, 'GET', `/garages/${g.id}/changes/not-an-id`, { as: a })).status, 404);
+  // Another owner's line is not a page of this log.
+  const theirs = (await linesOf(b.tenant))[0];
+  assert.equal((await call(base, 'GET', `/garages/${g.id}/changes/${theirs.id}`, { as: a })).status, 404);
   assert.equal((await call(base, 'GET', `/garages/${g.id}/changes`, { as: b })).status, 404);
   assert.equal((await call(base, 'PATCH', `/lanes/${lane.id}`, { as: a, body: { name: '' } })).status, 400);
   const latest = (await call(base, 'GET', `/garages/${g.id}/changes`, { as: a })).json.changes[0];

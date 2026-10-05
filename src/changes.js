@@ -195,43 +195,32 @@ export async function refused(req, err, { action, credential, credentialToken })
 
 /**
  * The garage's lines, newest first: its own and the account's (garage_id
- * NULL). Paged by (at, id), `before` being the last line of the page before.
+ * NULL). Paged by line: `after` is the id of the last line of the page
+ * before, and `next` the id of this page's last line, or null. Null when
+ * `after` names no line of this garage's log.
  */
-export async function linesForGarage(client, tenantId, garageId, { before = null, limit = LINES_PAGE } = {}) {
+export async function linesForGarage(client, tenantId, garageId, { after = null, limit = LINES_PAGE } = {}) {
   const size = Math.min(Math.max(Number.isInteger(limit) ? limit : LINES_PAGE, 1), LINES_MAX_PAGE);
   const values = [tenantId, garageId, size + 1];
-  let after = '';
-  if (before) {
-    values.push(before.at, before.id);
-    after = 'AND (at, id) < ($4::timestamptz, $5::uuid)';
+  let older = '';
+  if (after) {
+    const { rows } = await client.query(
+      'SELECT at, id FROM garage_changes WHERE tenant_id = $1 AND id = $2 AND (garage_id = $3 OR garage_id IS NULL)',
+      [tenantId, after, garageId],
+    );
+    if (!rows[0]) return null;
+    values.push(rows[0].at, rows[0].id);
+    older = 'AND (at, id) < ($4::timestamptz, $5::uuid)';
   }
   const { rows } = await client.query(
     `SELECT id, garage_id, at, outcome, actor_kind, actor_name, action, subject_kind, subject_id, subject_name,
             before, after, refusal
        FROM garage_changes
-      WHERE tenant_id = $1 AND (garage_id = $2 OR garage_id IS NULL) ${after}
+      WHERE tenant_id = $1 AND (garage_id = $2 OR garage_id IS NULL) ${older}
       ORDER BY at DESC, id DESC
       LIMIT $3`,
     values,
   );
   const page = rows.slice(0, size);
-  const last = page[page.length - 1];
-  return { lines: page, next: rows.length > size && last ? cursorOf(last) : null };
-}
-
-/** A page cursor: the last line's instant and id, as one opaque string. */
-export function cursorOf(line) {
-  return Buffer.from(JSON.stringify([new Date(line.at).toISOString(), line.id]), 'utf8').toString('base64url');
-}
-
-/** A cursor back to (at, id), or null when it is not one this route handed out. */
-export function readCursor(raw) {
-  if (raw === undefined) return { ok: true, value: null };
-  try {
-    const [at, id] = JSON.parse(Buffer.from(String(raw), 'base64url').toString('utf8'));
-    if (typeof at !== 'string' || Number.isNaN(Date.parse(at)) || typeof id !== 'string' || !UUID.test(id)) return { ok: false };
-    return { ok: true, value: { at, id } };
-  } catch {
-    return { ok: false };
-  }
+  return { lines: page, next: rows.length > size && page.length ? page[page.length - 1].id : null };
 }

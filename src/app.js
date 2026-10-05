@@ -73,6 +73,7 @@ export const ID_PARAMS = Object.freeze({
     laneId: (route) => (CONNECT_ROUTE.test(route) ? new HttpError(404, 'lane not found', 'lane_not_found') : new HttpError(404, 'lane not found')),
     deviceId: () => new HttpError(404, 'device not found'),
     tokenId: () => new HttpError(404, 'operator token not found'),
+    changeId: () => new HttpError(404, 'change not found'),
   }),
   lane: Object.freeze({
     sessionId: () => conflict('stay_not_open', STAY_NOT_OPEN),
@@ -2394,23 +2395,27 @@ export function createApp() {
 
   /**
    * The garage's change log, newest first: its own lines and the account's.
-   * `?before=<cursor>` continues from where the last page ended; `next` is
-   * that cursor, or null on the last page.
+   * `/changes/<id>` continues after that line: `next` is the id of the last
+   * line of the page, or null on the last page. An id in the path, checked as
+   * every id is, and no query: the owner's screens build no query string, so
+   * an address carries ids only. A line not in this garage's log is 404.
    */
-  operator.get('/garages/:garageId/changes', async (req, res, next) => {
+  const changesRead = async (req, res, next) => {
     try {
-      const cursor = changes.readCursor(req.query.before);
-      if (!cursor.ok) throw bad('before is a cursor this route handed out as `next`');
       const page = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
-        return changes.linesForGarage(client, req.tenantId, garage.id, { before: cursor.value });
+        const out = await changes.linesForGarage(client, req.tenantId, garage.id, { after: req.params.changeId ?? null });
+        if (!out) throw new HttpError(404, 'change not found');
+        return out;
       });
       res.json({ changes: page.lines.map(presentChange), next: page.next });
     } catch (err) {
       next(err);
     }
-  });
+  };
+  operator.get('/garages/:garageId/changes', changesRead);
+  operator.get('/garages/:garageId/changes/:changeId', changesRead);
 
   /**
    * A refused write is a line in the change log (src/changes.js): in the log

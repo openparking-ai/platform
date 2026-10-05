@@ -468,7 +468,7 @@ breaks each property in turn.
     DELETE /api/v1/lanes/<id>                                            only a lane never used
     POST   /api/v1/lanes/<id>/close       {reason, message, override?}   full | everyone
     POST   /api/v1/lanes/<id>/reopen
-    GET    /api/v1/garages/<id>/changes   {changes: [...], next}          newest first, 50 a page
+    GET    /api/v1/garages/<id>/changes[/<line id>]  {changes: [...], next}   newest first, 50 a page
 
 **The checklist** is worked out in one place, `src/setup.js`, from the reads
 that already exist -- the activation readout, the recorded payment account, the
