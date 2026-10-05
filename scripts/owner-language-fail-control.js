@@ -37,8 +37,8 @@ const BREAKS = [
     name: 'user_from_body',
     why: 'the admin and tenant changed are taken from the body',
     file: 'src/signIn.js',
-    from: 'const changed = await internals.setLanguage(req.session, language);',
-    to: 'const changed = await internals.setLanguage({ ...req.session, ...req.body }, language);',
+    from: 'const changed = await internals.setLanguage(req.session, language, req.change);',
+    to: 'const changed = await internals.setLanguage({ ...req.session, ...req.body }, language, req.change);',
   },
   {
     name: 'any_language_taken',
@@ -65,8 +65,8 @@ const BREAKS = [
     name: 'origin_unchecked',
     why: 'the language route takes a change from any Origin',
     file: 'src/signIn.js',
-    from: '      if (!originAllows(req, settings)) return res.status(403).json(ORIGIN_REFUSED);',
-    to: "      if (req.path !== '/language' && !originAllows(req, settings)) return res.status(403).json(ORIGIN_REFUSED);",
+    from: '      if (!originAllows(req, settings)) {\n        await refusedLanguage(req, 403, ORIGIN_REFUSED);',
+    to: "      if (req.path !== '/language' && !originAllows(req, settings)) {\n        await refusedLanguage(req, 403, ORIGIN_REFUSED);",
   },
   {
     name: 'sign_in_without_language',

@@ -134,6 +134,17 @@ export const TENANT_TABLES = [
     appendOnly: true,
   },
   {
+    table: 'garage_changes',
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO garage_changes (tenant_id, garage_id, outcome, actor_kind, actor_id, action, subject_kind)
+         VALUES ($1, $2, 'done', 'key', gen_random_uuid(), 'garage.update', 'garage') RETURNING id`,
+        [t, w.garage],
+      ),
+    // Append-only by grant and by trigger (0026); asserted in change-log.test.js.
+    appendOnly: true,
+  },
+  {
     table: 'events',
     insert: (c, t, w) =>
       c.query(
@@ -269,6 +280,9 @@ export const TENANT_TABLES = [
 export const TABLES_WITHOUT_TENANT_ID = {
   schema_migrations: 'migration bookkeeping; global to the database by definition',
   tenants: 'the tenant registry itself — scoped by its own id, not by a tenant_id column',
+  platform_security_log:
+    "refused attempts that name no account's garage and come with no account's credential (0026): nobody's, so " +
+    'no tenant; the application holds no grant on it and writes it only through record_refused_change()',
 };
 
 /**

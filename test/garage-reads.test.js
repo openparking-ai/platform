@@ -99,7 +99,9 @@ test('GET /garages/:id/lanes: each lane with its devices, when each was last hea
   // Ordered by creation; these two were made in one transaction, so the id breaks the tie.
   const entry = r.json.lanes.find((l) => l.id === world.entryLane);
   const exit = r.json.lanes.find((l) => l.id === world.exitLane);
-  assert.deepEqual(Object.keys(entry).sort(), ['devices', 'direction', 'id', 'name', 'reader']);
+  assert.deepEqual(Object.keys(entry).sort(), ['closed', 'devices', 'direction', 'id', 'name', 'reader', 'reopened']);
+  // Open, and never closed (0026): closing is covered in lane-setup.test.js.
+  assert.deepEqual([entry.closed, entry.reopened], [null, null]);
   assert.deepEqual([entry.id, entry.name, entry.direction], [world.entryLane, 'Entry 1', 'entry']);
   // Made in one transaction, so compared by name rather than by the creation order.
   const byName = (list) => [...list].sort((x, y) => x.name.localeCompare(y.name));

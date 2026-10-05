@@ -91,6 +91,17 @@ export async function readout(client, tenantId, garage, { now = null } = {}) {
     active: garage.activated_at !== null && garage.activated_at !== undefined,
     activated_at: garage.activated_at ?? null,
     conditions,
+    // The counts behind the first and third conditions, for a reader that
+    // shows them (the setup checklist, src/setup.js) rather than re-reading.
+    facts: {
+      rate_plans: { stored: plans.stored, in_force: plans.in_force, earliest: plans.earliest ?? null },
+      tax_sets: {
+        stated: taxes.stated,
+        in_force: taxes.in_force,
+        earliest: taxes.earliest ?? null,
+        rules_in_force: taxes.current ? taxes.current.rule_count : null,
+      },
+    },
   };
 }
 

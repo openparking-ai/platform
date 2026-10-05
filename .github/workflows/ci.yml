@@ -409,6 +409,17 @@ jobs:
         # statements never created, and the suite must go red.
         run: npm run taxes-fail-control
 
+      - name: Setup fail-control
+        # U4: the setup checklist worked out from the garage's own rows; lane
+        # setup and closing, the garage only from the session and the path, a
+        # used lane never removed, the last open lane closed only on purpose;
+        # every write's change-log line in its own transaction, refusals in
+        # the right log, no credential in a line, and the log append-only for
+        # the application and the owner alike. Each property is broken in
+        # turn, two of them on a scratch database, and each must turn its own
+        # test red.
+        run: npm run setup-fail-control
+
 
   sign-in-control:
     name: sign-in-control (${{ matrix.shard }}/8)

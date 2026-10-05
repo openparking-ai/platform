@@ -80,7 +80,7 @@ function locationFields(body) {
 }
 
 /** The garage's Location, registered on its account. Or the one it has. */
-export async function createLocation(tenantId, garageId, body, { actor }) {
+export async function createLocation(tenantId, garageId, body, { actor, record = null }) {
   const config = requireConnect();
   const existing = await getLocation(tenantId, garageId);
   if (existing) return { location: existing, created: false };
@@ -107,7 +107,14 @@ export async function createLocation(tenantId, garageId, body, { actor }) {
        RETURNING *`,
       [tenantId, garageId, account.account_id, location.id, displayName, actor],
     );
-    if (rows[0]) return { location: rows[0], created: true };
+    if (rows[0]) {
+      await record?.(client, {
+        garageId, action: 'payment_account.reader_place',
+        subject: { kind: 'payment_account', id: null, name: null },
+        before: null, after: { place_name: displayName },
+      });
+      return { location: rows[0], created: true };
+    }
     const { rows: again } = await client.query(
       'SELECT * FROM garage_terminal_locations WHERE tenant_id = $1 AND garage_id = $2', [tenantId, garageId]);
     return { location: again[0], created: false };
@@ -126,7 +133,7 @@ export async function getLocation(tenantId, garageId) {
 
 async function laneOr404(tenantId, laneId) {
   return withTenant(tenantId, async (client) => {
-    const { rows } = await client.query('SELECT id, garage_id FROM lanes WHERE tenant_id = $1 AND id = $2', [tenantId, laneId]);
+    const { rows } = await client.query('SELECT id, garage_id, name FROM lanes WHERE tenant_id = $1 AND id = $2', [tenantId, laneId]);
     if (!rows[0]) throw new ConnectRefusal(404, 'lane_not_found', 'lane not found');
     return rows[0];
   });
@@ -143,7 +150,7 @@ async function boundReader(client, tenantId, laneId) {
  * the lane. The registration code is what the reader shows on its screen; it
  * is sent to Stripe and kept nowhere here.
  */
-export async function bindReader(tenantId, laneId, body, { actor }) {
+export async function bindReader(tenantId, laneId, body, { actor, record = null }) {
   const config = requireConnect();
   const code = body?.registration_code;
   if (typeof code !== 'string' || !code.trim()) {
@@ -191,6 +198,12 @@ export async function bindReader(tenantId, laneId, body, { actor }) {
         occurredAt: new Date().toISOString(),
         detail: { reader_id: reader.id, location_id: location.location_id, actor },
       }]);
+      // The reader's registration code is never part of a line.
+      await record?.(client, {
+        garageId: lane.garage_id, action: 'lane.card_reader_connect',
+        subject: { kind: 'reader', id: rows[0].id, name: label },
+        before: null, after: { lane: lane.name ?? null, label },
+      });
       return rows[0];
     } catch (err) {
       if (err.code === '23505' && err.constraint === 'lane_readers_one_per_lane') {
@@ -205,7 +218,7 @@ export async function bindReader(tenantId, laneId, body, { actor }) {
 }
 
 /** End the lane's binding, by recording it. The row stays. */
-export async function unbindReader(tenantId, laneId, { actor }) {
+export async function unbindReader(tenantId, laneId, { actor, record = null }) {
   requireConnect();
   await laneOr404(tenantId, laneId);
   return withTenant(tenantId, async (client) => {
@@ -224,6 +237,11 @@ export async function unbindReader(tenantId, laneId, { actor }) {
       occurredAt: new Date().toISOString(),
       detail: { reader_id: rows[0].reader_id, actor },
     }]);
+    await record?.(client, {
+      garageId: rows[0].garage_id, action: 'lane.card_reader_disconnect',
+      subject: { kind: 'reader', id: rows[0].id, name: rows[0].label },
+      before: { label: rows[0].label }, after: null,
+    });
     return rows[0];
   });
 }

@@ -61,6 +61,7 @@ import express from 'express';
 import { isIP, isIPv6 } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pool, withTenant } from './db.js';
+import * as changes from './changes.js';
 import { generateDeviceToken, hashToken } from './auth.js';
 import { dummyHash, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
 
@@ -407,9 +408,20 @@ export const internals = {
    * The language of the admin a session names: the user and the tenant are the
    * SESSION's, never the request's. One column of one row.
    */
-  async setLanguage(session, language) {
-    return withTenant(session.tenant_id, async (c) =>
-      (await c.query('UPDATE operator_users SET language = $1 WHERE id = $2 AND tenant_id = $3', [language, session.user_id, session.tenant_id])).rowCount);
+  async setLanguage(session, language, ctx) {
+    return withTenant(session.tenant_id, async (c) => {
+      const was = (await c.query('SELECT language FROM operator_users WHERE id = $1 AND tenant_id = $2 FOR UPDATE', [session.user_id, session.tenant_id])).rows[0];
+      const { rowCount } = await c.query('UPDATE operator_users SET language = $1 WHERE id = $2 AND tenant_id = $3', [language, session.user_id, session.tenant_id]);
+      // Its line in the change log, in the same transaction (src/changes.js).
+      if (rowCount === 1) {
+        await changes.record(c, ctx, {
+          garageId: null, action: 'language.change',
+          subject: { kind: 'language', id: null, name: null },
+          before: { language: was?.language ?? null }, after: { language },
+        });
+      }
+      return rowCount;
+    });
   },
 };
 
@@ -526,18 +538,43 @@ export function createAuthRouter(settings) {
     }
   });
 
+  /**
+   * A refused change of the owner's language is a line in the change log
+   * (src/changes.js), as every refused change is. Sign-in, sign-out and the
+   * reads change nothing an owner set up, and are not.
+   */
+  const refusedLanguage = async (req, status, body) => {
+    if (req.method !== 'PUT' || req.path !== '/language') return;
+    const token = sessionToken(req);
+    await changes.refused(req, { status, code: body.code }, {
+      action: 'language.change',
+      credential: token ? 'session' : 'none',
+      credentialToken: token || null,
+    });
+  };
+
   /** The session the cookie names, or a 401 that says which: never signed in, or ended. */
   const session = async (req, res, next) => {
     try {
       const token = sessionToken(req);
-      if (token === null) return res.status(401).json(SIGN_IN_REQUIRED);
-      if (!originAllows(req, settings)) return res.status(403).json(ORIGIN_REFUSED);
+      if (token === null) {
+        await refusedLanguage(req, 401, SIGN_IN_REQUIRED);
+        return res.status(401).json(SIGN_IN_REQUIRED);
+      }
+      if (!originAllows(req, settings)) {
+        await refusedLanguage(req, 403, ORIGIN_REFUSED);
+        return res.status(403).json(ORIGIN_REFUSED);
+      }
       const found = await resolveSession(token, settings);
       if (!found) {
+        await refusedLanguage(req, 401, SESSION_ENDED);
         clearCookie(res, settings);
         return res.status(401).json(SESSION_ENDED);
       }
       req.session = found;
+      req.tenantId = found.tenant_id;
+      req.actor = { kind: 'owner', id: found.user_id, name: found.email };
+      req.change = changes.context(req, [token]);
       next();
     } catch (err) {
       next(err);
@@ -569,14 +606,20 @@ export function createAuthRouter(settings) {
    * is settled before the body is read; the admin and the tenant are the
    * session's. Anything but `en` or `es` is refused and writes nothing.
    */
-  router.put('/language', session, (req, res, next) => {
-    if (!req.is('application/json')) return res.status(400).json(LANGUAGE_REFUSED);
+  router.put('/language', session, async (req, res, next) => {
+    if (!req.is('application/json')) {
+      await refusedLanguage(req, 400, LANGUAGE_REFUSED);
+      return res.status(400).json(LANGUAGE_REFUSED);
+    }
     next();
   }, readLanguageBody, async (req, res, next) => {
     try {
       const language = languageBody(req.body);
-      if (!language) return res.status(400).json(LANGUAGE_REFUSED);
-      const changed = await internals.setLanguage(req.session, language);
+      if (!language) {
+        await refusedLanguage(req, 400, LANGUAGE_REFUSED);
+        return res.status(400).json(LANGUAGE_REFUSED);
+      }
+      const changed = await internals.setLanguage(req.session, language, req.change);
       if (changed !== 1) throw new Error('the signed-in admin has no row to change');
       return res.status(200).json({ language });
     } catch (err) {
@@ -592,7 +635,10 @@ export function createAuthRouter(settings) {
   // what it is, never by what it says. On sign-in, neither comes before the floor.
   router.use(async (err, req, res, _next) => {
     const onSignIn = req.method === 'POST' && req.path === '/sign-in';
-    if (err?.languageRefused) return res.status(400).json(LANGUAGE_REFUSED);
+    if (err?.languageRefused) {
+      await refusedLanguage(req, 400, LANGUAGE_REFUSED);
+      return res.status(400).json(LANGUAGE_REFUSED);
+    }
     if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);
     // A stored hash this code does not know is named here, PasswordHashUnrecognised.
     logFailure(req.path.replace(/^\//, ''), err);

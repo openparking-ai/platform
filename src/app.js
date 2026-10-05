@@ -15,20 +15,10 @@ import * as stripeAccount from './stripeAccount.js';
 import * as terminal from './terminal.js';
 import * as signIn from './signIn.js';
 import { startSetting } from './startSettings.js';
-
-class HttpError extends Error {
-  constructor(status, message, code = null) {
-    super(message);
-    this.status = status;
-    // A MACHINE-READABLE name for the refusal, published beside the message.
-    // Null for the statuses that do not carry one; see `conflict` below.
-    this.code = code;
-    // Structured detail beside the message, published only when set and only
-    // with a code. The plan store attaches the engine's findings here: a list
-    // an operator works through is data, not a sentence.
-    this.details = null;
-  }
-}
+import { HttpError } from './errors.js';
+import * as changes from './changes.js';
+import * as lanes from './lanes.js';
+import * as setup from './setup.js';
 
 const bad = (message) => new HttpError(400, message);
 
@@ -90,7 +80,10 @@ export const ID_PARAMS = Object.freeze({
 });
 function checkIds(router, params) {
   for (const [name, notFound] of Object.entries(params)) {
-    router.param(name, (req, _res, next, value) => next(UUID.test(value) ? undefined : notFound(req.route.path)));
+    // Marked, so the change log does not take a malformed id to the
+    // database either (src/changes.js): it names nothing, and it never
+    // reaches the database at all.
+    router.param(name, (req, _res, next, value) => next(UUID.test(value) ? undefined : Object.assign(notFound(req.route.path), { malformedId: true })));
   }
 }
 
@@ -716,14 +709,20 @@ export function createApp() {
     try {
       const token = bearerFrom(req.get('authorization'));
       if (token) {
+        // What came with the request, kept for the change log's refusal line
+        // (src/changes.js), which sends only its hash to the database.
+        req.credential = { kind: 'key', token };
         const { rows } = await pool.query('SELECT * FROM resolve_operator_token($1)', [hashToken(token)]);
         if (rows.length === 0) throw new HttpError(401, 'unknown or revoked operator token');
         req.tenantId = rows[0].tenant_id;
         req.operatorTokenId = rows[0].token_id;
+        req.actor = { kind: 'key', id: rows[0].token_id };
+        req.change = changes.context(req, [token]);
         pool.query('SELECT touch_operator_token($1)', [req.operatorTokenId]).catch(() => {});
         return next();
       }
       const session = signIn.sessionToken(req);
+      req.credential = session ? { kind: 'session', token: session } : { kind: 'none', token: null };
       if (session === null) throw new HttpError(401, 'operator token required');
       if (!signIn.originAllows(req, authSettings)) {
         throw new HttpError(403, signIn.ORIGIN_REFUSED.error, signIn.ORIGIN_REFUSED.code);
@@ -735,11 +734,42 @@ export function createApp() {
       }
       req.tenantId = found.tenant_id;
       req.operatorTokenId = found.token_id;
+      req.actor = { kind: 'owner', id: found.user_id, name: found.email };
+      req.change = changes.context(req, [session]);
       next();
     } catch (err) {
       next(err);
     }
   });
+
+  /**
+   * A write in one transaction with its change-log line (src/changes.js): `fn`
+   * makes the change and records its line on the same client, and a request
+   * that recorded no line, or more than one, rolls back. A change without its
+   * line cannot commit.
+   */
+  const changeTx = (req, fn) =>
+    withTenant(req.tenantId, async (client) => {
+      const before = req.change.count;
+      const out = await fn(client);
+      if (req.change.count !== before + 1) {
+        throw new Error(`a write recorded ${req.change.count - before} change-log lines, not one`);
+      }
+      return out;
+    });
+
+  /**
+   * A write whose change ran in a module's own transactions (the payment
+   * account and card readers, which ask Stripe between them): the module
+   * records the line in the transaction that changed something. When nothing
+   * changed -- asked again, answered with what was there -- the request still
+   * gets its one line, saying so, on its own.
+   */
+  const recorder = (req) => (client, line) => changes.record(client, req.change, line);
+  const lineIfNothingChanged = async (req, line) => {
+    if (req.change.count > 0) return;
+    await withTenant(req.tenantId, (client) => changes.record(client, req.change, line));
+  };
 
   operator.post('/garages', async (req, res, next) => {
     try {
@@ -755,7 +785,7 @@ export function createApp() {
       // Optional at creation, statable later, never defaulted: unstated is
       // the absence of the field, and an unstated garage cannot activate.
       const transient = transientField(req.body?.transient_available, { required: false });
-      const garage = await withTenant(req.tenantId, async (client) => {
+      const garage = await changeTx(req, async (client) => {
         // Each column is left out entirely when nothing was asked for, so the
         // value an unconfigured garage gets is written down in exactly one
         // place -- the column default in 0004 (0013 for the space class).
@@ -771,7 +801,19 @@ export function createApp() {
            VALUES (${values.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`,
           values,
         );
-        return rows[0];
+        const created = rows[0];
+        await changes.record(client, req.change, {
+          garageId: created.id,
+          action: 'garage.create',
+          subject: { kind: 'garage', id: created.id, name: created.name },
+          before: null,
+          after: {
+            name: created.name, timezone: created.timezone, currency: created.currency,
+            default_action: created.default_action, space_class: created.space_class,
+            transient_available: created.transient_available,
+          },
+        });
+        return created;
       });
       res.status(201).json({ garage });
     } catch (err) {
@@ -836,7 +878,13 @@ export function createApp() {
       if (action === undefined && transient === undefined) {
         throw bad('default_action or transient_available is required');
       }
-      const garage = await withTenant(req.tenantId, async (client) => {
+      const garage = await changeTx(req, async (client) => {
+        // Read first, locked: the line says what each field was.
+        const { rows: was } = await client.query(
+          'SELECT * FROM garages WHERE tenant_id = $1 AND id = $2 FOR UPDATE',
+          [req.tenantId, req.params.garageId],
+        );
+        if (!was[0]) throw new HttpError(404, 'garage not found');
         const sets = [];
         const values = [req.tenantId, req.params.garageId];
         if (action !== undefined) { values.push(action); sets.push(`default_action = $${values.length}`); }
@@ -846,9 +894,16 @@ export function createApp() {
             WHERE tenant_id = $1 AND id = $2 RETURNING *`,
           values,
         );
+        const fields = [...(action !== undefined ? ['default_action'] : []), ...(transient !== undefined ? ['transient_available'] : [])];
+        await changes.record(client, req.change, {
+          garageId: rows[0].id,
+          action: 'garage.update',
+          subject: { kind: 'garage', id: rows[0].id, name: rows[0].name },
+          before: Object.fromEntries(fields.map((f) => [f, was[0][f]])),
+          after: Object.fromEntries(fields.map((f) => [f, rows[0][f]])),
+        });
         return rows[0];
       });
-      if (!garage) throw new HttpError(404, 'garage not found');
       res.json({ garage });
     } catch (err) {
       next(err);
@@ -880,12 +935,20 @@ export function createApp() {
    */
   operator.post('/garages/:garageId/activate', async (req, res, next) => {
     try {
-      const out = await withTenant(req.tenantId, async (client) => {
+      const out = await changeTx(req, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
-        return activation.activate(client, req.tenantId, garage, {
+        const done = await activation.activate(client, req.tenantId, garage, {
           actor: `operator_token:${req.operatorTokenId}`,
         });
+        await changes.record(client, req.change, {
+          garageId: garage.id,
+          action: done.activated ? 'garage.open' : 'garage.open_again',
+          subject: { kind: 'garage', id: garage.id, name: garage.name },
+          before: { open: garage.activated_at !== null },
+          after: { open: true },
+        });
+        return done;
       });
       res.status(out.activated ? 201 : 200).json({ garage: out.garage, activated: out.activated });
     } catch (err) {
@@ -917,12 +980,20 @@ export function createApp() {
         if (!(module in body)) throw bad(`${module} is required: null (not linked) or {tenant_id, garage_id}`);
         links[module] = linkField(body[module], module);
       }
-      const garage = await withTenant(req.tenantId, async (client) => {
+      const garage = await changeTx(req, async (client) => {
         const current = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!current) throw new HttpError(404, 'garage not found');
-        return entitlement.stateLinks(client, req.tenantId, current, links, {
+        const stated = await entitlement.stateLinks(client, req.tenantId, current, links, {
           actor: `operator_token:${req.operatorTokenId}`,
         });
+        await changes.record(client, req.change, {
+          garageId: current.id,
+          action: 'garage.pass_links',
+          subject: { kind: 'garage', id: current.id, name: current.name },
+          before: linksOf(current, Object.keys(entitlement.MODULES)),
+          after: linksOf(stated, Object.keys(entitlement.MODULES)),
+        });
+        return stated;
       });
       res.json({ garage });
     } catch (err) {
@@ -951,12 +1022,20 @@ export function createApp() {
       }
       if (!('validations' in body)) throw bad('validations is required: null (not linked) or {tenant_id, garage_id}');
       const link = linkField(body.validations, 'validations');
-      const garage = await withTenant(req.tenantId, async (client) => {
+      const garage = await changeTx(req, async (client) => {
         const current = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!current) throw new HttpError(404, 'garage not found');
-        return validations.stateLink(client, req.tenantId, current, link, {
+        const stated = await validations.stateLink(client, req.tenantId, current, link, {
           actor: `operator_token:${req.operatorTokenId}`,
         });
+        await changes.record(client, req.change, {
+          garageId: current.id,
+          action: 'garage.validations_link',
+          subject: { kind: 'garage', id: current.id, name: current.name },
+          before: linksOf(current, ['validations']),
+          after: linksOf(stated, ['validations']),
+        });
+        return stated;
       });
       res.json({ garage });
     } catch (err) {
@@ -989,6 +1068,11 @@ export function createApp() {
     const { account, created } = await stripeAccount.createAccount(req.tenantId, req.params.garageId, {
       actor: `operator_token:${req.operatorTokenId}`,
       country: req.body?.country,
+      record: recorder(req),
+    });
+    await lineIfNothingChanged(req, {
+      garageId: req.params.garageId, action: 'payment_account.create_again',
+      subject: { kind: 'payment_account', id: null, name: null }, before: null, after: null,
     });
     res.status(created ? 201 : 200).json({ stripe_account: stripeAccount.presentAccount(account) });
   }));
@@ -1002,6 +1086,12 @@ export function createApp() {
   /** Stripe's onboarding link, for the operator to open. */
   operator.post('/garages/:garageId/stripe-account/onboarding-link', connectRoute(async (req, res) => {
     const link = await stripeAccount.onboardingLink(req.tenantId, req.params.garageId);
+    // Nothing here is changed: Stripe made a link. The line says one was
+    // asked for, never the link itself.
+    await lineIfNothingChanged(req, {
+      garageId: req.params.garageId, action: 'payment_account.setup_link',
+      subject: { kind: 'payment_account', id: null, name: null }, before: null, after: null,
+    });
     res.status(201).json({ onboarding_link: link });
   }));
 
@@ -1009,6 +1099,7 @@ export function createApp() {
   operator.post('/garages/:garageId/stripe-account/refresh', connectRoute(async (req, res) => {
     const row = await stripeAccount.refreshAccount(req.tenantId, req.params.garageId, {
       actor: `operator_token:${req.operatorTokenId}`,
+      record: recorder(req),
     });
     res.json({ stripe_account: stripeAccount.presentAccount(row) });
   }));
@@ -1020,6 +1111,11 @@ export function createApp() {
   operator.post('/garages/:garageId/stripe-account/location', connectRoute(async (req, res) => {
     const { location, created } = await terminal.createLocation(req.tenantId, req.params.garageId, req.body ?? {}, {
       actor: `operator_token:${req.operatorTokenId}`,
+      record: recorder(req),
+    });
+    await lineIfNothingChanged(req, {
+      garageId: req.params.garageId, action: 'payment_account.reader_place_again',
+      subject: { kind: 'payment_account', id: null, name: null }, before: null, after: null,
     });
     res.status(created ? 201 : 200).json({ location: terminal.presentLocation(location) });
   }));
@@ -1034,6 +1130,7 @@ export function createApp() {
   operator.post('/lanes/:laneId/reader', connectRoute(async (req, res) => {
     const row = await terminal.bindReader(req.tenantId, req.params.laneId, req.body ?? {}, {
       actor: `operator_token:${req.operatorTokenId}`,
+      record: recorder(req),
     });
     res.status(201).json({ reader: terminal.presentReader(row) });
   }));
@@ -1042,6 +1139,7 @@ export function createApp() {
   operator.post('/lanes/:laneId/reader/unbind', connectRoute(async (req, res) => {
     const row = await terminal.unbindReader(req.tenantId, req.params.laneId, {
       actor: `operator_token:${req.operatorTokenId}`,
+      record: recorder(req),
     });
     res.json({ reader: terminal.presentReader(row) });
   }));
@@ -1052,13 +1150,18 @@ export function createApp() {
       if (!name || !['entry', 'exit'].includes(direction)) {
         throw bad("name and direction ('entry' or 'exit') are required");
       }
-      const lane = await withTenant(req.tenantId, async (client) => {
+      const lane = await changeTx(req, async (client) => {
         // Asked first: a garage that is not there is a 404, not a foreign-key violation.
         if (!(await repo.getGarage(client, req.tenantId, req.params.garageId))) throw new HttpError(404, 'garage not found');
         const { rows } = await client.query(
           `INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1,$2,$3,$4) RETURNING *`,
           [req.tenantId, req.params.garageId, name, direction],
         );
+        await changes.record(client, req.change, {
+          garageId: rows[0].garage_id, action: 'lane.add',
+          subject: { kind: 'lane', id: rows[0].id, name: rows[0].name },
+          before: null, after: { name: rows[0].name, direction: rows[0].direction },
+        });
         return rows[0];
       });
       res.status(201).json({ lane });
@@ -1078,6 +1181,7 @@ export function createApp() {
    * and nothing writes it any more.
    */
   operator.post('/garages/:garageId/rates', (_req, _res, next) => {
+    // Always refused, so its one line is the refused-attempt line.
     next(
       new HttpError(
         RATES_RETIRED_STATUS,
@@ -1120,6 +1224,13 @@ export function createApp() {
           validated,
           actor: `operator_token:${req.operatorTokenId}`,
         });
+        // The plan's name and when it takes effect: the document itself stays
+        // where it is kept, and the line points at it.
+        await changes.record(client, req.change, {
+          garageId: garage.id, action: 'rate_plan.add',
+          subject: { kind: 'rate_plan', id: row.id, name: row.plan_version },
+          before: null, after: { plan_version: row.plan_version, effective_from: row.effective_from },
+        });
         return row;
       });
       res.status(201).json({ rate_plan: presentRatePlan(out) });
@@ -1153,15 +1264,23 @@ export function createApp() {
       // Generated here, hashed before it touches the database, and returned
       // exactly once. There is no endpoint that can show it again.
       const token = generateDeviceToken();
-      const device = await withTenant(req.tenantId, async (client) => {
+      // The code is never part of the change log: the line names the computer
+      // and its lane, and `record` refuses any line that holds the code.
+      req.change.secrets.push(token);
+      const device = await changeTx(req, async (client) => {
         // Asked first: a lane that is not there is a 404, not a foreign-key violation.
-        const lane = await client.query('SELECT 1 FROM lanes WHERE tenant_id = $1 AND id = $2', [req.tenantId, req.params.laneId]);
+        const lane = await client.query('SELECT garage_id, name FROM lanes WHERE tenant_id = $1 AND id = $2', [req.tenantId, req.params.laneId]);
         if (lane.rowCount === 0) throw new HttpError(404, 'lane not found');
         const { rows } = await client.query(
           `INSERT INTO lane_devices (tenant_id, lane_id, name, token_hash) VALUES ($1,$2,$3,$4)
            RETURNING id, lane_id, name, created_at`,
           [req.tenantId, req.params.laneId, name, hashToken(token)],
         );
+        await changes.record(client, req.change, {
+          garageId: lane.rows[0].garage_id, action: 'computer.connect',
+          subject: { kind: 'computer', id: rows[0].id, name: rows[0].name },
+          before: null, after: { name: rows[0].name, lane: lane.rows[0].name },
+        });
         return rows[0];
       });
       res.status(201).json({ device, token, token_note: 'shown once; it is not recoverable' });
@@ -1194,18 +1313,30 @@ export function createApp() {
    */
   operator.post('/devices/:deviceId/revoke', async (req, res, next) => {
     try {
-      const device = await withTenant(req.tenantId, async (client) => {
+      const device = await changeTx(req, async (client) => {
+        const { rows: was } = await client.query(
+          `SELECT d.revoked_at, l.garage_id, l.name AS lane FROM lane_devices d JOIN lanes l ON l.id = d.lane_id AND l.tenant_id = d.tenant_id
+            WHERE d.tenant_id = $1 AND d.id = $2 FOR UPDATE OF d`,
+          [req.tenantId, req.params.deviceId],
+        );
+        // Another tenant's device is not found rather than forbidden, which is
+        // what row-level security makes it: the row is not visible to ask about.
+        if (!was[0]) throw new HttpError(404, 'device not found');
         const { rows } = await client.query(
           `UPDATE lane_devices SET revoked_at = coalesce(revoked_at, now())
             WHERE tenant_id = $1 AND id = $2
             RETURNING id, lane_id, name, created_at, revoked_at`,
           [req.tenantId, req.params.deviceId],
         );
+        await changes.record(client, req.change, {
+          garageId: was[0].garage_id,
+          action: was[0].revoked_at === null ? 'computer.cancel' : 'computer.cancel_again',
+          subject: { kind: 'computer', id: rows[0].id, name: rows[0].name },
+          before: { access: was[0].revoked_at === null ? 'connected' : 'cancelled', lane: was[0].lane },
+          after: { access: 'cancelled', lane: was[0].lane },
+        });
         return rows[0];
       });
-      // Another tenant's device is not found rather than forbidden, which is
-      // what row-level security makes it: the row is not visible to ask about.
-      if (!device) throw new HttpError(404, 'device not found');
       res.json({ device });
     } catch (err) {
       next(err);
@@ -1240,16 +1371,27 @@ export function createApp() {
    */
   operator.post('/operator-tokens/:tokenId/revoke', async (req, res, next) => {
     try {
-      const tokenRow = await withTenant(req.tenantId, async (client) => {
+      const tokenRow = await changeTx(req, async (client) => {
+        const { rows: was } = await client.query(
+          'SELECT revoked_at, kind FROM operator_tokens WHERE tenant_id = $1 AND id = $2 FOR UPDATE',
+          [req.tenantId, req.params.tokenId],
+        );
+        if (!was[0]) throw new HttpError(404, 'operator token not found');
         const { rows } = await client.query(
           `UPDATE operator_tokens SET revoked_at = coalesce(revoked_at, now())
             WHERE tenant_id = $1 AND id = $2
             RETURNING id, name, created_at, last_seen_at, revoked_at`,
           [req.tenantId, req.params.tokenId],
         );
+        await changes.record(client, req.change, {
+          garageId: null,
+          action: was[0].revoked_at === null ? 'key.cancel' : 'key.cancel_again',
+          subject: { kind: 'key', id: rows[0].id, name: was[0].kind === 'key' ? rows[0].name : 'a sign-in' },
+          before: { access: was[0].revoked_at === null ? 'active' : 'cancelled' },
+          after: { access: 'cancelled' },
+        });
         return rows[0];
       });
-      if (!tokenRow) throw new HttpError(404, 'operator token not found');
       res.json({ operator_token: tokenRow });
     } catch (err) {
       next(err);
@@ -1423,7 +1565,8 @@ export function createApp() {
         // cursor and in no delta.
         const cursor = await repo.stayCursor(client, tenantId, garageId);
         const open = await repo.openStaysForLane(client, tenantId, garageId);
-        return { garage, plans, taxSets, stays: { cursor, open } };
+        const laneState = await lanes.laneState(client, tenantId, laneId);
+        return { garage, plans, taxSets, stays: { cursor, open }, laneState };
       });
       if (!payload.garage) throw new HttpError(404, 'garage not found');
       // Outside the transaction: two subprocesses, and nothing of theirs is
@@ -1441,6 +1584,11 @@ export function createApp() {
         // it -- the lane supports 'deny' and always has, and nothing could
         // reach it. A garage that has set nothing still gets 'allow'.
         default_action: payload.garage.default_action,
+        // This lane, open or closed by hand (0026): the reason -- `full` lets
+        // pass and monthly holders in, `everyone` closes it to all -- and the
+        // owner's message for the lane to show. Carried for the lane's own
+        // round; nothing at the lane acts on it yet.
+        lane: payload.laneState,
         // The gate's verdict (0014). Served so a lane can see it; the lane
         // does not read it yet, and a platform ahead of the lane refuses
         // nothing by adding a key.
@@ -2134,14 +2282,21 @@ export function createApp() {
     try {
       const set = await taxes.judgeTaxSet(req.body?.tax_set);
       taxes.assertStorable(set);
-      const out = await withTenant(req.tenantId, async (client) => {
+      const out = await changeTx(req, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
-        return taxes.storeTaxSet(client, req.tenantId, {
+        const stored = await taxes.storeTaxSet(client, req.tenantId, {
           garage,
           set,
           actor: `operator_token:${req.operatorTokenId}`,
         });
+        await changes.record(client, req.change, {
+          garageId: garage.id, action: 'tax_set.add',
+          subject: { kind: 'tax_set', id: stored.id ?? null, name: null },
+          before: null,
+          after: { effective_from: stored.effective_from ?? null, taxes: (stored.rules ?? []).map((r) => ({ label: r.label, percent_bp: r.percent_bp })) },
+        });
+        return stored;
       });
       res.status(201).json({ tax_set: out });
     } catch (err) {
@@ -2165,6 +2320,113 @@ export function createApp() {
     } catch (err) {
       next(err);
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // SETUP (U4): the checklist, lane setup and closing, and the change log.
+  // -------------------------------------------------------------------------
+
+  /**
+   * The garage's setup checklist: every step worked out from its own data,
+   * in order, done or not, with the facts it was decided on (src/setup.js).
+   * A read: nothing here writes.
+   */
+  operator.get('/garages/:garageId/setup', async (req, res, next) => {
+    try {
+      const out = await withTenant(req.tenantId, async (client) => {
+        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!garage) throw new HttpError(404, 'garage not found');
+        return setup.checklist(client, req.tenantId, garage);
+      });
+      res.json({ setup: out });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Rename a lane. Body: {name}. */
+  operator.patch('/lanes/:laneId', async (req, res, next) => {
+    try {
+      const lane = await changeTx(req, (client) => lanes.rename(client, req.tenantId, req.params.laneId, req.body ?? {}, req.change));
+      res.json({ lane: { id: lane.id, garage_id: lane.garage_id, name: lane.name, direction: lane.direction } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * Remove a lane that was never used: no stay, no computer, no card reader,
+   * no recorded event. Anything else is refused by name, `lane_has_history`,
+   * with what it has in `details`, and nothing is changed.
+   */
+  operator.delete('/lanes/:laneId', async (req, res, next) => {
+    try {
+      await changeTx(req, (client) => lanes.remove(client, req.tenantId, req.params.laneId, req.change));
+      res.status(204).end();
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * Close a lane by hand. Body: {reason: 'full' | 'everyone', message, override?}.
+   * The last open lane of a direction is refused, `last_open_lane`, unless
+   * `override` is true. Closing a closed lane changes its reason and message.
+   */
+  operator.post('/lanes/:laneId/close', async (req, res, next) => {
+    try {
+      const closed = await changeTx(req, (client) => lanes.close(client, req.tenantId, req.params.laneId, req.body ?? {}, req.change));
+      res.json({ lane: { id: req.params.laneId, closed: { reason: closed.closed_reason, message: closed.closed_message, at: closed.closed_at } } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Open a closed lane again. Refused by name when it is open. */
+  operator.post('/lanes/:laneId/reopen', async (req, res, next) => {
+    try {
+      const opened = await changeTx(req, (client) => lanes.reopen(client, req.tenantId, req.params.laneId, req.body, req.change));
+      res.json({ lane: { id: req.params.laneId, closed: null, reopened_at: opened.reopened_at } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * The garage's change log, newest first: its own lines and the account's.
+   * `?before=<cursor>` continues from where the last page ended; `next` is
+   * that cursor, or null on the last page.
+   */
+  operator.get('/garages/:garageId/changes', async (req, res, next) => {
+    try {
+      const cursor = changes.readCursor(req.query.before);
+      if (!cursor.ok) throw bad('before is a cursor this route handed out as `next`');
+      const page = await withTenant(req.tenantId, async (client) => {
+        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!garage) throw new HttpError(404, 'garage not found');
+        return changes.linesForGarage(client, req.tenantId, garage.id, { before: cursor.value });
+      });
+      res.json({ changes: page.lines.map(presentChange), next: page.next });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * A refused write is a line in the change log (src/changes.js): in the log
+   * of the account the path names, of the caller's account, or of nobody --
+   * the platform's own security log. Then answered as before.
+   */
+  operator.use(async (err, req, _res, next) => {
+    const status = err?.status ?? (err?.bodyUnreadable ? 400 : 500);
+    if (!SAFE_METHODS.has(req.method) && status >= 400 && status < 500 && !err?.malformedId) {
+      await changes.refused(req, err, {
+        action: actionFor(req),
+        credential: req.credential?.kind ?? 'none',
+        credentialToken: req.credential?.token ?? null,
+      });
+    }
+    next(err);
   });
 
   // Order matters and is load-bearing. '/api/v1' is a prefix of '/api/v1/lane',
@@ -2366,6 +2628,72 @@ async function activeGarageOrRefuse({ tenantId, garageId, laneId, laneEventId, a
     'garage_not_active',
     `this garage is not active: no stay is ${action === 'open' ? 'opened' : 'closed'} here until its rate setup is complete, its transient mode is stated and its taxes are stated`,
   );
+}
+
+/** The methods that change nothing: a refusal of one is not a refused change. */
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+/**
+ * EVERY OPERATOR WRITE ROUTE, with the action its change-log line names.
+ * test/change-log.test.js walks the router and requires this list to be
+ * exactly the routes it finds, so a write added without a line is caught.
+ */
+export const WRITE_ROUTES = Object.freeze([
+  ['POST', '/garages', 'garage.create'],
+  ['PATCH', '/garages/:garageId', 'garage.update'],
+  ['POST', '/garages/:garageId/activate', 'garage.open'],
+  ['PUT', '/garages/:garageId/entitlement-links', 'garage.pass_links'],
+  ['PUT', '/garages/:garageId/validations-link', 'garage.validations_link'],
+  ['POST', '/garages/:garageId/stripe-account', 'payment_account.create'],
+  ['POST', '/garages/:garageId/stripe-account/onboarding-link', 'payment_account.setup_link'],
+  ['POST', '/garages/:garageId/stripe-account/refresh', 'payment_account.read'],
+  ['POST', '/garages/:garageId/stripe-account/location', 'payment_account.reader_place'],
+  ['POST', '/lanes/:laneId/reader', 'lane.card_reader_connect'],
+  ['POST', '/lanes/:laneId/reader/unbind', 'lane.card_reader_disconnect'],
+  ['POST', '/garages/:garageId/lanes', 'lane.add'],
+  ['POST', '/garages/:garageId/rates', 'rates.retired'],
+  ['POST', '/garages/:garageId/rate-plans', 'rate_plan.add'],
+  ['POST', '/lanes/:laneId/devices', 'computer.connect'],
+  ['POST', '/devices/:deviceId/revoke', 'computer.cancel'],
+  ['POST', '/operator-tokens/:tokenId/revoke', 'key.cancel'],
+  ['POST', '/garages/:garageId/tax-sets', 'tax_set.add'],
+  ['PATCH', '/lanes/:laneId', 'lane.rename'],
+  ['DELETE', '/lanes/:laneId', 'lane.remove'],
+  ['POST', '/lanes/:laneId/close', 'lane.close'],
+  ['POST', '/lanes/:laneId/reopen', 'lane.reopen'],
+]);
+
+const WRITE_PATTERNS = WRITE_ROUTES.map(([method, path, action]) => [
+  method,
+  new RegExp(`^${path.replace(/:[A-Za-z]+/g, '[^/]+')}/?$`, 'i'),
+  action,
+]);
+
+/** The action a write request was asking for, whether or not its route was reached. */
+function actionFor(req) {
+  const found = WRITE_PATTERNS.find(([method, re]) => method === req.method && re.test(req.path));
+  return found ? found[2] : 'unknown.write';
+}
+
+/** A change-log line as the owner's screens read it. */
+function presentChange(line) {
+  return {
+    id: line.id,
+    garage_id: line.garage_id,
+    at: line.at,
+    outcome: line.outcome,
+    who: { kind: line.actor_kind, name: line.actor_name },
+    action: line.action,
+    subject: { kind: line.subject_kind, id: line.subject_id, name: line.subject_name },
+    before: line.before,
+    after: line.after,
+    refusal: line.refusal,
+  };
+}
+
+/** A garage's stated links, as the change log shows them: `{module: {tenant_id, garage_id} | null}`. */
+function linksOf(garage, modules) {
+  return Object.fromEntries(modules.map((m) => [m, garage[`${m}_link`] ?? null]));
 }
 
 /** A link from a request body, through the one place its shape is written. */
