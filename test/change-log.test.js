@@ -320,7 +320,7 @@ const WRITES = [
     action: 'alert_contact.add',
     setup: async () => ({ g: await newGarage(base, a) }),
     run: (s) => call(base, 'POST', `/garages/${s.g.id}/alert-contacts`, { as: a, body: { name: 'Night manager', phone: '555 010 1234' } }),
-    line: (l) => assert.deepEqual([l.subject_kind, l.subject_name, l.before, l.after], ['alert_contact', 'Night manager', null, { name: 'Night manager', language: 'en', phone: 'given', email: 'none' }]),
+    line: (l) => assert.deepEqual([l.subject_kind, l.subject_name, l.before, l.after], ['alert_contact', null, null, { language: 'en', phone: 'given', email: 'none' }]),
     state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM alert_contacts WHERE garage_id = $1', [s.g.id]),
   },
   {
@@ -331,7 +331,7 @@ const WRITES = [
       return { g, c: r.json.contact };
     },
     run: (s) => call(base, 'PATCH', `/garages/${s.g.id}/alert-contacts/${s.c.id}`, { as: a, body: { language: 'es' } }),
-    line: (l) => assert.deepEqual([l.subject_name, l.before, l.after], ['Day manager', { language: 'en' }, { language: 'es' }]),
+    line: (l) => assert.deepEqual([l.subject_name, l.before, l.after], [null, { language: 'en' }, { language: 'es' }]),
     state: (s) => one(a.tenant, 'SELECT language FROM alert_contacts WHERE id = $1', [s.c.id]),
   },
   {
@@ -342,7 +342,7 @@ const WRITES = [
       return { g, c: r.json.contact };
     },
     run: (s) => call(base, 'DELETE', `/garages/${s.g.id}/alert-contacts/${s.c.id}`, { as: a }),
-    line: (l) => assert.deepEqual([l.subject_name, l.before, l.after], ['Leaving', { name: 'Leaving', language: 'en', phone: 'none', email: 'given', by_text: [], by_email: [] }, null]),
+    line: (l) => assert.deepEqual([l.subject_name, l.before, l.after], [null, { language: 'en', phone: 'none', email: 'given', by_text: [], by_email: [] }, null]),
     state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM alert_contacts WHERE id = $1', [s.c.id]),
   },
   {
@@ -353,7 +353,7 @@ const WRITES = [
       return { g, c: r.json.contact };
     },
     run: (s) => call(base, 'PUT', `/garages/${s.g.id}/alert-contacts/${s.c.id}/choices`, { as: a, body: { by_text: ['card_payments_stopped'], by_email: [] } }),
-    line: (l) => assert.deepEqual([l.subject_name, l.before, l.after], ['Owner on call', { by_text: [] }, { by_text: ['card_payments_stopped'] }]),
+    line: (l) => assert.deepEqual([l.subject_name, l.before, l.after], [null, { by_text: [] }, { by_text: ['card_payments_stopped'] }]),
     state: (s) => one(a.tenant, 'SELECT by_text, by_email FROM alert_contacts WHERE id = $1', [s.c.id]),
   },
   {

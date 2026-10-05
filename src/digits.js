@@ -1,21 +1,15 @@
 /**
- * DIGITS OF ANY SCRIPT (U4b fix round): what "a number" is, wherever a
- * person's phone number must not get through.
- *
- * A phone number can be written in many ways: with commas or slashes between
- * its digits, with letters between them, in full-width digits, in
- * Arabic-Indic or Devanagari digits. Every check that looks for one reads the
- * text the same way:
+ * DIGITS OF ANY SCRIPT (U4b): how the change log's guard reads a person's
+ * phone number, so a line about anything else cannot hold it with commas,
+ * letters or another script's digits between or in place of its own
+ * (src/changes.js, `ctx.private`). A second wall only: a line about a person
+ * holds no typed text at all (src/alerts.js, LINE_WORDS).
  *
  *   1  Unicode compatibility normalisation (NFKC): full-width, circled,
- *      superscript and mathematical digits become plain ones, and a
- *      full-width or small `@` becomes `@`;
+ *      superscript and mathematical digits become plain ones;
  *   2  every decimal digit of any script is read as its value, 0 to 9;
  *   3  everything else is dropped -- whatever stands between the digits.
  *
- * THE DIGITS are this table, not the running engine's idea of them: the
- * database's rule (0029) is built from the same table, so the route and the
- * database refuse exactly the same names whatever Unicode version each runs.
  * Each entry is a script's zero; its nine follow it. The table holds every
  * decimal digit of Unicode 17 (test/alerts.test.js checks that the running
  * engine knows of none it lacks).
@@ -44,18 +38,4 @@ export function digitsOf(text) {
     if (v >= 0) out += v;
   }
   return out;
-}
-
-/** The most digits a person's name may hold: 7 or more could be a phone number. */
-export const NAME_DIGITS_MAX = 6;
-
-/** Whether the text could hold a phone number or an email address, however it is written. */
-export function holdsContactShape(text) {
-  return String(text).normalize('NFKC').includes('@') || digitsOf(text).length > NAME_DIGITS_MAX;
-}
-
-/** The same digits as a Postgres regular-expression bracket's contents: 0029 is built from it. */
-export function sqlDigitClass() {
-  const esc = (cp) => (cp > 0xFFFF ? `\\U${cp.toString(16).toUpperCase().padStart(8, '0')}` : `\\u${cp.toString(16).toUpperCase().padStart(4, '0')}`);
-  return DIGIT_ZEROS.map((z) => `${esc(z)}-${esc(z + 9)}`).join('');
 }

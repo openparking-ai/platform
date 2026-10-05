@@ -2500,6 +2500,7 @@ export function createApp() {
     if (!SAFE_METHODS.has(req.method) && status >= 400 && status < 500 && !err?.malformedId) {
       await changes.refused(req, err, {
         action: actionFor(req),
+        request: requestFor(req),
         credential: req.credential?.kind ?? 'none',
         credentialToken: req.credential?.token ?? null,
         address: signIn.callerAddress(req, authSettings),
@@ -2759,6 +2760,19 @@ function actionFor(req) {
   return found ? found[2] : 'unknown.write';
 }
 
+const CONTACT_PATH = /\/alert-contacts(\/|$)/i;
+
+/**
+ * The request a refused attempt names, when it is aimed at a person to tell:
+ * the route as it is written, never the path as it was sent, which could
+ * carry anything typed in place of an id. Undefined for any other request.
+ */
+function requestFor(req) {
+  if (!CONTACT_PATH.test(req.path ?? '')) return undefined;
+  const at = WRITE_PATTERNS.findIndex(([method, re]) => method === req.method && re.test(req.path));
+  return `${req.method} ${req.baseUrl ?? ''}${at >= 0 ? WRITE_ROUTES[at][1] : '/garages/:garageId/alert-contacts/...'}`;
+}
+
 /** A change-log line as the owner's screens read it. */
 function presentChange(line) {
   return {
@@ -2768,7 +2782,9 @@ function presentChange(line) {
     outcome: line.outcome,
     who: { kind: line.actor_kind, name: line.actor_name },
     action: line.action,
-    subject: { kind: line.subject_kind, id: line.subject_id, name: line.subject_name },
+    // A person to tell is named as they are now, or not at all when they
+    // have been removed (src/changes.js): the line itself never holds a name.
+    subject: { kind: line.subject_kind, id: line.subject_id, name: line.subject_name, removed: line.subject_removed === true },
     before: line.before,
     after: line.after,
     refusal: line.refusal,

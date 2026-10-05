@@ -14,18 +14,23 @@
  * this file: sending is the alert module's, which also decides how each
  * alert is detected. Until it lands, nobody is confirmed (0029 holds it so).
  *
- * A PERSON'S DETAILS NEVER ENTER A LOG. A change-log line names the person
- * and says what changed ("phone number changed", "by text: Card payments
- * stopped"); the number and the address themselves are never in it. Every
- * value the request or the row holds is handed to the line's guard
- * (`ctx.private`, src/changes.js), which refuses -- by throwing, so the
- * change rolls back -- a line that holds one. A database refusal is passed on
- * without its detail, which would quote the row.
+ * NOTHING AN OWNER TYPED ABOUT A PERSON ENTERS A LOG (U4b fix round 2). A
+ * change-log line about a person holds the person's id and what kind of
+ * change it was ("the name changed", "the phone number changed", "by text:
+ * Card payments stopped") -- never their name, phone number, email address
+ * or any other value typed for them. The log can only be added to, and no
+ * rule on what a name may hold can keep a number out of it (a number can be
+ * written in words, look-alike letters, any script's numerals), so the line
+ * never holds the name at all: the change log's read shows the person's name
+ * as it is now, from this table, and a person who has been removed as one
+ * who was removed (src/changes.js). The line's guard holds every line about
+ * a person to `LINE_WORDS` below, and refuses -- by throwing, so the change
+ * rolls back -- any other text. A database refusal is passed on without its
+ * detail, which would quote the row.
  */
 import { HttpError } from './errors.js';
 import * as changes from './changes.js';
 import { quietMinutes } from './setup.js';
-import { digitsOf, NAME_DIGITS_MAX } from './digits.js';
 
 /**
  * The alerts, in the order the owner reads them. `needs`: what each alert's
@@ -47,6 +52,18 @@ export const NAME_MAX = 80;
 export const EMAIL_MAX = 254;
 export const LANGUAGES = Object.freeze(['en', 'es']);
 
+/**
+ * Every word a change-log line about a person may hold, as a field or as a
+ * value: the fields that can change, what is said of a phone, an email
+ * address or a name (whether one is kept, or that it changed), the languages
+ * and the alerts. Nothing typed is among them.
+ */
+export const LINE_WORDS = Object.freeze(new Set([
+  'name', 'phone', 'email', 'language', 'by_text', 'by_email',
+  'given', 'none', 'changed',
+  ...LANGUAGES, ...ALERT_KEYS,
+]));
+
 const CONTROL = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 // Anything that is not a plain space between visible characters.
 const ODD_SPACE = /[\p{Z}\s]/u;
@@ -55,21 +72,14 @@ const bad = (message, code, details) => Object.assign(new HttpError(400, message
 const conflict = (code, message, details) => Object.assign(new HttpError(409, message, code), details ? { details } : {});
 
 /**
- * A person's name: a lane name's rule, and never a phone number or an email
- * address. A name is written into the change log, which can only be added
- * to, so a number must not get through however it is written: 7 or more
- * digits of any script in all, whatever stands between them, are refused, and
- * so is an `@` of any width (src/digits.js; 0029 holds the same).
+ * A person's name: a lane name's rule. What it holds is the owner's: a name
+ * is never written into a log (above), so nothing in it is looked for there.
  */
 export function nameField(raw) {
-  const rule = `name must be text of 1 to ${NAME_MAX} characters, with no control or invisible formatting characters, and no phone number or email address in it`;
+  const rule = `name must be text of 1 to ${NAME_MAX} characters, with no control or invisible formatting characters`;
   if (typeof raw !== 'string') throw bad(rule, 'alert_contact_name_refused', { reason: 'not_text' });
   const name = raw.trim();
   if (name === '' || name.length > NAME_MAX || CONTROL.test(name)) throw bad(rule, 'alert_contact_name_refused', { reason: 'shape' });
-  if (name.normalize('NFKC').includes('@')) throw bad(rule, 'alert_contact_name_refused', { reason: 'at' });
-  if (digitsOf(name).length > NAME_DIGITS_MAX) {
-    throw bad(`name holds ${NAME_DIGITS_MAX + 1} or more digits, which could be a phone number; ${rule}`, 'alert_contact_name_refused', { reason: 'digits' });
-  }
   return name;
 }
 
@@ -168,18 +178,17 @@ const present = (row) => ({
 /** What a line may say about a person's phone or email: whether there is one, never what it is. */
 const kept = (value) => (value === null ? 'none' : 'given');
 
-/** Every value a line about this person must never hold, as typed and as kept. */
+/** Every value a line about this person must never hold, as typed and as kept: a second wall behind LINE_WORDS. */
 function guard(ctx, ...values) {
   ctx.private = ctx.private ?? [];
   for (const v of values) {
     if (typeof v !== 'string' || v.trim() === '') continue;
     ctx.private.push(v, v.trim());
-    const digits = digitsOf(v);
-    if (digits.length >= 7) ctx.private.push(digits, digits.slice(-10), `+${digits}`);
   }
 }
 
-const subjectOf = (row) => ({ kind: 'alert_contact', id: row.id, name: row.name });
+/** The person a line is about: by id only. Their name is read when the log is read. */
+const subjectOf = (row) => ({ kind: 'alert_contact', id: row.id, name: null });
 
 const lockGarage = (client, garageId) =>
   client.query("SELECT pg_advisory_xact_lock(hashtextextended('alert-contacts|' || $1::text, 0))", [garageId]);
@@ -248,7 +257,7 @@ export async function add(client, tenantId, garageId, body, ctx) {
     const row = rows[0];
     await changes.record(client, ctx, {
       garageId, action: 'alert_contact.add', subject: subjectOf(row),
-      before: null, after: { name, language, phone: kept(phone), email: kept(email) },
+      before: null, after: { language, phone: kept(phone), email: kept(email) },
     });
     return { contact: present(row) };
   } catch (err) {
@@ -283,7 +292,8 @@ export async function change(client, tenantId, garageId, contactId, body, ctx) {
 
     const before = {};
     const after = {};
-    if (name !== row.name) { before.name = row.name; after.name = name; }
+    // That the name changed, never what it was or is.
+    if (name !== row.name) after.name = 'changed';
     if (language !== row.language) { before.language = row.language; after.language = language; }
     if (phone !== row.phone) { before.phone = kept(row.phone); after.phone = row.phone !== null && phone !== null ? 'changed' : kept(phone); }
     if (email !== row.email) { before.email = kept(row.email); after.email = row.email !== null && email !== null ? 'changed' : kept(email); }
@@ -311,7 +321,7 @@ export async function remove(client, tenantId, garageId, contactId, ctx) {
     const p = present(row);
     await changes.record(client, ctx, {
       garageId, action: 'alert_contact.remove', subject: subjectOf(row),
-      before: { name: row.name, language: row.language, phone: kept(row.phone), email: kept(row.email), by_text: p.by_text, by_email: p.by_email },
+      before: { language: row.language, phone: kept(row.phone), email: kept(row.email), by_text: p.by_text, by_email: p.by_email },
       after: null,
     });
     return p;

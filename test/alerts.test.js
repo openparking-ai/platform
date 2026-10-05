@@ -11,9 +11,12 @@
  *      its text choices off, and the answer and the line say so
  *   4  bounds: the 26th person and an over-long name, refused by name, by
  *      the route and by the database
- *   5  no contact details in any log: the change log, the security log and
- *      the server's output hold no phone number and no email address, as
- *      typed or as kept, after every route and every change kind
+ *   5  no typed contact text in any stored line (fix round 2): a line about
+ *      a person holds their id and what kind of change it was, never their
+ *      name, phone number or email address; the change log, the security
+ *      log and the server's output hold none of them, in any form, read as
+ *      raw text and as digits only, after every route and every change kind;
+ *      a removed person is named in no line, on any read
  *   7  the checklist step is the data: a garage with every alert covered and
  *      one with a gap; the open step is the same for both
  *   8  nothing is sent: no provider, no network call, no key read
@@ -32,7 +35,7 @@ import pg from 'pg';
 import { pool, withTenant, createTenant } from './helpers.js';
 import * as alerts from '../src/alerts.js';
 import * as changes from '../src/changes.js';
-import { DIGIT_ZEROS, sqlDigitClass } from '../src/digits.js';
+import { DIGIT_ZEROS } from '../src/digits.js';
 import { STEP_KEYS } from '../src/setup.js';
 import { startServer, owner, call, newGarage, newLane, linesOf, FOREIGN_ORIGIN } from './u4-world.js';
 
@@ -391,7 +394,7 @@ test('BOUNDS: the 26th person and an over-long name are refused by name, by the 
   const long = 'N'.repeat(alerts.NAME_MAX + 1);
   let r = await call(base, 'POST', `/garages/${g.id}/alert-contacts`, { as: a, body: send({ name: long, email: 'long.name@example.com' }) });
   assert.deepEqual([r.status, r.json.code], [400, 'alert_contact_name_refused']);
-  for (const name of ['', '   ', 'Tab\there', 'Zero​width', 'Call 5550101234', 'mail me@example.com']) {
+  for (const name of ['', '   ', 'Tab\there', 'Zero​width']) {
     r = await call(base, 'POST', `/garages/${g.id}/alert-contacts`, { as: a, body: send({ name, email: 'name.rule@example.com' }) });
     assert.deepEqual([r.status, r.json.code], [400, 'alert_contact_name_refused'], JSON.stringify(name));
   }
@@ -419,16 +422,32 @@ test('BOUNDS: the 26th person and an over-long name are refused by name, by the 
 });
 
 // ---------------------------------------------------------------------------
-// 4b -- a name never carries a phone number or an email address
+// 4b -- what an owner types about a person is theirs, and never in a log
 // ---------------------------------------------------------------------------
+
+/**
+ * Digits Unicode gives a value that are not decimal digits, and that NFKC
+ * leaves as they are -- the re-gate's forms -- and the Han numerals: read by
+ * the scan below from this table of its own, not from the platform's code.
+ */
+const OTHER_DIGITS = new Map([
+  ...[...'❶❷❸❹❺❻❼❽❾'].map((c, i) => [c, i + 1]), ['⓿', 0],
+  ...[...'➀➁➂➃➄➅➆➇➈'].map((c, i) => [c, i + 1]),
+  ...[...'➊➋➌➍➎➏➐➑➒'].map((c, i) => [c, i + 1]),
+  ...[...'⓵⓶⓷⓸⓹⓺⓻⓼⓽'].map((c, i) => [c, i + 1]),
+  ...[...'፩፪፫፬፭፮፯፰፱'].map((c, i) => [c, i + 1]),
+  ...[...'〇一二三四五六七八九'].map((c, i) => [c, i]),
+]);
 
 /**
  * A digit's value, read here from the running engine's own idea of a digit
  * and NOT from src/digits.js, so the scan below does not lean on the code it
  * checks: a decimal digit's value is its distance from the start of its
- * run of digits, modulo 10 (Unicode keeps each script's 0-9 together).
+ * run of digits, modulo 10 (Unicode keeps each script's 0-9 together); any
+ * other is OTHER_DIGITS's.
  */
 function scanDigitValue(ch) {
+  if (OTHER_DIGITS.has(ch)) return OTHER_DIGITS.get(ch);
   if (!/\p{Nd}/u.test(ch)) return -1;
   let cp = ch.codePointAt(0);
   let back = 0;
@@ -458,10 +477,10 @@ function* textsOf(value) {
 }
 
 /**
- * THE SCAN: which of `numbers` (each a phone number in any form) sits in any
- * text of `logs`. Each text is read as its digits only -- ids and times taken
- * out first, as they are the platform's own -- so no separator, letter or
- * script between a number's digits hides it.
+ * THE SCAN, as digits: which of `numbers` (each a phone number in any form)
+ * sits in any text of `logs`. Each text is read as its digits only -- ids and
+ * times taken out first, as they are the platform's own -- so no separator,
+ * letter or script between a number's digits hides it.
  */
 function numbersIn(logs, numbers) {
   // A number's last 7 digits find it, with or without its country.
@@ -474,7 +493,17 @@ function numbersIn(logs, numbers) {
   return [...found];
 }
 
-/** A number written every way the fix round names, and a generated set besides. */
+/** THE SCAN, as raw text: which of `typed` sits in any text of `logs`, as typed or normalised. */
+function typedIn(logs, typed) {
+  const wanted = [...new Set(typed.flatMap((t) => [t.trim(), t.trim().normalize('NFKC')]))].filter((t) => t.length >= 4);
+  const found = new Set();
+  for (const text of textsOf(logs)) {
+    for (const t of wanted) if (text.includes(t) || text.normalize('NFKC').includes(t)) found.add(t);
+  }
+  return [...found];
+}
+
+/** A number written every way the first fix round named, and a generated set besides. */
 function numberForms(seed = 7) {
   const arabicIndic = (d) => [...d].map((c) => String.fromCodePoint(0x660 + Number(c))).join('');
   const easternArabic = (d) => [...d].map((c) => String.fromCodePoint(0x6F0 + Number(c))).join('');
@@ -496,7 +525,7 @@ function numberForms(seed = 7) {
     ['digits split by words', 'Pat five 555 then 010 then 0189'],
     ['dots', 'Joe 555.010.0188'],
     ['spaces', 'Joe 555 010 0187'],
-    ['no-break spaces', 'Joe 555 010 0186'],
+    ['no-break spaces', 'Joe 555 010 0186'],
     ['underscores and bars', 'Joe 555_010|0185'],
     ['one digit a word', 'Ed 5 5 5 0 1 0 0 1 8 4'],
     ['scripts mixed', `Mo 5${arabicIndic('5')}${devanagari('5')}0${fullWidth('1')}0${mathBold('0')}183`],
@@ -507,7 +536,7 @@ function numberForms(seed = 7) {
   let state = seed;
   const rand = (n) => { state = (state * 1103515245 + 12345) % 2147483648; return state % n; };
   const scripts = [(c) => c, arabicIndic, easternArabic, devanagari, fullWidth, mathBold, (c) => String.fromCodePoint(0xE50 + Number(c)), (c) => String.fromCodePoint(0x9E6 + Number(c))];
-  const between = [',', '/', ' ', '.', '-', '_', '|', ';', ':', '·', '~', '*', 'x', 'o', 'ab', ' ', '，', '／', '、', '#', "'", '"', ''];
+  const between = [',', '/', ' ', '.', '-', '_', '|', ';', ':', '·', '~', '*', 'x', 'o', 'ab', ' ', '，', '／', '、', '#', "'", '"', ''];
   for (let i = 0; i < 60; i += 1) {
     const n = 7 + rand(6);
     let text = `Gen ${i} `;
@@ -522,36 +551,42 @@ function numberForms(seed = 7) {
   return forms;
 }
 
+/**
+ * The re-gate's forms: a number no count of digits finds -- digits that are
+ * not decimal, words, look-alike letters, Han and Roman numerals -- and the
+ * plain ones. Each a name, as an owner could type it.
+ */
+const RE_GATE_FORMS = [
+  ['negative circled digits', 'Maria ❺❺❺⓿❶⓿⓿❶❾❾'],
+  ['sans-serif circled digits', 'Marta ➄➄➄➀➀➈➈'],
+  ['double circled digits', 'Marco ⓹⓹⓹⓵⓵⓽⓽'],
+  ['Ethiopic digits', 'Abebe ፭፭፭፩፩፱፱'],
+  ['words', 'Maria five five five oh one oh oh one nine nine'],
+  ['look-alike letters', 'Maria 555-OlO-Ol99'],
+  ['Han numerals', 'Maria 五五五〇一〇〇一九九'],
+  ['Roman numerals', 'Maria ⅤⅤⅤ ⅠⅠ ⅨⅨ'],
+  ['plain digits', 'Maria 555-010-0199'],
+  ['an address', 'Maria maria.n@example.com'],
+  ['a full-width address', 'Maria maria.w＠example.com'],
+];
+
 const AT_FORMS = [['@', 'Mail me@example'], ['full-width @', 'Mail me＠example'], ['small @', 'Mail me﹫example']];
 
-test('A NAME NEVER CARRIES A NUMBER: 7 or more digits of any script in all, whatever stands between them, or an @ of any width, refused with a plain reason -- by the route and by the database', async () => {
+test('A NAME IS THE OWNER\'S: a name with a number in any form, or an address, is kept as typed -- by the route and by the database', async () => {
   const g = await newGarage(base, a);
   const person = await addPerson(a, g.id, { name: 'Renamed later', email: 'renamed.later@example.com' });
   const insert = (name) => withTenant(a.tenant, (c) =>
-    c.query("INSERT INTO alert_contacts (tenant_id, garage_id, name, email) VALUES ($1, $2, $3, 'direct.name@example.com')", [a.tenant, g.id, name]));
-  const refusedForms = [...numberForms().map(([what, name]) => [what, name, 'digits']), ...AT_FORMS.map(([what, name]) => [what, name, 'at'])];
-  assert.ok(refusedForms.length > 70, `${refusedForms.length} forms`);
-  for (const [what, name, reason] of refusedForms) {
-    assert.ok(scanDigits(name).length >= 7 || reason === 'at', `${what}: the form itself holds fewer than 7 digits`);
-    for (const [method, path] of [['POST', `/garages/${g.id}/alert-contacts`], ['PATCH', `/garages/${g.id}/alert-contacts/${person.id}`]]) {
-      const r = await call(base, method, path, { as: a, body: send(method === 'POST' ? { name, email: 'name.form@example.com' } : { name }) });
-      assert.deepEqual([r.status, r.json?.code, r.json?.details?.reason], [400, 'alert_contact_name_refused', reason], `${what}, ${method}: ${JSON.stringify(name)} -> ${r.status} ${r.text}`);
-      assert.equal(r.text.includes(name), false, `${what}: the refusal quotes the name`);
-    }
-    await assert.rejects(insert(name), /alert_contacts_name_holds_no_contact/, `${what}: the database took ${JSON.stringify(name)}`);
+    c.query("INSERT INTO alert_contacts (tenant_id, garage_id, name, email) VALUES ($1, $2, $3, 'direct.name@example.com') RETURNING id", [a.tenant, g.id, name]));
+  const forms = [...RE_GATE_FORMS, ...AT_FORMS, ...numberForms().slice(0, 25)];
+  for (const [what, name] of forms) {
+    const r = await call(base, 'PATCH', `/garages/${g.id}/alert-contacts/${person.id}`, { as: a, body: send({ name }) });
+    assert.deepEqual([r.status, r.json?.contact?.name], [200, name], `${what}: ${JSON.stringify(name)} -> ${r.status} ${r.text}`);
+    const { rows: [row] } = await insert(name);
+    await withTenant(a.tenant, (c) => c.query('DELETE FROM alert_contacts WHERE id = $1', [row.id]));
   }
-  // A name may hold a few digits: a bay, a shift, a floor.
-  for (const name of ['Bay 12', 'Night shift 2', 'Level 3 lead', 'Gate 1-2-3', 'Unit 123456', 'Ana María Núñez', 'محمد', '李小龙']) {
-    const r = await call(base, 'POST', `/garages/${g.id}/alert-contacts`, { as: a, body: send({ name, email: 'fine.name@example.com' }) });
-    assert.equal(r.status, 201, `${JSON.stringify(name)}: ${r.text}`);
-    assert.equal((await call(base, 'DELETE', `/garages/${g.id}/alert-contacts/${r.json.contact.id}`, { as: a })).status, 204);
-  }
-  assert.deepEqual((await contacts(a.tenant, g.id)).map((c) => c.name), ['Renamed later'], 'a refused name was kept');
 });
 
-test('the digits the route and the database count are the same table, and it lacks none the running engine knows', () => {
-  const migration = readFileSync(new URL('../migrations/0029_alert_contacts.sql', import.meta.url), 'utf8');
-  assert.ok(migration.includes(`'[^${sqlDigitClass()}]'`), '0029 counts other digits than src/digits.js');
+test('the digits the line guard reads lack none the running engine knows', () => {
   const missing = [];
   for (let cp = 0; cp <= 0x10FFFF; cp += 1) {
     if (cp >= 0xD800 && cp <= 0xDFFF) continue;
@@ -560,9 +595,9 @@ test('the digits the route and the database count are the same table, and it lac
   assert.deepEqual(missing, [], 'digits the table lacks');
 });
 
-test('THE SCAN reads digits only: a number planted in any form, in a line read back from the database, is found; none is found where none is', async () => {
+test('THE SCAN finds what was typed: a name planted in a line read back from the database is found as raw text, and a number in it as digits only; none is found where none is', async () => {
   const c = await createTenant('alerts-scan');
-  const forms = numberForms(11);
+  const forms = [...numberForms(11), ...RE_GATE_FORMS];
   const found = await withTenant(c, async (client) => {
     // Planted inside a transaction that is rolled back: the log can only be added to.
     await client.query('SAVEPOINT plant');
@@ -570,57 +605,93 @@ test('THE SCAN reads digits only: a number planted in any form, in a line read b
       for (const [, name] of forms) {
         await client.query(
           `INSERT INTO garage_changes (tenant_id, garage_id, outcome, actor_kind, actor_id, actor_name, action, subject_kind, subject_id, subject_name, before, after)
-           VALUES ($1, NULL, 'done', 'owner', gen_random_uuid(), 'scan@example.com', 'alert_contact.change', 'alert_contact', gen_random_uuid(), $2, NULL, $3)`,
-          [c, name, JSON.stringify({ note: name })],
+           VALUES ($1, NULL, 'done', 'owner', gen_random_uuid(), 'scan@example.com', 'lane.rename', 'lane', gen_random_uuid(), NULL, NULL, $2)`,
+          [c, JSON.stringify({ name })],
         );
       }
       const { rows } = await client.query('SELECT * FROM garage_changes WHERE tenant_id = $1', [c]);
-      return forms.map(([what, name]) => [what, numbersIn(rows, [name])]);
+      return forms.map(([what, name]) => [what, typedIn(rows, [name]), numbersIn(rows, [name]), scanDigits(name).length]);
     } finally {
       await client.query('ROLLBACK TO SAVEPOINT plant');
     }
   });
-  for (const [what, hits] of found) assert.equal(hits.length, 1, `${what}: the scan did not find the planted number`);
+  for (const [what, raw, numbers, digits] of found) {
+    assert.ok(raw.length >= 1, `${what}: the scan did not find the planted name`);
+    if (digits >= 7) assert.equal(numbers.length, 1, `${what}: the scan did not find the planted number`);
+  }
+  // The re-gate's digit forms are read as digits too.
+  for (const what of ['negative circled digits', 'Ethiopic digits', 'Han numerals', 'double circled digits']) {
+    assert.ok(found.find(([w]) => w === what)[3] >= 7, `${what}: the scan reads too few digits`);
+  }
   // Each form's number as plain digits, found in each other written form.
   assert.deepEqual(numbersIn(['call 555 010 0199'], ['Maria 555,010,0199']), ['0100199']);
   assert.deepEqual(numbersIn([`a ${'٥٥٥٠١٠٠١٩٩'}`], ['+1 555-010-0199']), ['0100199']);
+  assert.deepEqual(numbersIn(['call 555 010 0199'], ['Maria ❺❺❺⓿❶⓿⓿❶❾❾']), ['0100199']);
   // Ids and times are the platform's own; a few digits are not a number.
   assert.deepEqual(numbersIn([{ id: 'a5550100-1990-4000-8000-000000000000', at: '2026-10-05T20:20:00.000Z', name: 'Bay 12' }], ['555-010-0199', '2026100520']), []);
+  assert.deepEqual(typedIn([{ action: 'alert_contact.change', after: { name: 'changed' } }], ['Maria 555-010-0199']), []);
 });
 
 // ---------------------------------------------------------------------------
 // 5
 // ---------------------------------------------------------------------------
 
-test('NO CONTACT DETAILS IN ANY LOG: after every route and every change kind, the change log, the security log and the server output hold no phone number and no email address, as typed or as kept', async () => {
+/** What a stored line about a person may hold besides ids and times: the platform's own words, lower-case and underscores. */
+const PLATFORM_WORD = /^[a-z_]+$/;
+
+test('NO TYPED CONTACT TEXT IN ANY STORED LINE: after every route and every change kind, no name, phone number or email address -- in any form -- is in the change log, the security log or the server output, read as raw text and as digits only', async () => {
   const g = await newGarage(base, a);
   const theirs = await newGarage(base, b);
   const p = await addPerson(a, g.id, { name: 'Every kind', phone: '(555) 010-4100', email: 'every.kind@example.com', language: 'es' });
-  const q = await addPerson(a, g.id, { name: 'Second', phone: '+44 20 7946 0101' });
+  const q = await addPerson(a, g.id, { name: 'Second person', phone: '+44 20 7946 0101' });
+  const nameForms = [...RE_GATE_FORMS, ...AT_FORMS, ...numberForms(5).slice(0, 25)].map(([, n]) => n);
+  // An address and a number written in the re-gate's forms, as a phone or an address: refused, and not in the line either.
+  const oddPhones = ['❺❺❺⓿❶⓿⓿❶❾❾', '፭፭፭፩፩፱፱፱፱', 'five five five oh one oh', '555-OlO-Ol99', '五五五〇一〇〇一九九'];
+  const oddEmails = ['maria.❺❺❺@example.com', 'maria five@example.com', 'maria.n＠example.com'];
   const steps = [
     ['PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { phone: '555.010.4101' }],
-    ['PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { email: 'every.kind.new@example.com', name: 'Every kind 2' }],
+    ['PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { email: 'every.kind.new@example.com', name: 'Every kind renamed' }],
     ['PUT', `/garages/${g.id}/alert-contacts/${p.id}/choices`, { by_text: ['lane_problem', 'lane_not_answering'], by_email: ['card_payments_stopped'] }],
     ['PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { phone: null }],
     ['PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { phone: '+1 555 010 4102', language: 'en' }],
-    // Refused: a bad number, a bad address, text with no phone, another account's.
+    // Every name form, as a change and as an add (each added one removed again).
+    ...nameForms.map((name) => ['PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { name }]),
+    ...RE_GATE_FORMS.map(([, name]) => ['POST', `/garages/${g.id}/alert-contacts`, { name, email: 'name.form@example.com', phone: '555 010 4110' }]),
+    // Refused: a bad number, a bad address, in plain and the re-gate's forms; a name too long; text with no phone; another account's.
     ['PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { phone: '555-010-41O2' }],
     ['PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { email: 'every kind@example.com' }],
-    ['POST', `/garages/${g.id}/alert-contacts`, { name: 'Refused 555 0104103', phone: '5550104103' }],
-    // Refused: a number hidden in a name, every way the fix round names.
-    ...numberForms(3).slice(0, 25).map(([, name]) => ['POST', `/garages/${g.id}/alert-contacts`, { name, email: 'hidden.number@example.com' }]),
-    ...numberForms(5).slice(0, 25).map(([, name]) => ['PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { name }]),
-    ['POST', `/garages/${theirs.id}/alert-contacts`, { name: 'Not mine', phone: '555 010 4104', email: 'not.mine@example.com' }],
-    ['DELETE', `/garages/${g.id}/alert-contacts/${q.id}`, undefined],
-    ['DELETE', `/garages/${g.id}/alert-contacts/${p.id}`, undefined],
+    ...oddPhones.map((phone) => ['PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { phone }]),
+    ...oddEmails.map((email) => ['PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { email }]),
+    ['POST', `/garages/${g.id}/alert-contacts`, { name: `Maria 555 010 0199 ${'x'.repeat(80)}`, phone: '5550104103' }],
+    ['PUT', `/garages/${g.id}/alert-contacts/${q.id}/choices`, { by_text: [], by_email: ['lane_problem'] }],
+    ['POST', `/garages/${theirs.id}/alert-contacts`, { name: 'Not mine 555 010 4104', phone: '555 010 4104', email: 'not.mine@example.com' }],
   ];
   for (const [method, path, body] of steps) await call(base, method, path, { as: a, body: send(body) });
+  for (const c of await contacts(a.tenant, g.id)) {
+    if (c.id !== p.id && c.id !== q.id) assert.equal((await call(base, 'DELETE', `/garages/${g.id}/alert-contacts/${c.id}`, { as: a })).status, 204);
+  }
+  await call(base, 'DELETE', `/garages/${g.id}/alert-contacts/${q.id}`, { as: a });
+  await call(base, 'DELETE', `/garages/${g.id}/alert-contacts/${p.id}`, { as: a });
   // With no sign-in at all, and from another site: the security log and the caller's own log.
-  await call(base, 'POST', `/garages/${g.id}/alert-contacts`, { body: send({ name: 'Nobody', phone: '555 010 4105', email: 'nobody.here@example.com' }) });
-  await call(base, 'POST', `/garages/${g.id}/alert-contacts`, { as: a, origin: FOREIGN_ORIGIN, body: send({ name: 'Elsewhere', phone: '555 010 4106' }) });
+  await call(base, 'POST', `/garages/${g.id}/alert-contacts`, { body: send({ name: 'Nobody 555 010 4105', phone: '555 010 4105', email: 'nobody.here@example.com' }) });
+  await call(base, 'POST', `/garages/${g.id}/alert-contacts`, { as: a, origin: FOREIGN_ORIGIN, body: send({ name: 'Elsewhere ❺❺❺⓿❶⓿⓿❶❾❽', phone: '555 010 4106' }) });
+  // Typed text where an id goes: in the path, with no sign-in, which is refused before the id is read.
+  const inPaths = ['Maria-5550100177', 'maria.p@example.com', 'Maria ❺❺❺⓿❶⓿⓿❶❼❼'];
+  for (const text of inPaths) {
+    send({ name: text });
+    for (const [method, path] of [
+      ['PATCH', `/garages/${g.id}/alert-contacts/${encodeURIComponent(text)}`],
+      ['DELETE', `/garages/${g.id}/alert-contacts/${encodeURIComponent(text)}`],
+      ['PUT', `/garages/${g.id}/alert-contacts/${encodeURIComponent(text)}/choices`],
+      ['POST', `/garages/${g.id}/alert-contacts/${encodeURIComponent(text)}/more`],
+    ]) {
+      await call(base, method, path, { body: { name: text } });
+      await call(base, method, path, { as: a, origin: FOREIGN_ORIGIN, body: { name: text } });
+    }
+  }
 
   const kinds = new Set((await linesOf(a.tenant)).filter((l) => l.action.startsWith('alert_contact.')).map((l) => `${l.outcome}:${l.action}`));
-  for (const k of ['done:alert_contact.add', 'done:alert_contact.change', 'done:alert_contact.choices', 'done:alert_contact.remove', 'refused:alert_contact.change', 'refused:alert_contact.add']) {
+  for (const k of ['done:alert_contact.add', 'done:alert_contact.change', 'done:alert_contact.choices', 'done:alert_contact.remove', 'refused:alert_contact.change', 'refused:alert_contact.add', 'refused:alert_contact.choices', 'refused:alert_contact.remove']) {
     assert.ok(kinds.has(k), `no ${k} line was made to scan`);
   }
 
@@ -628,64 +699,108 @@ test('NO CONTACT DETAILS IN ANY LOG: after every route and every change kind, th
     lines: (await c.query('SELECT * FROM garage_changes WHERE tenant_id = ANY($1)', [[a.tenant, b.tenant]])).rows,
     security: (await c.query('SELECT * FROM platform_security_log WHERE coalesce(last_at, at) >= $1', [STARTED])).rows,
   }));
-  assert.ok(lines.length > 20 && security.length >= 1, `${lines.length} lines and ${security.length} security lines scanned`);
-  const logs = JSON.stringify([lines, security]);
-  const output = printed.join('');
-
-  // Each detail as typed, as kept, and as its bare digits.
-  const forms = new Set();
-  for (const d of details) {
-    // A fragment no one could be reached at (`@example.com`) is every owner's email's ending.
-    if (d.trim().length < 7 || d.trim().startsWith('@')) continue;
-    forms.add(d.trim());
-    for (const kept of [() => alerts.phoneField(d), () => alerts.emailField(d)]) {
-      try { forms.add(kept()); } catch { /* a refused one is scanned as typed */ }
-    }
-    const digits = d.replace(/[^0-9]/g, '');
-    if (digits.length >= 7) forms.add(digits.slice(-7));
-  }
-  assert.ok(forms.size > 60, `${forms.size} forms scanned`);
-  const inLogs = [...forms].filter((f) => logs.includes(f));
-  const inOutput = [...forms].filter((f) => output.includes(f));
-  assert.deepEqual(inLogs, [], 'a phone number or email address is in a log');
-  assert.deepEqual(inOutput, [], 'a phone number or email address was printed');
-  // Every number this file sent -- as a phone, or hidden in a name, in any
-  // form the fix round names -- read as digits only, in every log and the output.
-  const numbers = [...details, ...names, ...numberForms().map(([, n]) => n)].filter((d) => scanDigits(d).length >= 7);
-  assert.ok(numbers.length > 80, `${numbers.length} numbers scanned`);
-  assert.deepEqual(numbersIn([lines, security], numbers), [], 'a phone number is in a log, written some way');
+  assert.ok(lines.length > 60 && security.length >= 1, `${lines.length} lines and ${security.length} security lines scanned`);
   // The test runner reports through the same stream in its own binary frames
   // (names, times, places); those are not the server's output.
-  const serverOutput = printed.filter((chunk) => !chunk.includes('"\x04type"'));
-  assert.deepEqual(numbersIn(serverOutput, numbers), [], 'a phone number was printed, written some way');
-  // And nothing that could be one, or an address, in a line about a person.
+  const output = printed.filter((chunk) => !chunk.includes('"\x04type"'));
+
+  // Each stored line about a person: no name, and nothing but the platform's own words -- a red names the line.
   for (const l of lines.filter((x) => x.subject_kind === 'alert_contact')) {
-    for (const text of textsOf([l.subject_name, l.before, l.after])) {
-      assert.equal(scanDigits(text).length >= 7 || text.normalize('NFKC').includes('@'), false, `line ${l.id} holds something that could be a number or an address`);
+    assert.equal(l.subject_name, null, `line ${l.id} (${l.action}) holds a name`);
+    for (const text of textsOf([l.before, l.after])) assert.match(text, PLATFORM_WORD, `line ${l.id} (${l.action}) holds ${JSON.stringify(text)}`);
+  }
+  // RAW TEXT: every name, phone number and email address this file sent, as
+  // typed, as kept and normalised.
+  const typed = new Set();
+  for (const d of [...details, ...names]) {
+    // A fragment no one could be reached at (`@example.com`) is every owner's email's ending.
+    if (d.trim().length < 6 || d.trim().startsWith('@')) continue;
+    typed.add(d.trim());
+    for (const kept of [() => alerts.phoneField(d), () => alerts.emailField(d)]) {
+      try { typed.add(kept()); } catch { /* a refused one is scanned as typed */ }
     }
   }
+  assert.ok(typed.size > 80, `${typed.size} typed texts scanned`);
+  for (const form of [...RE_GATE_FORMS.map(([, n]) => n), ...oddPhones, ...oddEmails, ...inPaths]) assert.ok(typed.has(form), `${form} was not scanned`);
+  assert.deepEqual(typedIn([lines, security], [...typed]), [], 'something typed about a person is in a log');
+  assert.deepEqual(typedIn(output, [...typed]), [], 'something typed about a person was printed');
+  // DIGITS ONLY: every number sent, as a phone, in a name, in an address or a path.
+  const numbers = [...typed].filter((d) => scanDigits(d).length >= 7);
+  assert.ok(numbers.length > 60, `${numbers.length} numbers scanned`);
+  assert.deepEqual(numbersIn([lines, security], numbers), [], 'a number typed about a person is in a log, written some way');
+  assert.deepEqual(numbersIn(output, numbers), [], 'a number typed about a person was printed, written some way');
+  // A refused attempt on a person names the route, never the path as it was sent.
+  const ROUTES = new Set(['POST /api/v1/garages/:garageId/alert-contacts', 'PATCH /api/v1/garages/:garageId/alert-contacts/:contactId',
+    'DELETE /api/v1/garages/:garageId/alert-contacts/:contactId', 'PUT /api/v1/garages/:garageId/alert-contacts/:contactId/choices',
+    'POST /api/v1/garages/:garageId/alert-contacts/...']);
+  const tried = [...lines, ...security].filter((l) => /alert-contacts/i.test(l.request ?? ''));
+  assert.ok(tried.length >= 4, `${tried.length} refused attempts on a person`);
+  for (const l of tried) assert.ok(ROUTES.has(l.request), `a refused attempt names ${JSON.stringify(l.request)}`);
 });
 
-test('the guard itself: a line about a person that holds their phone or email is refused before it is written', async () => {
+test('REMOVAL REMOVES: a person is named in every line as they are named now; removed, every line about them says so and names no one, on every read', async () => {
+  const g = await newGarage(base, a);
+  const stays = await addPerson(a, g.id, { name: 'Stays named', email: 'stays.named@example.com' });
+  const p = await addPerson(a, g.id, { name: 'Ravi before', phone: '555 010 4300' });
+  await call(base, 'PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { as: a, body: send({ name: 'Ravi now', email: 'ravi.now@example.com' }) });
+  await call(base, 'PATCH', `/garages/${g.id}/alert-contacts/${p.id}`, { as: a, body: send({ phone: '555 010 4301', language: 'es' }) });
+  await call(base, 'PUT', `/garages/${g.id}/alert-contacts/${p.id}/choices`, { as: a, body: { by_text: ['card_payments_stopped'], by_email: ['lane_problem'] } });
+  const read = async () => {
+    const r = await call(base, 'GET', `/garages/${g.id}/changes`, { as: a });
+    assert.equal(r.status, 200, r.text);
+    return r.json.changes.filter((l) => l.subject.kind === 'alert_contact');
+  };
+  const about = (lines, id) => lines.filter((l) => l.subject.id === id);
+  let lines = await read();
+  assert.equal(about(lines, p.id).length, 4, 'add, two changes and the choices');
+  for (const l of about(lines, p.id)) assert.deepEqual([l.subject.name, l.subject.removed], ['Ravi now', false], `${l.action}: named as they are now`);
+  assert.equal(JSON.stringify(lines).includes('Ravi before'), false, 'the name before is still read');
+  assert.deepEqual(about(lines, p.id).find((l) => l.after?.name).after, { name: 'changed', email: 'given' }, 'the name changed, said with no before and after');
+
+  assert.equal((await call(base, 'DELETE', `/garages/${g.id}/alert-contacts/${p.id}`, { as: a })).status, 204);
+  lines = await read();
+  assert.equal(about(lines, p.id).length, 5, 'and the removal');
+  for (const l of about(lines, p.id)) assert.deepEqual([l.subject.name, l.subject.removed], [null, true], `${l.action}: still named after the removal`);
+  for (const l of about(lines, stays.id)) assert.deepEqual([l.subject.name, l.subject.removed], ['Stays named', false], 'another person lost their name');
+  const refused = await call(base, 'GET', `/garages/${g.id}/refused-attempts`, { as: a });
+  const stored = await ownerDb(async (c) => (await c.query('SELECT * FROM garage_changes WHERE tenant_id = $1', [a.tenant])).rows);
+  for (const [where, value] of [['the change log read', lines], ['the refused attempts read', refused.json], ['the stored lines', stored]]) {
+    assert.deepEqual(typedIn(value, ['Ravi before', 'Ravi now']), [], `${where} still names the removed person`);
+  }
+  // Every other kind of line still names its subject as it was written.
+  const lane = await newLane(base, a, g.id, 'North gate', 'entry');
+  const laneLine = (await call(base, 'GET', `/garages/${g.id}/changes`, { as: a })).json.changes.find((l) => l.subject.id === lane.id);
+  assert.deepEqual([laneLine.subject.name, laneLine.subject.removed], ['North gate', false]);
+});
+
+test('the guard itself: a line about a person holds no name and nothing but the platform\'s words, and no line holds their phone or email -- refused before it is written, by the route\'s guard and by the database', async () => {
   const ctx = changes.context({ tenantId: a.tenant, actor: { kind: 'owner', id: a.userId, name: a.email } });
   ctx.private.push('+15550104200');
   const g = await newGarage(base, a);
-  const write = (after) => withTenant(a.tenant, (c) =>
-    changes.record(c, ctx, { garageId: g.id, action: 'alert_contact.change', subject: { kind: 'alert_contact', id: null, name: 'Guarded' }, before: {}, after }));
+  const person = (name = null) => ({ kind: 'alert_contact', id: null, name });
+  const write = (after, subject = person()) => withTenant(a.tenant, (c) =>
+    changes.record(c, ctx, { garageId: g.id, action: 'alert_contact.change', subject, before: {}, after }));
   await assert.rejects(write({ phone: '+15550104200' }), changes.ContactDetailInLine);
   await assert.rejects(write({ note: 'call 555 010 4299' }), changes.ContactDetailInLine);
   await assert.rejects(write({ note: 'guarded@example.com' }), changes.ContactDetailInLine);
-  // However the number or the @ is written.
-  for (const [what, text] of [...numberForms(13), ...AT_FORMS]) {
-    await assert.rejects(write({ note: text }), changes.ContactDetailInLine, `${what}: ${JSON.stringify(text)} got through`);
-    assert.throws(() => changes.assertNoContactDetail({ subject: { name: text } }, [], { shapes: true }), changes.ContactDetailInLine, what);
+  await assert.rejects(write({ name: 'maria' }), changes.ContactDetailInLine, 'a typed name in lower case');
+  await assert.rejects(write({ name: 'changed' }, person('Guarded')), changes.ContactDetailInLine, 'a name as the subject');
+  // However the name is written.
+  for (const [what, text] of [...numberForms(13), ...AT_FORMS, ...RE_GATE_FORMS]) {
+    await assert.rejects(write({ name: text }), changes.ContactDetailInLine, `${what}: ${JSON.stringify(text)} got through`);
+    assert.throws(() => changes.assertContactLineWords({ subject: person(text), before: null, after: null }), changes.ContactDetailInLine, what);
   }
   // A line about something else still never holds the person's own number, written any way.
   for (const text of ['5,5,5,0,1,0,4,2,0,0', '555/010/4200', '٥٥٥٠١٠٤٢٠٠', '５５５０１０４２００', '5a5b5c0d1e0f4g2h0i0']) {
     assert.throws(() => changes.assertNoContactDetail({ after: { note: text } }, ['+15550104200']), changes.ContactDetailInLine, text);
   }
-  await withTenant(a.tenant, (c) => changes.record(c, ctx, { garageId: g.id, action: 'alert_contact.change', subject: { kind: 'alert_contact', id: null, name: 'Guarded' }, before: { phone: 'given' }, after: { phone: 'changed' } }));
-  assert.equal(ctx.count, 1, 'a line that says only what changed is written');
+  await withTenant(a.tenant, (c) => changes.record(c, ctx, { garageId: g.id, action: 'alert_contact.change', subject: person(), before: { phone: 'given' }, after: { phone: 'changed', name: 'changed', by_text: ['lane_problem'] } }));
+  assert.equal(ctx.count, 1, 'a line that says only what kind of change it was is written');
+  // The database: a line about a person never holds a name, whoever writes it.
+  await assert.rejects(withTenant(a.tenant, (c) => c.query(
+    `INSERT INTO garage_changes (tenant_id, garage_id, outcome, actor_kind, actor_id, actor_name, action, subject_kind, subject_id, subject_name, before, after)
+     VALUES ($1, $2, 'done', 'owner', $3, $4, 'alert_contact.add', 'alert_contact', gen_random_uuid(), 'Maria five five five', NULL, NULL)`,
+    [a.tenant, g.id, a.userId, a.email])), /garage_changes_person_unnamed/);
 });
 
 // ---------------------------------------------------------------------------

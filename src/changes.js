@@ -18,13 +18,19 @@
  *                 minute from one source in a log; one more carries the rest.
  *
  * WHAT A LINE NEVER HOLDS: a password, a key, a lane computer's connection
- * code, a cookie or a session value -- nor a phone number or email address
- * of a person to tell (U4b). A line is built from named fields only, never
- * from a request body, and `record` refuses -- by throwing, so the change
- * rolls back -- any value shaped like one of this platform's credentials,
- * any value the write handed it as private (`ctx.private`: the person's
- * details as typed and as kept), and, in a line about a person to tell,
- * anything shaped like a phone number or an email address.
+ * code, a cookie or a session value -- nor anything an owner typed about a
+ * person to tell (U4b): their name, phone number or email address. A line
+ * is built from named fields only, never from a request body, and `record`
+ * refuses -- by throwing, so the change rolls back -- any value shaped like
+ * one of this platform's credentials, any value the write handed it as
+ * private (`ctx.private`: the person's details as typed and as kept), and,
+ * in a line about a person to tell, a name or any word that is not one of
+ * src/alerts.js's LINE_WORDS.
+ *
+ * A PERSON'S NAME IS READ WHEN THE LOG IS READ: a line about a person holds
+ * their id, and `linesForGarage` names them as they are named now, or says
+ * they were removed (`subject_removed`). Removing a person takes their name
+ * out of every line, page and file at once.
  *
  * The log is append-only: the application role may SELECT and INSERT, and a
  * trigger refuses UPDATE, DELETE and TRUNCATE for every role.
@@ -32,7 +38,8 @@
 import { pool } from './db.js';
 import { createHash } from 'node:crypto';
 import { hashToken } from './auth.js';
-import { digitsOf, holdsContactShape } from './digits.js';
+import { digitsOf } from './digits.js';
+import { LINE_WORDS } from './alerts.js';
 
 /** The subjects a line can be about, as the table allows them. */
 export const SUBJECTS = Object.freeze([
@@ -60,25 +67,37 @@ export class SecretInLine extends Error {
 
 export class ContactDetailInLine extends Error {
   constructor(where) {
-    super(`a change line would have held a person's phone number or email address (${where}); nothing was written`);
+    super(`a change line would have held something typed about a person to tell (${where}); nothing was written`);
   }
 }
 
 /**
  * Throws ContactDetailInLine when any string of the line is, or holds, one
  * of `details` -- as written, or as its digits once everything that is not a
- * digit is dropped, so no separator or script hides a number; and, for a
- * line about a person to tell, anything that could be a phone number or an
- * email address (src/digits.js). Exported for the tests.
+ * digit is dropped, so no separator or script hides a number. Exported for
+ * the tests.
  */
-export function assertNoContactDetail(line, details = [], { shapes = false } = {}) {
+export function assertNoContactDetail(line, details = []) {
   // A number's last 7 digits are enough to find it, with or without its country.
   const numbers = details.map(digitsOf).filter((d) => d.length >= 7).map((d) => d.slice(-7));
   for (const [text, where] of strings(line, 'line')) {
     if (details.some((d) => d && text.includes(d))) throw new ContactDetailInLine(where);
     const digits = digitsOf(text);
     if (numbers.some((d) => digits.includes(d))) throw new ContactDetailInLine(where);
-    if (shapes && holdsContactShape(text)) throw new ContactDetailInLine(where);
+  }
+}
+
+/**
+ * Throws ContactDetailInLine unless a line about a person to tell holds no
+ * name and nothing but LINE_WORDS, as fields and as values: whatever an
+ * owner typed, it is not one of them. Exported for the tests.
+ */
+export function assertContactLineWords({ subject, before, after }) {
+  if (subject?.name !== null && subject?.name !== undefined) throw new ContactDetailInLine('line.subject.name');
+  for (const [side, value] of [['before', before], ['after', after]]) {
+    for (const [text, where] of strings(value, `line.${side}`)) {
+      if (!LINE_WORDS.has(text)) throw new ContactDetailInLine(where);
+    }
   }
 }
 
@@ -156,7 +175,8 @@ export async function record(client, ctx, { garageId = null, action, subject, be
   if (!SUBJECTS.includes(subject?.kind)) throw new Error(`a change line names an unknown subject ${JSON.stringify(subject?.kind)}`);
   assertNoCredential({ action, subject, before, after }, ctx.secrets);
   // The subject's id is a uuid, never typed: its digits are not a number.
-  assertNoContactDetail({ action, subject: { kind: subject.kind, name: subject.name }, before, after }, ctx.private ?? [], { shapes: subject.kind === 'alert_contact' });
+  assertNoContactDetail({ action, subject: { kind: subject.kind, name: subject.name }, before, after }, ctx.private ?? []);
+  if (subject.kind === 'alert_contact') assertContactLineWords({ subject, before, after });
   // Asked again, answered with what was there: nothing to write down.
   if (nothingChanged(before, after)) {
     ctx.unchanged = true;
@@ -229,16 +249,20 @@ function refusalName(err, target) {
  * Record a refused write. Never throws: a refusal is answered whether or not
  * its line could be written, and a failure here is logged by what it is.
  *
+ * `request` is what the line names as tried, when the caller says it
+ * (src/app.js, for a person to tell: the route, never the path as sent);
+ * otherwise the method and the path.
+ *
  * `credential` is what came with the request -- 'none', 'session' or 'key' --
  * and `credentialToken` the value, which never leaves this function: only its
  * hash goes to the database, the hash the sign-in already computes.
  */
-export async function refused(req, err, { action, credential, credentialToken, address = null, idleSeconds }) {
+export async function refused(req, err, { action, request: said, credential, credentialToken, address = null, idleSeconds }) {
   try {
     const fromRoute = targetOf(req);
     const target = fromRoute.kind ? fromRoute : targetFromPath(req.path);
     const actor = req.actor ?? null;
-    const request = `${req.method} ${(req.baseUrl ?? '') + (req.path ?? '')}`.slice(0, 300);
+    const request = (said ?? `${req.method} ${(req.baseUrl ?? '') + (req.path ?? '')}`).slice(0, 300);
     await pool.query('SELECT record_refused_change($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)', [
       req.tenantId ?? null,
       req.tenantId ? null : credentialToken ? hashToken(credentialToken) : null,
@@ -279,14 +303,19 @@ export async function linesForGarage(client, tenantId, garageId, { outcome = 'do
     );
     if (!rows[0]) return null;
     values.push(rows[0].at, rows[0].id);
-    older = 'AND (at, id) < ($5::timestamptz, $6::uuid)';
+    older = 'AND (gc.at, gc.id) < ($5::timestamptz, $6::uuid)';
   }
+  // A person to tell is named as they are now; one removed has no name.
   const { rows } = await client.query(
-    `SELECT id, garage_id, at, outcome, actor_kind, actor_name, action, subject_kind, subject_id, subject_name,
-            before, after, refusal, attempts, last_at
-       FROM garage_changes
-      WHERE tenant_id = $1 AND (garage_id = $2 OR garage_id IS NULL) AND outcome = $4 ${older}
-      ORDER BY at DESC, id DESC
+    `SELECT gc.id, gc.garage_id, gc.at, gc.outcome, gc.actor_kind, gc.actor_name, gc.action, gc.subject_kind, gc.subject_id,
+            CASE WHEN gc.subject_kind = 'alert_contact' THEN ac.name ELSE gc.subject_name END AS subject_name,
+            (gc.subject_kind = 'alert_contact' AND ac.id IS NULL) AS subject_removed,
+            gc.before, gc.after, gc.refusal, gc.attempts, gc.last_at
+       FROM garage_changes gc
+       LEFT JOIN alert_contacts ac
+         ON gc.subject_kind = 'alert_contact' AND ac.tenant_id = gc.tenant_id AND ac.id = gc.subject_id
+      WHERE gc.tenant_id = $1 AND (gc.garage_id = $2 OR gc.garage_id IS NULL) AND gc.outcome = $4 ${older}
+      ORDER BY gc.at DESC, gc.id DESC
       LIMIT $3`,
     values,
   );

@@ -13,6 +13,11 @@
  *   text_choice_unchecked     a text choice is taken for a person with no phone     (check 3)
  *   phone_in_line             the guard is off and the number put in the line       (check 5)
  *   contact_guard_off         the line's guard lets a person's details through      (check 5)
+ *   name_in_line              a person's name is stored in their line again        (fix 2, check 1)
+ *   line_words_off            a line about a person may hold any text               (fix 2, check 1)
+ *   request_as_sent           a refused attempt on a person names the path as sent  (fix 2, check 1)
+ *   removed_still_said_named  a removed person's lines are not said to be removed   (fix 2, check 2)
+ *   name_as_written           the log's read names a person as the line holds them  (fix 2, check 2)
  *   line_outside_transaction  a person's line is written on its own transaction    (check 6)
  *   alert_line_skipped        a person's change commits without its line            (check 6)
  *   step_counts_texts_only    the checklist step ignores email choices              (check 7)
@@ -20,9 +25,10 @@
  *   send_planted              the round's code makes a network call                 (check 8)
  *   provider_planted          a text and email provider is a dependency             (check 8)
  *   person_by_account_only    a person is looked up by account and id, not garage   (fix N1)
- *   ascii_digits_only         only 0-9 count as digits, in names and the guard      (fix F3)
- *   at_one_width_only         only a plain @ counts, not a full-width or small one  (fix F3)
+ *   ascii_digits_only         only 0-9 count as digits in the line guard            (fix F3)
  *   scan_keeps_separators     the log scan reads numbers with what stands between   (fix F3)
+ *   scan_raw_text_off         the log scan does not read text as it was typed       (fix 2, check 1)
+ *   scan_decimal_only         the log scan reads only decimal digits                (fix 2, check 1)
  *
  * Schema breaks (the copy's migrations edited; a scratch database built from
  * them):
@@ -30,7 +36,7 @@
  *   name_bound_dropped        the database takes an over-long name                  (check 4)
  *   policy_dropped            a garage's people are readable by every account       (check 1)
  *   other_garage_taken        the database takes a person on another account's garage (check 1)
- *   ascii_digits_in_database  the database counts only 0-9 in a name                (fix F3)
+ *   person_named_in_database  the database takes a name on a line about a person    (fix 2, check 1)
  *
  * Plants that would write a person's details into the append-only log run
  * on a scratch database, so nothing they write stays in the suite's own.
@@ -43,7 +49,6 @@ import { copyFileSync, cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import pg from 'pg';
-import { sqlDigitClass } from '../src/digits.js';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const SCRATCH = 'openparking_alerts_control';
@@ -97,10 +102,10 @@ const SOURCE_BREAKS = [
     why: "the guard is off and a person's number is put in their line",
     suite: ALERTS,
     scratch: true,
-    red: ['NO CONTACT DETAILS IN ANY LOG'],
+    red: ['NO TYPED CONTACT TEXT IN ANY STORED LINE'],
     edits: [
       { file: 'src/alerts.js', from: "    if (phone !== row.phone) { before.phone = kept(row.phone); after.phone = row.phone !== null && phone !== null ? 'changed' : kept(phone); }", to: '    if (phone !== row.phone) { before.phone = kept(row.phone); after.phone = phone; }' },
-      { file: 'src/changes.js', from: "  assertNoContactDetail({ action, subject: { kind: subject.kind, name: subject.name }, before, after }, ctx.private ?? [], { shapes: subject.kind === 'alert_contact' });", to: '' },
+      { file: 'src/changes.js', from: "  assertNoContactDetail({ action, subject: { kind: subject.kind, name: subject.name }, before, after }, ctx.private ?? []);\n  if (subject.kind === 'alert_contact') assertContactLineWords({ subject, before, after });", to: '' },
     ],
   },
   {
@@ -109,7 +114,48 @@ const SOURCE_BREAKS = [
     suite: ALERTS,
     scratch: true,
     red: ['the guard itself'],
-    edits: [{ file: 'src/changes.js', from: 'export function assertNoContactDetail(line, details = [], { shapes = false } = {}) {', to: 'export function assertNoContactDetail(line, details = [], { shapes = false } = {}) {\n  return;' }],
+    edits: [{ file: 'src/changes.js', from: 'export function assertNoContactDetail(line, details = []) {', to: 'export function assertNoContactDetail(line, details = []) {\n  return;' }],
+  },
+  {
+    name: 'name_in_line',
+    why: "a person's name is stored in their line again, the word check off",
+    suite: ALERTS,
+    scratch: true,
+    red: ['NO TYPED CONTACT TEXT IN ANY STORED LINE', 'REMOVAL REMOVES'],
+    edits: [
+      { file: 'src/alerts.js', from: "    if (name !== row.name) after.name = 'changed';", to: '    if (name !== row.name) { before.name = row.name; after.name = name; }' },
+      { file: 'src/changes.js', from: "  if (subject.kind === 'alert_contact') assertContactLineWords({ subject, before, after });", to: '' },
+    ],
+  },
+  {
+    name: 'line_words_off',
+    why: 'a line about a person may hold any text',
+    suite: ALERTS,
+    scratch: true,
+    red: ['the guard itself'],
+    edits: [{ file: 'src/changes.js', from: 'export function assertContactLineWords({ subject, before, after }) {', to: 'export function assertContactLineWords({ subject, before, after }) {\n  return;' }],
+  },
+  {
+    name: 'request_as_sent',
+    why: 'a refused attempt on a person names the path as it was sent',
+    suite: ALERTS,
+    scratch: true,
+    red: ['NO TYPED CONTACT TEXT IN ANY STORED LINE'],
+    edits: [{ file: 'src/app.js', from: '        request: requestFor(req),', to: '' }],
+  },
+  {
+    name: 'removed_still_said_named',
+    why: "a removed person's lines are not said to be removed",
+    suite: ALERTS,
+    red: ['REMOVAL REMOVES'],
+    edits: [{ file: 'src/changes.js', from: "            (gc.subject_kind = 'alert_contact' AND ac.id IS NULL) AS subject_removed,", to: '            false AS subject_removed,' }],
+  },
+  {
+    name: 'name_as_written',
+    why: 'the log reads a person as the line holds them, not as they are named now',
+    suite: ALERTS,
+    red: ['REMOVAL REMOVES'],
+    edits: [{ file: 'src/changes.js', from: "            CASE WHEN gc.subject_kind = 'alert_contact' THEN ac.name ELSE gc.subject_name END AS subject_name,", to: '            gc.subject_name,' }],
   },
   {
     name: 'line_outside_transaction',
@@ -168,24 +214,31 @@ const SOURCE_BREAKS = [
   },
   {
     name: 'ascii_digits_only',
-    why: 'only 0-9 count as digits, in a name and in the line guard',
+    why: 'only 0-9 count as digits in the line guard',
     suite: ALERTS,
-    red: ['A NAME NEVER CARRIES A NUMBER', 'the guard itself'],
+    red: ['the guard itself'],
     edits: [{ file: 'src/digits.js', from: '  for (const zero of DIGIT_ZEROS) if (cp >= zero && cp <= zero + 9) return cp - zero;', to: '  for (const zero of [0x30]) if (cp >= zero && cp <= zero + 9) return cp - zero;' }],
-  },
-  {
-    name: 'at_one_width_only',
-    why: 'only a plain @ is refused in a name',
-    suite: ALERTS,
-    red: ['A NAME NEVER CARRIES A NUMBER'],
-    edits: [{ file: 'src/alerts.js', from: "  if (name.normalize('NFKC').includes('@')) throw bad(", to: "  if (name.includes('@')) throw bad(" }],
   },
   {
     name: 'scan_keeps_separators',
     why: "the log scan reads a number with what stands between its digits",
     suite: ALERTS,
-    red: ['THE SCAN reads digits only'],
+    red: ['THE SCAN finds what was typed'],
     edits: [{ file: ALERTS, from: "    const digits = scanDigits(text.replace(UUIDS, ' ').replace(TIMES, ' '));", to: "    const digits = text.replace(UUIDS, ' ').replace(TIMES, ' ').normalize('NFKC').replace(/[\\s().+-]/g, '');" }],
+  },
+  {
+    name: 'scan_raw_text_off',
+    why: 'the log scan does not read text as it was typed',
+    suite: ALERTS,
+    red: ['THE SCAN finds what was typed'],
+    edits: [{ file: ALERTS, from: '    for (const t of wanted) if (text.includes(t) || text.normalize(\'NFKC\').includes(t)) found.add(t);', to: '' }],
+  },
+  {
+    name: 'scan_decimal_only',
+    why: 'the log scan reads only decimal digits',
+    suite: ALERTS,
+    red: ['THE SCAN finds what was typed'],
+    edits: [{ file: ALERTS, from: '  if (OTHER_DIGITS.has(ch)) return OTHER_DIGITS.get(ch);', to: '' }],
   },
 ];
 
@@ -212,11 +265,11 @@ const SCHEMA_BREAKS = [
     edits: [{ file: '0029_alert_contacts.sql', from: '    IF NOT EXISTS (SELECT 1 FROM garages WHERE id = NEW.garage_id AND tenant_id = NEW.tenant_id) THEN', to: '    IF false THEN' }],
   },
   {
-    name: 'ascii_digits_in_database',
-    why: 'the database counts only 0-9 in a name',
+    name: 'person_named_in_database',
+    why: 'the database takes a name on a line about a person',
     suite: ALERTS,
-    red: ['A NAME NEVER CARRIES A NUMBER'],
-    edits: [{ file: '0029_alert_contacts.sql', from: `'[^${sqlDigitClass()}]'`, to: "'[^0-9]'" }],
+    red: ['the guard itself'],
+    edits: [{ file: '0029_alert_contacts.sql', from: "ALTER TABLE garage_changes ADD CONSTRAINT garage_changes_person_unnamed\n  CHECK (subject_kind <> 'alert_contact' OR subject_name IS NULL);", to: '' }],
   },
   {
     name: 'policy_dropped',
