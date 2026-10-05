@@ -1173,8 +1173,7 @@ values, enforced by `npm run check-no-real-data`.
 
 AGPL-3.0-or-later — see [LICENSE](LICENSE).
 
-Contributions are welcome and require a signed CLA before anything merges. See
-[CONTRIBUTING.md](CONTRIBUTING.md).
+Open Parking AI does not accept outside contributions. Pull requests, issues and comments are limited to the maintainers.
 
 ---
 
