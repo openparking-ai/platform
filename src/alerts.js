@@ -25,6 +25,7 @@
 import { HttpError } from './errors.js';
 import * as changes from './changes.js';
 import { quietMinutes } from './setup.js';
+import { digitsOf, NAME_DIGITS_MAX } from './digits.js';
 
 /**
  * The alerts, in the order the owner reads them. `needs`: what each alert's
@@ -53,14 +54,22 @@ const ODD_SPACE = /[\p{Z}\s]/u;
 const bad = (message, code, details) => Object.assign(new HttpError(400, message, code), details ? { details } : {});
 const conflict = (code, message, details) => Object.assign(new HttpError(409, message, code), details ? { details } : {});
 
-/** A person's name: a lane name's rule, and never a phone number or an email address. */
+/**
+ * A person's name: a lane name's rule, and never a phone number or an email
+ * address. A name is written into the change log, which can only be added
+ * to, so a number must not get through however it is written: 7 or more
+ * digits of any script in all, whatever stands between them, are refused, and
+ * so is an `@` of any width (src/digits.js; 0029 holds the same).
+ */
 export function nameField(raw) {
   const rule = `name must be text of 1 to ${NAME_MAX} characters, with no control or invisible formatting characters, and no phone number or email address in it`;
-  if (typeof raw !== 'string') throw bad(rule, 'alert_contact_name_refused');
+  if (typeof raw !== 'string') throw bad(rule, 'alert_contact_name_refused', { reason: 'not_text' });
   const name = raw.trim();
-  if (name === '' || name.length > NAME_MAX || CONTROL.test(name)) throw bad(rule, 'alert_contact_name_refused');
-  // A name is written into the change log; a phone number or address must never be.
-  if (name.includes('@') || /\d{7,}/.test(name.replace(/[\s().+-]/g, ''))) throw bad(rule, 'alert_contact_name_refused');
+  if (name === '' || name.length > NAME_MAX || CONTROL.test(name)) throw bad(rule, 'alert_contact_name_refused', { reason: 'shape' });
+  if (name.normalize('NFKC').includes('@')) throw bad(rule, 'alert_contact_name_refused', { reason: 'at' });
+  if (digitsOf(name).length > NAME_DIGITS_MAX) {
+    throw bad(`name holds ${NAME_DIGITS_MAX + 1} or more digits, which could be a phone number; ${rule}`, 'alert_contact_name_refused', { reason: 'digits' });
+  }
   return name;
 }
 
@@ -165,7 +174,7 @@ function guard(ctx, ...values) {
   for (const v of values) {
     if (typeof v !== 'string' || v.trim() === '') continue;
     ctx.private.push(v, v.trim());
-    const digits = v.replace(/[^0-9]/g, '');
+    const digits = digitsOf(v);
     if (digits.length >= 7) ctx.private.push(digits, digits.slice(-10), `+${digits}`);
   }
 }

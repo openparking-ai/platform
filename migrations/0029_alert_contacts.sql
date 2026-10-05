@@ -17,7 +17,9 @@
 --   email     trimmed, exactly one `@` with something either side, no space
 --             and no invisible character, at most 254 characters
 --   name      1 to 80 characters, no control or invisible formatting
---             character, no surrounding space (a lane name's rule, U4)
+--             character, no surrounding space (a lane name's rule, U4);
+--             and never a phone number or email address: no @ and at most
+--             6 digits of any script, read after normalisation
 --   language  en or es, English unless said otherwise
 -- At least one of phone or email. At most 25 people a garage.
 --
@@ -54,6 +56,16 @@ CREATE TABLE alert_contacts (
     length(name) BETWEEN 1 AND 80
     AND name = btrim(name)
     AND name !~ '[\u0000-\u001f\u007f-\u009f­؜᠎​-‏ -‮⁠-⁯﻿￹-￻]'
+  ),
+  -- A name is written into the change log, which can only be added to: no
+  -- phone number or email address may get through in one, however it is
+  -- written. After compatibility normalisation (full-width, circled and
+  -- similar digits become plain ones; a full-width @ becomes @): no @, and
+  -- at most 6 decimal digits of any script in all, whatever stands between
+  -- them. The digits are src/digits.js's table, the route's own.
+  CONSTRAINT alert_contacts_name_holds_no_contact CHECK (
+    strpos(normalize(name, NFKC), '@') = 0
+    AND length(regexp_replace(normalize(name, NFKC), '[^\u0030-\u0039\u0660-\u0669\u06F0-\u06F9\u07C0-\u07C9\u0966-\u096F\u09E6-\u09EF\u0A66-\u0A6F\u0AE6-\u0AEF\u0B66-\u0B6F\u0BE6-\u0BEF\u0C66-\u0C6F\u0CE6-\u0CEF\u0D66-\u0D6F\u0DE6-\u0DEF\u0E50-\u0E59\u0ED0-\u0ED9\u0F20-\u0F29\u1040-\u1049\u1090-\u1099\u17E0-\u17E9\u1810-\u1819\u1946-\u194F\u19D0-\u19D9\u1A80-\u1A89\u1A90-\u1A99\u1B50-\u1B59\u1BB0-\u1BB9\u1C40-\u1C49\u1C50-\u1C59\uA620-\uA629\uA8D0-\uA8D9\uA900-\uA909\uA9D0-\uA9D9\uA9F0-\uA9F9\uAA50-\uAA59\uABF0-\uABF9\uFF10-\uFF19\U000104A0-\U000104A9\U00010D30-\U00010D39\U00010D40-\U00010D49\U00011066-\U0001106F\U000110F0-\U000110F9\U00011136-\U0001113F\U000111D0-\U000111D9\U000112F0-\U000112F9\U00011450-\U00011459\U000114D0-\U000114D9\U00011650-\U00011659\U000116C0-\U000116C9\U000116D0-\U000116D9\U000116DA-\U000116E3\U00011730-\U00011739\U000118E0-\U000118E9\U00011950-\U00011959\U00011BF0-\U00011BF9\U00011C50-\U00011C59\U00011D50-\U00011D59\U00011DA0-\U00011DA9\U00011DE0-\U00011DE9\U00011F50-\U00011F59\U00016130-\U00016139\U00016A60-\U00016A69\U00016AC0-\U00016AC9\U00016B50-\U00016B59\U00016D70-\U00016D79\U0001CCF0-\U0001CCF9\U0001D7CE-\U0001D7D7\U0001D7D8-\U0001D7E1\U0001D7E2-\U0001D7EB\U0001D7EC-\U0001D7F5\U0001D7F6-\U0001D7FF\U0001E140-\U0001E149\U0001E2F0-\U0001E2F9\U0001E4F0-\U0001E4F9\U0001E5F1-\U0001E5FA\U0001E950-\U0001E959\U0001FBF0-\U0001FBF9]', '', 'g')) <= 6
   ),
   CONSTRAINT alert_contacts_phone_shape CHECK (phone IS NULL OR phone ~ '^\+[0-9]{8,15}$'),
   CONSTRAINT alert_contacts_email_shape CHECK (

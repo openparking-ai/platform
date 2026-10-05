@@ -32,6 +32,7 @@
 import { pool } from './db.js';
 import { createHash } from 'node:crypto';
 import { hashToken } from './auth.js';
+import { digitsOf, holdsContactShape } from './digits.js';
 
 /** The subjects a line can be about, as the table allows them. */
 export const SUBJECTS = Object.freeze([
@@ -63,18 +64,21 @@ export class ContactDetailInLine extends Error {
   }
 }
 
-/** A phone number or an email address, wherever it sits in a string. */
-const CONTACT_SHAPES = [/@/, /\d{7,}/];
-
 /**
  * Throws ContactDetailInLine when any string of the line is, or holds, one
- * of `details`; and, for a line about a person to tell, anything shaped like
- * a phone number or an email address. Exported for the tests.
+ * of `details` -- as written, or as its digits once everything that is not a
+ * digit is dropped, so no separator or script hides a number; and, for a
+ * line about a person to tell, anything that could be a phone number or an
+ * email address (src/digits.js). Exported for the tests.
  */
 export function assertNoContactDetail(line, details = [], { shapes = false } = {}) {
+  // A number's last 7 digits are enough to find it, with or without its country.
+  const numbers = details.map(digitsOf).filter((d) => d.length >= 7).map((d) => d.slice(-7));
   for (const [text, where] of strings(line, 'line')) {
     if (details.some((d) => d && text.includes(d))) throw new ContactDetailInLine(where);
-    if (shapes && CONTACT_SHAPES.some((shape) => shape.test(text.replace(/[\s().+-]/g, '')))) throw new ContactDetailInLine(where);
+    const digits = digitsOf(text);
+    if (numbers.some((d) => digits.includes(d))) throw new ContactDetailInLine(where);
+    if (shapes && holdsContactShape(text)) throw new ContactDetailInLine(where);
   }
 }
 

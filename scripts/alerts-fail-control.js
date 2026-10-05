@@ -19,6 +19,10 @@
  *   alerts_hold_open          the alerts step changes the open step                 (check 7)
  *   send_planted              the round's code makes a network call                 (check 8)
  *   provider_planted          a text and email provider is a dependency             (check 8)
+ *   person_by_account_only    a person is looked up by account and id, not garage   (fix N1)
+ *   ascii_digits_only         only 0-9 count as digits, in names and the guard      (fix F3)
+ *   at_one_width_only         only a plain @ counts, not a full-width or small one  (fix F3)
+ *   scan_keeps_separators     the log scan reads numbers with what stands between   (fix F3)
  *
  * Schema breaks (the copy's migrations edited; a scratch database built from
  * them):
@@ -26,6 +30,7 @@
  *   name_bound_dropped        the database takes an over-long name                  (check 4)
  *   policy_dropped            a garage's people are readable by every account       (check 1)
  *   other_garage_taken        the database takes a person on another account's garage (check 1)
+ *   ascii_digits_in_database  the database counts only 0-9 in a name                (fix F3)
  *
  * Plants that would write a person's details into the append-only log run
  * on a scratch database, so nothing they write stays in the suite's own.
@@ -38,6 +43,7 @@ import { copyFileSync, cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import pg from 'pg';
+import { sqlDigitClass } from '../src/digits.js';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const SCRATCH = 'openparking_alerts_control';
@@ -153,6 +159,34 @@ const SOURCE_BREAKS = [
     red: ['NOTHING IS SENT'],
     edits: [{ file: 'package.json', from: '"express": "^4.21.2",', to: '"express": "^4.21.2",\n    "twilio": "^5.0.0",' }],
   },
+  {
+    name: 'person_by_account_only',
+    why: 'a person is looked up by account and id, not by the garage in the path',
+    suite: ALERTS,
+    red: ['YOUR GARAGE ONLY, within the account'],
+    edits: [{ file: 'src/alerts.js', from: "    'SELECT * FROM alert_contacts WHERE tenant_id = $1 AND garage_id = $2 AND id = $3 FOR UPDATE',", to: "    'SELECT * FROM alert_contacts WHERE tenant_id = $1 AND $2::uuid IS NOT NULL AND id = $3 FOR UPDATE'," }],
+  },
+  {
+    name: 'ascii_digits_only',
+    why: 'only 0-9 count as digits, in a name and in the line guard',
+    suite: ALERTS,
+    red: ['A NAME NEVER CARRIES A NUMBER', 'the guard itself'],
+    edits: [{ file: 'src/digits.js', from: '  for (const zero of DIGIT_ZEROS) if (cp >= zero && cp <= zero + 9) return cp - zero;', to: '  for (const zero of [0x30]) if (cp >= zero && cp <= zero + 9) return cp - zero;' }],
+  },
+  {
+    name: 'at_one_width_only',
+    why: 'only a plain @ is refused in a name',
+    suite: ALERTS,
+    red: ['A NAME NEVER CARRIES A NUMBER'],
+    edits: [{ file: 'src/alerts.js', from: "  if (name.normalize('NFKC').includes('@')) throw bad(", to: "  if (name.includes('@')) throw bad(" }],
+  },
+  {
+    name: 'scan_keeps_separators',
+    why: "the log scan reads a number with what stands between its digits",
+    suite: ALERTS,
+    red: ['THE SCAN reads digits only'],
+    edits: [{ file: ALERTS, from: "    const digits = scanDigits(text.replace(UUIDS, ' ').replace(TIMES, ' '));", to: "    const digits = text.replace(UUIDS, ' ').replace(TIMES, ' ').normalize('NFKC').replace(/[\\s().+-]/g, '');" }],
+  },
 ];
 
 const SCHEMA_BREAKS = [
@@ -176,6 +210,13 @@ const SCHEMA_BREAKS = [
     suite: ALERTS,
     red: ['YOUR GARAGE ONLY'],
     edits: [{ file: '0029_alert_contacts.sql', from: '    IF NOT EXISTS (SELECT 1 FROM garages WHERE id = NEW.garage_id AND tenant_id = NEW.tenant_id) THEN', to: '    IF false THEN' }],
+  },
+  {
+    name: 'ascii_digits_in_database',
+    why: 'the database counts only 0-9 in a name',
+    suite: ALERTS,
+    red: ['A NAME NEVER CARRIES A NUMBER'],
+    edits: [{ file: '0029_alert_contacts.sql', from: `'[^${sqlDigitClass()}]'`, to: "'[^0-9]'" }],
   },
   {
     name: 'policy_dropped',

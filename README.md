@@ -569,7 +569,11 @@ phone or address away turns the choices that needed it off in the same change,
 and the answer's `turned_off` and the line say which. At most 25 people a
 garage (`409 alert_contacts_full`) and a name of 1 to 80 characters, no
 invisible characters and no phone number or address in it
-(`alert_contact_name_refused`): the database holds every one of these rules
+(`alert_contact_name_refused`, `details.reason`): however it is written --
+after Unicode compatibility normalisation, 7 or more digits of any script in
+all, whatever stands between them (`digits`), or an `@` of any width (`at`).
+The digits are one table, `src/digits.js`, which 0029's rule is built from, so
+the route and the database refuse the same names. The database holds every one of these rules
 too, whoever writes the row -- and a person's garage is one of their own
 account's, which a foreign key alone would not hold (it is checked without
 row-level security).
@@ -577,12 +581,13 @@ row-level security).
 **A person's details never enter a log.** A line names the person and says
 what changed -- `phone: given -> changed`, `by_text: [card_payments_stopped]`
 -- and the number or address never: `src/changes.js` refuses a line holding
-any value the write handed it as private, or, in a line about a person,
-anything shaped like a number or an address. A database refusal is passed on
+any value the write handed it as private -- compared as digits only too, so
+no separator or script hides a number -- or, in a line about a person,
+anything that could be a number or an address. A database refusal is passed on
 without its detail, which would quote the row. The garage and the person come
 from the session and the path only. The checklist's `alerts` step is done when
 every alert has at least one person; it never holds opening back.
-`npm run alerts-fail-control` breaks each property in turn (17).
+`npm run alerts-fail-control` breaks each property in turn (22).
 
 ### A lane that has gone quiet
 
