@@ -461,6 +461,52 @@ each query as well as by row-level security; another tenant's garage is `404`.
 credential hash is ever in an answer. `npm run garage-reads-fail-control`
 breaks each property in turn.
 
+### Setup: the checklist, lane setup and closing, and the change log
+
+    GET    /api/v1/garages/<id>/setup     {setup: {garage_id, open, takes_any_driver, steps: [{key, done, facts}]}}
+    PATCH  /api/v1/lanes/<id>             {name}                         rename
+    DELETE /api/v1/lanes/<id>                                            only a lane never used
+    POST   /api/v1/lanes/<id>/close       {reason, message, override?}   full | everyone
+    POST   /api/v1/lanes/<id>/reopen
+    GET    /api/v1/garages/<id>/changes   {changes: [...], next}          newest first, 50 a page
+
+**The checklist** is worked out in one place, `src/setup.js`, from the reads
+that already exist -- the activation readout, the recorded payment account, the
+lanes with their computers and readers -- and nothing is ticked by hand. Steps,
+in order: `garage_details`, `drivers`, `lanes` (a way in and a way out),
+`lane_computers`, `rates`, `taxes`, `getting_paid` and `card_readers` (only for
+a garage that takes any driver), `open` (and what is still missing). A lane
+computer counts as connected when it was heard from within
+`LANE_QUIET_MINUTES` (5), the admin's setting since U2b: the checklist is the
+one place this platform states that verdict; the devices route below still
+publishes the timestamp alone.
+
+**A lane** is renamed, or removed only if it never had a stay, a computer, a
+card reader or an event (`409 lane_has_history`, with what it has in
+`details`). It is **closed by hand** with a reason -- `full` (pass and monthly
+holders still get in) or `everyone` -- and the owner's message, and who closed
+it and when are kept on it; reopening keeps the same (0026). Closing the last
+open lane of a direction is `409 last_open_lane` unless the request says
+`override: true`. `/lane/rules` carries the lane's state and message; nothing
+at the lane acts on it yet.
+
+**The change log** (`garage_changes`, 0026). Every operator write route --
+`WRITE_ROUTES` in `src/app.js`, 22, checked against the router -- and the
+owner's language write one line each, in the same transaction as the change:
+who (the signed-in owner by email, or the key by its name), what, before and
+after, when. A write that changed nothing writes a line saying so. A refused
+write is a line too, through `record_refused_change()`: in the log of the
+account whose garage, lane, computer or key the path names (someone from
+another account is never named there), in the caller's own account's log, or,
+naming nothing and coming with nothing, in `platform_security_log`, which no
+owner reads and the application holds no grant on. A malformed id is refused
+before the database, as before, and writes no line. The log is append-only:
+the application may `SELECT` and `INSERT`, and a trigger refuses `UPDATE`,
+`DELETE` and `TRUNCATE` for every role, the table's owner included. No line
+holds a password, key, lane computer code, cookie or session value: a line is
+built from named fields, and `src/changes.js` refuses one that holds a
+credential. `npm run setup-fail-control` breaks each property in turn.
+
 ### A lane that has gone quiet
 
 `GET /api/v1/garages/<id>/devices` lists the devices on that garage's lanes with

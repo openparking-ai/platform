@@ -1178,10 +1178,10 @@ export function createApp() {
    * who still calls it is told where the price now lives instead of being
    * left to guess whether the path was mistyped. The table itself stays --
    * `sessions.rate_id` references it and the hourly-legacy rows name it --
-   * and nothing writes it any more.
+   * and nothing writes it any more. Always refused, so its one change-log
+   * line is the refused-attempt line (src/changes.js).
    */
   operator.post('/garages/:garageId/rates', (_req, _res, next) => {
-    // Always refused, so its one line is the refused-attempt line.
     next(
       new HttpError(
         RATES_RETIRED_STATUS,

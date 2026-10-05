@@ -164,7 +164,9 @@ function stage() {
 }
 
 const run = (dir, suite, extraEnv = {}) =>
-  spawnSync(process.execPath, ['--test', suite], { cwd: dir, env: { ...process.env, ...extraEnv }, stdio: 'pipe', encoding: 'utf8' });
+  // The spec reporter, named: Node's default without a terminal is TAP on some
+  // versions, and the red test's name is read from the spec lines.
+  spawnSync(process.execPath, ['--test', '--test-reporter=spec', suite], { cwd: dir, env: { ...process.env, ...extraEnv }, stdio: 'pipe', encoding: 'utf8' });
 
 const redTests = (result) => [...new Set([...result.stdout.matchAll(/^✖ (.+?) \(\d/gm)].map((m) => m[1]))];
 
