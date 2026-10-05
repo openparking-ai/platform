@@ -18,10 +18,13 @@
  *                 minute from one source in a log; one more carries the rest.
  *
  * WHAT A LINE NEVER HOLDS: a password, a key, a lane computer's connection
- * code, a cookie or a session value. A line is built from named fields only,
- * never from a request body, and `record` refuses -- by throwing, so the
- * change rolls back -- any value shaped like one of this platform's
- * credentials.
+ * code, a cookie or a session value -- nor a phone number or email address
+ * of a person to tell (U4b). A line is built from named fields only, never
+ * from a request body, and `record` refuses -- by throwing, so the change
+ * rolls back -- any value shaped like one of this platform's credentials,
+ * any value the write handed it as private (`ctx.private`: the person's
+ * details as typed and as kept), and, in a line about a person to tell,
+ * anything shaped like a phone number or an email address.
  *
  * The log is append-only: the application role may SELECT and INSERT, and a
  * trigger refuses UPDATE, DELETE and TRUNCATE for every role.
@@ -32,7 +35,7 @@ import { hashToken } from './auth.js';
 
 /** The subjects a line can be about, as the table allows them. */
 export const SUBJECTS = Object.freeze([
-  'garage', 'lane', 'computer', 'reader', 'payment_account', 'rate_plan', 'tax_set', 'key', 'language', 'unknown',
+  'garage', 'lane', 'computer', 'reader', 'payment_account', 'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'unknown',
 ]);
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -51,6 +54,27 @@ const CREDENTIAL_SHAPES = [/opl_[A-Za-z0-9_-]{20,}/, /op_session=/i, /scrypt\$/]
 export class SecretInLine extends Error {
   constructor(where) {
     super(`a change line would have held something shaped like a credential (${where}); nothing was written`);
+  }
+}
+
+export class ContactDetailInLine extends Error {
+  constructor(where) {
+    super(`a change line would have held a person's phone number or email address (${where}); nothing was written`);
+  }
+}
+
+/** A phone number or an email address, wherever it sits in a string. */
+const CONTACT_SHAPES = [/@/, /\d{7,}/];
+
+/**
+ * Throws ContactDetailInLine when any string of the line is, or holds, one
+ * of `details`; and, for a line about a person to tell, anything shaped like
+ * a phone number or an email address. Exported for the tests.
+ */
+export function assertNoContactDetail(line, details = [], { shapes = false } = {}) {
+  for (const [text, where] of strings(line, 'line')) {
+    if (details.some((d) => d && text.includes(d))) throw new ContactDetailInLine(where);
+    if (shapes && CONTACT_SHAPES.some((shape) => shape.test(text.replace(/[\s().+-]/g, '')))) throw new ContactDetailInLine(where);
   }
 }
 
@@ -78,7 +102,7 @@ export function assertNoCredential(line, secrets = []) {
  * when the first line is written.
  */
 export function context(req, secrets = []) {
-  return { tenantId: req.tenantId, actor: req.actor, count: 0, unchanged: false, secrets: secrets.filter(Boolean) };
+  return { tenantId: req.tenantId, actor: req.actor, count: 0, unchanged: false, secrets: secrets.filter(Boolean), private: [] };
 }
 
 /** A value as one string, its keys in order: two values that say the same are the same string. */
@@ -127,6 +151,8 @@ export async function record(client, ctx, { garageId = null, action, subject, be
   if (!ctx) throw new Error('a change was made with no change context');
   if (!SUBJECTS.includes(subject?.kind)) throw new Error(`a change line names an unknown subject ${JSON.stringify(subject?.kind)}`);
   assertNoCredential({ action, subject, before, after }, ctx.secrets);
+  // The subject's id is a uuid, never typed: its digits are not a number.
+  assertNoContactDetail({ action, subject: { kind: subject.kind, name: subject.name }, before, after }, ctx.private ?? [], { shapes: subject.kind === 'alert_contact' });
   // Asked again, answered with what was there: nothing to write down.
   if (nothingChanged(before, after)) {
     ctx.unchanged = true;

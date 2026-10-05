@@ -420,6 +420,18 @@ jobs:
         # test red.
         run: npm run setup-fail-control
 
+      - name: Alerts fail-control
+        # U4b: who gets which alert. The garage only from the session and the
+        # path; phone numbers and email addresses kept one way or refused
+        # with their reason; no text without a phone and no email without an
+        # address; at most 25 people and a bounded name in the database too;
+        # no person's number or address in any log or the server's output;
+        # each change and its line one transaction; the checklist step worked
+        # out from the rows, never holding opening back; and nothing sent.
+        # Each property is broken in turn, some on a scratch database, and
+        # each must turn its own test red.
+        run: npm run alerts-fail-control
+
 
   sign-in-control:
     name: sign-in-control (${{ matrix.shard }}/8)
