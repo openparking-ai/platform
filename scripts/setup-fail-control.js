@@ -17,12 +17,14 @@
  *   refusal_unrecorded        a refused write writes no line
  *   key_in_line               a lane computer's code is put in its line
  *   guard_off_key_in_line     the guard is switched off and the code put in the line
+ *   quiet_minutes_fixed       the quiet setting is a number in the code, not the declared one
  *   drivers_unanswerable      the drivers answer can be taken back to unanswered
  *
  * Schema breaks (the copy's migration 0026 edited; a scratch database built
  * from it):
  *   update_granted            the application may UPDATE and DELETE the log
  *   trigger_dropped           nothing stops the owner of the table rewriting it
+ *   refusals_unbounded        every refused attempt writes a line of its own (0027)
  *
  * Needs the same environment as the suite (the rate engine, a Postgres it may
  * make a scratch database on).
@@ -39,6 +41,7 @@ const SCRATCH = 'openparking_setup_control';
 const SETUP = 'test/setup.test.js';
 const LANES = 'test/lane-setup.test.js';
 const LOG = 'test/change-log.test.js';
+const FLOOD = 'test/refusal-flood.test.js';
 
 const SOURCE_BREAKS = [
   {
@@ -53,7 +56,7 @@ const SOURCE_BREAKS = [
     why: 'a lane computer counts however long it was unheard',
     suite: SETUP,
     red: ['lane_computers: done when every lane has a computer'],
-    edits: [{ file: 'src/setup.js', from: "state: now - latest < LANE_QUIET_MINUTES * 60_000 ? 'working' : 'quiet',", to: "state: 'working',"}],
+    edits: [{ file: 'src/setup.js', from: "state: now - latest < quiet * 60_000 ? 'working' : 'quiet',", to: "state: 'working',"}],
   },
   {
     name: 'garage_from_body',
@@ -131,6 +134,13 @@ const SOURCE_BREAKS = [
     ],
   },
   {
+    name: 'quiet_minutes_fixed',
+    why: 'the quiet setting is a number in the code, not the declared setting',
+    suite: SETUP,
+    red: ['ONE SETTING'],
+    edits: [{ file: 'src/setup.js', from: "export const quietMinutes = () => startSetting('LANE_QUIET_MINUTES');", to: 'export const quietMinutes = () => 5;' }],
+  },
+  {
     name: 'drivers_unanswerable',
     why: 'the drivers answer can be taken back to unanswered',
     suite: LANES,
@@ -140,6 +150,13 @@ const SOURCE_BREAKS = [
 ];
 
 const SCHEMA_BREAKS = [
+  {
+    name: 'refusals_unbounded',
+    why: 'every refused attempt writes a line of its own',
+    suite: FLOOD,
+    red: ['10,000 refused attempts from one source'],
+    edits: [{ file: '0027_refusals_counted.sql', from: "v_window    constant interval := interval '60 seconds';", to: "v_window    constant interval := interval '0 seconds';" }],
+  },
   {
     name: 'update_granted',
     why: 'the application may UPDATE and DELETE the log',
@@ -233,7 +250,7 @@ async function buildScratch(dir, edits) {
 let failures = 0;
 
 console.log('== control A: each suite must PASS intact ==');
-for (const suite of [SETUP, LANES, LOG]) {
+for (const suite of [SETUP, LANES, LOG, FLOOD]) {
   const dir = stage();
   try {
     const intact = run(dir, suite);

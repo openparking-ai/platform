@@ -478,14 +478,15 @@ test("REFUSED ATTEMPTS land in the right log: the wrong site, an ended session, 
   const client = securityRows();
   await client.connect();
   try {
-    const count = async () => (await client.query('SELECT count(*)::int AS n FROM platform_security_log')).rows[0].n;
+    // Attempts, not rows: a refusal repeated within a minute is counted on its line (0027).
+    const count = async () => (await client.query('SELECT coalesce(sum(attempts), 0)::int AS n FROM platform_security_log')).rows[0].n;
     const was = await count();
     sinceA = await idsOf(a.tenant);
     sinceB = await idsOf(b.tenant);
     assert.equal((await call(base, 'POST', '/garages', { body: { name: 'Nobody', timezone: 'UTC', currency: 'USD' } })).status, 401);
     assert.equal((await call(base, 'DELETE', '/lanes/00000000-0000-4000-8000-000000000000', { body: {} })).status, 401);
     assert.equal(await count(), was + 2);
-    const last = (await client.query('SELECT refusal, request, credential FROM platform_security_log ORDER BY at DESC LIMIT 2')).rows;
+    const last = (await client.query('SELECT refusal, request, credential FROM platform_security_log ORDER BY coalesce(last_at, at) DESC LIMIT 2')).rows;
     assert.deepEqual(last.map((r) => [r.refusal, r.credential]).sort(), [['not_signed_in', 'none'], ['not_signed_in', 'none']]);
     assert.deepEqual([(await refusedSince(a.tenant, sinceA)).length, (await refusedSince(b.tenant, sinceB)).length], [0, 0]);
   } finally {
@@ -504,7 +505,7 @@ test('THE READ: newest first, the garage and the account, paged; another owner c
   const times = first.json.changes.map((c) => Date.parse(c.at));
   assert.deepEqual(times, [...times].sort((x, y) => y - x), 'newest first');
   assert.deepEqual(first.json.changes[0].after, { name: 'Paged 54' });
-  assert.deepEqual(Object.keys(first.json.changes[0]).sort(), ['action', 'after', 'at', 'before', 'garage_id', 'id', 'outcome', 'refusal', 'subject', 'who']);
+  assert.deepEqual(Object.keys(first.json.changes[0]).sort(), ['action', 'after', 'at', 'attempts', 'before', 'garage_id', 'id', 'last_at', 'outcome', 'refusal', 'subject', 'who']);
   assert.deepEqual(first.json.changes[0].who, { kind: 'owner', name: a.email });
   const second = await call(base, 'GET', `/garages/${g.id}/changes/${first.json.next}`, { as: a });
   assert.equal(second.status, 200);
@@ -562,7 +563,7 @@ test('NO SECRET IN THE LOG OR THE OUTPUT: no password, key, connection code, coo
     // This file's own owners, and the security log since it began: other
     // suites run beside this one and their lines are theirs to answer for.
     const lines = (await owner.query('SELECT * FROM garage_changes WHERE tenant_id = ANY($1)', [[a.tenant, b.tenant]])).rows;
-    const security = (await owner.query('SELECT * FROM platform_security_log WHERE at >= $1', [STARTED])).rows;
+    const security = (await owner.query('SELECT * FROM platform_security_log WHERE coalesce(last_at, at) >= $1', [STARTED])).rows;
     assert.ok(security.length >= 2, `a scan of ${security.length} security lines`);
     assert.ok(lines.length > 30, `a scan of ${lines.length} lines`);
     text = JSON.stringify([lines, security]);

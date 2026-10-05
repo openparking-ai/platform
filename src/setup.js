@@ -15,7 +15,7 @@
  *   drivers         whether it takes drivers without a pass (stated or not)
  *   lanes           at least one way in and one way out
  *   lane_computers  every lane has a connected computer heard from within
- *                   LANE_QUIET_MINUTES
+ *                   quietMinutes()
  *   rates           a rate plan in force
  *   taxes           taxes stated (charging none is a statement)
  *   getting_paid    ONLY for a garage that takes any driver: a payment
@@ -26,14 +26,16 @@
 import * as repo from './repository.js';
 import * as activation from './activation.js';
 import { recordedFacts } from './stripeAccount.js';
+import { startSetting } from './startSettings.js';
 
 /**
  * How long a lane computer may go unheard before its lane counts as not
- * connected: the admin's own setting since U2b (`LANE_QUIET_MINUTES` in its
- * src/settings.js), served here so the admin reads it rather than keeping a
- * second copy that could disagree.
+ * connected: `LANE_QUIET_MINUTES`, a start setting (src/startSettings.js,
+ * 5 unless the deployment says otherwise), and set nowhere else. The setup
+ * read and the lanes read return the value they used; the admin reads it
+ * from them and keeps no copy. Read on each request.
  */
-export const LANE_QUIET_MINUTES = 5;
+export const quietMinutes = () => startSetting('LANE_QUIET_MINUTES');
 
 /** The steps, in the order the checklist shows them. */
 export const STEP_KEYS = Object.freeze([
@@ -44,7 +46,7 @@ export const STEP_KEYS = Object.freeze([
 const GATE = Object.freeze({ rate_setup_complete: 'rates', transient_mode_stated: 'drivers', taxes_stated: 'taxes' });
 
 /** How a lane's computers stand, at `now`. */
-function laneComputer(lane, now) {
+function laneComputer(lane, now, quiet) {
   const live = lane.devices.filter((d) => d.revoked_at === null);
   if (lane.devices.length === 0) return { state: 'none', last_heard_at: null };
   if (live.length === 0) return { state: 'cancelled', last_heard_at: null };
@@ -52,7 +54,7 @@ function laneComputer(lane, now) {
   if (heard.length === 0) return { state: 'never_heard', last_heard_at: null };
   const latest = Math.max(...heard);
   return {
-    state: now - latest < LANE_QUIET_MINUTES * 60_000 ? 'working' : 'quiet',
+    state: now - latest < quiet * 60_000 ? 'working' : 'quiet',
     last_heard_at: new Date(latest).toISOString(),
   };
 }
@@ -92,12 +94,13 @@ export async function checklist(client, tenantId, garage) {
     },
   });
 
-  const computers = lanes.map((l) => ({ ...laneLine(l), ...laneComputer(l, now) }));
+  const quiet = quietMinutes();
+  const computers = lanes.map((l) => ({ ...laneLine(l), ...laneComputer(l, now, quiet) }));
   steps.push({
     key: 'lane_computers',
     done: lanes.length > 0 && computers.every((c) => c.state === 'working'),
     facts: {
-      quiet_minutes: LANE_QUIET_MINUTES,
+      quiet_minutes: quiet,
       lanes: lanes.length,
       working: computers.filter((c) => c.state === 'working').length,
       not_working: computers.filter((c) => c.state !== 'working'),

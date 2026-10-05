@@ -452,7 +452,7 @@ each query as well as by row-level security; another tenant's garage is `404`.
 
     GET /api/v1/garages                     {garages: [{id, name, timezone, currency, live}]}
     GET /api/v1/garages/<id>                {garage: {id, name, timezone, currency, live}}
-    GET /api/v1/garages/<id>/lanes          {lanes: [{id, name, direction,
+    GET /api/v1/garages/<id>/lanes          {quiet_minutes, lanes: [{id, name, direction,
                                                       devices: [{id, name, last_seen_at, revoked_at}],
                                                       reader: {reader_id, label, bound_at} | null}]}
 
@@ -477,9 +477,11 @@ in order: `garage_details`, `drivers`, `lanes` (a way in and a way out),
 `lane_computers`, `rates`, `taxes`, `getting_paid` and `card_readers` (only for
 a garage that takes any driver), `open` (and what is still missing). A lane
 computer counts as connected when it was heard from within
-`LANE_QUIET_MINUTES` (5), the admin's setting since U2b: the checklist is the
-one place this platform states that verdict; the devices route below still
-publishes the timestamp alone.
+`LANE_QUIET_MINUTES` minutes: a start setting (5 unless the deployment sets
+it), declared once in `src/startSettings.js`. It is the platform's one verdict
+on a quiet lane: the setup read and the lanes read (`quiet_minutes`) return
+the value they used, and the admin reads it from them and keeps no copy. The
+devices route below still publishes the timestamp alone.
 
 **A lane** is renamed, or removed only if it never had a stay, a computer, a
 card reader or an event (`409 lane_has_history`, with what it has in
@@ -499,7 +501,12 @@ write is a line too, through `record_refused_change()`: in the log of the
 account whose garage, lane, computer or key the path names (someone from
 another account is never named there), in the caller's own account's log, or,
 naming nothing and coming with nothing, in `platform_security_log`, which no
-owner reads and the application holds no grant on. A malformed id is refused
+owner reads and the application holds no grant on. A refused attempt repeated
+-- the same caller, from the same address (kept only as a hash), the same
+request and refusal -- within a minute of its line's first attempt is counted
+on that line (`attempts`, `last_at`; 0027) instead of written again, so
+hammering a route cannot fill the log. Changes that were made are never
+counted together. A malformed id is refused
 before the database, as before, and writes no line. The log is append-only:
 the application may `SELECT` and `INSERT`, and a trigger refuses `UPDATE`,
 `DELETE` and `TRUNCATE` for every role, the table's owner included. No line
@@ -514,9 +521,9 @@ credential. `npm run setup-fail-control` breaks each property in turn.
 the only place anything can see that a lane has stopped reporting, because a
 lane that is switched off cannot report that it is switched off.
 
-The platform publishes the timestamp and **no verdict**. How long is too long is
-a per-site assumption, and a threshold chosen here would be one nobody measured,
-applied to every site. `revoked_at` is in the listing beside it, because a
+This route publishes the timestamp and **no verdict**. How long is too long is a
+per-site assumption: the one place it is set is `LANE_QUIET_MINUTES`, which the
+deployment declares, and only the setup and lanes reads apply it. `revoked_at` is in the listing beside it, because a
 revoked device that stops being seen is not a fault. `token_hash` is not.
 
 ### Every conflict names itself

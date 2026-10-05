@@ -550,6 +550,7 @@ export function createAuthRouter(settings) {
       action: 'language.change',
       credential: token ? 'session' : 'none',
       credentialToken: token || null,
+      address: callerAddress(req, settings),
     });
   };
 

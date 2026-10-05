@@ -11,7 +11,9 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { pool, withTenant, storePlan, flatHourlyPlan, stateTaxes } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
-import { LANE_QUIET_MINUTES, STEP_KEYS } from '../src/setup.js';
+import { STEP_KEYS, quietMinutes } from '../src/setup.js';
+
+const LANE_QUIET_MINUTES = quietMinutes();
 import { startServer, owner, call } from './u4-world.js';
 
 let server;
@@ -190,6 +192,25 @@ test('open: done when the garage is open; otherwise what the platform still need
   assert.equal(opened.open, true);
   assert.equal(step(opened, 'open').done, true);
   assert.deepEqual(step(opened, 'open').facts.required_missing, []);
+});
+
+test('ONE SETTING: LANE_QUIET_MINUTES moves the checklist and the lanes read together, and both say the value they used', async () => {
+  const g = await garage({ lanes: [['In', 'entry'], ['Out', 'exit']] });
+  await computer(g.lanes.In, { heardMinutesAgo: 10 });
+  await computer(g.lanes.Out, { heardMinutesAgo: 10 });
+  const lanesRead = async () => (await call(base, 'GET', `/garages/${g.id}/lanes`, { as: a })).json;
+  assert.equal(LANE_QUIET_MINUTES, 5, 'unset, the setting is 5');
+  let s = step(await read(g.id), 'lane_computers');
+  assert.deepEqual([s.done, s.facts.quiet_minutes, (await lanesRead()).quiet_minutes], [false, 5, 5]);
+  const was = process.env.LANE_QUIET_MINUTES;
+  process.env.LANE_QUIET_MINUTES = '30';
+  try {
+    s = step(await read(g.id), 'lane_computers');
+    assert.deepEqual([s.done, s.facts.quiet_minutes, (await lanesRead()).quiet_minutes], [true, 30, 30], 'heard 10 minutes ago is working at 30');
+  } finally {
+    if (was === undefined) delete process.env.LANE_QUIET_MINUTES;
+    else process.env.LANE_QUIET_MINUTES = was;
+  }
 });
 
 test("another owner's garage is not found, and the read writes nothing", async () => {

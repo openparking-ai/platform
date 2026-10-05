@@ -25,6 +25,7 @@
  * trigger refuses UPDATE, DELETE and TRUNCATE for every role.
  */
 import { pool } from './db.js';
+import { createHash } from 'node:crypto';
 import { hashToken } from './auth.js';
 
 /** The subjects a line can be about, as the table allows them. */
@@ -153,6 +154,15 @@ function targetFromPath(path) {
   return { kind: null, id: null };
 }
 
+/**
+ * Where a refused attempt came from, as the line keeps it: a hash of the
+ * caller's address (the sign-in limiter's reading of it), never the address.
+ * The same attempt from the same source within a minute is counted onto one
+ * line (0027); two sources stay two lines.
+ */
+export const sourceKey = (address) =>
+  address ? createHash('sha256').update(`openparking-refusal-source:${address}`, 'utf8').digest('hex').slice(0, 32) : null;
+
 /** The refusal's name: the code it was answered with, or a name for its status. */
 function refusalName(err) {
   if (typeof err?.code === 'string' && /^[a-z0-9_]{1,64}$/.test(err.code)) return err.code;
@@ -169,13 +179,13 @@ function refusalName(err) {
  * and `credentialToken` the value, which never leaves this function: only its
  * hash goes to the database, the hash the sign-in already computes.
  */
-export async function refused(req, err, { action, credential, credentialToken }) {
+export async function refused(req, err, { action, credential, credentialToken, address = null }) {
   try {
     const fromRoute = targetOf(req);
     const target = fromRoute.kind ? fromRoute : targetFromPath(req.path);
     const actor = req.actor ?? null;
     const request = `${req.method} ${(req.baseUrl ?? '') + (req.path ?? '')}`.slice(0, 300);
-    await pool.query('SELECT record_refused_change($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)', [
+    await pool.query('SELECT record_refused_change($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)', [
       req.tenantId ?? null,
       req.tenantId ? null : credentialToken ? hashToken(credentialToken) : null,
       credential,
@@ -187,6 +197,7 @@ export async function refused(req, err, { action, credential, credentialToken })
       action,
       refusalName(err),
       request,
+      sourceKey(address),
     ]);
   } catch (failure) {
     console.error(`[changes] a refused attempt could not be recorded: ${failure?.code ?? failure?.name ?? 'error'}`);
@@ -214,7 +225,7 @@ export async function linesForGarage(client, tenantId, garageId, { after = null,
   }
   const { rows } = await client.query(
     `SELECT id, garage_id, at, outcome, actor_kind, actor_name, action, subject_kind, subject_id, subject_name,
-            before, after, refusal
+            before, after, refusal, attempts, last_at
        FROM garage_changes
       WHERE tenant_id = $1 AND (garage_id = $2 OR garage_id IS NULL) ${older}
       ORDER BY at DESC, id DESC

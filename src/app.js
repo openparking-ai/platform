@@ -866,7 +866,9 @@ export function createApp() {
         if (!garage) throw new HttpError(404, 'garage not found');
         return repo.lanesForGarage(client, req.tenantId, req.params.garageId);
       });
-      res.json({ lanes });
+      // The one setting that says when a lane computer counts as not heard
+      // from (src/setup.js), served so the screens read it and keep no copy.
+      res.json({ lanes, quiet_minutes: setup.quietMinutes() });
     } catch (err) {
       next(err);
     }
@@ -2429,6 +2431,7 @@ export function createApp() {
         action: actionFor(req),
         credential: req.credential?.kind ?? 'none',
         credentialToken: req.credential?.token ?? null,
+        address: signIn.callerAddress(req, authSettings),
       });
     }
     next(err);
@@ -2693,6 +2696,10 @@ function presentChange(line) {
     before: line.before,
     after: line.after,
     refusal: line.refusal,
+    // A refused attempt repeated from the same source within a minute is one
+    // line: how many times, and when the last was (0027).
+    attempts: line.attempts,
+    last_at: line.last_at,
   };
 }
 
