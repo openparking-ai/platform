@@ -89,10 +89,17 @@ CREATE POLICY alert_contacts_tenant_isolation ON alert_contacts
 GRANT SELECT, INSERT, UPDATE, DELETE ON alert_contacts TO openparking_app;
 
 -- ---------------------------------------------------------------------------
--- At most 25 people a garage, whoever writes the row. One garage's adds are
--- taken one at a time (the same lock the route takes before it counts), so
--- two at once cannot both be the 25th. A person moved to another garage
--- counts there.
+-- A person is on a garage of their own account, and at most 25 a garage,
+-- whoever writes the row.
+--
+-- The garage: a foreign key is checked without row-level security, so on
+-- its own it would take another account's garage id. The trigger reads the
+-- garage as the writer -- under the policy -- and refuses one that is not
+-- the row's own account's.
+--
+-- The count: one garage's adds are taken one at a time (the same lock the
+-- route takes before it counts), so two at once cannot both be the 25th. A
+-- person moved to another garage counts there.
 -- ---------------------------------------------------------------------------
 CREATE FUNCTION alert_contacts_bounded() RETURNS trigger
   LANGUAGE plpgsql
@@ -101,8 +108,12 @@ CREATE FUNCTION alert_contacts_bounded() RETURNS trigger
   DECLARE
     v_people integer;
   BEGIN
-    IF TG_OP = 'UPDATE' AND NEW.garage_id = OLD.garage_id THEN
+    IF TG_OP = 'UPDATE' AND NEW.garage_id = OLD.garage_id AND NEW.tenant_id = OLD.tenant_id THEN
       RETURN NEW;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM garages WHERE id = NEW.garage_id AND tenant_id = NEW.tenant_id) THEN
+      RAISE EXCEPTION 'alert_contacts_garage: a person is on a garage of their own account'
+        USING ERRCODE = 'foreign_key_violation';
     END IF;
     PERFORM pg_advisory_xact_lock(hashtextextended('alert-contacts|' || NEW.garage_id::text, 0));
     SELECT count(*) INTO v_people FROM alert_contacts WHERE garage_id = NEW.garage_id AND id <> NEW.id;
@@ -115,7 +126,7 @@ CREATE FUNCTION alert_contacts_bounded() RETURNS trigger
   $$;
 
 CREATE TRIGGER alert_contacts_at_most_25
-  BEFORE INSERT OR UPDATE OF garage_id ON alert_contacts
+  BEFORE INSERT OR UPDATE OF garage_id, tenant_id ON alert_contacts
   FOR EACH ROW EXECUTE FUNCTION alert_contacts_bounded();
 
 -- ---------------------------------------------------------------------------

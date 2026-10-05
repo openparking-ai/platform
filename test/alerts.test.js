@@ -149,6 +149,13 @@ test('YOUR GARAGE ONLY: another account\'s garage or person is not found and not
     (await c.query('SELECT count(*)::int AS n FROM alert_contacts c WHERE NOT EXISTS (SELECT 1 FROM garages g WHERE g.id = c.garage_id)')).rows[0].n);
   assert.equal(astray, 0, 'a person of this account sits on a garage that is not its own');
   assert.equal(await snapshot(), was);
+
+  // The database holds it too: a row written straight in, on another account's garage, is refused.
+  await assert.rejects(withTenant(a.tenant, (c) =>
+    c.query("INSERT INTO alert_contacts (tenant_id, garage_id, name, email) VALUES ($1, $2, 'Direct', 'direct@example.com')", [a.tenant, theirs.id])), /alert_contacts_garage/);
+  await assert.rejects(withTenant(a.tenant, (c) =>
+    c.query('UPDATE alert_contacts SET garage_id = $2 WHERE id = $1', [myPerson.id, theirs.id])), /alert_contacts_garage/);
+  assert.equal(await snapshot(), was);
 });
 
 // ---------------------------------------------------------------------------

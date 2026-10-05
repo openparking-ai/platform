@@ -25,6 +25,7 @@
  *   contacts_bound_dropped    the database takes a 26th person                      (check 4)
  *   name_bound_dropped        the database takes an over-long name                  (check 4)
  *   policy_dropped            a garage's people are readable by every account       (check 1)
+ *   other_garage_taken        the database takes a person on another account's garage (check 1)
  *
  * Plants that would write a person's details into the append-only log run
  * on a scratch database, so nothing they write stays in the suite's own.
@@ -160,7 +161,7 @@ const SCHEMA_BREAKS = [
     why: 'the database takes a 26th person',
     suite: ALERTS,
     red: ['BOUNDS'],
-    edits: [{ file: '0029_alert_contacts.sql', from: "CREATE TRIGGER alert_contacts_at_most_25\n  BEFORE INSERT OR UPDATE OF garage_id ON alert_contacts\n  FOR EACH ROW EXECUTE FUNCTION alert_contacts_bounded();", to: '' }],
+    edits: [{ file: '0029_alert_contacts.sql', from: '    IF v_people >= 25 THEN', to: '    IF false THEN' }],
   },
   {
     name: 'name_bound_dropped',
@@ -168,6 +169,13 @@ const SCHEMA_BREAKS = [
     suite: ALERTS,
     red: ['BOUNDS'],
     edits: [{ file: '0029_alert_contacts.sql', from: '    length(name) BETWEEN 1 AND 80\n    AND name = btrim(name)', to: '    name = btrim(name)' }],
+  },
+  {
+    name: 'other_garage_taken',
+    why: "the database takes a person on another account's garage",
+    suite: ALERTS,
+    red: ['YOUR GARAGE ONLY'],
+    edits: [{ file: '0029_alert_contacts.sql', from: '    IF NOT EXISTS (SELECT 1 FROM garages WHERE id = NEW.garage_id AND tenant_id = NEW.tenant_id) THEN', to: '    IF false THEN' }],
   },
   {
     name: 'policy_dropped',
