@@ -271,6 +271,25 @@ export const TENANT_TABLES = [
       ),
   },
   {
+    table: 'board_messages',
+    insert: (c, t, w) =>
+      c.query(`INSERT INTO board_messages (tenant_id, garage_id, text) VALUES ($1, $2, 'Row') RETURNING id`, [t, w.garage]),
+  },
+  {
+    table: 'board_message_lanes',
+    // A message of its own, shown on the world's way in: one row per message and lane.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH m AS (
+           INSERT INTO board_messages (tenant_id, garage_id, text) VALUES ($1, $2, 'Row') RETURNING id
+         )
+         INSERT INTO board_message_lanes (tenant_id, message_id, lane_id)
+         SELECT $1, m.id, $3 FROM m
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+  },
+  {
     table: 'lane_devices',
     insert: (c, t, w) =>
       c.query(

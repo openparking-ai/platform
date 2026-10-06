@@ -135,11 +135,13 @@ test('the payload carries the plans whole, the space class, the entitlements, th
   const g = await garage({ plans: 3 });
   const payload = await rules(g.entry);
   assert.deepEqual(Object.keys(payload).sort(), [
-    'active', 'currency', 'default_action', 'direction', 'entitlements', 'garage_id', 'lane', 'lane_id',
+    'active', 'board', 'currency', 'default_action', 'direction', 'entitlements', 'garage_id', 'lane', 'lane_id',
     'rate_plans', 'space_class', 'stays', 'synced_at', 'tax_sets', 'timezone',
   ]);
   // The asking lane, open (0026): closing it is covered in lane-setup.test.js.
   assert.deepEqual(payload.lane, { state: 'open', reason: null, message: null, closed_at: null });
+  // Its board (0030): no price switch and no message yet; covered in board.test.js.
+  assert.deepEqual(payload.board, { prices: false, messages: [] });
   for (const gone of ['hourly_minor', 'rate_id', 'plate_rules']) assert.equal(gone in payload, false, gone);
   assert.equal(payload.space_class, 'standard');
   assert.equal(payload.active, true);
@@ -242,11 +244,13 @@ test('the open stays travel with a cursor, closed ones do not, and the delta car
   assert.equal(first.stays.cursor, first.stays.open[1].change_seq, 'the cursor is the highest value the garage holds');
   // The stay route without `since` is the same set and the same cursor.
   const full = await (await stays(g.exit)).json();
-  assert.deepEqual(full, { cursor: first.stays.cursor, open: first.stays.open });
+  // ...and the lane's own state and board ride along on every answer (U4c).
+  const laneNow = { lane: first.lane, board: first.board };
+  assert.deepEqual(full, { cursor: first.stays.cursor, open: first.stays.open, ...laneNow });
 
   // Nothing changed: the delta is empty and the cursor does not move.
   const quiet = await (await stays(g.exit, first.stays.cursor)).json();
-  assert.deepEqual(quiet, { since: first.stays.cursor, cursor: first.stays.cursor, changes: [], more: false });
+  assert.deepEqual(quiet, { since: first.stays.cursor, cursor: first.stays.cursor, changes: [], more: false, ...laneNow });
 
   // A leaves and C arrives: the delta carries A closed and C open, in that
   // order, and the cursor is the last row's.

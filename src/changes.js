@@ -43,7 +43,7 @@ import { LINE_WORDS } from './alerts.js';
 
 /** The subjects a line can be about, as the table allows them. */
 export const SUBJECTS = Object.freeze([
-  'garage', 'lane', 'computer', 'reader', 'payment_account', 'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'unknown',
+  'garage', 'lane', 'computer', 'reader', 'payment_account', 'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'unknown',
 ]);
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

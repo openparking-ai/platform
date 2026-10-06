@@ -8,8 +8,11 @@
  * monthly holders still get in) or `everyone` -- and the owner's own message
  * for the lane to show. Closing the last open lane of a direction would leave
  * no way in, or no way out: it is refused by name unless the request says it
- * is a deliberate override. The lane itself does not act on a closing yet;
- * `/lane/rules` carries it for the lane's own round.
+ * is a deliberate override. The lane acts on it (U4c): `/lane/rules` and the
+ * fast `/lane/stays` both carry it. `full` is a way in's reason only -- a way
+ * out has nobody to let in -- and is refused on an exit by name (0030 holds
+ * the same for every writer). The message is text for the lane's screen, so
+ * every character must be one the screen can draw (src/screenText.js).
  *
  * REMOVING. Only a lane that never had a stay, a computer, a card reader or a
  * recorded event can be removed: anything else is history, and the refusal
@@ -17,6 +20,7 @@
  */
 import { HttpError } from './errors.js';
 import * as changes from './changes.js';
+import { undrawable, nameCharacter } from './screenText.js';
 
 export const CLOSE_REASONS = Object.freeze(['full', 'everyone']);
 export const NAME_MAX = 80;
@@ -37,14 +41,35 @@ export function nameField(raw) {
   return name;
 }
 
-function messageField(raw) {
-  if (typeof raw !== 'string') throw bad(`message must be text of 1 to ${MESSAGE_MAX} characters`, 'lane_message_refused');
-  const message = raw.trim();
-  if (message === '' || message.length > MESSAGE_MAX || CONTROL.test(message)) {
-    throw bad(`message must be text of 1 to ${MESSAGE_MAX} characters, with no control or invisible formatting characters`, 'lane_message_refused');
+/**
+ * Text for a lane's screen -- a closed lane's message, or one on its board:
+ * 1 to `MESSAGE_MAX` characters, no control or invisible formatting
+ * character, and every character one the screen can draw once upper-cased
+ * (src/screenText.js). A character it cannot draw is refused BY NAME, every
+ * one of them, in `details.characters`, so the owner is told what to change
+ * rather than finding a gap on the screen.
+ */
+export function screenTextField(raw, { field = 'message', code = 'lane_message_refused' } = {}) {
+  if (typeof raw !== 'string') throw bad(`${field} must be text of 1 to ${MESSAGE_MAX} characters`, code);
+  const text = raw.trim();
+  if (text === '' || text.length > MESSAGE_MAX || CONTROL.test(text)) {
+    throw bad(`${field} must be text of 1 to ${MESSAGE_MAX} characters, with no control or invisible formatting characters`, code);
   }
-  return message;
+  const absent = undrawable(text);
+  if (absent.length) {
+    throw Object.assign(
+      bad(
+        `${field} has ${absent.length === 1 ? 'a character' : 'characters'} the lane's screen cannot show: ${absent.map(nameCharacter).join(', ')}. ` +
+          "The screen shows letters A to Z, the digits, spaces, the Spanish accented letters, and . , - : ' ! ? / +",
+        code,
+      ),
+      { details: { characters: absent } },
+    );
+  }
+  return text;
 }
+
+const messageField = (raw) => screenTextField(raw);
 
 function onlyKeys(body, keys) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw bad(`the body is JSON: {${keys.join(', ')}}`);
@@ -148,6 +173,13 @@ export async function close(client, tenantId, laneId, body, ctx) {
   const message = messageField(body.message);
   if (body.override !== undefined && body.override !== true) throw bad('override, when sent, is true', 'lane_override_refused');
   const lane = await lockedGarageLanes(client, tenantId, laneId);
+  // FULL IS A WAY IN'S REASON (U4c, rule 3). It lets pass and monthly
+  // holders in and nobody else; a way out has nobody to let in, so a full
+  // exit would be a lane closed to every car leaving while it said it was
+  // not. Refused by name; an exit is closed to everyone.
+  if (body.reason === 'full' && lane.direction !== 'entry') {
+    throw bad('reason full is for a way in: it lets pass and monthly holders in. A way out is closed to everyone', 'lane_reason_refused');
+  }
   const lanes = lane.all;
   const openOthers = lanes.filter((l) => l.id !== lane.id && l.direction === lane.direction && l.closed_reason === null);
   if (lane.closed_reason === null && openOthers.length === 0 && body.override !== true) {

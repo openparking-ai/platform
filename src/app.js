@@ -18,6 +18,9 @@ import { startSetting } from './startSettings.js';
 import { HttpError } from './errors.js';
 import * as changes from './changes.js';
 import * as lanes from './lanes.js';
+import * as board from './board.js';
+import { SCREEN_CHARACTERS } from './screenText.js';
+import { MESSAGE_MAX } from './lanes.js';
 import * as setup from './setup.js';
 import * as alerts from './alerts.js';
 
@@ -76,6 +79,7 @@ export const ID_PARAMS = Object.freeze({
     tokenId: () => new HttpError(404, 'operator token not found'),
     changeId: () => new HttpError(404, 'change not found'),
     contactId: () => new HttpError(404, 'alert contact not found', 'alert_contact_not_found'),
+    messageId: () => new HttpError(404, 'board message not found', 'board_message_not_found'),
   }),
   lane: Object.freeze({
     sessionId: () => conflict('stay_not_open', STAY_NOT_OPEN),
@@ -867,7 +871,9 @@ export function createApp() {
       });
       // The one setting that says when a lane computer counts as not heard
       // from (src/setup.js), served so the screens read it and keep no copy.
-      res.json({ lanes, quiet_minutes: setup.quietMinutes() });
+      // What a lane's screen can draw, so the owner's screens can say, as
+      // the owner types, which characters a message cannot have (U4c, rule 7).
+      res.json({ lanes, quiet_minutes: setup.quietMinutes(), screen: { characters: SCREEN_CHARACTERS, message_max: MESSAGE_MAX } });
     } catch (err) {
       next(err);
     }
@@ -1556,7 +1562,8 @@ export function createApp() {
         const cursor = await repo.stayCursor(client, tenantId, garageId);
         const open = await repo.openStaysForLane(client, tenantId, garageId);
         const laneState = await lanes.laneState(client, tenantId, laneId);
-        return { garage, plans, taxSets, stays: { cursor, open }, laneState };
+        const boardState = await board.forLane(client, tenantId, laneId);
+        return { garage, plans, taxSets, stays: { cursor, open }, laneState, boardState };
       });
       if (!payload.garage) throw new HttpError(404, 'garage not found');
       // Outside the transaction: two subprocesses, and nothing of theirs is
@@ -1576,9 +1583,13 @@ export function createApp() {
         default_action: payload.garage.default_action,
         // This lane, open or closed by hand (0026): the reason -- `full` lets
         // pass and monthly holders in, `everyone` closes it to all -- and the
-        // owner's message for the lane to show. Carried for the lane's own
-        // round; nothing at the lane acts on it yet.
+        // owner's message for the lane to show. The lane acts on it (U4c),
+        // and the fast read below carries the same object, so a close or a
+        // reopen reaches the lane within one fast cadence.
         lane: payload.laneState,
+        // This lane's board (0030): its price switch and the owner's
+        // messages for it that have not ended. The fast read carries it too.
+        board: payload.boardState,
         // The gate's verdict (0014). Served so a lane can see it; the lane
         // does not read it yet, and a platform ahead of the lane refuses
         // nothing by adding a key.
@@ -1609,7 +1620,7 @@ export function createApp() {
    */
   lane.get('/stays', async (req, res, next) => {
     try {
-      const { tenantId, garageId } = req.device;
+      const { tenantId, garageId, laneId } = req.device;
       const since = req.query.since;
       if (since !== undefined && !/^\d{1,18}$/.test(String(since))) {
         throw bad('since must be a cursor this route handed out: a string of digits');
@@ -1617,10 +1628,16 @@ export function createApp() {
       const answer = await withTenant(tenantId, async (client) => {
         const garage = await repo.getGarage(client, tenantId, garageId);
         if (!garage) return null;
+        // THE LANE'S OWN STATE RIDES THE FAST READ (U4c, rule 4): open or
+        // closed, and its board, on every answer -- the full set and every
+        // delta -- so a close, a reopen or a message reaches the lane within
+        // one fast cadence rather than the slow read's five minutes.
+        const lane = await lanes.laneState(client, tenantId, laneId);
+        const laneBoard = await board.forLane(client, tenantId, laneId);
         if (since === undefined) {
           const cursor = await repo.stayCursor(client, tenantId, garageId);
           const open = await repo.openStaysForLane(client, tenantId, garageId);
-          return { cursor, open };
+          return { cursor, open, lane, board: laneBoard };
         }
         const { changes, more } = await repo.stayChangesSince(client, tenantId, garageId, String(since), STAY_PAGE);
         // The cursor never runs ahead of what was delivered: the last row's
@@ -1628,7 +1645,7 @@ export function createApp() {
         // the table after the rows were read could cover a row that committed
         // in between, and that row would then be in no delta.
         const cursor = changes.length ? changes[changes.length - 1].change_seq : String(since);
-        return { since: String(since), cursor, changes, more };
+        return { since: String(since), cursor, changes, more, lane, board: laneBoard };
       });
       if (!answer) throw new HttpError(404, 'garage not found');
       res.json(answer);
@@ -2460,6 +2477,62 @@ export function createApp() {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // THE BOARD (U4c, amendment 1): the owner's messages for the lanes' screens,
+  // and each lane's price switch (src/board.js). The garage comes from the
+  // path and the session only.
+  // -------------------------------------------------------------------------
+
+  /** The garage's board: its messages and each lane's price switch. A read. */
+  operator.get('/garages/:garageId/board', async (req, res, next) => {
+    try {
+      const out = await withTenant(req.tenantId, async (client) => board.read(client, req.tenantId, await ownGarage(client, req)));
+      res.json({ ...out, screen: { characters: SCREEN_CHARACTERS, message_max: MESSAGE_MAX } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Add a message. Body: {text, lanes: [laneId], starts?, ends?}, times in the garage's own time as YYYY-MM-DDTHH:MM. */
+  operator.post('/garages/:garageId/board-messages', async (req, res, next) => {
+    try {
+      const out = await changeTx(req, async (client) => board.add(client, req.tenantId, await ownGarage(client, req), req.body ?? {}, req.change));
+      res.status(201).json(out);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Change a message: any of {text, lanes, starts, ends}; null takes a start or an end away. */
+  operator.patch('/garages/:garageId/board-messages/:messageId', async (req, res, next) => {
+    try {
+      const out = await changeTx(req, async (client) => board.change(client, req.tenantId, await ownGarage(client, req), req.params.messageId, req.body ?? {}, req.change));
+      res.json(out);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Remove a message from every lane it shows on. */
+  operator.delete('/garages/:garageId/board-messages/:messageId', async (req, res, next) => {
+    try {
+      await changeTx(req, async (client) => board.remove(client, req.tenantId, await ownGarage(client, req), req.params.messageId, req.change));
+      res.status(204).end();
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** This lane shows the price on its board, or not. Body: {show: true | false}. */
+  operator.put('/lanes/:laneId/board-prices', async (req, res, next) => {
+    try {
+      const out = await changeTx(req, (client) => board.setPrices(client, req.tenantId, req.params.laneId, req.body ?? {}, req.change));
+      res.json(out);
+    } catch (err) {
+      next(err);
+    }
+  });
+
   /**
    * The garage's change log, newest first: its own lines and the account's.
    * The changes made and the refused attempts are read apart, so no number
@@ -2746,6 +2819,10 @@ export const WRITE_ROUTES = Object.freeze([
   ['PATCH', '/garages/:garageId/alert-contacts/:contactId', 'alert_contact.change'],
   ['DELETE', '/garages/:garageId/alert-contacts/:contactId', 'alert_contact.remove'],
   ['PUT', '/garages/:garageId/alert-contacts/:contactId/choices', 'alert_contact.choices'],
+  ['POST', '/garages/:garageId/board-messages', 'board_message.add'],
+  ['PATCH', '/garages/:garageId/board-messages/:messageId', 'board_message.change'],
+  ['DELETE', '/garages/:garageId/board-messages/:messageId', 'board_message.remove'],
+  ['PUT', '/lanes/:laneId/board-prices', 'lane.board_prices'],
 ]);
 
 const WRITE_PATTERNS = WRITE_ROUTES.map(([method, path, action]) => [
