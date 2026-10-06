@@ -78,19 +78,25 @@ const SELECT = `
          to_char(m.ends_at AT TIME ZONE g.timezone, 'YYYY-MM-DD"T"HH24:MI') AS ends,
          COALESCE((SELECT array_agg(ml.lane_id ORDER BY l.created_at, l.id)
                      FROM board_message_lanes ml JOIN lanes l ON l.id = ml.lane_id AND l.tenant_id = ml.tenant_id
-                    WHERE ml.tenant_id = m.tenant_id AND ml.message_id = m.id), '{}') AS lanes
+                    WHERE ml.tenant_id = m.tenant_id AND ml.message_id = m.id), '{}') AS lanes,
+         COALESCE((SELECT array_agg(l.name ORDER BY l.created_at, l.id)
+                     FROM board_message_lanes ml JOIN lanes l ON l.id = ml.lane_id AND l.tenant_id = ml.tenant_id
+                    WHERE ml.tenant_id = m.tenant_id AND ml.message_id = m.id), '{}') AS lane_names
     FROM board_messages m JOIN garages g ON g.id = m.garage_id AND g.tenant_id = m.tenant_id`;
 
 const present = (r) => ({ id: r.id, text: r.text, lanes: r.lanes, starts: r.starts, ends: r.ends, starts_at: r.starts_at, ends_at: r.ends_at, created_at: r.created_at });
 
-/** What a line keeps of a message: what the screen shows and where and when, never anything else. */
-const lineOf = (m) => ({ text: m.text, lanes: m.lanes, starts: m.starts, ends: m.ends });
+/**
+ * What a line keeps of a message: what the screen shows, on which lanes --
+ * by name, as the owner reads them -- and when, in the garage's own time.
+ */
+const lineOf = (r) => ({ text: r.text, lanes: r.lane_names, starts: r.starts, ends: r.ends });
 
 async function messageRow(client, tenantId, garageId, messageId, lock = false) {
   if (lock) await client.query('SELECT 1 FROM board_messages WHERE tenant_id = $1 AND garage_id = $2 AND id = $3 FOR UPDATE', [tenantId, garageId, messageId]);
   const { rows } = await client.query(`${SELECT} WHERE m.tenant_id = $1 AND m.garage_id = $2 AND m.id = $3`, [tenantId, garageId, messageId]);
   if (!rows[0]) throw new HttpError(404, 'board message not found', 'board_message_not_found');
-  return present(rows[0]);
+  return rows[0];
 }
 
 /** The garage's board: its messages, oldest first, and each lane's price switch. A read. */
@@ -135,12 +141,12 @@ export async function add(client, tenantId, garage, body, ctx) {
   for (const laneId of laneIds) {
     await client.query('INSERT INTO board_message_lanes (tenant_id, message_id, lane_id) VALUES ($1,$2,$3)', [tenantId, id, laneId]);
   }
-  const message = await messageRow(client, tenantId, garage.id, id);
+  const row = await messageRow(client, tenantId, garage.id, id);
   await changes.record(client, ctx, {
     garageId: garage.id, action: 'board_message.add', subject: { kind: 'board_message', id, name: text },
-    before: null, after: lineOf(message),
+    before: null, after: lineOf(row),
   });
-  return { message };
+  return { message: present(row) };
 }
 
 export async function change(client, tenantId, garage, messageId, body, ctx) {
@@ -165,12 +171,12 @@ export async function change(client, tenantId, garage, messageId, body, ctx) {
       );
     }
   }
-  const message = await messageRow(client, tenantId, garage.id, messageId);
+  const now = await messageRow(client, tenantId, garage.id, messageId);
   await changes.record(client, ctx, {
-    garageId: garage.id, action: 'board_message.change', subject: { kind: 'board_message', id: messageId, name: message.text },
-    before: lineOf(row), after: lineOf(message),
+    garageId: garage.id, action: 'board_message.change', subject: { kind: 'board_message', id: messageId, name: now.text },
+    before: lineOf(row), after: lineOf(now),
   });
-  return { message };
+  return { message: present(now) };
 }
 
 export async function remove(client, tenantId, garage, messageId, ctx) {

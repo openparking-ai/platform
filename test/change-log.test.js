@@ -364,7 +364,7 @@ const WRITES = [
       return { g, lane: await newLane(base, a, g.id, 'North', 'entry') };
     },
     run: (s) => call(base, 'POST', `/garages/${s.g.id}/board-messages`, { as: a, body: { text: 'Event tonight', lanes: [s.lane.id] } }),
-    line: (l, s) => assert.deepEqual([l.subject_kind, l.subject_name, l.before, l.after], ['board_message', 'Event tonight', null, { text: 'Event tonight', lanes: [s.lane.id], starts: null, ends: null }]),
+    line: (l) => assert.deepEqual([l.subject_kind, l.subject_name, l.before, l.after], ['board_message', 'Event tonight', null, { text: 'Event tonight', lanes: ['North'], starts: null, ends: null }]),
     state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM board_messages WHERE garage_id = $1', [s.g.id]),
   },
   {
@@ -376,7 +376,7 @@ const WRITES = [
       return { g, lane, m: r.json.message };
     },
     run: (s) => call(base, 'PATCH', `/garages/${s.g.id}/board-messages/${s.m.id}`, { as: a, body: { text: 'Event tomorrow' } }),
-    line: (l, s) => assert.deepEqual([l.subject_name, l.before.text, l.after], ['Event tomorrow', 'Event tonight', { text: 'Event tomorrow', lanes: [s.lane.id], starts: null, ends: null }]),
+    line: (l) => assert.deepEqual([l.subject_name, l.before.text, l.after], ['Event tomorrow', 'Event tonight', { text: 'Event tomorrow', lanes: ['North'], starts: null, ends: null }]),
     state: (s) => one(a.tenant, 'SELECT text FROM board_messages WHERE id = $1', [s.m.id]),
   },
   {
@@ -388,7 +388,7 @@ const WRITES = [
       return { g, lane, m: r.json.message };
     },
     run: (s) => call(base, 'DELETE', `/garages/${s.g.id}/board-messages/${s.m.id}`, { as: a }),
-    line: (l, s) => assert.deepEqual([l.subject_name, l.before, l.after], ['Going', { text: 'Going', lanes: [s.lane.id], starts: null, ends: null }, null]),
+    line: (l) => assert.deepEqual([l.subject_name, l.before, l.after], ['Going', { text: 'Going', lanes: ['North'], starts: null, ends: null }, null]),
     state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM board_messages WHERE id = $1', [s.m.id]),
   },
   {
