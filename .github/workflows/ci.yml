@@ -33,6 +33,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
+      - name: No dependency with a known high or critical problem
+        # Read against the advisories of the day the job runs, so an advisory
+        # published after a change was green turns the next run red.
+        run: npm audit --audit-level=high
 
       - name: No real personal data in the repository
         run: node .github/scripts/check-no-real-data.js --self-test
