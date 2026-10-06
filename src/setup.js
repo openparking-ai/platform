@@ -21,12 +21,17 @@
  *   getting_paid    ONLY for a garage that takes any driver: a payment
  *                   account that can take cards
  *   card_readers    ONLY for such a garage: every way out has a card reader
+ *   alerts          every alert has at least one person to tell, by text or
+ *                   by email (U4b, src/alerts.js). It never holds back
+ *                   opening: the open step is worked out exactly as before
+ *                   it existed
  *   open            open or not, and what is still missing
  */
 import * as repo from './repository.js';
 import * as activation from './activation.js';
 import { recordedFacts } from './stripeAccount.js';
 import { startSetting } from './startSettings.js';
+import * as alerts from './alerts.js';
 
 /**
  * How long a lane computer may go unheard before its lane counts as not
@@ -39,7 +44,7 @@ export const quietMinutes = () => startSetting('LANE_QUIET_MINUTES');
 
 /** The steps, in the order the checklist shows them. */
 export const STEP_KEYS = Object.freeze([
-  'garage_details', 'drivers', 'lanes', 'lane_computers', 'rates', 'taxes', 'getting_paid', 'card_readers', 'open',
+  'garage_details', 'drivers', 'lanes', 'lane_computers', 'rates', 'taxes', 'getting_paid', 'card_readers', 'alerts', 'open',
 ]);
 
 /** Which activation condition each step stands for: what the platform needs before a garage can open. */
@@ -132,7 +137,21 @@ export async function checklist(client, tenantId, garage) {
     });
   }
 
+  // What opening is about: worked out before the alerts step, which never
+  // holds opening back, so the open step is what it was before alerts existed.
   const notDone = steps.filter((s) => !s.done).map((s) => s.key);
+
+  const told = await alerts.coverage(client, tenantId, garage.id);
+  steps.push({
+    key: 'alerts',
+    done: told.alerts.every((a) => a.by_text + a.by_email > 0),
+    facts: {
+      people: told.people,
+      alerts: told.alerts,
+      nobody_told: told.alerts.filter((a) => a.by_text + a.by_email === 0).map((a) => a.key),
+    },
+  });
+
   steps.push({
     key: 'open',
     done: readout.active,

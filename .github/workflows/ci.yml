@@ -33,6 +33,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
+      - name: No dependency with a known high or critical problem
+        # Read against the advisories of the day the job runs, so an advisory
+        # published after a change was green turns the next run red.
+        run: npm audit --audit-level=high
 
       - name: No real personal data in the repository
         run: node .github/scripts/check-no-real-data.js --self-test
@@ -419,6 +423,18 @@ jobs:
         # turn, two of them on a scratch database, and each must turn its own
         # test red.
         run: npm run setup-fail-control
+
+      - name: Alerts fail-control
+        # U4b: who gets which alert. The garage only from the session and the
+        # path; phone numbers and email addresses kept one way or refused
+        # with their reason; no text without a phone and no email without an
+        # address; at most 25 people and a bounded name in the database too;
+        # no person's number or address in any log or the server's output;
+        # each change and its line one transaction; the checklist step worked
+        # out from the rows, never holding opening back; and nothing sent.
+        # Each property is broken in turn, some on a scratch database, and
+        # each must turn its own test red.
+        run: npm run alerts-fail-control
 
 
   sign-in-control:

@@ -19,6 +19,7 @@ import { HttpError } from './errors.js';
 import * as changes from './changes.js';
 import * as lanes from './lanes.js';
 import * as setup from './setup.js';
+import * as alerts from './alerts.js';
 
 const bad = (message) => new HttpError(400, message);
 
@@ -74,6 +75,7 @@ export const ID_PARAMS = Object.freeze({
     deviceId: () => new HttpError(404, 'device not found'),
     tokenId: () => new HttpError(404, 'operator token not found'),
     changeId: () => new HttpError(404, 'change not found'),
+    contactId: () => new HttpError(404, 'alert contact not found', 'alert_contact_not_found'),
   }),
   lane: Object.freeze({
     sessionId: () => conflict('stay_not_open', STAY_NOT_OPEN),
@@ -2380,6 +2382,84 @@ export function createApp() {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // ALERTS (U4b): who gets which alert, and how (src/alerts.js). Nothing is
+  // sent. The garage and the person come from the session and the path only:
+  // another account's garage, or a person of another garage, is not found.
+  // -------------------------------------------------------------------------
+
+  /** The garage, or a 404: read on the write's own transaction. */
+  const ownGarage = async (client, req) => {
+    const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+    if (!garage) throw new HttpError(404, 'garage not found');
+    return garage;
+  };
+
+  /** The alerts, in order, and the garage's people with what each gets. A read. */
+  operator.get('/garages/:garageId/alerts', async (req, res, next) => {
+    try {
+      const out = await withTenant(req.tenantId, async (client) => {
+        const garage = await ownGarage(client, req);
+        return alerts.read(client, req.tenantId, garage.id);
+      });
+      res.json(out);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Add a person. Body: {name, phone?, email?, language?}: a phone, an email, or both. */
+  operator.post('/garages/:garageId/alert-contacts', async (req, res, next) => {
+    try {
+      const out = await changeTx(req, async (client) => {
+        const garage = await ownGarage(client, req);
+        return alerts.add(client, req.tenantId, garage.id, req.body ?? {}, req.change);
+      });
+      res.status(201).json(out);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Change a person: any of {name, phone, email, language}; null takes a phone or email away. */
+  operator.patch('/garages/:garageId/alert-contacts/:contactId', async (req, res, next) => {
+    try {
+      const out = await changeTx(req, async (client) => {
+        const garage = await ownGarage(client, req);
+        return alerts.change(client, req.tenantId, garage.id, req.params.contactId, req.body ?? {}, req.change);
+      });
+      res.json(out);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Remove a person, and every choice of theirs with them. */
+  operator.delete('/garages/:garageId/alert-contacts/:contactId', async (req, res, next) => {
+    try {
+      await changeTx(req, async (client) => {
+        const garage = await ownGarage(client, req);
+        return alerts.remove(client, req.tenantId, garage.id, req.params.contactId, req.change);
+      });
+      res.status(204).end();
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Which alerts a person gets: {by_text: [alert], by_email: [alert]}, the whole of both. */
+  operator.put('/garages/:garageId/alert-contacts/:contactId/choices', async (req, res, next) => {
+    try {
+      const out = await changeTx(req, async (client) => {
+        const garage = await ownGarage(client, req);
+        return alerts.setChoices(client, req.tenantId, garage.id, req.params.contactId, req.body ?? {}, req.change);
+      });
+      res.json(out);
+    } catch (err) {
+      next(err);
+    }
+  });
+
   /**
    * The garage's change log, newest first: its own lines and the account's.
    * The changes made and the refused attempts are read apart, so no number
@@ -2420,6 +2500,7 @@ export function createApp() {
     if (!SAFE_METHODS.has(req.method) && status >= 400 && status < 500 && !err?.malformedId) {
       await changes.refused(req, err, {
         action: actionFor(req),
+        request: requestFor(req),
         credential: req.credential?.kind ?? 'none',
         credentialToken: req.credential?.token ?? null,
         address: signIn.callerAddress(req, authSettings),
@@ -2661,6 +2742,10 @@ export const WRITE_ROUTES = Object.freeze([
   ['DELETE', '/lanes/:laneId', 'lane.remove'],
   ['POST', '/lanes/:laneId/close', 'lane.close'],
   ['POST', '/lanes/:laneId/reopen', 'lane.reopen'],
+  ['POST', '/garages/:garageId/alert-contacts', 'alert_contact.add'],
+  ['PATCH', '/garages/:garageId/alert-contacts/:contactId', 'alert_contact.change'],
+  ['DELETE', '/garages/:garageId/alert-contacts/:contactId', 'alert_contact.remove'],
+  ['PUT', '/garages/:garageId/alert-contacts/:contactId/choices', 'alert_contact.choices'],
 ]);
 
 const WRITE_PATTERNS = WRITE_ROUTES.map(([method, path, action]) => [
@@ -2675,6 +2760,19 @@ function actionFor(req) {
   return found ? found[2] : 'unknown.write';
 }
 
+const CONTACT_PATH = /\/alert-contacts(\/|$)/i;
+
+/**
+ * The request a refused attempt names, when it is aimed at a person to tell:
+ * the route as it is written, never the path as it was sent, which could
+ * carry anything typed in place of an id. Undefined for any other request.
+ */
+function requestFor(req) {
+  if (!CONTACT_PATH.test(req.path ?? '')) return undefined;
+  const at = WRITE_PATTERNS.findIndex(([method, re]) => method === req.method && re.test(req.path));
+  return `${req.method} ${req.baseUrl ?? ''}${at >= 0 ? WRITE_ROUTES[at][1] : '/garages/:garageId/alert-contacts/...'}`;
+}
+
 /** A change-log line as the owner's screens read it. */
 function presentChange(line) {
   return {
@@ -2684,7 +2782,9 @@ function presentChange(line) {
     outcome: line.outcome,
     who: { kind: line.actor_kind, name: line.actor_name },
     action: line.action,
-    subject: { kind: line.subject_kind, id: line.subject_id, name: line.subject_name },
+    // A person to tell is named as they are now, or not at all when they
+    // have been removed (src/changes.js): the line itself never holds a name.
+    subject: { kind: line.subject_kind, id: line.subject_id, name: line.subject_name, removed: line.subject_removed === true },
     before: line.before,
     after: line.after,
     refusal: line.refusal,

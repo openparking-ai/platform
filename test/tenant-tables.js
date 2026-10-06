@@ -257,6 +257,20 @@ export const TENANT_TABLES = [
     noDelete: true,
   },
   {
+    table: 'alert_contacts',
+    // At most 25 a garage (0029), so each row is the first of a garage of its own.
+    insert: (c, t) =>
+      c.query(
+        `WITH g AS (
+           INSERT INTO garages (tenant_id, name, timezone, currency) VALUES ($1, 'Row', 'UTC', 'USD') RETURNING id
+         )
+         INSERT INTO alert_contacts (tenant_id, garage_id, name, email)
+         SELECT $1, g.id, 'Row', 'row@example.com' FROM g
+         RETURNING id`,
+        [t],
+      ),
+  },
+  {
     table: 'lane_devices',
     insert: (c, t, w) =>
       c.query(

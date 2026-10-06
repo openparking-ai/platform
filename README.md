@@ -476,7 +476,8 @@ that already exist -- the activation readout, the recorded payment account, the
 lanes with their computers and readers -- and nothing is ticked by hand. Steps,
 in order: `garage_details`, `drivers`, `lanes` (a way in and a way out),
 `lane_computers`, `rates`, `taxes`, `getting_paid` and `card_readers` (only for
-a garage that takes any driver), `open` (and what is still missing). A lane
+a garage that takes any driver), `alerts` (every alert has someone to tell,
+below), `open` (and what is still missing). A lane
 computer counts as connected when it was heard from within
 `LANE_QUIET_MINUTES` minutes: a start setting (5 unless the deployment sets
 it), declared once in `src/startSettings.js`. It is the platform's one verdict
@@ -498,7 +499,7 @@ second (`test/races.test.js`). `/lane/rules` carries the lane's state and
 message; nothing at the lane acts on it yet.
 
 **The change log** (`garage_changes`, 0026). Every operator write route --
-`WRITE_ROUTES` in `src/app.js`, 22, checked against the router -- and the
+`WRITE_ROUTES` in `src/app.js`, 26, checked against the router -- and the
 owner's language write one line each, in the same transaction as the change:
 who (the signed-in owner by email, or the key by its name), what, before and
 after, when. A request that changed nothing -- the same before and after --
@@ -531,6 +532,65 @@ the application may `SELECT` and `INSERT`, and a trigger refuses `UPDATE`,
 holds a password, key, lane computer code, cookie or session value: a line is
 built from named fields, and `src/changes.js` refuses one that holds a
 credential. `npm run setup-fail-control` breaks each property in turn.
+
+### Alerts: who gets which alert, and how
+
+    GET    /api/v1/garages/<id>/alerts                         {alerts: [{key, needs}], quiet_minutes, max_contacts, sending, contacts: [...]}
+    POST   /api/v1/garages/<id>/alert-contacts                 {name, phone?, email?, language?}   201 {contact}
+    PATCH  /api/v1/garages/<id>/alert-contacts/<id>            {name?, phone?, email?, language?}  {contact, turned_off}
+    DELETE /api/v1/garages/<id>/alert-contacts/<id>                                                204
+    PUT    /api/v1/garages/<id>/alert-contacts/<id>/choices    {by_text: [alert], by_email: [alert]}  {contact}
+
+Per garage, the people to tell when something goes wrong (`alert_contacts`,
+0029): a name, a phone number and/or an email address, and a language (`en`
+unless said). They have no account and never sign in. **The alerts** are one
+list, `ALERTS` in `src/alerts.js`, in order: `lane_problem`,
+`lane_not_answering` (its description needs `quiet_minutes`, the quiet setting
+above, read from the platform), `garage_not_answering`,
+`card_payments_stopped`, `attendant_link_dropped`. Adding one is one entry
+there. For each alert, each person gets it by text, by email, both or neither.
+
+**Nothing is sent** in this round: no provider, no key, no network call
+(`sending: false`). Sending is the alert module's. Until it lands nobody is
+`confirmed`, and 0029 holds that false: before the first alert goes to a
+person, they will be asked to confirm.
+
+**A phone number** is kept as `+` and 8 to 15 digits: a US number of 10
+digits, or 11 starting with 1, as `+1` and the 10; any other must start with
+`+`. Spaces, dashes, dots and brackets between the digits are dropped; letters,
+invisible characters and anything else are refused, `400
+alert_contact_phone_refused`, with the reason in `details.reason` and never the
+number. **An email address** is trimmed, has one `@` with something either
+side, no space or invisible character, and at most 254 characters, or `400
+alert_contact_email_refused`. A person needs one or both
+(`alert_contact_unreachable`). A text choice needs a phone and an email choice
+an address (`409 alert_text_needs_phone`, `alert_email_needs_email`); taking a
+phone or address away turns the choices that needed it off in the same change,
+and the answer's `turned_off` and the line say which. At most 25 people a
+garage (`409 alert_contacts_full`) and a name of 1 to 80 characters with no
+invisible characters (`alert_contact_name_refused`, `details.reason`). What a
+name holds is the owner's. The database holds every one of these rules too,
+whoever writes the row -- and a person's garage is one of their own account's,
+which a foreign key alone would not hold (it is checked without row-level
+security).
+
+**Nothing typed about a person enters a log.** A line about a person holds
+their id and what kind of change it was -- `name: changed`, `phone: given ->
+changed`, `by_text: [card_payments_stopped]` -- never their name, number,
+address or any other typed value: `src/changes.js` refuses a line about a
+person that holds a name or any word but the platform's own (`LINE_WORDS` in
+`src/alerts.js`), and 0029 refuses a name on one (`garage_changes_person_unnamed`).
+**The name is read when the log is read**: the change log names each person as
+they are named now, and a person who has been removed as removed
+(`subject.removed`, with no name) -- so removing a person takes their name out
+of every line, page and file. A refused attempt on a person names the route
+(`PATCH /api/v1/garages/:garageId/alert-contacts/:contactId`), never the path as
+it was sent. No line holds a value the write handed the guard as private
+either, compared as digits only too. A database refusal is passed on without
+its detail, which would quote the row. The garage and the person come from the
+session and the path only. The checklist's `alerts` step is done when every
+alert has at least one person; it never holds opening back.
+`npm run alerts-fail-control` breaks each property in turn (28).
 
 ### A lane that has gone quiet
 

@@ -168,7 +168,7 @@ const SOURCE_BREAKS = [
     why: 'refused attempts are read with the changes',
     suite: LOG,
     red: ['THE READ'],
-    edits: [{ file: 'src/changes.js', from: "      WHERE tenant_id = $1 AND (garage_id = $2 OR garage_id IS NULL) AND outcome = $4 ${older}", to: "      WHERE tenant_id = $1 AND (garage_id = $2 OR garage_id IS NULL) AND $4::text IS NOT NULL ${older}" }],
+    edits: [{ file: 'src/changes.js', from: "      WHERE gc.tenant_id = $1 AND (gc.garage_id = $2 OR gc.garage_id IS NULL) AND gc.outcome = $4 ${older}", to: "      WHERE gc.tenant_id = $1 AND (gc.garage_id = $2 OR gc.garage_id IS NULL) AND $4::text IS NOT NULL ${older}" }],
   },
   {
     name: 'not_found_unnamed',

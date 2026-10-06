@@ -1,8 +1,8 @@
 /**
  * U4 check 6 -- EVERY CHANGE IS LOGGED, AND THE LOG CANNOT BE CHANGED.
  *
- *   - The router's write routes are exactly WRITE_ROUTES (22), and with the
- *     owner's language that is 23 writes. For EVERY one: one change makes
+ *   - The router's write routes are exactly WRITE_ROUTES (26: U4's 22 and
+ *     U4b's 4), and with the owner's language that is 27 writes. For EVERY one: one change makes
  *     exactly one line, naming who, what, before and after; a request that
  *     changes nothing makes none, on every route that can be asked again.
  *   - For every one that changes something: when its line cannot be written,
@@ -314,6 +314,48 @@ const WRITES = [
     line: (l) => assert.deepEqual([l.before, l.after], [{ state: 'closed', reason: 'everyone', message: 'Night' }, { state: 'open' }]),
     state: (s) => one(a.tenant, 'SELECT closed_reason FROM lanes WHERE id = $1', [s.lane.id]),
   },
+  // U4b: the people told of alerts. A person's line names them and says what
+  // changed; their phone number and email address are never in it.
+  {
+    action: 'alert_contact.add',
+    setup: async () => ({ g: await newGarage(base, a) }),
+    run: (s) => call(base, 'POST', `/garages/${s.g.id}/alert-contacts`, { as: a, body: { name: 'Night manager', phone: '555 010 1234' } }),
+    line: (l) => assert.deepEqual([l.subject_kind, l.subject_name, l.before, l.after], ['alert_contact', null, null, { language: 'en', phone: 'given', email: 'none' }]),
+    state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM alert_contacts WHERE garage_id = $1', [s.g.id]),
+  },
+  {
+    action: 'alert_contact.change',
+    setup: async () => {
+      const g = await newGarage(base, a);
+      const r = await call(base, 'POST', `/garages/${g.id}/alert-contacts`, { as: a, body: { name: 'Day manager', email: 'day.manager@example.com' } });
+      return { g, c: r.json.contact };
+    },
+    run: (s) => call(base, 'PATCH', `/garages/${s.g.id}/alert-contacts/${s.c.id}`, { as: a, body: { language: 'es' } }),
+    line: (l) => assert.deepEqual([l.subject_name, l.before, l.after], [null, { language: 'en' }, { language: 'es' }]),
+    state: (s) => one(a.tenant, 'SELECT language FROM alert_contacts WHERE id = $1', [s.c.id]),
+  },
+  {
+    action: 'alert_contact.remove',
+    setup: async () => {
+      const g = await newGarage(base, a);
+      const r = await call(base, 'POST', `/garages/${g.id}/alert-contacts`, { as: a, body: { name: 'Leaving', email: 'leaving@example.com' } });
+      return { g, c: r.json.contact };
+    },
+    run: (s) => call(base, 'DELETE', `/garages/${s.g.id}/alert-contacts/${s.c.id}`, { as: a }),
+    line: (l) => assert.deepEqual([l.subject_name, l.before, l.after], [null, { language: 'en', phone: 'none', email: 'given', by_text: [], by_email: [] }, null]),
+    state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM alert_contacts WHERE id = $1', [s.c.id]),
+  },
+  {
+    action: 'alert_contact.choices',
+    setup: async () => {
+      const g = await newGarage(base, a);
+      const r = await call(base, 'POST', `/garages/${g.id}/alert-contacts`, { as: a, body: { name: 'Owner on call', phone: '+44 20 7946 0000', email: 'on.call@example.com' } });
+      return { g, c: r.json.contact };
+    },
+    run: (s) => call(base, 'PUT', `/garages/${s.g.id}/alert-contacts/${s.c.id}/choices`, { as: a, body: { by_text: ['card_payments_stopped'], by_email: [] } }),
+    line: (l) => assert.deepEqual([l.subject_name, l.before, l.after], [null, { by_text: [] }, { by_text: ['card_payments_stopped'] }]),
+    state: (s) => one(a.tenant, 'SELECT by_text, by_email FROM alert_contacts WHERE id = $1', [s.c.id]),
+  },
   {
     action: 'language.change',
     setup: async () => ({}),
@@ -342,15 +384,16 @@ function routeTable(expressApp) {
   return out;
 }
 
-test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 22 -- and every one has a recipe here, or is always refused', () => {
+test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 26 -- and every one has a recipe here, or is always refused', () => {
   const writes = routeTable(expressApp).filter((r) => r.mount === '/api/v1' && r.method !== 'GET').map((r) => `${r.method} ${r.path}`);
   assert.deepEqual(writes.sort(), WRITE_ROUTES.map(([m, p]) => `${m} ${p}`).sort());
-  assert.equal(WRITE_ROUTES.length, 22);
+  // 22 from U4, and U4b's four: a person added, changed, removed, and what they get.
+  assert.equal(WRITE_ROUTES.length, 26);
   const covered = new Set([...WRITES.map((w) => w.action), ...ALWAYS_REFUSED]);
   assert.deepEqual(WRITE_ROUTES.map(([, , action]) => action).filter((x) => !covered.has(x)), [], 'a write route with no recipe here');
   // The owner's one write outside the operator router: the language.
   assert.deepEqual(routeTable(expressApp).filter((r) => r.mount === '/api/v1/auth' && r.method === 'PUT').map((r) => r.path), ['/language']);
-  assert.equal(WRITES.length, 22, '21 operator writes that can succeed, and the language: 23 writes with the retired rates route');
+  assert.equal(WRITES.length, 26, '25 operator writes that can succeed, and the language: 27 writes with the retired rates route');
 });
 
 test('EVERY WRITE: one change, exactly one line -- who, what, before and after -- by the session, and by the key the same way', async () => {
@@ -606,6 +649,8 @@ test('NOTHING CHANGED, NO LINE: every route asked for what is already so writes 
   const paid = await paidGarage();
   assert.equal((await call(base, 'POST', `/garages/${paid.g.id}/stripe-account/refresh`, { as: a })).status, 200);
   assert.equal((await call(base, 'POST', `/garages/${paid.g.id}/stripe-account/location`, { as: a, body: { display_name: 'Paid Garage', address: ADDRESS } })).status, 201);
+  const person = (await call(base, 'POST', `/garages/${g.id}/alert-contacts`, { as: a, body: { name: 'Same person', phone: '5550104444' } })).json.contact;
+  assert.equal((await call(base, 'PUT', `/garages/${g.id}/alert-contacts/${person.id}/choices`, { as: a, body: { by_text: ['lane_problem'], by_email: [] } })).status, 200);
 
   const again = [
     ['the drivers answer, the same', () => call(base, 'PATCH', `/garages/${g.id}`, { as: a, body: { transient_available: true } }), 200],
@@ -621,6 +666,8 @@ test('NOTHING CHANGED, NO LINE: every route asked for what is already so writes 
     ['the payment account read again, unchanged', () => call(base, 'POST', `/garages/${paid.g.id}/stripe-account/refresh`, { as: a }), 200],
     ['the reader place asked for again', () => call(base, 'POST', `/garages/${paid.g.id}/stripe-account/location`, { as: a, body: { display_name: 'Paid Garage', address: ADDRESS } }), 200],
     ['the language it already is', () => call(base, 'PUT', '/auth/language', { as: a, body: { language: 'en' } }), 200],
+    ['a person changed to what they are', () => call(base, 'PATCH', `/garages/${g.id}/alert-contacts/${person.id}`, { as: a, body: { name: 'Same person', phone: '(555) 010-4444', language: 'en' } }), 200],
+    ['a person given the choices they have', () => call(base, 'PUT', `/garages/${g.id}/alert-contacts/${person.id}/choices`, { as: a, body: { by_text: ['lane_problem'], by_email: [] } }), 200],
   ];
   for (const [what, run, status] of again) {
     const since = await ids();
