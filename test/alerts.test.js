@@ -689,6 +689,40 @@ test('NO TYPED CONTACT TEXT IN ANY STORED LINE: after every route and every chan
       await call(base, method, path, { as: a, origin: FOREIGN_ORIGIN, body: { name: text } });
     }
   }
+  // And in every spelling of the address the server takes for the contact
+  // routes: any case, a trailing slash, a doubled slash, the garage's id in
+  // capitals, characters encoded in the id. Each spelling carries its own
+  // text, so a red names the spelling it came through.
+  const spelled = (n) => `Maria-55501002${String(n).padStart(2, '0')}`;
+  const spellings = [
+    ['PATCH', '/api/v1/garages/G/alert-contacts/{id}'],
+    ['PATCH', '/api/v1/garages/G/Alert-Contacts/{id}'],
+    ['PATCH', '/api/v1/garages/G/ALERT-CONTACTS/{id}'],
+    ['DELETE', '/api/v1/garages/G/aLeRt-CoNtAcTs/{id}'],
+    ['PATCH', '/api/v1/garages/G/alert-contacts/{id}/'],
+    ['DELETE', '/api/v1/garages/G/Alert-Contacts/{id}/'],
+    ['PUT', '/api/v1/garages/G/alert-contacts/{id}/choices/'],
+    ['PUT', '/api/v1/garages/G/Alert-Contacts/{id}/CHOICES'],
+    ['POST', '/api/v1/garages/G/ALERT-CONTACTS/{id}/more'],
+    ['PATCH', '/API/V1/GARAGES/G/ALERT-CONTACTS/{id}'],
+    ['PATCH', '/api/v1//garages/G/Alert-Contacts/{id}'],
+    ['PATCH', '/api/v1/garages/{GARAGE}/Alert-Contacts/{id}'],
+    ['PATCH', '/api/v1/garages/G/alert-contacts/{encoded}'],
+    ['PATCH', '/api/v1/garages/G/Alert-Contacts/{encoded}/'],
+    ['PATCH', '/api/v1/garages/G/ALERT-CONTACTS/{id}%2Fchoices'],
+  ].map(([method, shape], n) => {
+    const text = spelled(n);
+    const id = shape.includes('{encoded}') ? text.replace('M', '%4D').replace('5', '%35') : encodeURIComponent(text);
+    const path = shape.replace('{GARAGE}', g.id.toUpperCase()).replace('/G/', `/${g.id}/`).replace(/\{(id|encoded)\}/, id);
+    return { method, shape, text, sent: id, path };
+  });
+  for (const s of spellings) {
+    send({ name: s.text });
+    for (const headers of [{}, { cookie: a.cookie, origin: FOREIGN_ORIGIN }]) {
+      const r = await fetch(`${base}${s.path}`, { method: s.method, headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify({ name: s.text }) });
+      assert.ok([401, 403].includes(r.status), `${s.method} ${s.shape} was answered ${r.status}, not refused`);
+    }
+  }
 
   const kinds = new Set((await linesOf(a.tenant)).filter((l) => l.action.startsWith('alert_contact.')).map((l) => `${l.outcome}:${l.action}`));
   for (const k of ['done:alert_contact.add', 'done:alert_contact.change', 'done:alert_contact.choices', 'done:alert_contact.remove', 'refused:alert_contact.change', 'refused:alert_contact.add', 'refused:alert_contact.choices', 'refused:alert_contact.remove']) {
@@ -721,7 +755,12 @@ test('NO TYPED CONTACT TEXT IN ANY STORED LINE: after every route and every chan
     }
   }
   assert.ok(typed.size > 80, `${typed.size} typed texts scanned`);
-  for (const form of [...RE_GATE_FORMS.map(([, n]) => n), ...oddPhones, ...oddEmails, ...inPaths]) assert.ok(typed.has(form), `${form} was not scanned`);
+  for (const form of [...RE_GATE_FORMS.map(([, n]) => n), ...oddPhones, ...oddEmails, ...inPaths, ...spellings.map((s) => s.text)]) assert.ok(typed.has(form), `${form} was not scanned`);
+  // Each spelling of the address, by name: neither its text nor the id as it was sent is in a log.
+  for (const s of spellings) {
+    const held = [...lines, ...security].filter((l) => [s.text, s.sent].some((t) => JSON.stringify(l).includes(t)));
+    assert.deepEqual(held.map((l) => l.request), [], `typed text sent through ${s.method} ${s.shape} is in a log`);
+  }
   assert.deepEqual(typedIn([lines, security], [...typed]), [], 'something typed about a person is in a log');
   assert.deepEqual(typedIn(output, [...typed]), [], 'something typed about a person was printed');
   // DIGITS ONLY: every number sent, as a phone, in a name, in an address or a path.
@@ -735,7 +774,8 @@ test('NO TYPED CONTACT TEXT IN ANY STORED LINE: after every route and every chan
     'POST /api/v1/garages/:garageId/alert-contacts/...']);
   const tried = [...lines, ...security].filter((l) => /alert-contacts/i.test(l.request ?? ''));
   assert.ok(tried.length >= 4, `${tried.length} refused attempts on a person`);
-  for (const l of tried) assert.ok(ROUTES.has(l.request), `a refused attempt names ${JSON.stringify(l.request)}`);
+  // The mount is named as it was sent (`/API/V1`): the platform's own words, in the caller's case.
+  for (const l of tried) assert.ok(ROUTES.has(l.request.replace(/^([A-Z]+) \/api\/v1\//i, '$1 /api/v1/')), `a refused attempt names ${JSON.stringify(l.request)}`);
 });
 
 test('REMOVAL REMOVES: a person is named in every line as they are named now; removed, every line about them says so and names no one, on every read', async () => {

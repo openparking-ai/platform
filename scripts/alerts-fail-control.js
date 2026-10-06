@@ -16,6 +16,7 @@
  *   name_in_line              a person's name is stored in their line again        (fix 2, check 1)
  *   line_words_off            a line about a person may hold any text               (fix 2, check 1)
  *   request_as_sent           a refused attempt on a person names the path as sent  (fix 2, check 1)
+ *   contact_path_case_only    a person's address is known in lower case only        (fix 3, G1)
  *   removed_still_said_named  a removed person's lines are not said to be removed   (fix 2, check 2)
  *   name_as_written           the log's read names a person as the line holds them  (fix 2, check 2)
  *   line_outside_transaction  a person's line is written on its own transaction    (check 6)
@@ -142,6 +143,16 @@ const SOURCE_BREAKS = [
     scratch: true,
     red: ['NO TYPED CONTACT TEXT IN ANY STORED LINE'],
     edits: [{ file: 'src/app.js', from: '        request: requestFor(req),', to: '' }],
+  },
+  {
+    name: 'contact_path_case_only',
+    why: "a person's address is known in lower case only, as the second re-gate's plant had it",
+    suite: ALERTS,
+    scratch: true,
+    red: ['NO TYPED CONTACT TEXT IN ANY STORED LINE'],
+    // Red by the spelling it came through, not only by the test's name.
+    says: 'typed text sent through PATCH /api/v1/garages/G/Alert-Contacts/{id} is in a log',
+    edits: [{ file: 'src/app.js', from: 'const CONTACT_PATH = /\\/alert-contacts(\\/|$)/i;', to: 'const CONTACT_PATH = /\\/alert-contacts(\\/|$)/;' }],
   },
   {
     name: 'removed_still_said_named',
@@ -373,12 +384,12 @@ for (const suite of [ALERTS, LOG, ISOLATION]) {
 
 function judge(brk, broken) {
   const red = redTests(broken);
-  const named = brk.red.every((want) => red.some((t) => t.includes(want)));
+  const named = brk.red.every((want) => red.some((t) => t.includes(want))) && (!brk.says || broken.stdout.includes(brk.says));
   if (broken.status === 0) {
     console.error(`  ${brk.name.padEnd(26)} *** PASSED WHEN ${brk.why.toUpperCase()} — the suite is not measuring this ***`);
     failures += 1;
   } else if (!named) {
-    console.error(`  ${brk.name.padEnd(26)} *** RED, BUT NOT IN "${brk.red.join('", "')}" — red: ${red.join(' | ')} ***`);
+    console.error(`  ${brk.name.padEnd(26)} *** RED, BUT NOT IN "${brk.red.join('", "')}"${brk.says ? ` SAYING "${brk.says}"` : ''} — red: ${red.join(' | ')} ***`);
     failures += 1;
   } else {
     console.log(`  ${brk.name.padEnd(26)} fails as required when ${brk.why} — ${summarise(broken)}; named: ${brk.red.join(', ')}`);
