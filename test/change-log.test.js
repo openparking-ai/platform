@@ -356,6 +356,51 @@ const WRITES = [
     line: (l) => assert.deepEqual([l.subject_name, l.before, l.after], [null, { by_text: [] }, { by_text: ['card_payments_stopped'] }]),
     state: (s) => one(a.tenant, 'SELECT by_text, by_email FROM alert_contacts WHERE id = $1', [s.c.id]),
   },
+  // U4c: the board. A message's line holds what the screen shows, where and when.
+  {
+    action: 'board_message.add',
+    setup: async () => {
+      const g = await newGarage(base, a);
+      return { g, lane: await newLane(base, a, g.id, 'North', 'entry') };
+    },
+    run: (s) => call(base, 'POST', `/garages/${s.g.id}/board-messages`, { as: a, body: { text: 'Event tonight', lanes: [s.lane.id] } }),
+    line: (l) => assert.deepEqual([l.subject_kind, l.subject_name, l.before, l.after], ['board_message', 'Event tonight', null, { text: 'Event tonight', lanes: ['North'], starts: null, ends: null }]),
+    state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM board_messages WHERE garage_id = $1', [s.g.id]),
+  },
+  {
+    action: 'board_message.change',
+    setup: async () => {
+      const g = await newGarage(base, a);
+      const lane = await newLane(base, a, g.id, 'North', 'entry');
+      const r = await call(base, 'POST', `/garages/${g.id}/board-messages`, { as: a, body: { text: 'Event tonight', lanes: [lane.id] } });
+      return { g, lane, m: r.json.message };
+    },
+    run: (s) => call(base, 'PATCH', `/garages/${s.g.id}/board-messages/${s.m.id}`, { as: a, body: { text: 'Event tomorrow' } }),
+    line: (l) => assert.deepEqual([l.subject_name, l.before.text, l.after], ['Event tomorrow', 'Event tonight', { text: 'Event tomorrow', lanes: ['North'], starts: null, ends: null }]),
+    state: (s) => one(a.tenant, 'SELECT text FROM board_messages WHERE id = $1', [s.m.id]),
+  },
+  {
+    action: 'board_message.remove',
+    setup: async () => {
+      const g = await newGarage(base, a);
+      const lane = await newLane(base, a, g.id, 'North', 'entry');
+      const r = await call(base, 'POST', `/garages/${g.id}/board-messages`, { as: a, body: { text: 'Going', lanes: [lane.id] } });
+      return { g, lane, m: r.json.message };
+    },
+    run: (s) => call(base, 'DELETE', `/garages/${s.g.id}/board-messages/${s.m.id}`, { as: a }),
+    line: (l) => assert.deepEqual([l.subject_name, l.before, l.after], ['Going', { text: 'Going', lanes: ['North'], starts: null, ends: null }, null]),
+    state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM board_messages WHERE id = $1', [s.m.id]),
+  },
+  {
+    action: 'lane.board_prices',
+    setup: async () => {
+      const g = await newGarage(base, a);
+      return { lane: await newLane(base, a, g.id, 'North', 'entry') };
+    },
+    run: (s) => call(base, 'PUT', `/lanes/${s.lane.id}/board-prices`, { as: a, body: { show: true } }),
+    line: (l) => assert.deepEqual([l.subject_kind, l.before, l.after], ['lane', { prices: false }, { prices: true }]),
+    state: (s) => one(a.tenant, 'SELECT board_prices FROM lanes WHERE id = $1', [s.lane.id]),
+  },
   {
     action: 'language.change',
     setup: async () => ({}),
@@ -384,16 +429,18 @@ function routeTable(expressApp) {
   return out;
 }
 
-test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 26 -- and every one has a recipe here, or is always refused', () => {
+test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 30 -- and every one has a recipe here, or is always refused', () => {
   const writes = routeTable(expressApp).filter((r) => r.mount === '/api/v1' && r.method !== 'GET').map((r) => `${r.method} ${r.path}`);
   assert.deepEqual(writes.sort(), WRITE_ROUTES.map(([m, p]) => `${m} ${p}`).sort());
-  // 22 from U4, and U4b's four: a person added, changed, removed, and what they get.
-  assert.equal(WRITE_ROUTES.length, 26);
+  // 22 from U4, U4b's four: a person added, changed, removed, and what they
+  // get; and U4c's four: a board message added, changed, removed, and a
+  // lane's price switch.
+  assert.equal(WRITE_ROUTES.length, 30);
   const covered = new Set([...WRITES.map((w) => w.action), ...ALWAYS_REFUSED]);
   assert.deepEqual(WRITE_ROUTES.map(([, , action]) => action).filter((x) => !covered.has(x)), [], 'a write route with no recipe here');
   // The owner's one write outside the operator router: the language.
   assert.deepEqual(routeTable(expressApp).filter((r) => r.mount === '/api/v1/auth' && r.method === 'PUT').map((r) => r.path), ['/language']);
-  assert.equal(WRITES.length, 26, '25 operator writes that can succeed, and the language: 27 writes with the retired rates route');
+  assert.equal(WRITES.length, 30, '29 operator writes that can succeed, and the language: 31 writes with the retired rates route');
 });
 
 test('EVERY WRITE: one change, exactly one line -- who, what, before and after -- by the session, and by the key the same way', async () => {
@@ -498,7 +545,7 @@ test("REFUSED ATTEMPTS land in the right log: the wrong site, an ended session, 
 
   // A key refused in its own garage: named by the name it was issued under.
   sinceA = await idsOf(a.tenant);
-  assert.equal((await call(base, 'POST', `/lanes/${exit.id}/close`, { as: a, via: 'key', body: { reason: 'full', message: 'Full' } })).status, 409);
+  assert.equal((await call(base, 'POST', `/lanes/${exit.id}/close`, { as: a, via: 'key', body: { reason: 'everyone', message: 'Closed' } })).status, 409);
   assert.deepEqual((await refusedSince(a.tenant, sinceA)).map((l) => [l.garage_id, l.refusal, l.actor_kind, l.actor_id, l.actor_name]),
     [[g.id, 'last_open_lane', 'key', a.keyId, 'Front desk key']]);
 
@@ -651,6 +698,8 @@ test('NOTHING CHANGED, NO LINE: every route asked for what is already so writes 
   assert.equal((await call(base, 'POST', `/garages/${paid.g.id}/stripe-account/location`, { as: a, body: { display_name: 'Paid Garage', address: ADDRESS } })).status, 201);
   const person = (await call(base, 'POST', `/garages/${g.id}/alert-contacts`, { as: a, body: { name: 'Same person', phone: '5550104444' } })).json.contact;
   assert.equal((await call(base, 'PUT', `/garages/${g.id}/alert-contacts/${person.id}/choices`, { as: a, body: { by_text: ['lane_problem'], by_email: [] } })).status, 200);
+  const notice = (await call(base, 'POST', `/garages/${g.id}/board-messages`, { as: a, body: { text: 'Same words', lanes: [lane.id], starts: '2030-01-01T08:00' } })).json.message;
+  assert.equal((await call(base, 'PUT', `/lanes/${lane.id}/board-prices`, { as: a, body: { show: true } })).status, 200);
 
   const again = [
     ['the drivers answer, the same', () => call(base, 'PATCH', `/garages/${g.id}`, { as: a, body: { transient_available: true } }), 200],
@@ -668,6 +717,8 @@ test('NOTHING CHANGED, NO LINE: every route asked for what is already so writes 
     ['the language it already is', () => call(base, 'PUT', '/auth/language', { as: a, body: { language: 'en' } }), 200],
     ['a person changed to what they are', () => call(base, 'PATCH', `/garages/${g.id}/alert-contacts/${person.id}`, { as: a, body: { name: 'Same person', phone: '(555) 010-4444', language: 'en' } }), 200],
     ['a person given the choices they have', () => call(base, 'PUT', `/garages/${g.id}/alert-contacts/${person.id}/choices`, { as: a, body: { by_text: ['lane_problem'], by_email: [] } }), 200],
+    ['a board message changed to what it says', () => call(base, 'PATCH', `/garages/${g.id}/board-messages/${notice.id}`, { as: a, body: { text: ' Same words ', lanes: [lane.id], starts: '2030-01-01T08:00', ends: null } }), 200],
+    ['the price switch, as it is', () => call(base, 'PUT', `/lanes/${lane.id}/board-prices`, { as: a, body: { show: true } }), 200],
   ];
   for (const [what, run, status] of again) {
     const since = await ids();

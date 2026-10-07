@@ -8,15 +8,22 @@
  * monthly holders still get in) or `everyone` -- and the owner's own message
  * for the lane to show. Closing the last open lane of a direction would leave
  * no way in, or no way out: it is refused by name unless the request says it
- * is a deliberate override. The lane itself does not act on a closing yet;
- * `/lane/rules` carries it for the lane's own round.
+ * is a deliberate override. The lane acts on it (U4c): `/lane/rules` and the
+ * fast `/lane/stays` both carry it. `full` is a way in's reason only -- a way
+ * out has nobody to let in -- and is refused on an exit by name (0030 holds
+ * the same for every writer). The message is text for the lane's screen, so
+ * every character must be one the screen can draw (src/screenText.js).
  *
  * REMOVING. Only a lane that never had a stay, a computer, a card reader or a
  * recorded event can be removed: anything else is history, and the refusal
- * says which.
+ * says which. Nothing on the board outlives its lane: removing one takes it
+ * off every message in the same transaction, and a message left on no lane is
+ * removed with it (0030 refuses a message on no lane for every writer). The
+ * line names both.
  */
 import { HttpError } from './errors.js';
 import * as changes from './changes.js';
+import { undrawable, nameCharacter } from './screenText.js';
 
 export const CLOSE_REASONS = Object.freeze(['full', 'everyone']);
 export const NAME_MAX = 80;
@@ -37,14 +44,35 @@ export function nameField(raw) {
   return name;
 }
 
-function messageField(raw) {
-  if (typeof raw !== 'string') throw bad(`message must be text of 1 to ${MESSAGE_MAX} characters`, 'lane_message_refused');
-  const message = raw.trim();
-  if (message === '' || message.length > MESSAGE_MAX || CONTROL.test(message)) {
-    throw bad(`message must be text of 1 to ${MESSAGE_MAX} characters, with no control or invisible formatting characters`, 'lane_message_refused');
+/**
+ * Text for a lane's screen -- a closed lane's message, or one on its board:
+ * 1 to `MESSAGE_MAX` characters, no control or invisible formatting
+ * character, and every character one the screen can draw once upper-cased
+ * (src/screenText.js). A character it cannot draw is refused BY NAME, every
+ * one of them, in `details.characters`, so the owner is told what to change
+ * rather than finding a gap on the screen.
+ */
+export function screenTextField(raw, { field = 'message', code = 'lane_message_refused' } = {}) {
+  if (typeof raw !== 'string') throw bad(`${field} must be text of 1 to ${MESSAGE_MAX} characters`, code);
+  const text = raw.trim();
+  if (text === '' || text.length > MESSAGE_MAX || CONTROL.test(text)) {
+    throw bad(`${field} must be text of 1 to ${MESSAGE_MAX} characters, with no control or invisible formatting characters`, code);
   }
-  return message;
+  const absent = undrawable(text);
+  if (absent.length) {
+    throw Object.assign(
+      bad(
+        `${field} has ${absent.length === 1 ? 'a character' : 'characters'} the lane's screen cannot show: ${absent.map(nameCharacter).join(', ')}. ` +
+          "The screen shows letters A to Z, the digits, spaces, the Spanish accented letters, and . , - : ' ! ? / +",
+        code,
+      ),
+      { details: { characters: absent } },
+    );
+  }
+  return text;
 }
+
+const messageField = (raw) => screenTextField(raw);
 
 function onlyKeys(body, keys) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw bad(`the body is JSON: {${keys.join(', ')}}`);
@@ -120,6 +148,34 @@ async function historyOf(client, tenantId, laneId) {
   return rows[0];
 }
 
+/**
+ * The board messages on a lane about to go: each locked, as a change to it
+ * locks it, then the ones on no other lane removed. The lane's own rows go
+ * with the lane. What the line keeps: the messages that lost the lane, and
+ * the ones removed with it, by their words -- only when there are any.
+ */
+async function offTheBoard(client, tenantId, laneId) {
+  const { rows: on } = await client.query(
+    `SELECT m.id FROM board_messages m JOIN board_message_lanes ml ON ml.message_id = m.id AND ml.tenant_id = m.tenant_id
+      WHERE m.tenant_id = $1 AND ml.lane_id = $2 ORDER BY m.id FOR UPDATE OF m`,
+    [tenantId, laneId],
+  );
+  if (on.length === 0) return {};
+  const { rows } = await client.query(
+    `SELECT m.id, m.text,
+            (SELECT count(*) FROM board_message_lanes o WHERE o.tenant_id = m.tenant_id AND o.message_id = m.id AND o.lane_id <> $2)::int AS others
+       FROM board_messages m WHERE m.tenant_id = $1 AND m.id = ANY($3::uuid[]) ORDER BY m.created_at, m.id`,
+    [tenantId, laneId, on.map((r) => r.id)],
+  );
+  const gone = rows.filter((r) => r.others === 0);
+  if (gone.length) await client.query('DELETE FROM board_messages WHERE tenant_id = $1 AND id = ANY($2::uuid[])', [tenantId, gone.map((r) => r.id)]);
+  const kept = rows.filter((r) => r.others > 0);
+  return {
+    ...(kept.length ? { messages_off: kept.map((r) => r.text) } : {}),
+    ...(gone.length ? { messages_removed: gone.map((r) => r.text) } : {}),
+  };
+}
+
 export async function remove(client, tenantId, laneId, ctx) {
   const lane = await lockedLane(client, tenantId, laneId);
   const had = await historyOf(client, tenantId, laneId);
@@ -132,10 +188,11 @@ export async function remove(client, tenantId, laneId, ctx) {
       had,
     );
   }
+  const board = await offTheBoard(client, tenantId, laneId);
   await client.query('DELETE FROM lanes WHERE tenant_id = $1 AND id = $2', [tenantId, laneId]);
   await changes.record(client, ctx, {
     garageId: lane.garage_id, action: 'lane.remove', subject: subjectOf(lane),
-    before: { name: lane.name, direction: lane.direction }, after: null,
+    before: { name: lane.name, direction: lane.direction, ...board }, after: null,
   });
   return lane;
 }
@@ -148,6 +205,13 @@ export async function close(client, tenantId, laneId, body, ctx) {
   const message = messageField(body.message);
   if (body.override !== undefined && body.override !== true) throw bad('override, when sent, is true', 'lane_override_refused');
   const lane = await lockedGarageLanes(client, tenantId, laneId);
+  // FULL IS A WAY IN'S REASON (U4c, rule 3). It lets pass and monthly
+  // holders in and nobody else; a way out has nobody to let in, so a full
+  // exit would be a lane closed to every car leaving while it said it was
+  // not. Refused by name; an exit is closed to everyone.
+  if (body.reason === 'full' && lane.direction !== 'entry') {
+    throw bad('reason full is for a way in: it lets pass and monthly holders in. A way out is closed to everyone', 'lane_reason_refused');
+  }
   const lanes = lane.all;
   const openOthers = lanes.filter((l) => l.id !== lane.id && l.direction === lane.direction && l.closed_reason === null);
   if (lane.closed_reason === null && openOthers.length === 0 && body.override !== true) {

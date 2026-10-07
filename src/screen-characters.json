@@ -1,0 +1,9 @@
+{
+  "characters": " !'+,-./0123456789:?ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÑÓÚÜ",
+  "source": {
+    "repo": "openparking-ai/gate-agent",
+    "commit": "cfc5ecb1ab13d9ce3ebc98ad87646636185a9421",
+    "path": "src/gate_agent/font.py",
+    "names": ["GLYPHS", "ACCENTED"]
+  }
+}

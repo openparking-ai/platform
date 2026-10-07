@@ -189,9 +189,10 @@ test('the last open lane of a direction: refused with a warning that names it, a
   const inRefused = await call(base, 'POST', `/lanes/${entry.id}/close`, { as: a, body: { reason: 'full', message: 'Full.' } });
   assert.deepEqual([inRefused.status, inRefused.json.code, inRefused.json.details], [409, 'last_open_lane', { direction: 'entry' }]);
   assert.match(inRefused.json.error, /last open way in/);
-  // A closed lane closed again changes its reason and message, and is not the last-lane question.
-  const reclose = await call(base, 'POST', `/lanes/${second.id}/close`, { as: a, body: { reason: 'full', message: 'Full now.' } });
+  // A closed lane closed again changes its message, and is not the last-lane question.
+  const reclose = await call(base, 'POST', `/lanes/${second.id}/close`, { as: a, body: { reason: 'everyone', message: 'Closed until morning.' } });
   assert.equal(reclose.status, 200, reclose.text);
+  assert.equal((await laneRow(a.tenant, second.id)).closed_message, 'Closed until morning.');
 });
 
 // --- check 2: your garage only -----------------------------------------------------------

@@ -65,7 +65,7 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 | | |
 |---|---|
 | `GET /api/v1/lane/rules` | what the lane caches so it can decide offline: the garage's plans whole, its space class, each linked module's register, the open stays with a cursor — the slow cadence |
-| `GET /api/v1/lane/stays?since=<cursor>` | every stay changed since the cursor, closed rows included — the fast cadence; without `since`, the full open set |
+| `GET /api/v1/lane/stays?since=<cursor>` | every stay changed since the cursor, closed rows included — the fast cadence; without `since`, the full open set; every answer also carries the lane's own `lane` state and `board` |
 | `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` |
 | `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor` |
 | `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation`; carries and echoes an optional `descriptor` |
@@ -465,7 +465,7 @@ breaks each property in turn.
 
     GET    /api/v1/garages/<id>/setup     {setup: {garage_id, open, takes_any_driver, steps: [{key, done, facts}]}}
     PATCH  /api/v1/lanes/<id>             {name}                         rename
-    DELETE /api/v1/lanes/<id>                                            only a lane never used
+    DELETE /api/v1/lanes/<id>                                            only a lane never used; takes its screen messages with it
     POST   /api/v1/lanes/<id>/close       {reason, message, override?}   full | everyone
     POST   /api/v1/lanes/<id>/reopen
     GET    /api/v1/garages/<id>/changes[/<line id>]           {changes: [...], next}            the changes made, newest first, 50 a page
@@ -495,11 +495,50 @@ open lane of a direction is `409 last_open_lane` unless the request says
 id, before it reads any of them, so two closings at once queue rather than
 deadlock, and the second sees the first; connecting a computer holds its lane
 (`FOR KEY SHARE`), so a removal at the same moment either refuses it or comes
-second (`test/races.test.js`). `/lane/rules` carries the lane's state and
-message; nothing at the lane acts on it yet.
+second (`test/races.test.js`). `/lane/rules` and the fast `/lane/stays` both
+carry the lane's state and message, and the lane acts on it (U4c). `full` is
+a way in's reason only and is refused on a way out by name
+(`400 lane_reason_refused`; 0030 holds the same in the database).
+
+**Text for a lane's screen** -- a closed lane's message, or a board message --
+is 1 to 160 characters, and every character must be one the screen can draw
+once upper-cased: the screen's font is upper case only, `A`-`Z`, `0`-`9`, the
+Spanish accented capitals and `` .,-:'!?/+`` and space. A character outside it
+is refused naming each one (`details.characters`), never shown as a gap. The
+list is `src/screen-characters.json`, a copy of gate-agent's
+`src/gate_agent/font.py` at the commit the file names;
+`npm run check-screen-characters` reads that font at that commit and requires
+the same set (in CI, with a self-test that plants one character on each
+side). `GET /api/v1/garages/<id>/lanes` and `.../board` serve the list as
+`screen: {characters, message_max}`.
+
+**The board** (0030): what a lane's screen shows while no ticket or fee is up
+and the lane is open -- the owner's messages, one after another, and the
+price where the owner switches it on. Nobody types a price: the lane works it
+out with the engine and the taxes it charges with.
+
+    GET    /api/v1/garages/<id>/board                                          {timezone, messages_max, messages, lanes, screen}
+    POST   /api/v1/garages/<id>/board-messages        {text, lanes: [laneId], starts?, ends?}   201 {message}
+    PATCH  /api/v1/garages/<id>/board-messages/<id>   {text?, lanes?, starts?, ends?}           {message}
+    DELETE /api/v1/garages/<id>/board-messages/<id>                                              204
+    PUT    /api/v1/lanes/<id>/board-prices            {show: true | false}                      {lane: {id, prices}}
+
+`starts` and `ends` are optional, written in the garage's own time as
+`YYYY-MM-DDTHH:MM` and kept as instants turned with the garage's timezone; an
+end not after the start, or already past, is refused. At most 20 messages a
+garage. A message is on at least one lane, always: a change to no lanes is
+refused by name, removing a lane takes it off every message and removes a
+message left on no lane in the same transaction (its change-log line names
+both, `messages_off` and `messages_removed`), and the database refuses a
+commit that would leave a message on no lane, whoever writes it. Each lane's `/lane/rules` and `/lane/stays` carry
+`board: {prices, messages: [{id, text, starts_at, ends_at}]}` -- that lane's
+messages that have not ended, oldest first -- and the lane decides by its own
+clock which are in force, so an event's message goes up and comes down on
+time with the network down. `npm run board-fail-control` breaks each property
+in turn.
 
 **The change log** (`garage_changes`, 0026). Every operator write route --
-`WRITE_ROUTES` in `src/app.js`, 26, checked against the router -- and the
+`WRITE_ROUTES` in `src/app.js`, 30, checked against the router -- and the
 owner's language write one line each, in the same transaction as the change:
 who (the signed-in owner by email, or the key by its name), what, before and
 after, when. A request that changed nothing -- the same before and after --
