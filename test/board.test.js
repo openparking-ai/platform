@@ -214,12 +214,154 @@ test('MESSAGES: added, changed and removed; refused by name for no lane, a lane 
   }
   const over = await call(base, 'POST', `/garages/${g.id}/board-messages`, { as: a, body: { text: 'One more', lanes: [entry.id] } });
   assert.deepEqual([over.status, over.json.code], [409, 'board_messages_full']);
-  // A lane removed takes its message rows with it; the message stays, on no lane.
-  const spare = await newLane(base, a, other.g.id, 'Spare', 'entry');
-  const onSpare = (await call(base, 'POST', `/garages/${other.g.id}/board-messages`, { as: a, body: { text: 'Spare only', lanes: [spare.id] } })).json.message;
+});
+
+// --- fix round, F1: nothing on the board outlives its lane ------------------------------
+
+const garageLines = (tenant, garageId, action) =>
+  withTenant(tenant, async (c) => (await c.query('SELECT before, after FROM garage_changes WHERE garage_id = $1 AND action = $2 ORDER BY at, id', [garageId, action])).rows);
+
+test('F1 check 1. A LANE REMOVED TAKES ITS MESSAGES: one on that lane alone goes with it, one on others loses it; the change log names both; nothing counts toward the most a garage holds', async () => {
+  const { g, entry } = await world();
+  const spare = await newLane(base, a, g.id, 'Spare', 'entry');
+  const alone = (await call(base, 'POST', `/garages/${g.id}/board-messages`, { as: a, body: { text: 'Spare only', lanes: [spare.id] } })).json.message;
+  const shared = (await call(base, 'POST', `/garages/${g.id}/board-messages`, { as: a, body: { text: 'Both doors', lanes: [entry.id, spare.id] } })).json.message;
+  for (let i = 2; i < MESSAGES_MAX; i += 1) {
+    assert.equal((await call(base, 'POST', `/garages/${g.id}/board-messages`, { as: a, body: { text: `Notice ${i}`, lanes: [entry.id] } })).status, 201);
+  }
   assert.equal((await call(base, 'DELETE', `/lanes/${spare.id}`, { as: a })).status, 204);
-  const left = (await call(base, 'GET', `/garages/${other.g.id}/board`, { as: a })).json.messages.find((x) => x.id === onSpare.id);
-  assert.deepEqual(left.lanes, []);
+  const read = (await call(base, 'GET', `/garages/${g.id}/board`, { as: a })).json;
+  assert.equal(read.messages.find((m) => m.id === alone.id), undefined, 'the message on that lane alone is gone');
+  assert.deepEqual(read.messages.find((m) => m.id === shared.id).lanes, [entry.id], 'the other keeps its other lane');
+  assert.ok(read.messages.every((m) => m.lanes.length > 0), 'no message on no lane');
+  assert.equal(await withTenant(a.tenant, async (c) => (await c.query('SELECT count(*)::int AS n FROM board_messages WHERE id = $1', [alone.id])).rows[0].n), 0);
+  assert.deepEqual(await garageLines(a.tenant, g.id, 'lane.remove'), [{
+    before: { name: 'Spare', direction: 'entry', messages_off: ['Both doors'], messages_removed: ['Spare only'] }, after: null,
+  }]);
+  // The one removed with the lane no longer counts: the garage takes one more.
+  assert.equal((await call(base, 'POST', `/garages/${g.id}/board-messages`, { as: a, body: { text: 'One more', lanes: [entry.id] } })).status, 201);
+  // A lane with no message on it: its line is as it always was.
+  const bare = await newLane(base, a, g.id, 'Bare', 'exit');
+  assert.equal((await call(base, 'DELETE', `/lanes/${bare.id}`, { as: a })).status, 204);
+  assert.deepEqual((await garageLines(a.tenant, g.id, 'lane.remove'))[1], { before: { name: 'Bare', direction: 'exit' }, after: null });
+});
+
+test('F1 check 2. A MESSAGE IS ALWAYS ON A LANE: a change to no lanes is refused by name and nothing changes; the database refuses a message left on no lane, whoever writes it', async () => {
+  const { g, entry, exit } = await world();
+  const m = (await call(base, 'POST', `/garages/${g.id}/board-messages`, { as: a, body: { text: 'Event tonight', lanes: [entry.id] } })).json.message;
+  for (const body of [{ lanes: [] }, { text: 'Text only', lanes: [] }]) {
+    const before = await snapshot(a.tenant);
+    const r = await call(base, 'PATCH', `/garages/${g.id}/board-messages/${m.id}`, { as: a, body });
+    assert.deepEqual([r.status, r.json.code], [400, 'board_lanes_refused'], JSON.stringify(body));
+    assert.equal(await snapshot(a.tenant), before);
+  }
+  // A text-only change keeps its lanes.
+  const changed = await call(base, 'PATCH', `/garages/${g.id}/board-messages/${m.id}`, { as: a, body: { text: 'Event tomorrow' } });
+  assert.deepEqual(changed.json.message.lanes, [entry.id]);
+  // The route bypassed: a message's last lane taken off, a message written with none, a lane removed under its only message.
+  const raw = [
+    ['its last lane taken off', (c) => c.query('DELETE FROM board_message_lanes WHERE message_id = $1', [m.id])],
+    ['written with none', (c) => c.query('INSERT INTO board_messages (tenant_id, garage_id, text) VALUES ($1,$2,$3)', [a.tenant, g.id, 'No lane'])],
+    ['its only lane removed', (c) => c.query('DELETE FROM lanes WHERE id = $1', [entry.id])],
+  ];
+  for (const [what, write] of raw) {
+    const before = await snapshot(a.tenant);
+    await assert.rejects(withTenant(a.tenant, write), /a message shows on at least one lane/, what);
+    assert.equal(await snapshot(a.tenant), before, `${what}: nothing changed`);
+  }
+  // Moved to another lane in one transaction: taken.
+  await withTenant(a.tenant, async (c) => {
+    await c.query('DELETE FROM board_message_lanes WHERE message_id = $1', [m.id]);
+    await c.query('INSERT INTO board_message_lanes (tenant_id, message_id, lane_id) VALUES ($1,$2,$3)', [a.tenant, m.id, exit.id]);
+  });
+});
+
+/**
+ * Every column that names a lane, as the database says (its foreign keys to
+ * lanes), and what removing the lane does to its rows. `history`: a row
+ * there is the lane's history, so the lane is not removed (src/lanes.js
+ * `historyOf`). `board`: the route takes the lane off the message and
+ * removes a message left on no lane. A column added later that names a lane
+ * is red here until it is listed with what removing does to it.
+ */
+const NAMES_A_LANE = {
+  'sessions.entry_lane_id': 'history',
+  'sessions.exit_lane_id': 'history',
+  'events.lane_id': 'history',
+  'lane_devices.lane_id': 'history',
+  'lane_readers.lane_id': 'history',
+  // Written at a close with the stay's own exit lane, beside its close event, which the purge never reaches (0011).
+  'shadow_searches.exit_lane_id': 'history',
+  'board_message_lanes.lane_id': 'board',
+};
+
+test('F1 check 3. THE SWEEP: every column that names a lane is listed, and removing a lane strands no row of any of them', async () => {
+  const fks = (await pool.query(
+    `SELECT c.conrelid::regclass::text || '.' || a.attname AS col
+       FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+      WHERE c.contype = 'f' AND c.confrelid = 'lanes'::regclass ORDER BY 1`,
+  )).rows.map((r) => r.col);
+  assert.deepEqual(fks, Object.keys(NAMES_A_LANE).sort(), 'a column names a lane that is not listed here, or one listed is gone');
+  const loose = (await pool.query(
+    `SELECT table_name || '.' || column_name AS col FROM information_schema.columns
+      WHERE table_schema = 'public' AND column_name ILIKE '%lane%' AND table_name <> 'lanes' ORDER BY 1`,
+  )).rows.map((r) => r.col).filter((col) => !(col in NAMES_A_LANE));
+  assert.deepEqual(loose, [], 'a column named for a lane with no foreign key to lanes');
+
+  const { g } = await world();
+  const seed = {
+    'sessions.entry_lane_id': (c, lane) => c.query(
+      `WITH v AS (INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'F1-' || gen_random_uuid()) RETURNING id)
+       INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency, open_event_id, entry_confirmation)
+       SELECT $1, $2, v.id, $3, now(), 'USD', gen_random_uuid()::text, 'confirmed' FROM v`, [a.tenant, g.id, lane]),
+    'sessions.exit_lane_id': async (c, lane, other) => {
+      const ev = `f1-${lane}`;
+      await c.query(`INSERT INTO events (tenant_id, garage_id, lane_id, event_id, kind, occurred_at, detail) VALUES ($1,$2,$3,$4,'loop_tripped',now(),'{}')`, [a.tenant, g.id, other, ev]);
+      await c.query(
+        `WITH v AS (INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'F1-' || gen_random_uuid()) RETURNING id)
+         INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency, open_event_id, entry_confirmation,
+                               exit_lane_id, exit_at, exit_outcome, exit_confirmation, close_event_id)
+         SELECT $1, $2, v.id, $4, now() - interval '1 hour', 'USD', gen_random_uuid()::text, 'confirmed', $3, now(), 'covered', 'confirmed', $5 FROM v`,
+        [a.tenant, g.id, lane, other, ev]);
+    },
+    'events.lane_id': (c, lane) => c.query(`INSERT INTO events (tenant_id, garage_id, lane_id, event_id, kind, occurred_at, detail) VALUES ($1,$2,$3,gen_random_uuid()::text,'loop_tripped',now(),'{}')`, [a.tenant, g.id, lane]),
+    'lane_devices.lane_id': (c, lane) => c.query(`INSERT INTO lane_devices (tenant_id, lane_id, name, token_hash) VALUES ($1,$2,'pi',$3)`, [a.tenant, lane, hashToken(generateDeviceToken())]),
+    'lane_readers.lane_id': (c, lane) => c.query(
+      `INSERT INTO lane_readers (tenant_id, garage_id, lane_id, account_id, location_id, reader_id, label, bound_by)
+       VALUES ($1,$2,$3,'acct_stubF1','tml_stubF1', 'tmr_f1' || replace(gen_random_uuid()::text, '-', ''),'R','test')`, [a.tenant, g.id, lane]),
+    'shadow_searches.exit_lane_id': async (c, lane) => {
+      // As a close writes it: the close event at this lane, the stay closed at it, the search beside them.
+      const ev = `f1s-${lane}`;
+      await c.query(`INSERT INTO events (tenant_id, garage_id, lane_id, event_id, kind, occurred_at, detail) VALUES ($1,$2,$3,$4,'loop_tripped',now(),'{}')`, [a.tenant, g.id, lane, ev]);
+      await c.query(
+        `INSERT INTO shadow_searches (tenant_id, garage_id, session_id, exit_lane_id, close_event_id, candidate_ids, candidates_open, candidates_with_descriptor, true_stay_comparable, redacted_at)
+         VALUES ($1,$2,NULL,$3,$4,NULL,0,0,false,now())`, [a.tenant, g.id, lane, ev]);
+    },
+  };
+  const helper = await newLane(base, a, g.id, 'Helper', 'entry');
+  for (const [col, fate] of Object.entries(NAMES_A_LANE)) {
+    const lane = await newLane(base, a, g.id, `Sweep ${col}`.slice(0, 80), col.includes('exit') ? 'exit' : 'entry');
+    if (fate === 'board') {
+      const alone = (await call(base, 'POST', `/garages/${g.id}/board-messages`, { as: a, body: { text: 'Only here', lanes: [lane.id] } })).json.message;
+      const shared = (await call(base, 'POST', `/garages/${g.id}/board-messages`, { as: a, body: { text: 'Here and there', lanes: [lane.id, helper.id] } })).json.message;
+      assert.equal((await call(base, 'DELETE', `/lanes/${lane.id}`, { as: a })).status, 204, col);
+      const left = await withTenant(a.tenant, async (c) => (await c.query(
+        `SELECT m.id, array_agg(ml.lane_id) FILTER (WHERE ml.lane_id IS NOT NULL) AS lanes
+           FROM board_messages m LEFT JOIN board_message_lanes ml ON ml.message_id = m.id WHERE m.id = ANY($1::uuid[]) GROUP BY m.id`,
+        [[alone.id, shared.id]])).rows);
+      assert.deepEqual(left, [{ id: shared.id, lanes: [helper.id] }], `${col}: the lone message went, the other lost only this lane`);
+      continue;
+    }
+    await withTenant(a.tenant, (c) => seed[col](c, lane.id, helper.id));
+    const [table, column] = col.split('.');
+    const naming = () => withTenant(a.tenant, async (c) => (await c.query(`SELECT count(*)::int AS n FROM ${table} WHERE ${column} = $1`, [lane.id])).rows[0].n);
+    assert.equal(await naming(), 1, `${col}: seeded`);
+    const before = await snapshot(a.tenant);
+    const r = await call(base, 'DELETE', `/lanes/${lane.id}`, { as: a });
+    assert.deepEqual([r.status, r.json?.code], [409, 'lane_has_history'], `${col}: ${r.text}`);
+    assert.equal(await snapshot(a.tenant), before, `${col}: the lane stays`);
+    assert.equal(await naming(), 1, `${col}: its row still names the lane`);
+  }
 });
 
 test("YOUR GARAGE ONLY: another owner's garage, message or lane is not found, by session and by key, and nothing changes; the database refuses a lane of another garage", async () => {

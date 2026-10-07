@@ -15,12 +15,22 @@
  *   messages_every_lane        a lane is sent every message of its garage            (check 13)
  *   ended_message_sent         a message past its end is still sent                  (check 13)
  *   prices_switch_ignored      the price switch never reaches the lane               (B3)
+ *   lone_message_kept          a lane removed leaves its lone message on no lane     (F1 check 1)
+ *   removal_line_silent        the lane's removal line does not name what it removed (F1 check 1)
+ *   change_to_no_lanes         a change to no lanes is taken                         (F1 check 2)
+ *   entry_stays_uncounted      a lane a stay came in by is removed                   (F1 check 3)
+ *   exit_stays_uncounted       a lane a stay went out by is removed                  (F1 check 3)
+ *   computers_uncounted        a lane with a lane computer is removed                (F1 check 3)
+ *   readers_uncounted          a lane with a card reader is removed                  (F1 check 3)
+ *   events_uncounted           a lane with an event (or a plate search) is removed   (F1 check 3)
  *
  * Schema breaks (the copy's migrations edited; a scratch database built from
  * them):
  *   full_exit_stored           the database takes full on a way out                  (check 7)
  *   message_lane_any_garage    the database takes a lane of another garage           (B2)
  *   board_policy_dropped       a garage's messages are readable by every account     (B2)
+ *   message_on_no_lane_stored  the database takes a message on no lane              (F1 check 2)
+ *   lane_column_unlisted       a new column names a lane, unlisted in the sweep      (F1 check 3)
  *
  * Needs the same environment as the suite (a Postgres it may make a scratch
  * database on).
@@ -101,6 +111,40 @@ const SOURCE_BREAKS = [
     red: ['THE PRICE SWITCH'],
     edits: [{ file: 'src/board.js', from: '    prices: lane?.board_prices === true,', to: '    prices: false,' }],
   },
+  {
+    name: 'lone_message_kept',
+    why: 'a lane removed leaves its lone message on no lane',
+    suite: BOARD,
+    red: ['F1 check 1. A LANE REMOVED TAKES ITS MESSAGES', 'F1 check 3. THE SWEEP'],
+    edits: [{ file: 'src/lanes.js', from: "  if (gone.length) await client.query('DELETE FROM board_messages", to: "  if (false) await client.query('DELETE FROM board_messages" }],
+  },
+  {
+    name: 'removal_line_silent',
+    why: "the lane's removal line does not name what it removed",
+    suite: BOARD,
+    red: ['F1 check 1. A LANE REMOVED TAKES ITS MESSAGES'],
+    edits: [
+      { file: 'src/lanes.js', from: '    ...(kept.length ? { messages_off:', to: '    ...(false ? { messages_off:' },
+      { file: 'src/lanes.js', from: '    ...(gone.length ? { messages_removed:', to: '    ...(false ? { messages_removed:' },
+    ],
+  },
+  {
+    name: 'change_to_no_lanes',
+    why: 'a change to no lanes is taken',
+    suite: BOARD,
+    red: ['F1 check 2. A MESSAGE IS ALWAYS ON A LANE'],
+    edits: [
+      { file: 'src/board.js', from: '  if (!Array.isArray(raw) || raw.length === 0 ||', to: '  if (!Array.isArray(raw) ||' },
+      { file: 'src/board.js', from: '  if (laneIds.length === 0) throw', to: '  if (false) throw' },
+    ],
+  },
+  ...[
+    ['entry_stays_uncounted', 'a lane a stay came in by is removed', '(entry_lane_id = $2 OR exit_lane_id = $2)', 'exit_lane_id = $2'],
+    ['exit_stays_uncounted', 'a lane a stay went out by is removed', '(entry_lane_id = $2 OR exit_lane_id = $2)', 'entry_lane_id = $2'],
+    ['computers_uncounted', 'a lane with a lane computer is removed', '(SELECT count(*) FROM lane_devices WHERE tenant_id = $1 AND lane_id = $2)', '0'],
+    ['readers_uncounted', 'a lane with a card reader is removed', '(SELECT count(*) FROM lane_readers WHERE tenant_id = $1 AND lane_id = $2)', '0'],
+    ['events_uncounted', 'a lane with an event (or a plate search) is removed', '(SELECT count(*) FROM events WHERE tenant_id = $1 AND lane_id = $2)', '0'],
+  ].map(([name, why, from, to]) => ({ name, why, suite: BOARD, red: ['F1 check 3. THE SWEEP'], edits: [{ file: 'src/lanes.js', from, to }] })),
 ];
 
 const SCHEMA_BREAKS = [
@@ -124,6 +168,20 @@ const SCHEMA_BREAKS = [
     suite: ISOLATION,
     red: ['board_messages: a tenant reads only its own rows'],
     edits: [{ file: '0030_lane_board.sql', from: 'CREATE POLICY board_messages_tenant_isolation ON board_messages\n  USING      (tenant_id = current_tenant_id())', to: 'CREATE POLICY board_messages_tenant_isolation ON board_messages\n  USING      (true)' }],
+  },
+  {
+    name: 'message_on_no_lane_stored',
+    why: 'the database takes a message on no lane',
+    suite: BOARD,
+    red: ['F1 check 2. A MESSAGE IS ALWAYS ON A LANE'],
+    edits: [{ file: '0030_lane_board.sql', from: '       AND NOT EXISTS (SELECT 1 FROM board_message_lanes WHERE message_id = message) THEN', to: '       AND false THEN' }],
+  },
+  {
+    name: 'lane_column_unlisted',
+    why: 'a new column names a lane, unlisted in the sweep',
+    suite: BOARD,
+    red: ['F1 check 3. THE SWEEP'],
+    edits: [{ file: '0030_lane_board.sql', from: '  ADD COLUMN board_prices boolean NOT NULL DEFAULT false,', to: '  ADD COLUMN board_prices boolean NOT NULL DEFAULT false,\n  ADD COLUMN paired_lane_id uuid REFERENCES lanes(id) ON DELETE SET NULL,' }],
   },
 ];
 

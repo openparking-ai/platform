@@ -465,7 +465,7 @@ breaks each property in turn.
 
     GET    /api/v1/garages/<id>/setup     {setup: {garage_id, open, takes_any_driver, steps: [{key, done, facts}]}}
     PATCH  /api/v1/lanes/<id>             {name}                         rename
-    DELETE /api/v1/lanes/<id>                                            only a lane never used
+    DELETE /api/v1/lanes/<id>                                            only a lane never used; takes its screen messages with it
     POST   /api/v1/lanes/<id>/close       {reason, message, override?}   full | everyone
     POST   /api/v1/lanes/<id>/reopen
     GET    /api/v1/garages/<id>/changes[/<line id>]           {changes: [...], next}            the changes made, newest first, 50 a page
@@ -526,7 +526,11 @@ out with the engine and the taxes it charges with.
 `starts` and `ends` are optional, written in the garage's own time as
 `YYYY-MM-DDTHH:MM` and kept as instants turned with the garage's timezone; an
 end not after the start, or already past, is refused. At most 20 messages a
-garage. Each lane's `/lane/rules` and `/lane/stays` carry
+garage. A message is on at least one lane, always: a change to no lanes is
+refused by name, removing a lane takes it off every message and removes a
+message left on no lane in the same transaction (its change-log line names
+both, `messages_off` and `messages_removed`), and the database refuses a
+commit that would leave a message on no lane, whoever writes it. Each lane's `/lane/rules` and `/lane/stays` carry
 `board: {prices, messages: [{id, text, starts_at, ends_at}]}` -- that lane's
 messages that have not ended, oldest first -- and the lane decides by its own
 clock which are in force, so an event's message goes up and comes down on

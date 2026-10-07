@@ -7,7 +7,9 @@
  *
  * A MESSAGE is text for the screen (the closed message's rule, src/lanes.js:
  * 1 to 160 characters, every one drawable once upper-cased), the lanes it
- * shows on -- at least one, every one a lane of this garage -- and an
+ * shows on -- at least one, always, every one a lane of this garage; a lane
+ * removed takes its messages off it, and one left on no lane goes with it
+ * (src/lanes.js, 0030) -- and an
  * optional start and end, written in the GARAGE'S time as `YYYY-MM-DDTHH:MM`
  * and kept as instants turned with the garage's timezone. The lane compares
  * the instants with its own clock, so a message goes up and comes down by
@@ -155,6 +157,7 @@ export async function change(client, tenantId, garage, messageId, body, ctx) {
   const row = await messageRow(client, tenantId, garage.id, messageId, true);
   const text = body.text === undefined ? row.text : screenTextField(body.text, { field: 'text', code: 'board_text_refused' });
   const laneIds = body.lanes === undefined ? row.lanes : lanesField(body.lanes);
+  if (laneIds.length === 0) throw bad('lanes is the list of lanes the message shows on: a message shows on at least one lane', 'board_lanes_refused');
   const starts = body.starts === undefined ? row.starts : localField(body.starts, 'starts');
   const ends = body.ends === undefined ? row.ends : localField(body.ends, 'ends');
   if (body.lanes !== undefined) await checkLanes(client, tenantId, garage.id, laneIds);

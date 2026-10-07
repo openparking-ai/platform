@@ -272,8 +272,17 @@ export const TENANT_TABLES = [
   },
   {
     table: 'board_messages',
+    // A message is on at least one lane at every commit (0030): written with the world's way in.
     insert: (c, t, w) =>
-      c.query(`INSERT INTO board_messages (tenant_id, garage_id, text) VALUES ($1, $2, 'Row') RETURNING id`, [t, w.garage]),
+      c.query(
+        `WITH m AS (
+           INSERT INTO board_messages (tenant_id, garage_id, text) VALUES ($1, $2, 'Row') RETURNING id
+         ), l AS (
+           INSERT INTO board_message_lanes (tenant_id, message_id, lane_id) SELECT $1, m.id, $3 FROM m
+         )
+         SELECT id FROM m`,
+        [t, w.garage, w.entryLane],
+      ),
   },
   {
     table: 'board_message_lanes',

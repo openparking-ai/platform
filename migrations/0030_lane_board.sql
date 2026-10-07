@@ -14,8 +14,13 @@
 --                         tonight goes up and comes down by itself; a lane
 --                         with no network keeps to the instants it holds.
 --   board_message_lanes   which lanes a message shows on. Every one is a lane
---                         of the message's own garage; a lane that is removed
---                         takes its rows with it.
+--                         of the message's own garage, and a message is on at
+--                         least one, always: nothing on the board outlives its
+--                         lane. Removing a lane takes it off every message
+--                         (its rows go with it) and the route removes, in the
+--                         same transaction, a message left on no lane
+--                         (src/lanes.js); a transaction that would commit a
+--                         message on no lane is refused, whoever writes it.
 --   lanes.board_prices    the owner's switch: this lane shows the price.
 --
 -- The text of a message is 1 to 160 characters with no control or invisible
@@ -144,6 +149,47 @@ CREATE FUNCTION board_message_lanes_same_garage() RETURNS trigger
 CREATE TRIGGER board_message_lanes_on_own_garage
   AFTER INSERT OR UPDATE ON board_message_lanes
   FOR EACH ROW EXECUTE FUNCTION board_message_lanes_same_garage();
+
+-- ---------------------------------------------------------------------------
+-- A message is on at least one lane, at every commit, whoever writes.
+--
+-- Checked at COMMIT (a deferred constraint trigger), so a message and its
+-- first lane are written one after the other in one transaction, and a lane
+-- removed with its last message goes in one. Fired by a message written and
+-- by a lane row going -- deleted, by a lane's removal too, or moved to
+-- another message. A message that is itself gone by then (removed, or its
+-- garage or account with it) is not checked.
+-- ---------------------------------------------------------------------------
+CREATE FUNCTION board_messages_on_a_lane() RETURNS trigger
+  LANGUAGE plpgsql
+  SET search_path = pg_catalog, public
+  AS $$
+  DECLARE
+    message uuid;
+  BEGIN
+    IF TG_TABLE_NAME = 'board_messages' THEN
+      message := NEW.id;
+    ELSE
+      message := OLD.message_id;
+    END IF;
+    IF EXISTS (SELECT 1 FROM board_messages WHERE id = message)
+       AND NOT EXISTS (SELECT 1 FROM board_message_lanes WHERE message_id = message) THEN
+      RAISE EXCEPTION 'board_messages_lanes: a message shows on at least one lane'
+        USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NULL;
+  END
+  $$;
+
+CREATE CONSTRAINT TRIGGER board_messages_have_a_lane
+  AFTER INSERT ON board_messages
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION board_messages_on_a_lane();
+
+CREATE CONSTRAINT TRIGGER board_message_lanes_leave_a_lane
+  AFTER DELETE OR UPDATE OF message_id ON board_message_lanes
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION board_messages_on_a_lane();
 
 -- The change log names a message as its subject.
 ALTER TABLE garage_changes DROP CONSTRAINT garage_changes_subject_kind_check;
