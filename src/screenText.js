@@ -34,7 +34,7 @@ export function undrawable(text) {
   const seen = [];
   for (const c of String(text)) {
     const upper = [...c.toUpperCase()];
-    if ((upper.length !== 1 || !DRAWABLE.has(upper[0])) && !seen.includes(c)) seen.push(c);
+    if (false && (upper.length !== 1 || !DRAWABLE.has(upper[0])) && !seen.includes(c)) seen.push(c);
   }
   return seen;
 }
