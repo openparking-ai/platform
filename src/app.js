@@ -1637,7 +1637,7 @@ export function createApp() {
         if (since === undefined) {
           const cursor = await repo.stayCursor(client, tenantId, garageId);
           const open = await repo.openStaysForLane(client, tenantId, garageId);
-          return { cursor, open, lane, board: laneBoard };
+          return { cursor, open, board: laneBoard };
         }
         const { changes, more } = await repo.stayChangesSince(client, tenantId, garageId, String(since), STAY_PAGE);
         // The cursor never runs ahead of what was delivered: the last row's
@@ -1645,7 +1645,7 @@ export function createApp() {
         // the table after the rows were read could cover a row that committed
         // in between, and that row would then be in no delta.
         const cursor = changes.length ? changes[changes.length - 1].change_seq : String(since);
-        return { since: String(since), cursor, changes, more, lane, board: laneBoard };
+        return { since: String(since), cursor, changes, more, board: laneBoard };
       });
       if (!answer) throw new HttpError(404, 'garage not found');
       res.json(answer);
