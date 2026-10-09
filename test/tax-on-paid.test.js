@@ -187,6 +187,8 @@ before(async () => {
   operatorToken = token;
   admin = new pg.Client({ connectionString: process.env.DATABASE_URL });
   await admin.connect();
+  // The owner, in this file's one account: FORCE binds it too.
+  await admin.query("SELECT set_config('openparking.tenant_id', $1, false)", [tenant]);
   server = createApp().listen(0);
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}`;

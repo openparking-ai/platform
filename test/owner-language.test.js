@@ -248,7 +248,7 @@ test('only PUT changes it: any other method on the path is not a route', async (
 
 // --- the migration ------------------------------------------------------------------------
 
-/** Every statement of `files`, in order, on the owner connection to `url`. */
+/** Every statement of `files`, in order, on the connection to `url`. */
 async function apply(url, files) {
   const c = new pg.Client({ connectionString: url });
   await c.connect();
@@ -263,7 +263,10 @@ test('0025 on a database that already has admins: every one is English, and the 
   const files = (await readdir(MIGRATIONS)).filter((f) => f.endsWith('.sql')).sort();
   const at = files.findIndex((f) => f.startsWith('0025_'));
   assert.ok(at > 0, 'no 0025 migration on disk');
-  const owner = new URL(process.env.DATABASE_URL);
+  // Built by the superuser, as the database of a deployment that predates the
+  // owner rules was: it applies 0001 itself and writes admins in three
+  // accounts with no account set.
+  const owner = new URL(process.env.SUPERUSER_URL);
   const maintenance = new URL(owner);
   maintenance.pathname = '/postgres';
   const name = `op_lang_${randomUUID().slice(0, 8)}`;
@@ -271,7 +274,12 @@ test('0025 on a database that already has admins: every one is English, and the 
   scratch.pathname = `/${name}`;
   const m = new pg.Client({ connectionString: maintenance.toString() });
   await m.connect();
-  await m.query(`CREATE DATABASE ${pg.escapeIdentifier(name)}`);
+  try {
+    await m.query(`CREATE DATABASE ${pg.escapeIdentifier(name)}`);
+  } catch (err) {
+    await m.end();
+    throw err;
+  }
   try {
     await apply(scratch.toString(), files.slice(0, at));
     const c = new pg.Client({ connectionString: scratch.toString() });

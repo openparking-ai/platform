@@ -257,7 +257,7 @@ const scratchAdmin = new URL(adminUrl);
 scratchAdmin.pathname = `/${SCRATCH}`;
 const scratchApp = new URL(`postgres://openparking_app@${host}/${SCRATCH}`);
 scratchApp.password = appPassword;
-const maintenance = new URL(adminUrl);
+const maintenance = new URL(required('SUPERUSER_URL'));
 maintenance.pathname = '/postgres';
 
 const scratchEnv = {
@@ -295,7 +295,6 @@ function plant(dir, brk) {
 async function buildScratch(dir, brk) {
   await withAdmin(maintenance.toString(), async (c) => {
     await c.query(`DROP DATABASE IF EXISTS ${pg.escapeIdentifier(SCRATCH)}`);
-    await c.query(`CREATE DATABASE ${pg.escapeIdentifier(SCRATCH)}`);
   });
   const partial = mkdtempSync(join(tmpdir(), 'openparking-tax-on-paid-migrations-'));
   for (const file of readdirSync(join(ROOT, 'migrations')).filter((f) => f.endsWith('.sql'))) {
@@ -307,8 +306,8 @@ async function buildScratch(dir, brk) {
     return planted;
   }
   for (const [script, extra] of [
+    ['scripts/prepare-database.js', { MIGRATIONS_DIR: partial }],
     ['scripts/migrate.js', { MIGRATIONS_DIR: partial }],
-    ['scripts/ensure-app-role.js', {}],
   ]) {
     const result = spawnSync(process.execPath, [script], {
       cwd: dir,

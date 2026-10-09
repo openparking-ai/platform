@@ -7,35 +7,20 @@
  * secret between two terminals.
  */
 import { chmodSync, writeFileSync } from 'node:fs';
-import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createApp } from '../src/app.js';
 import { withTenant, pool } from '../src/db.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 
-const adminUrl = process.env.DATABASE_URL;
-if (!adminUrl || !process.env.APP_DB_PASSWORD || !process.env.APP_DATABASE_URL) {
-  console.error('DATABASE_URL, APP_DATABASE_URL and APP_DB_PASSWORD are required (copy .env.example)');
+if (!process.env.SUPERUSER_URL || !process.env.DATABASE_URL || !process.env.APP_DB_PASSWORD || !process.env.APP_DATABASE_URL) {
+  console.error('SUPERUSER_URL, DATABASE_URL, APP_DATABASE_URL and APP_DB_PASSWORD are required (copy .env.example)');
   process.exit(1);
 }
 
-const dbName = new URL(adminUrl).pathname.slice(1);
-const maintenance = new URL(adminUrl);
-maintenance.pathname = '/postgres';
-
-// 1. database
-const admin = new pg.Client({ connectionString: maintenance.toString() });
-await admin.connect();
-const { rowCount } = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [dbName]);
-if (rowCount === 0) {
-  await admin.query(`CREATE DATABASE ${pg.escapeIdentifier(dbName)}`);
-  console.log(`created database ${dbName}`);
-}
-await admin.end();
-
-// 2. schema and role
-for (const script of ['scripts/migrate.js', 'scripts/ensure-app-role.js']) {
+// 1 and 2. database, owner, app role and schema: the one superuser step, then
+// every other migration as the owner
+for (const script of ['scripts/prepare-database.js', 'scripts/migrate.js']) {
   const r = spawnSync(process.execPath, [script], { stdio: 'inherit' });
   if (r.status !== 0) process.exit(r.status ?? 1);
 }

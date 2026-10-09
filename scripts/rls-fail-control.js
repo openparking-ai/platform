@@ -69,17 +69,16 @@ async function withAdmin(url, fn) {
   }
 }
 
-const maintenance = new URL(adminUrl);
+const maintenance = new URL(required('SUPERUSER_URL'));
 maintenance.pathname = '/postgres';
 
 console.log(`== rebuilding scratch database '${SCRATCH}' ==`);
 await withAdmin(maintenance.toString(), async (c) => {
   await c.query(`DROP DATABASE IF EXISTS ${pg.escapeIdentifier(SCRATCH)}`);
-  await c.query(`CREATE DATABASE ${pg.escapeIdentifier(SCRATCH)}`);
 });
 
 console.log('== migrating ==');
-for (const script of ['scripts/migrate.js', 'scripts/ensure-app-role.js']) {
+for (const script of ['scripts/prepare-database.js', 'scripts/migrate.js']) {
   const r = run([script]);
   if (r.status !== 0) {
     console.error(r.stdout, r.stderr);

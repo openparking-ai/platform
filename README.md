@@ -20,15 +20,18 @@ Node / Express / Postgres 16.
 ```sh
 npm install
 cp .env.example .env
-createdb openparking_dev
-npm run migrate                 # schema + RLS, as the owner role
-npm run ensure-app-role         # the NOSUPERUSER NOBYPASSRLS role the app connects as
+npm run prepare-database        # as a superuser, once: the owner, the database, 0001, the app role
+npm run migrate                 # every other migration, as the owner
 npm test
 ```
 
 ## Why two database URLs
 
-`DATABASE_URL` is the owner connection. It runs migrations and nothing else.
+`DATABASE_URL` is the owner connection. It runs migrations and nothing else. The owner
+must be **NOSUPERUSER and NOBYPASSRLS** — an ordinary role that owns the schema, so every
+`FORCE`d policy binds it too; the three functions that must look across accounts open
+exactly that lookup for themselves (migration 0031), and CI migrates as such an owner so a
+function that leans on seeing past a policy fails there first.
 
 `APP_DATABASE_URL` is what the application and the tests connect as, and it points at a
 role created `NOSUPERUSER NOBYPASSRLS`. This is load-bearing, not ceremony: **a Postgres
@@ -37,6 +40,27 @@ not stop one. An isolation test run as a superuser sees every tenant's rows whet
 policies are present or absent, so it proves nothing in either direction. Connecting as an
 unprivileged role is what makes the test mean something.
 
+### The one step that needs a superuser
+
+`npm run prepare-database`, with `SUPERUSER_URL` set to a superuser on the cluster. It is
+the only step that uses one, and it is separate from `migrate` because of migration 0001:
+0001's first statement gives the application role `NOSUPERUSER NOBYPASSRLS`, and Postgres
+lets only a superuser change `SUPERUSER`, even to say no. So on a cluster where
+`openparking_app` already exists, an ordinary owner cannot run 0001 — and 0001 is applied
+everywhere and is never edited. `prepare-database` therefore:
+
+1. makes the owner (`DATABASE_URL`'s role, NOSUPERUSER NOBYPASSRLS) if it is missing, and
+   refuses an existing one that is a superuser or BYPASSRLS — it never alters it;
+2. makes the database, owned by the owner, if it is missing;
+3. applies 0001 to a database that has not got it, hands the three things it makes
+   (`tenants`, `parking_sites`, `current_tenant_id()`) to the owner and records it, so
+   `npm run migrate` starts at 0002 and the owner owns everything;
+4. gives `openparking_app` its login and `APP_DB_PASSWORD`, NOSUPERUSER NOBYPASSRLS
+   NOCREATEDB NOCREATEROLE, and refuses it if it is a member of the owner.
+
+Run it once for a new database; again whenever the application role's password changes.
+`npm run migrate` as an ordinary owner refuses a database without 0001 and names this step.
+
 See [docs/RLS_TEMPLATE.md](docs/RLS_TEMPLATE.md) for the pattern every new tenant-owned
 table follows, and [docs/DATA_RETENTION.md](docs/DATA_RETENTION.md) for what is stored about
 vehicles and how long it is kept.
@@ -44,7 +68,7 @@ vehicles and how long it is kept.
 ## Watch a car drive through
 
 ```sh
-npm run demo          # database, schema, app role, a demo garage, server on :3000
+npm run demo          # prepare-database, migrate, a demo garage, server on :3000
 ```
 
 It prints a tenant, a garage and two device tokens, and writes them to

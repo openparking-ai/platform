@@ -10,8 +10,12 @@ permissions:
 
 env:
   PGPASSWORD: postgres
-  ADMIN_URL: postgres://postgres:postgres@localhost:5432
-  DATABASE_URL: postgres://postgres:postgres@localhost:5432/openparking_test
+  # The superuser: `npm run prepare-database`, and the tests that make and
+  # drop scratch databases. Never the owner and never the application.
+  SUPERUSER_URL: postgres://postgres:postgres@localhost:5432
+  # The owner, as production has one: NOSUPERUSER, NOBYPASSRLS. It runs every
+  # migration after 0001.
+  DATABASE_URL: postgres://openparking_owner:ci_owner_password@localhost:5432/openparking_test
   APP_DATABASE_URL: postgres://openparking_app:ci_password@localhost:5432/openparking_test
   APP_DB_PASSWORD: ci_password
 

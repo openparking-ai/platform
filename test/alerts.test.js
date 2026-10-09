@@ -31,8 +31,7 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import pg from 'pg';
-import { pool, withTenant, createTenant } from './helpers.js';
+import { pool, withTenant, createTenant, superuserClient } from './helpers.js';
 import * as alerts from '../src/alerts.js';
 import * as changes from '../src/changes.js';
 import { DIGIT_ZEROS } from '../src/digits.js';
@@ -85,8 +84,9 @@ const addPerson = async (as, garageId, body) => {
   return r.json.contact;
 };
 
+// Reads every stored line, across accounts: the superuser, who sees them all.
 const ownerDb = async (fn) => {
-  const c = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  const c = superuserClient();
   await c.connect();
   try {
     return await fn(c);

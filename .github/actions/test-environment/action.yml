@@ -1,10 +1,10 @@
 name: The test environment
 description: >-
   Node, the npm packages, the rate engine and the two entitlement modules at
-  their pins, and a migrated test database with its application role. Every
-  job that runs tests or fail-controls starts here, so each runs in the
-  environment the suite always ran in. Needs the Postgres service and the
-  workflow's database settings.
+  their pins, and a test database migrated by an ordinary owner, with its
+  application role. Every job that runs tests or fail-controls starts here,
+  so each runs in the environment the suite always ran in. Needs the
+  Postgres service and the workflow's database settings.
 runs:
   using: composite
   steps:
@@ -43,16 +43,19 @@ runs:
         done
         echo "GARAGE_PASS_SRC=$RUNNER_TEMP/garage-pass" >> "$GITHUB_ENV"
         echo "MONTHLY_BILLING_SRC=$RUNNER_TEMP/monthly-billing" >> "$GITHUB_ENV"
-    - name: Create the test database
+    - name: Prepare the database -- the one step that runs as a superuser
+      # Makes the ordinary owner (NOSUPERUSER, NOBYPASSRLS) and the database,
+      # applies 0001 -- whose role statement only a superuser may run -- and
+      # hands what it made to the owner, and gives the application role its
+      # login: NOSUPERUSER, NOBYPASSRLS. A superuser bypasses row-level
+      # security unconditionally, so neither the owner nor the application
+      # may be one -- for the owner, that is how production runs; for the
+      # application, it is what makes every isolation assertion mean anything.
       shell: bash
-      run: psql "$ADMIN_URL/postgres" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE openparking_test'
-    - name: Migrate
+      run: npm run prepare-database
+    - name: Migrate, as the ordinary owner
+      # Every migration from 0002 on, the way production runs them. A definer
+      # that relies on seeing past a FORCED policy fails here, where it
+      # failed on a live host while CI migrated as a superuser and passed.
       shell: bash
       run: npm run migrate
-    - name: Create the application role
-      # NOSUPERUSER, NOBYPASSRLS. The service container hands out a superuser
-      # by default, and a superuser bypasses row-level security
-      # unconditionally -- running the isolation suite as one would make every
-      # assertion in it meaningless.
-      shell: bash
-      run: npm run ensure-app-role

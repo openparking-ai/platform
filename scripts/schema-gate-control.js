@@ -47,7 +47,7 @@ const scratchAdmin = new URL(adminUrl);
 scratchAdmin.pathname = `/${SCRATCH}`;
 const scratchApp = new URL(`postgres://openparking_app@${base.host}/${SCRATCH}`);
 scratchApp.password = appPassword;
-const maintenance = new URL(adminUrl);
+const maintenance = new URL(required('SUPERUSER_URL'));
 maintenance.pathname = '/postgres';
 
 const env = {
@@ -121,7 +121,6 @@ if (!withheld) throw new Error('no migrations on disk — there is nothing to be
 console.log(`== rebuilding scratch database '${SCRATCH}', withholding ${withheld} ==`);
 await withAdmin(maintenance.toString(), async (c) => {
   await c.query(`DROP DATABASE IF EXISTS ${pg.escapeIdentifier(SCRATCH)}`);
-  await c.query(`CREATE DATABASE ${pg.escapeIdentifier(SCRATCH)}`);
 });
 
 const partial = mkdtempSync(path.join(tmpdir(), 'openparking-migrations-'));
@@ -129,8 +128,8 @@ for (const file of migrations.filter((f) => f !== withheld)) {
   copyFileSync(path.join(ROOT, 'migrations', file), path.join(partial, file));
 }
 
+run('scripts/prepare-database.js', { MIGRATIONS_DIR: partial });
 run('scripts/migrate.js', { MIGRATIONS_DIR: partial });
-run('scripts/ensure-app-role.js');
 
 let failures = 0;
 

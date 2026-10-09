@@ -158,7 +158,7 @@ const scratchAdmin = new URL(adminUrl);
 scratchAdmin.pathname = `/${SCRATCH}`;
 const scratchApp = new URL(`postgres://openparking_app@${host}/${SCRATCH}`);
 scratchApp.password = appPassword;
-const maintenance = new URL(adminUrl);
+const maintenance = new URL(required('SUPERUSER_URL'));
 maintenance.pathname = '/postgres';
 
 const scratchEnv = {
@@ -180,7 +180,6 @@ async function withAdmin(url, fn) {
 async function buildScratch(dir, brk) {
   await withAdmin(maintenance.toString(), async (c) => {
     await c.query(`DROP DATABASE IF EXISTS ${pg.escapeIdentifier(SCRATCH)}`);
-    await c.query(`CREATE DATABASE ${pg.escapeIdentifier(SCRATCH)}`);
   });
 
   const partial = mkdtempSync(join(tmpdir(), 'openparking-close-migrations-'));
@@ -198,8 +197,8 @@ async function buildScratch(dir, brk) {
   }
 
   for (const [script, extra] of [
+    ['scripts/prepare-database.js', { MIGRATIONS_DIR: partial }],
     ['scripts/migrate.js', { MIGRATIONS_DIR: partial }],
-    ['scripts/ensure-app-role.js', {}],
   ]) {
     const result = spawnSync(process.execPath, [script], {
       cwd: dir,
