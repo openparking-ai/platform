@@ -6,7 +6,7 @@
  */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
+import { pool, withTenant, createTenant, buildWorld, superuserClient } from './helpers.js';
 import { TENANT_TABLES } from './tenant-tables.js';
 
 let A;
@@ -198,8 +198,8 @@ test('owner reads: a tenant\'s session and its key never see B\'s garages, garag
 
 test('owner reads, the PREDICATE ALONE: with row-level security bypassed, A\'s reads still return none of B\'s rows', async () => {
   const repo = await import('../src/repository.js');
-  const pg = (await import('pg')).default;
-  const owner = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  // The superuser on this database: the owner is bound by FORCE like anyone.
+  const owner = superuserClient();
   await owner.connect();
   try {
     const role = (await owner.query('SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user')).rows[0];

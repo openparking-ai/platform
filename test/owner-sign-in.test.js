@@ -16,7 +16,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import pg from 'pg';
 import { createApp, BODY_TOO_LARGE, BODY_UNREADABLE } from '../src/app.js';
-import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
+import { pool, withTenant, createTenant, buildWorld, superuserClient } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { createAdmin, resetAdminPassword } from '../src/adminAccount.js';
 import { hashCount, hashPassword } from '../src/passwords.js';
@@ -109,7 +109,8 @@ let trusted;
 let limited;
 
 before(async () => {
-  admin = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  // Reads and moves the lock rows of many accounts: the superuser, who sees them all.
+  admin = superuserClient();
   await admin.connect();
   // The floor at its least, so the many refusals here stay quick; THE FLOOR below holds it at a larger value.
   const quick = { SIGN_IN_REFUSAL_FLOOR_MS: '200', SESSION_COOKIE_INSECURE: undefined };

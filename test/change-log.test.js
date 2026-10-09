@@ -21,7 +21,7 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import pg from 'pg';
-import { pool, withTenant, storePlan, flatHourlyPlan, stateTaxes } from './helpers.js';
+import { pool, withTenant, storePlan, flatHourlyPlan, stateTaxes, superuserClient } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { WRITE_ROUTES } from '../src/app.js';
 import * as changes from '../src/changes.js';
@@ -751,6 +751,9 @@ test('THE LOG CANNOT BE CHANGED: UPDATE, DELETE and TRUNCATE are refused for the
   const owner = securityRows();
   await owner.connect();
   try {
+    // In the line's own account: FORCE binds the owner too, and an UPDATE that
+    // finds no row would never reach the trigger this is about.
+    await owner.query("SELECT set_config('openparking.tenant_id', $1, false)", [a.tenant]);
     for (const sql of [
       ["UPDATE garage_changes SET action = 'garage.edited' WHERE id = $1", [line.id]],
       ['DELETE FROM garage_changes WHERE id = $1', [line.id]],
@@ -769,7 +772,8 @@ test('THE LOG CANNOT BE CHANGED: UPDATE, DELETE and TRUNCATE are refused for the
 });
 
 test('NO SECRET IN THE LOG OR THE OUTPUT: no password, key, connection code, cookie or session value in any line or anything printed', async () => {
-  const owner = securityRows();
+  // Every line of two accounts: the superuser, who sees them all.
+  const owner = superuserClient();
   await owner.connect();
   let text;
   try {

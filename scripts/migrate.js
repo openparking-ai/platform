@@ -31,6 +31,20 @@ const applied = new Set(
 const files = (await readdir(dir)).filter((f) => f.endsWith('.sql')).sort();
 let count = 0;
 
+// 0001's first statement gives the application role NOSUPERUSER NOBYPASSRLS,
+// which only a superuser may do. An ordinary owner -- the owner production
+// has -- gets 0001 from `npm run prepare-database`, the one step that runs as
+// a superuser, and starts here at 0002.
+const FIRST = '0001_tenants_and_rls.sql';
+if (files.includes(FIRST) && !applied.has(FIRST)) {
+  const { rows } = await client.query('SELECT rolsuper FROM pg_roles WHERE rolname = current_user');
+  if (!rows[0].rolsuper) {
+    console.error(`${FIRST} is not applied, and it needs a superuser: run \`npm run prepare-database\` first (README, "Why two database URLs").`);
+    await client.end();
+    process.exit(1);
+  }
+}
+
 for (const file of files) {
   if (applied.has(file)) {
     console.log(`skip  ${file} (already applied)`);

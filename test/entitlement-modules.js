@@ -58,8 +58,12 @@ async function withAdmin(url, fn) {
 }
 
 export async function startEntitlementModules() {
-  const admin = process.env.DATABASE_URL;
-  if (!admin) throw new Error('DATABASE_URL (the owner connection) is required to build the module databases');
+  // The modules' databases are theirs, built from their own migrations, which
+  // make and ALTER their own roles: a superuser builds them, not this
+  // platform's owner.
+  const superuser = process.env.SUPERUSER_URL;
+  if (!superuser) throw new Error('SUPERUSER_URL is required to build the module databases');
+  const admin = new URL(superuser);
   const maintenance = new URL(admin);
   maintenance.pathname = '/postgres';
   const suffix = randomUUID().slice(0, 8);

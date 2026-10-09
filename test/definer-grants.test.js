@@ -15,11 +15,13 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
-import { pool } from './helpers.js';
+import { pool, superuserClient } from './helpers.js';
 
+// A superuser on this database: the test makes a role with no grants and
+// becomes it, which the owner -- NOCREATEROLE -- may not.
 let owner;
 before(async () => {
-  owner = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  owner = superuserClient();
   await owner.connect();
 });
 after(async () => {

@@ -181,6 +181,9 @@ test('the count is the only change a line allows, and only on a refused line, fo
   const client = owner_();
   await client.connect();
   try {
+    // In the lines' own account: FORCE binds the owner too, and an UPDATE that
+    // finds no row would never reach the trigger this is about.
+    await client.query("SELECT set_config('openparking.tenant_id', $1, false)", [a.tenant]);
     const lines = await linesOf(a.tenant);
     const refused = lines.find((l) => l.outcome === 'refused');
     const done = lines.find((l) => l.outcome === 'done');

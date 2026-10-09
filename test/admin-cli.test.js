@@ -14,8 +14,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import pg from 'pg';
-import { pool, createTenant } from './helpers.js';
+import { pool, createTenant, superuserClient } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 
 const scratch = mkdtempSync(join(tmpdir(), 'openparking-admin-cli-'));
@@ -37,7 +36,8 @@ function run(script, args) {
 const users = async (tenant) => (await admin.query('SELECT email FROM operator_users WHERE tenant_id = $1', [tenant])).rows;
 
 before(async () => {
-  admin = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  // Puts sessions and a lock in place and reads them back, across accounts.
+  admin = superuserClient();
   await admin.connect();
 });
 after(async () => {

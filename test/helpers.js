@@ -1,5 +1,19 @@
 import { randomUUID } from 'node:crypto';
+import pg from 'pg';
 import { pool, withTenant } from '../src/db.js';
+
+/**
+ * A connection to the test database as the SUPERUSER (SUPERUSER_URL), which
+ * sees every row: for a test that looks across accounts, or puts a row in
+ * place by hand, the way no role of a deployment can. The owner is NOSUPERUSER
+ * and NOBYPASSRLS, and FORCE binds it like anyone (0031), so it is not that.
+ * Not connected; the caller connects and ends it.
+ */
+export function superuserClient() {
+  const url = new URL(process.env.SUPERUSER_URL);
+  url.pathname = new URL(process.env.APP_DATABASE_URL).pathname;
+  return new pg.Client({ connectionString: url.toString() });
+}
 
 /**
  * Create a tenant using the application connection.
