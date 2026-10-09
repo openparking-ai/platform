@@ -94,6 +94,7 @@ test('each Connect route answers one sentence: none is configured', async () => 
     ['POST', `/garages/${garage}/stripe-account/onboarding-link`],
     ['POST', `/garages/${garage}/stripe-account/refresh`],
     ['POST', `/garages/${garage}/stripe-account/location`],
+    ['GET', `/garages/${garage}/stripe-account/location`],
     ['GET', `/garages/${garage}/readers`],
     ['POST', `/lanes/${lane}/reader`],
     ['POST', `/lanes/${lane}/reader/unbind`],

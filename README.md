@@ -1258,6 +1258,12 @@ the internet; nothing here talks to the device.
 - `POST /api/v1/garages/<id>/stripe-account/location` with
   `{display_name, address: {line1, city, state, postal_code, country}}`
   registers the garage's one Location, or answers the one it has.
+- `GET /api/v1/garages/<id>/stripe-account/location` answers
+  `{location: {garage_id, location_id, display_name, created_at} | null}`:
+  the Location as this platform recorded it, asking Stripe nothing; another
+  account's garage is `404 garage_not_found`. The address itself is sent to
+  Stripe and not kept here: a caller that wants to show it later writes it in
+  the `display_name` too.
 - `POST /api/v1/lanes/<id>/reader` with `{registration_code, label}` registers
   the reader showing that code, at the garage's Location, and binds it to the
   lane. The code is sent to Stripe and kept nowhere here.

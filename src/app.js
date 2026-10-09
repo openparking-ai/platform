@@ -1115,6 +1115,12 @@ export function createApp() {
     res.status(created ? 201 : 200).json({ location: terminal.presentLocation(location) });
   }));
 
+  /** The garage's Location as this platform recorded it, or null. Asks Stripe nothing. */
+  operator.get('/garages/:garageId/stripe-account/location', connectRoute(async (req, res) => {
+    const row = await terminal.readLocation(req.tenantId, req.params.garageId);
+    res.json({ location: terminal.presentLocation(row) });
+  }));
+
   /** Every reader binding the garage's lanes have had, current ones first. */
   operator.get('/garages/:garageId/readers', connectRoute(async (req, res) => {
     const rows = await terminal.listReaders(req.tenantId, req.params.garageId);

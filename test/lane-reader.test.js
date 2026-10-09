@@ -96,6 +96,7 @@ test('with no Connect configured, the reader routes say so and ask Stripe nothin
   const n = stub.requests.length;
   for (const [method, path] of [
     ['POST', `/garages/${w.garage}/stripe-account/location`],
+    ['GET', `/garages/${w.garage}/stripe-account/location`],
     ['GET', `/garages/${w.garage}/readers`],
     ['POST', `/lanes/${w.laneA}/reader`],
     ['POST', `/lanes/${w.laneA}/reader/unbind`],
@@ -139,6 +140,38 @@ test('the Location is registered ON the garage\'s account, and refused until it 
   assert.equal(again.status, 200);
   assert.equal((await again.json()).location.location_id, loc.location_id);
   assert.equal(terminalRequests('locations').length, n);
+});
+
+test('the Location is read back as recorded: none before, the same after, this account only, and Stripe is asked nothing', async () => {
+  const w = await world();
+  const read = (garage, token) => op('GET', `/garages/${garage}/stripe-account/location`, undefined, token);
+
+  const n0 = stub.requests.length;
+  const none = await read(w.garage);
+  assert.equal(none.status, 200);
+  assert.deepEqual(await none.json(), { location: null });
+  assert.equal(stub.requests.length, n0, 'reading the Location asked Stripe');
+
+  const made = await location(w.garage, { display_name: '1 Example Street, Springfield, IL 62701, US', address: ADDRESS });
+  assert.equal(made.status, 201);
+  const { location: loc } = await made.json();
+  const n1 = stub.requests.length;
+  const back = await read(w.garage);
+  assert.equal(back.status, 200);
+  assert.deepEqual(await back.json(), { location: loc });
+  assert.equal(loc.display_name, '1 Example Street, Springfield, IL 62701, US');
+  assert.equal(stub.requests.length, n1, 'reading the Location asked Stripe');
+
+  // Another garage of the same account has none: it reads none, never this one.
+  const sibling = await world();
+  assert.deepEqual(await (await read(sibling.garage)).json(), { location: null });
+
+  // Another account is told the garage is not found, by name, and nothing of the Location.
+  const foreign = await read(w.garage, otherToken);
+  assert.equal(foreign.status, 404);
+  const text = await foreign.text();
+  assert.deepEqual(JSON.parse(text), { error: 'garage not found', code: 'garage_not_found' });
+  assert.ok(!text.includes(loc.location_id), 'another account was shown the Location');
 });
 
 test('a reader is registered on the garage\'s account, at its Location, and bound to the lane', async () => {
