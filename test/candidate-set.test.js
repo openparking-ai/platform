@@ -18,7 +18,7 @@ import { candidateStays, forSearch } from '../src/candidates.js';
 let tenant;
 let world;
 
-const descriptor = (tag) => `opvid-fp/1:${Buffer.from(`${tag}-${randomUUID()}`).toString('base64url')}`;
+const descriptor = (tag) => `opvid-opa-id/2:${Buffer.from(`${tag}-${randomUUID()}`).toString('base64url')}`;
 const plate = (prefix) => `${prefix}-${randomUUID().slice(0, 8)}`;
 
 /** One stay, written directly, with every component a candidate carries. */
@@ -168,7 +168,7 @@ test('forSearch sends exactly the stays with a descriptor, as {id, descriptor}, 
   assert.ok(sent.length > 0, 'the control: there is something to send');
   for (const c of sent) {
     assert.deepEqual(Object.keys(c).sort(), ['descriptor', 'id']);
-    assert.ok(c.descriptor.startsWith('opvid-fp/'));
+    assert.ok(c.descriptor.startsWith('opvid-opa-id/'));
   }
   // No plate, ticket or attribute leaves for the identity service.
   const text = JSON.stringify(sent);

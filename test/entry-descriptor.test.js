@@ -53,7 +53,7 @@ const plate = (prefix) => `${prefix}-${randomUUID().slice(0, 8)}`;
 // The shape the identity service produces: a versioned prefix and an opaque
 // base64url payload. This platform does not parse it, and nothing here depends
 // on the payload meaning anything.
-const descriptor = (tag) => `opvid-fp/1:${Buffer.from(`${tag}-${randomUUID()}`).toString('base64url')}`;
+const descriptor = (tag) => `opvid-opa-id/2:${Buffer.from(`${tag}-${randomUUID()}`).toString('base64url')}`;
 
 const openEntry = (body) => fetch(`${base}/api/v1/lane/sessions/open`, post(entryToken, body));
 
@@ -165,7 +165,7 @@ test('the lookup by identity carries the stored descriptor too', async () => {
 // --- what the route refuses ------------------------------------------------
 
 test('a descriptor that is not a string, is blank, or is over the bound is refused', async () => {
-  for (const bad of [42, true, ['opvid-fp/1:abc'], { v: 1 }, '', '   ', 'x'.repeat(65537)]) {
+  for (const bad of [42, true, ['opvid-opa-id/2:abc'], { v: 1 }, '', '   ', 'x'.repeat(65537)]) {
     const res = await openEntry({
       plate: plate('BAD'),
       entry_at: new Date().toISOString(),
