@@ -20,6 +20,22 @@
  *   unbinding_deletes          ending a binding deletes its row.
  *   history_hidden             the listing shows only current bindings.
  *
+ * The read of the Location (U6), GET .../stripe-account/location:
+ *
+ *   location_read_dropped      the route is not there.
+ *   location_read_not_404      another account's garage answers "no Location"
+ *                              instead of not found.
+ *   location_read_any_garage   the read answers the account's newest Location,
+ *                              whichever garage was asked.
+ *   location_read_asks_stripe  the read asks Stripe before it answers.
+ *   location_read_unconfigured with no Connect configured, the read answers
+ *                              instead of saying so.
+ *
+ * Another account's own row cannot be planted into the answer from here: the
+ * application reads as `openparking_app`, and row-level security on
+ * garage_terminal_locations hides every other account's rows from it whatever
+ * the query says. The not-found above is what this route adds on top of that.
+ *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0021.
  *
@@ -92,6 +108,46 @@ const SOURCE_BREAKS = [
     file: 'src/terminal.js',
     from: '`SELECT * FROM lane_readers WHERE tenant_id = $1 AND garage_id = $2\n',
     to: '`SELECT * FROM lane_readers WHERE tenant_id = $1 AND garage_id = $2 AND unbound_at IS NULL\n',
+  },
+  {
+    name: 'location_read_dropped',
+    why: 'the read of the Location is not there',
+    file: 'src/app.js',
+    from: "  operator.get('/garages/:garageId/stripe-account/location', connectRoute(async (req, res) => {\n" +
+      '    const row = await terminal.readLocation(req.tenantId, req.params.garageId);\n' +
+      '    res.json({ location: terminal.presentLocation(row) });\n' +
+      '  }));\n',
+    to: '',
+  },
+  {
+    name: 'location_read_not_404',
+    why: "another account's garage answers no Location instead of not found",
+    file: 'src/terminal.js',
+    from: '  requireConnect();\n  return getLocation(tenantId, garageId);',
+    to: '  requireConnect();\n  return withTenant(tenantId, async (client) => (await client.query(\n' +
+      "    'SELECT * FROM garage_terminal_locations WHERE tenant_id = $1 AND garage_id = $2', [tenantId, garageId])).rows[0] ?? null);",
+  },
+  {
+    name: 'location_read_any_garage',
+    why: "the read answers the account's newest Location, whichever garage was asked",
+    file: 'src/terminal.js',
+    from: '  requireConnect();\n  return getLocation(tenantId, garageId);',
+    to: '  requireConnect();\n  await getLocation(tenantId, garageId);\n  return withTenant(tenantId, async (client) => (await client.query(\n' +
+      "    'SELECT * FROM garage_terminal_locations WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1', [tenantId])).rows[0] ?? null);",
+  },
+  {
+    name: 'location_read_asks_stripe',
+    why: 'the read asks Stripe before it answers',
+    file: 'src/terminal.js',
+    from: '  requireConnect();\n  return getLocation(tenantId, garageId);',
+    to: "  requireConnect();\n  await refreshAccount(tenantId, garageId, { actor: 'read' }).catch(() => {});\n  return getLocation(tenantId, garageId);",
+  },
+  {
+    name: 'location_read_unconfigured',
+    why: 'with no Connect configured the read answers instead of saying so',
+    file: 'src/terminal.js',
+    from: '  requireConnect();\n  return getLocation(tenantId, garageId);',
+    to: '  return getLocation(tenantId, garageId);',
   },
 ];
 

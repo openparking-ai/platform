@@ -121,6 +121,16 @@ export async function createLocation(tenantId, garageId, body, { actor, record =
   });
 }
 
+/**
+ * The garage's Location as this platform recorded it, or null: what the
+ * owner's screens read to know whether the garage has given its readers'
+ * place, and to show what it gave. Stripe is asked nothing.
+ */
+export async function readLocation(tenantId, garageId) {
+  requireConnect();
+  return getLocation(tenantId, garageId);
+}
+
 export async function getLocation(tenantId, garageId) {
   return withTenant(tenantId, async (client) => {
     const { rows: g } = await client.query('SELECT 1 FROM garages WHERE tenant_id = $1 AND id = $2', [tenantId, garageId]);
