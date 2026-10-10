@@ -330,7 +330,7 @@ test('the reconciler recomputes each lane-decided fee out of band and names the 
   const rowAfter = await rowFor(plantedId);
   assert.deepEqual(rowAfter, rowBefore);
   // through the operator's route, the same report under `lane_decisions`
-  const res = await op('GET', `/garages/${g.id}/reconciliation?hours=720&max_stay_hours=48`);
+  const res = await op('GET', `/garages/${g.id}/reconciliation?hours=2160&max_stay_hours=48`);
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.deepEqual(body.lane_decisions.diverged.map((d) => d.session_id), [plantedId]);

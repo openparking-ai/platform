@@ -29,7 +29,13 @@ import { generateDeviceToken, hashToken } from '../src/auth.js';
 
 // Every SECURITY DEFINER function there is, by what it needs from the owner.
 // A new one is refused by the walk below until it is put in one of these.
-const OPENS_THE_LOOKUP = ['list_tenant_ids_for_maintenance', 'record_refused_change', 'resolve_lane_device'];
+const OPENS_THE_LOOKUP = [
+  'list_tenant_ids_for_maintenance', 'record_refused_change', 'resolve_lane_device',
+  // 0032: a link is presented, and its tenant is what is being found out.
+  'resolve_operator_invite', 'resolve_operator_invite_for_email', 'resolve_operator_password_reset',
+];
+// The FORCED tables a definer reads across accounts, each with 0031's policy.
+const LOOKUP_TABLES = ['tenants', 'garages', 'lanes', 'operator_invites', 'operator_password_resets'];
 const READS_NO_FORCED_TABLE = [
   'resolve_operator_session', // operator_tokens, operator_users
   'resolve_operator_token', // operator_tokens
@@ -116,7 +122,7 @@ test('every SECURITY DEFINER function is accounted for, and a planted one is fou
   }
 });
 
-test('the three that open the lookup are the only ones that do', async () => {
+test('the ones that open the lookup are the only ones that do', async () => {
   const { rows } = await owner.query(`
     SELECT p.proname AS name FROM pg_proc p
      WHERE p.pronamespace = 'public'::regnamespace AND p.prosecdef
@@ -173,7 +179,7 @@ test('the application role reads nothing more, whatever it sets', async () => {
   try {
     await client.query('BEGIN');
     await client.query("SELECT set_config('openparking.definer_lookup', 'on', true)");
-    for (const table of ['tenants', 'garages', 'lanes']) {
+    for (const table of LOOKUP_TABLES) {
       const { rows } = await client.query(`SELECT count(*)::int AS n FROM ${table}`);
       assert.equal(rows[0].n, 0, `${table}: nothing with no account`);
     }
@@ -196,9 +202,9 @@ test('the bodies are the owner\'s alone: the application role cannot call one', 
 });
 
 test("the owner's own connection is still bound by FORCE", async () => {
-  for (const table of ['tenants', 'garages', 'lanes']) {
+  for (const table of LOOKUP_TABLES) {
     const { rows } = await owner.query(`SELECT count(*)::int AS n FROM ${table}`);
-    assert.equal(rows[0].n, 0, `${table}: the owner sees nothing outside the three functions`);
+    assert.equal(rows[0].n, 0, `${table}: the owner sees nothing outside the functions that open the lookup`);
   }
 });
 
@@ -209,6 +215,9 @@ test('the setting is put back as it was after each call', async () => {
     await client.query("SELECT set_config('openparking.definer_lookup', 'as-it-was', true)");
     await client.query('SELECT * FROM resolve_lane_device($1)', [hashToken(token)]);
     await client.query('SELECT * FROM list_tenant_ids_for_maintenance()');
+    for (const fn of ['resolve_operator_invite', 'resolve_operator_invite_for_email', 'resolve_operator_password_reset']) {
+      await client.query(`SELECT * FROM ${fn}($1)`, ['0'.repeat(64)]);
+    }
     const { rows } = await client.query("SELECT current_setting('openparking.definer_lookup') AS v");
     assert.equal(rows[0].v, 'as-it-was');
     await client.query('ROLLBACK');

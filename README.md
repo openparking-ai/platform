@@ -318,8 +318,12 @@ curl -H "authorization: Bearer $OPERATOR_TOKEN" \
 ### The owner signs in
 
 **One admin per tenant**: an email and a password, and nothing else — no roles,
-no user management, no sign-up and no email sent from this repository. A
-sign-in **is a session token**, minted the way operator tokens are (random 32
+no user management and **no sign-up**: an admin is made only by an emailed
+invite the deployment's operator sends (`invite-admin`, below) or at the
+database (`create-admin`). This repository sends email for exactly three
+things: that invite, a link to choose a new password, and a notice that an
+invite was accepted (migration 0032; "Invites, and a forgotten password",
+below). A sign-in **is a session token**, minted the way operator tokens are (random 32
 bytes, only its SHA-256 stored), so every operator route works unchanged behind
 it (migration 0024).
 
@@ -469,6 +473,93 @@ what was sent.
 `test/owner-sign-in-output.test.js` hold each of these; `npm run
 owner-sign-in-fail-control` breaks each one in turn.
 
+### Invites, and a forgotten password
+
+**Sign-up is by invitation only.** The deployment's operator invites the one
+admin of a new tenant at the database, as `create-admin` is run:
+
+```sh
+npm run invite-admin -- --name "<company>" --email <email> [--language es]
+npm run invite-admin -- --resend <email> [--language es]
+```
+
+The first makes the tenant, an invite for the email, and sends the invite
+email — all of it or none: with no email configured, no `ADMIN_ORIGIN` for the
+link to lead to, or a send the email service refuses, it says so in one line
+and stores nothing. The second replaces the waiting invite of that email with
+a new one and sends it: the earlier link then says "replaced". Each prints one
+line, `invited <email> for tenant <id>; the link ends <date>`, and **never the
+link**, which goes to the inbox only. Its arguments follow `create-admin`'s
+rules: a password argument, an unknown option and a bare value are refused,
+and a refusal never repeats what was typed. An email that already names an
+admin, or already has an invite waiting, is refused by name.
+
+**The link is a credential, and it is never stored or logged.** It carries 32
+random bytes (`opi_…` an invite, `opr_…` a reset); only their SHA-256 is kept
+(migration 0032), so a copy of the database holds no link that works. The
+token rides in the URL **fragment** — `<ADMIN_ORIGIN>/#invite=<token>`,
+`<ADMIN_ORIGIN>/#reset=<token>` — which a browser never sends, so neither a
+proxy nor this server can log it; the admin screen reads it there and sends it
+back in a POST body. **An invite lasts seven days and works once**; a tenant has
+at most one live invite and an email at most one, held by the database. **A
+reset link lasts one hour and works once**; asking again replaces it. An invite
+and a reset are two tables and never share a slot.
+
+    POST /api/v1/auth/invite/status  {token}                     ->  200 {status, message[, email, language, expires_at]}
+    POST /api/v1/auth/invite/accept  {token, password, language} ->  200 {email, tenant_id, session_ends_at, language} and the cookie
+    POST /api/v1/auth/forgot         {email}                     ->  200 {message}
+    POST /api/v1/auth/reset          {token, password}           ->  200 {email, message}
+
+`status` is `ready`, `used`, `expired`, `replaced` or `invalid`, each with one
+plain sentence for the screen; `email`, `language` and `expires_at` only when
+ready. **Accept** takes the password under sign-in's rule (12 to 1024
+characters) and the language (`en` or `es`), makes the admin, marks the invite
+used and signs them in, as sign-in does; an invite that is not ready is refused
+`409 invite_<status>` and makes nothing, a password outside the rule `400
+password_refused`. The address in `EMAIL_NOTICE_TO` is told, by email, that
+the invite was accepted. **Forgot** answers the same sentence, byte for byte,
+whether or not the email names an admin, after the same database statements
+(an unknown email's find and write nothing, as sign-in's do), and the reset
+email is sent after the answer, so its round trip is not on the wire. **Reset**
+sets the new password, ends every session of the admin and clears every lock
+on it, as `reset-admin-password` does; it signs nobody in. A link that is not
+ready is refused `409 reset_<status>`.
+
+The four doors keep sign-in's rules: with no `ADMIN_ORIGIN` they answer `409
+sign_in_not_configured`; a foreign `Origin` is refused `403 origin_refused`; a
+body that is not JSON of the door's exact shape answers one fixed sentence
+(`400 invite_unreadable`, `forgot_unreadable`, `reset_unreadable`), never the
+parser's; no door has a path parameter or reads the query. **No answer of any
+of them comes sooner than `SIGN_IN_REFUSAL_FLOOR_MS`** after the request
+arrived. Each door counts its own attempts per caller address, the address
+sign-in counts: `ACCOUNT_LINK_ATTEMPTS_PER_ADDRESS` (default 10) per
+`ACCOUNT_LINK_ATTEMPTS_WINDOW_MINUTES` (default 60), then `429
+link_rate_limited`. Accept and reset hash a password in a place in sign-in's
+hash line (`503 link_busy` when it is full).
+
+**Email** is one `fetch` to the email service's HTTP API (Resend's, unless
+`EMAIL_API_URL` names another), with no dependency (`src/email.js`), in plain
+text, in English or Spanish (`src/emailText.js`): the invite in the invite's
+language, a reset in the admin's own.
+
+    EMAIL_KEY_FILE    the file holding the service's key, mounted as a secret (an absolute path)
+    EMAIL_FROM        the sender: an address, or Name <address>
+    EMAIL_NOTICE_TO   who is told that an invite was accepted (optional)
+    EMAIL_API_URL     where the service takes a message (optional)
+
+The key is read from its file at each send, never from the environment, and
+never written out; no address of anyone's is written in this repository, each
+is a setting. The first two are set together or not at all; with neither,
+`serve` says that email is off, and a reset is asked for in vain. A setting
+that is not one of its forms, or a key file that is named and cannot be read,
+refuses to start. A send that fails is logged by what failed — the key file,
+the service unreachable, the status it answered — never the address or the
+link.
+
+`test/account-links.test.js` and `test/account-links-output.test.js` hold
+each of these, against a stand-in for the email service; `npm run
+account-links-fail-control` breaks each one in turn.
+
 ### The owner's reads
 
 What the owner's screens read, behind the session or a key, tenant-scoped in
@@ -484,6 +575,22 @@ each query as well as by row-level security; another tenant's garage is `404`.
 `revoked_at`, as the devices route lists it; a reader is the one bound now. No
 credential hash is ever in an answer. `npm run garage-reads-fail-control`
 breaks each property in turn.
+
+### Making a garage
+
+    POST /api/v1/garages   {name, timezone, currency, default_action?, space_class?, transient_available?}   201 {garage}
+
+A garage's time zone, money and name are frozen onto its stays and its money,
+so each is checked before anything is stored, and each refusal is one plain
+sentence with its own code, never a bare 500: a **time zone** the database
+does not know (`pg_timezone_names`, spelled as it spells it) is refused `400
+garage_timezone_refused`; a **currency** that is not a code in use today
+(ISO 4217, less funds, metals and test codes — `src/currencies.js`, the list
+the admin screen offers) or not in capitals (`usd`) is refused `400
+garage_currency_refused`; a **name** that is not text, is only spaces, or is
+longer than the column allows (100 characters, migration 0032) is refused `400
+garage_name_refused`. `test/garage-checks.test.js` holds each;
+`npm run garage-checks-fail-control` breaks each in turn.
 
 ### Setup: the checklist, lane setup and closing, and the change log
 

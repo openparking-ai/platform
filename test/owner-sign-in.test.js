@@ -610,7 +610,10 @@ test('A GET never changes anything: every operator GET, cookie-authenticated fro
 
 test('NO CREDENTIAL IN A URL: no auth route has a path parameter, and the auth code reads no query', async () => {
   const auth = routeTable(main.app).filter((r) => r.base === '/api/v1/auth');
-  assert.deepEqual(auth.map((r) => `${r.method} ${r.path}`).sort(), ['GET /me', 'POST /sign-in', 'POST /sign-out', 'PUT /language']);
+  // Sign-in's four, and the four doors behind an emailed link (0032, test/account-links.test.js).
+  assert.deepEqual(auth.map((r) => `${r.method} ${r.path}`).sort(), [
+    'GET /me', 'POST /forgot', 'POST /invite/accept', 'POST /invite/status', 'POST /reset', 'POST /sign-in', 'POST /sign-out', 'PUT /language',
+  ]);
   for (const r of auth) assert.equal(r.path.includes(':'), false, `${r.method} ${r.path}`);
   const source = readFileSync(new URL('../src/signIn.js', import.meta.url), 'utf8');
   assert.equal(/req\.(query|params)\b/.test(source), false, 'src/signIn.js reads req.query or req.params');

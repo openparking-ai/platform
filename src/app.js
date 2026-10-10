@@ -23,6 +23,7 @@ import { SCREEN_CHARACTERS } from './screenText.js';
 import { MESSAGE_MAX } from './lanes.js';
 import * as setup from './setup.js';
 import * as alerts from './alerts.js';
+import { garageCurrency, garageName, garageTimezone } from './garageFields.js';
 
 const bad = (message) => new HttpError(400, message);
 
@@ -777,8 +778,13 @@ export function createApp() {
 
   operator.post('/garages', async (req, res, next) => {
     try {
-      const { name, timezone, currency } = req.body ?? {};
-      if (!name || !timezone || !currency) throw bad('name, timezone and currency are required');
+      const raw = req.body ?? {};
+      if (!raw.name || !raw.timezone || !raw.currency) throw bad('name, timezone and currency are required');
+      // Each refused in its own sentence before the database is asked to
+      // store it (src/garageFields.js): never a bare 500, never taken unread.
+      const name = garageName(raw.name);
+      const currency = garageCurrency(raw.currency);
+      const timezone = await garageTimezone(pool, raw.timezone);
       // Optional. A garage that says nothing gets the column default, which is
       // the value this platform has always served.
       const action = defaultAction(req.body?.default_action, { required: false });
