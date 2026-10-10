@@ -3,6 +3,7 @@ import { closePool } from './db.js';
 import { assertSchemaCurrent } from './schema.js';
 import { dummyHash } from './passwords.js';
 import { readAuthSettings } from './signIn.js';
+import { assertCanSend, readEmailSettings } from './email.js';
 import { assertStartSettings } from './startSettings.js';
 import { assertValidationsDoor } from './validations.js';
 
@@ -45,6 +46,20 @@ if (!auth.cookieSecure) {
 }
 if (auth.adminOrigin === null) {
   console.log('[platform] owner sign-in is off: ADMIN_ORIGIN is not set');
+}
+
+// Email (0032) the same way: a setting that is not one of its forms refuses to
+// start, and so does a key file that is named and cannot be read -- found now,
+// not when the first owner asks for a reset. With none, it is said once.
+try {
+  const email = readEmailSettings();
+  if (email.configured) assertCanSend(email);
+  else console.log('[platform] email is off: EMAIL_KEY_FILE and EMAIL_FROM are not set, so no reset link is sent');
+  if (email.configured && !email.noticeTo) console.log('[platform] no one is told when an invite is accepted: EMAIL_NOTICE_TO is not set');
+} catch (err) {
+  console.error(`[platform] REFUSING TO SERVE: ${err.message}`);
+  await closePool().catch(() => {});
+  process.exit(1);
 }
 
 if (typeof auth.trustProxy === 'number') {

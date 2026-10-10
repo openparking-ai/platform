@@ -11,6 +11,9 @@
  *   GET  /api/v1/auth/me         email, tenant, when the session ends, language
  *   PUT  /api/v1/auth/language   {language} -> the signed-in admin's own language (0025)
  *
+ * and, beside them, the four doors behind an emailed link -- an invite, and a
+ * forgotten password -- in src/accountDoors.js (0032), held to the same rules.
+ *
  * What each rule is for, because each is one of the ways sign-in went wrong on
  * the maintainer's other systems:
  *
@@ -64,6 +67,8 @@ import { pool, withTenant } from './db.js';
 import * as changes from './changes.js';
 import { generateDeviceToken, hashToken } from './auth.js';
 import { dummyHash, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
+import { mountAccountDoors } from './accountDoors.js';
+import { readEmailSettings } from './email.js';
 
 export const COOKIE = 'op_session';
 export const MAX_FAILED = 10;
@@ -110,6 +115,9 @@ export const NUMBER_SETTINGS = Object.freeze({
   SIGN_IN_REFUSAL_FLOOR_MS: { min: 200, max: 5000, fallback: 500 },
   SIGN_IN_HASH_LINE: { min: 1, max: 1000, fallback: 48 },
   SIGN_IN_HASH_LINE_PER_ADDRESS: { min: 1, max: 16, fallback: 2 },
+  // The doors behind an emailed link (0032), each counted on its own.
+  ACCOUNT_LINK_ATTEMPTS_PER_ADDRESS: { min: 1, max: 1000, fallback: 10 },
+  ACCOUNT_LINK_ATTEMPTS_WINDOW_MINUTES: { min: 1, max: 1440, fallback: 60 },
 });
 
 //: The most proxy hops TRUST_PROXY may name.
@@ -200,6 +208,8 @@ export function readAuthSettings(env = process.env) {
     refusalFloorMs: whole(env, 'SIGN_IN_REFUSAL_FLOOR_MS'),
     hashLine,
     hashLinePerAddress,
+    linkAttemptsPerAddress: whole(env, 'ACCOUNT_LINK_ATTEMPTS_PER_ADDRESS'),
+    linkAttemptsWindowSeconds: whole(env, 'ACCOUNT_LINK_ATTEMPTS_WINDOW_MINUTES') * 60,
   };
 }
 
@@ -309,7 +319,7 @@ export async function resolveSession(token, settings) {
   return rows[0] ?? null;
 }
 
-const endsAt = (session) => new Date(Math.min(new Date(session.expires_at).getTime(), new Date(session.idle_ends_at).getTime()));
+export const endsAt = (session) => new Date(Math.min(new Date(session.expires_at).getTime(), new Date(session.idle_ends_at).getTime()));
 
 /**
  * Whether a cookie-authenticated request may change something: a safe method,
@@ -466,7 +476,7 @@ function languageBody(body) {
   return typeof language === 'string' && LANGUAGES.includes(language) ? language : null;
 }
 
-export function createAuthRouter(settings) {
+export function createAuthRouter(settings, email = readEmailSettings()) {
   const router = express.Router();
   const limiter = addressLimiter({ max: settings.attemptsPerAddress, windowSeconds: settings.attemptsWindowSeconds });
   const line = hashLine({ max: settings.hashLine, perAddress: settings.hashLinePerAddress });
@@ -536,6 +546,13 @@ export function createAuthRouter(settings) {
     } finally {
       leave?.();
     }
+  });
+
+  // The doors behind an emailed link (src/accountDoors.js): sign-in's floor,
+  // its hash line, its address and its sessions, so there is one of each.
+  mountAccountDoors(router, {
+    settings, email, line, answer: refuse,
+    signIn: { addressLimiter, callerAddress, endsAt, internals, setCookie, NOBODY, NOT_CONFIGURED, ORIGIN_REFUSED },
   });
 
   /**

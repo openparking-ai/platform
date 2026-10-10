@@ -206,6 +206,36 @@ export const TENANT_TABLES = [
       ),
   },
   {
+    table: 'operator_invites',
+    // Every row here is an invite already used, so the one-live-per-tenant
+    // and one-live-per-email indexes (0032) never meet a policy test.
+    insert: (c, t) =>
+      c.query(
+        `INSERT INTO operator_invites (tenant_id, email, token_hash, expires_at, used_at)
+         VALUES ($1, 'iso-' || gen_random_uuid()::text || '@example.com',
+                 md5(gen_random_uuid()::text) || md5(gen_random_uuid()::text), now() + interval '7 days', now())
+         RETURNING id`,
+        [t],
+      ),
+  },
+  {
+    table: 'operator_password_resets',
+    // A reset belongs to the tenant's one admin, made here if it is not; each
+    // row is one already used, so one-live-per-admin never meets a policy test.
+    insert: (c, t) =>
+      c.query(
+        `WITH u AS (
+           INSERT INTO operator_users (tenant_id, email, password_hash)
+           VALUES ($1, 'iso-' || gen_random_uuid()::text || '@example.com', 'scrypt$row')
+           ON CONFLICT (tenant_id) DO UPDATE SET password_changed_at = now() RETURNING id, tenant_id
+         )
+         INSERT INTO operator_password_resets (tenant_id, user_id, token_hash, expires_at, used_at)
+         SELECT tenant_id, id, md5(gen_random_uuid()::text) || md5(gen_random_uuid()::text), now() + interval '1 hour', now()
+           FROM u RETURNING id`,
+        [t],
+      ),
+  },
+  {
     table: 'garage_stripe_accounts',
     // One per garage (0020), so each row gets a garage of its own.
     insert: (c, t) =>

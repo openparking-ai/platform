@@ -459,6 +459,26 @@ jobs:
         # turn and each must turn its own test red.
         run: npm run board-fail-control
 
+      - name: Account-links fail-control
+        # U7d-1 (0032): an admin by invitation only, and a password reset by
+        # email. The invite accepts once, an expired or replaced link accepts
+        # nothing, a send that fails stores nothing; the token is in no stored
+        # row (planted on a scratch database whose table would take it), no
+        # log line and no command output; forgot gives the same answer, work
+        # and time whoever it names; a reset works once; the doors keep
+        # sign-in's floor, Origin rule and per-address count; one live invite
+        # per tenant, and both tables FORCED. Each property is broken in turn
+        # and its suite must go red.
+        run: npm run account-links-fail-control
+
+      - name: Garage-checks fail-control
+        # U7d-1: a new garage's time zone, currency and name, each refused in a
+        # plain sentence before the database ("Mars/Olympus", "usd", "XYZ", a
+        # name that is a number or longer than the column allows), and the
+        # column's own bound. Each property is broken in turn and the suite
+        # must go red.
+        run: npm run garage-checks-fail-control
+
 
   sign-in-control:
     name: sign-in-control (${{ matrix.shard }}/8)
