@@ -7,7 +7,7 @@
 -- opt-in and off by default), the lane dropped it on translation, and this
 -- route destructured only the keys it knew and silently ignored the rest.
 --
--- WHAT IT IS. An opaque, versioned, compact string — `opvid-fp/<version>:…` —
+-- WHAT IT IS. An opaque, versioned, compact string — `opvid-opa-id/<version>:…` —
 -- computed from one capture: a bounded set of keypoint descriptors, a colour
 -- histogram and a coarse edge grid, after a fixed resize. Not an image, and a
 -- photograph cannot be reconstructed from it. This platform does not parse it:

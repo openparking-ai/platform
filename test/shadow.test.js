@@ -52,7 +52,7 @@ const post = (token, body) => ({
 });
 
 const plate = (prefix) => `${prefix}-${randomUUID().slice(0, 8)}`;
-const descriptor = (tag) => `opvid-fp/1:${Buffer.from(`${tag}-${randomUUID()}`).toString('base64url')}`;
+const descriptor = (tag) => `opvid-opa-id/2:${Buffer.from(`${tag}-${randomUUID()}`).toString('base64url')}`;
 
 const openEntry = (body) => fetch(`${base}/api/v1/lane/sessions/open`, post(entryToken, body));
 const closeExit = (body) => fetch(`${base}/api/v1/lane/sessions/close`, post(exitToken, body));
@@ -398,7 +398,7 @@ test('the report: every rate over the comparable rows, the denominator and the o
   // The stand-in answers by the exit descriptor's tag: M matches itself, W
   // matches P instead (wrong), T ties with P, N nothing, NC nothing.
   const byTag = fakeSearch((body) => {
-    const tag = Buffer.from(body.descriptor.slice('opvid-fp/1:'.length), 'base64url').toString().split('-')[0];
+    const tag = Buffer.from(body.descriptor.slice('opvid-opa-id/2:'.length), 'base64url').toString().split('-')[0];
     const P = stays.P.id;
     return {
       M: () => recordMatching([stays.M.id], body),

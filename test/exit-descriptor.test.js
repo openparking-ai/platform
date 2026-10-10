@@ -48,7 +48,7 @@ const post = (token, body) => ({
 });
 
 const plate = (prefix) => `${prefix}-${randomUUID().slice(0, 8)}`;
-const descriptor = (tag) => `opvid-fp/1:${Buffer.from(`${tag}-${randomUUID()}`).toString('base64url')}`;
+const descriptor = (tag) => `opvid-opa-id/2:${Buffer.from(`${tag}-${randomUUID()}`).toString('base64url')}`;
 
 const openEntry = (body) => fetch(`${base}/api/v1/lane/sessions/open`, post(entryToken, body));
 const closeExit = (body) => fetch(`${base}/api/v1/lane/sessions/close`, post(exitToken, body));
@@ -170,7 +170,7 @@ test('a bad descriptor on the close is refused, and the stay stays OPEN', async 
   // truthful state for an exit this platform did not accept.
   const p = plate('XBAD');
   const id = await openStay(p);
-  for (const bad of [42, ['opvid-fp/1:abc'], '', '   ', 'x'.repeat(65537)]) {
+  for (const bad of [42, ['opvid-opa-id/2:abc'], '', '   ', 'x'.repeat(65537)]) {
     const res = await closeExit({
       plate: p,
       exit_at: '2026-08-26T11:00:00Z',

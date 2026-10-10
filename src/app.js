@@ -308,7 +308,7 @@ const PLATE_MAX = 32;
  * The longest appearance descriptor this platform will hold on a session.
  *
  * A descriptor is the identity service's opaque, versioned, compact string
- * (`opvid-fp/<version>:…`), and this platform does not parse it -- migration
+ * (`opvid-opa-id/<version>:…`), and this platform does not parse it -- migration
  * 0009 says why it lives on the session. What this side CAN
  * stand behind is that it is a string, that it is not blank, and that it is not
  * a device token's worth of text: it is stored per stay and compared against

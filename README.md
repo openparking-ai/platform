@@ -156,7 +156,7 @@ as `descriptor`, and the platform holds it on the session as `entry_descriptor`
 (migration 0009).
 
 A descriptor is an opaque, versioned, compact value produced by the identity
-service (`opvid-fp/<version>:…`). It is not an image, a photograph cannot be
+service (`opvid-opa-id/<version>:…`). It is not an image, a photograph cannot be
 reconstructed from it, and this platform does not parse it: what is checked is
 that it is a string, not blank, and at most 64 KiB (a bound with its reason
 given in `src/app.js`).
