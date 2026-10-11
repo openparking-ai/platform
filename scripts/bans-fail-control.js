@@ -16,6 +16,8 @@
  *   listed_redacted       a listed car's vehicle is redacted by the retention window
  *   added_by_hand         a route that puts a car on the list
  *   listed_unread         a tailgater with no identity read is listed (gate F5)
+ *   week_of_eight_days    the week is eight days (re-gate G2)
+ *   week_of_six_days      the week is six days (re-gate G2)
  *
  * The arming loop's pictures have no control here: none is stored anywhere,
  * so there is no picture for the week rule to take by mistake.
@@ -89,6 +91,18 @@ const BREAKS = [
     why: 'a tailgater with no identity read is listed',
     red: ['THE SWITCH'],
     edits: [{ file: 'src/bans.js', from: 'if (!session.tailgater || !garage.ban_tailgaters || !session.entry_descriptor) return false;', to: 'if (!session.tailgater || !garage.ban_tailgaters) return false;' }],
+  },
+  {
+    name: 'week_of_eight_days',
+    why: 'the week is eight days',
+    red: ['ONE WEEK AFTER THE CAR LEFT'],
+    edits: [{ file: 'src/bans.js', from: 'export const PICTURE_DAYS = 7;', to: 'export const PICTURE_DAYS = 8;' }],
+  },
+  {
+    name: 'week_of_six_days',
+    why: 'the week is six days',
+    red: ['ONE WEEK AFTER THE CAR LEFT'],
+    edits: [{ file: 'src/bans.js', from: 'export const PICTURE_DAYS = 7;', to: 'export const PICTURE_DAYS = 6;' }],
   },
 ];
 

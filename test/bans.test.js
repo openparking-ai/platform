@@ -21,7 +21,7 @@ import { createApp, WRITE_ROUTES } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
-import { removeExpiredPictures, PICTURE_DAYS } from '../src/bans.js';
+import { removeExpiredPictures } from '../src/bans.js';
 import { redactExpiredVehicles } from '../src/retention.js';
 
 let engine;
@@ -141,7 +141,10 @@ test('1. a picture is kept by its entry: a JPEG or a PNG by its bytes, a resend 
   assert.deepEqual([row.content_type, Buffer.compare(row.image, JPEG)], ['image/jpeg', 0]);
 });
 
-test('1. ONE WEEK AFTER THE CAR LEFT: kept while inside, kept six days after the exit, gone eight days after; a picture no stay holds goes a week after it was taken', async () => {
+test('1. ONE WEEK AFTER THE CAR LEFT: kept while inside, kept six and a half days after the exit, gone seven and a half days after; a picture no stay holds goes a week after it was taken', async () => {
+  // His answer is one week, so the days are written out, never derived from
+  // the constant under test: a week of six or eight days goes red here (U7f
+  // re-gate, G2).
   const g = await garage();
   const inside = await openStay(g, { entryAt: ago(30) });
   const leftRecently = await openStay(g, { entryAt: ago(7) });
@@ -149,17 +152,17 @@ test('1. ONE WEEK AFTER THE CAR LEFT: kept while inside, kept six days after the
   const unheldOld = randomUUID();
   const unheldNew = randomUUID();
   for (const s of [inside, leftRecently, leftLongAgo]) assert.equal((await picture(g, s.eventId, { takenAt: ago(9) })).status, 201);
-  assert.equal((await picture(g, unheldOld, { takenAt: ago(PICTURE_DAYS + 1) })).status, 201);
-  assert.equal((await picture(g, unheldNew, { takenAt: ago(PICTURE_DAYS - 1) })).status, 201);
-  await closeAt(g, leftRecently, ago(PICTURE_DAYS - 1));
-  await closeAt(g, leftLongAgo, ago(PICTURE_DAYS + 1));
+  assert.equal((await picture(g, unheldOld, { takenAt: ago(7.5) })).status, 201);
+  assert.equal((await picture(g, unheldNew, { takenAt: ago(6.5) })).status, 201);
+  await closeAt(g, leftRecently, ago(6.5));
+  await closeAt(g, leftLongAgo, ago(7.5));
 
   await purge();
   assert.equal(await pictureCount(inside.eventId), 1, 'a car still inside keeps its pictures, however old they are');
-  assert.equal(await pictureCount(leftRecently.eventId), 1, 'six days after the exit: kept');
-  assert.equal(await pictureCount(leftLongAgo.eventId), 0, 'eight days after the exit: gone');
-  assert.equal(await pictureCount(unheldNew), 1, 'no stay, taken six days ago: kept');
-  assert.equal(await pictureCount(unheldOld), 0, 'no stay, taken eight days ago: gone');
+  assert.equal(await pictureCount(leftRecently.eventId), 1, 'six and a half days after the exit: kept');
+  assert.equal(await pictureCount(leftLongAgo.eventId), 0, 'seven and a half days after the exit: gone');
+  assert.equal(await pictureCount(unheldNew), 1, 'no stay, taken six and a half days ago: kept');
+  assert.equal(await pictureCount(unheldOld), 0, 'no stay, taken seven and a half days ago: gone');
 });
 
 test('2. A TAILGATER THE LANE IDENTIFIED IS A STAY: opened as any other, marked, and it closes with a price at the exit', async () => {
