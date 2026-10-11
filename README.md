@@ -835,7 +835,7 @@ the platform is the engine's first caller, and this is the store.
 
 ```sh
 curl -H "authorization: Bearer $OPERATOR_TOKEN" -H 'content-type: application/json' \
-  -d '{"plan": { ...the plan document, whole... }}' \
+  -d '{"plan": { ...the plan document, whole... }, "confirmed": true}' \
   http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans     # 201, the row and the document
 curl -H "authorization: Bearer $OPERATOR_TOKEN" \
   http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans     # every plan of the garage
@@ -865,11 +865,66 @@ What the store does, and does not do — the reasons are in `migrations/0012_rat
   `409 plan_version_exists`, `409 plan_effective_from_taken`. Two versions at one
   instant is the ambiguity the engine refuses on every stay from then on; it is
   refused here first.
+- **The owner confirms, every time (U7g).** The body carries `"confirmed": true`
+  or it is `400 not_confirmed`, before the engine is asked: nothing is saved
+  until somebody has checked the prices and said so. The admin asks for it with
+  a tick and a Confirm button, after showing the prices the plan charges; a key
+  sends it too. The change-log line says `confirmed: true`, and its own actor and
+  time say who confirmed and when.
+- **A plan never starts in the past (U7g).** An `effective_from` more than 60 s
+  before this server's clock is `409 plan_starts_in_the_past`. Measured before
+  it was built: a plan dated one hour back was stored and priced a car that came
+  in half an hour earlier — 2.50 became 10.00. The engine prices on the plan in
+  force at entry, so "a rate change never reaches back into a car that is
+  already parked" holds only while every plan starts after it is saved. The
+  60 s are for the owner's screen and this server reading two clocks.
 - **Append-only by grant, like `events`.** A changed price is a new version.
   Storing one is recorded as a `rate_plan_stored` event naming the operator token.
 - **A closed stay keeps `plan_version`, `breakdown` and `space_class` beside
   `fee_minor`** — the version that priced it, the engine's plain-English ledger
   and the class it was priced as, together or not at all.
+
+### Try a stay: the close's pricing, nothing stored (U7g)
+
+```sh
+curl -H "authorization: Bearer $OPERATOR_TOKEN" -H 'content-type: application/json' \
+  -d '{"plan": { ...a draft, optional... }, "stays": [{"entry": "2026-10-14T08:30", "exit": "2026-10-14T17:45"}]}' \
+  http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans/try
+```
+
+What a car would pay, before the owner saves anything. `stays` is 1 to 100
+`{ entry, exit }`, each a date and time **in the garage's own time**
+(`YYYY-MM-DDTHH:MM`); a time the clocks skip is refused by name, and a time that
+happens twice is the first of the two. Without `plan` the garage's stored plans
+price them; with `plan`, the stored plans **and** the draft, exactly as the
+close will see them once it is saved — a car that came in before the draft
+starts is priced by the plan it would really get.
+
+- **The close's own path.** Each stay goes through `priceStay`, then
+  `taxedPricing` with the tax taken at the exit, the two functions the close
+  calls. A test prices 50 stays this way, stores the draft, closes all 50
+  through the lane routes and requires every fee and every line to be the same.
+- **Each answer**: the stay in the garage's time and as instants, its minutes,
+  the plan and the special that priced it, the discounts or increases applied,
+  the rate lines, the tax lines, the subtotal and what the driver pays — or
+  `refused: true` with the engine's findings. A garage whose taxes are not
+  stated for that moment yet (rates come before taxes on the checklist) is
+  answered without tax and `taxes_stated: false`.
+- **Nothing is stored.** A read-only transaction: no plan, no event, no
+  change-log line, done or refused — it is the one operator POST that is not a
+  write (`READ_POSTS`).
+- **The store's own refusals.** A draft the engine cannot load is the store's
+  `400`; one the store would refuse for this garage is the store's `409`
+  (currency, space class, a version name or a start already used). A draft with
+  findings is still tried: they come back in `draft_findings`, and the stays
+  they touch come back refused. Another account's garage is `404`; nothing
+  stored and no draft is `409 no_rate_plan`; more than 20 tries a minute from
+  one owner or key is `429 too_many_tries`.
+
+`npm run rates-and-open-fail-control` breaks each U7g property in turn — the
+try's tax taken its own way, a try that writes, the limit, the draft priced
+alone, a plan dated back, the confirmation ignored, one opening step dropped,
+alerts made required — and requires the test that names it to go red.
 
 ### The close prices through the engine, and a close that cannot price still closes
 
@@ -918,9 +973,18 @@ suite to go red.
 
 ### The activation gate
 
-A garage is not usable until its **rate setup is complete**, its **transient
-mode is stated** (migration 0014) and its **taxes are stated** (0022). Three
-conditions, observed from the schema:
+**A garage opens only when its whole setup is done (U7g)**: every step of the
+setup checklist except alerts — the garage's details, the drivers answer, a way
+in and a way out, every lane computer heard from, a rate plan in force, taxes
+stated, and, for a garage that takes any driver, a payment account that can
+take cards and a card reader on every way out. A pass-only garage has no
+getting-paid or card-reader step. Alerts never hold opening back. The list is
+worked out **once**, by `openingSteps` in `src/setup.js`: the setup read shows
+it as the open step's `not_done`, and `POST .../activate` refuses on it,
+`409 garage_not_activatable` with the steps in `details.unmet`.
+
+The database re-checks the three conditions it can see as the row is written
+(migrations 0014 and 0022), and `GET .../activation` reads them:
 
 - **rate_setup_complete** — at least one plan is stored and a version is in
   force now. The store already refused a plan the engine found fault with, so
@@ -935,16 +999,18 @@ conditions, observed from the schema:
   none, or **unstated** — and no set in force is unstated, never "none". See
   *A garage's taxes* below.
 
-There is no payment condition. The payment-processor onboarding and the tested
-money collection are a separate requirement with its own place; this gate
-carries no such condition at all rather than an unchecked one, and a test
-sweeps `src/` and `migrations/` for the processor's name.
+The payment condition is the setup's getting-paid step: the account this
+platform **recorded** for the garage can take cards. Activation's own module
+and its migrations still name no payment processor, and a test sweeps them.
+What the owner also asked for — money collection **tested** — is not a
+condition yet, because nothing in the system tests a payment yet; a gate never
+reports satisfied what it cannot observe.
 
 ```sh
 curl -H "authorization: Bearer $OPERATOR_TOKEN" \
   http://127.0.0.1:3000/api/v1/garages/<id>/activation   # active?, and each condition with why not
 curl -X POST -H "authorization: Bearer $OPERATOR_TOKEN" \
-  http://127.0.0.1:3000/api/v1/garages/<id>/activate     # 201 and a garage_activated event, or 409 garage_not_activatable with `details.unmet`
+  http://127.0.0.1:3000/api/v1/garages/<id>/activate     # 201 and a garage_activated event, or 409 garage_not_activatable with the setup steps not done in `details.unmet`
 ```
 
 Activation is an act, with a timestamp and the operator token that did it, and

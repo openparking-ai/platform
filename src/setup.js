@@ -25,7 +25,9 @@
  *                   by email (U4b, src/alerts.js). It never holds back
  *                   opening: the open step is worked out exactly as before
  *                   it existed
- *   open            open or not, and what is still missing
+ *   open            open or not, and what is still missing. Opening waits
+ *                   for every step above except alerts (`openingSteps`,
+ *                   U7g), and the activate route refuses on the same list.
  */
 import * as repo from './repository.js';
 import * as activation from './activation.js';
@@ -66,8 +68,18 @@ function laneComputer(lane, now, quiet) {
 
 const laneLine = (lane) => ({ lane_id: lane.id, name: lane.name, direction: lane.direction });
 
-/** The checklist for one garage, read on the caller's transaction. */
-export async function checklist(client, tenantId, garage) {
+/**
+ * WHAT OPENING WAITS FOR (U7g): every step before alerts, worked out here and
+ * nowhere else. The checklist below shows these steps and the open step's
+ * `not_done`; `POST .../activate` refuses while `notDone` is not empty
+ * (src/activation.js). One function for both, so the screen cannot show a
+ * garage ready that the platform will refuse, or the other way round.
+ *
+ * For a pass-only garage that is the steps it has: getting paid and card
+ * readers are not among them. Alerts are not among them for any garage: they
+ * never hold opening back.
+ */
+export async function openingSteps(client, tenantId, garage) {
   const now = (await client.query('SELECT now() AS now')).rows[0].now.getTime();
   const readout = await activation.readout(client, tenantId, garage);
   const lanes = await repo.lanesForGarage(client, tenantId, garage.id);
@@ -138,8 +150,14 @@ export async function checklist(client, tenantId, garage) {
   }
 
   // What opening is about: worked out before the alerts step, which never
-  // holds opening back, so the open step is what it was before alerts existed.
+  // holds opening back.
   const notDone = steps.filter((s) => !s.done).map((s) => s.key);
+  return { readout, steps, notDone };
+}
+
+/** The checklist for one garage, read on the caller's transaction. */
+export async function checklist(client, tenantId, garage) {
+  const { readout, steps, notDone } = await openingSteps(client, tenantId, garage);
 
   const told = await alerts.coverage(client, tenantId, garage.id);
   steps.push({
@@ -160,7 +178,8 @@ export async function checklist(client, tenantId, garage) {
       opened_at: readout.activated_at,
       // What the platform itself requires before the garage can open.
       required_missing: readout.conditions.filter((c) => !c.met).map((c) => GATE[c.condition]),
-      // Every step above that is not done yet.
+      // Every step above that is not done yet: exactly what opening waits
+      // for (`openingSteps`), and what POST .../activate refuses on.
       not_done: notDone,
     },
   });

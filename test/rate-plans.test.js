@@ -57,7 +57,8 @@ function plan(overrides = {}) {
   return {
     ...structuredClone(flatLot),
     plan_version: `flat-${stamp}`,
-    effective_from: new Date(Date.UTC(2026, 0, 1) - Math.floor(Math.random() * 1e10)).toISOString(),
+    // In the future: the store refuses a plan that starts in the past (U7g).
+    effective_from: new Date(Date.UTC(2036, 0, 1) - Math.floor(Math.random() * 1e10)).toISOString(),
     ...overrides,
   };
 }
@@ -72,7 +73,7 @@ async function newGarage(currency = 'USD') {
 }
 
 const store = (garageId, document) =>
-  fetch(`${base}/api/v1/garages/${garageId}/rate-plans`, asOperator(operatorToken, { plan: document }));
+  fetch(`${base}/api/v1/garages/${garageId}/rate-plans`, asOperator(operatorToken, { plan: document, confirmed: true }));
 const list = (garageId) => fetch(`${base}/api/v1/garages/${garageId}/rate-plans`, asOperator(operatorToken));
 
 const countFor = (garageId) =>
@@ -132,9 +133,9 @@ test('the read returns EVERY plan of the garage, oldest effective date first, an
   const garage = await newGarage();
   const other = await newGarage();
   const docs = [
-    plan({ effective_from: '2026-03-01T00:00:00-05:00' }),
-    plan({ effective_from: '2026-01-01T00:00:00-05:00' }),
-    plan({ effective_from: '2026-02-01T00:00:00-05:00' }),
+    plan({ effective_from: '2036-03-01T00:00:00-05:00' }),
+    plan({ effective_from: '2036-01-01T00:00:00-05:00' }),
+    plan({ effective_from: '2036-02-01T00:00:00-05:00' }),
   ];
   for (const d of docs) assert.equal((await store(garage, d)).status, 201);
   assert.equal((await store(other, plan())).status, 201);
@@ -217,8 +218,10 @@ test('a SETTLED finding still refuses: a decision is an acknowledgement, not a p
 test('a body that is not a plan document at all is refused before the engine is asked', async () => {
   const garage = await newGarage();
   for (const body of [{}, { plan: 'flat' }, { plan: [1] }, { plan: null }]) {
-    const res = await fetch(`${base}/api/v1/garages/${garage}/rate-plans`, asOperator(operatorToken, body));
+    // Confirmed, so what is refused is the body, not the missing confirmation.
+    const res = await fetch(`${base}/api/v1/garages/${garage}/rate-plans`, asOperator(operatorToken, { ...body, confirmed: true }));
     assert.equal(res.status, 400, JSON.stringify(body));
+    assert.notEqual((await res.json()).code, 'not_confirmed');
   }
   assert.equal(await countFor(garage), 0);
 });
@@ -305,15 +308,15 @@ test('a version name already used by the garage is refused by name', async () =>
 
 test('two versions taking effect at one instant are refused at write time, the ambiguity the engine refuses at quote time', async () => {
   const garage = await newGarage();
-  const at = '2026-06-01T00:00:00-04:00';
+  const at = '2036-06-01T00:00:00-04:00';
   assert.equal((await store(garage, plan({ effective_from: at }))).status, 201);
   // The same instant, written differently: the key is the instant, not the text.
-  const res = await store(garage, plan({ effective_from: '2026-06-01T04:00:00Z' }));
+  const res = await store(garage, plan({ effective_from: '2036-06-01T04:00:00Z' }));
   assert.equal(res.status, 409);
   assert.equal((await res.json()).code, 'plan_effective_from_taken');
   assert.equal(await countFor(garage), 1);
   // CONTROL: a later instant is a new version and lands.
-  assert.equal((await store(garage, plan({ effective_from: '2026-06-02T00:00:00-04:00' }))).status, 201);
+  assert.equal((await store(garage, plan({ effective_from: '2036-06-02T00:00:00-04:00' }))).status, 201);
 });
 
 // --- no engine is a refusal, never an acceptance --------------------------------------

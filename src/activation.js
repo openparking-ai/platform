@@ -1,9 +1,13 @@
 /**
- * The activation gate: a garage is not usable until its rate setup is
- * complete, its transient mode is stated and its taxes are stated
- * (migrations 0014 and 0022).
+ * The activation gate: a garage is not usable until its whole setup is done
+ * (U7g) -- every step of the setup checklist except alerts, worked out by
+ * `openingSteps` in src/setup.js and nowhere else. The checklist shows the
+ * same list as the open step's `not_done`, so what the screen calls ready is
+ * what this gate opens.
  *
- * Three conditions, observed from the schema and never inferred:
+ * The readout below still carries the three conditions the DATABASE can see
+ * and its trigger re-checks as the row is written (migrations 0014, 0022) --
+ * the second layer, not the whole gate:
  *
  *   rate_setup_complete    at least one plan is stored (0012) and a version
  *                          is in force now. The store already refused a plan
@@ -17,12 +21,12 @@
  *                          states -- with rules, none, UNSTATED -- and the same
  *                          rule: no set in force is unstated, never "none".
  *
- * There is deliberately no payment condition. The payment-processor
- * onboarding and the tested money collection are a separate requirement with
- * its own place; this gate carries no payment condition at all rather than an
- * unchecked one, because a gate never reports satisfied what it cannot
- * observe. (The test sweeps these sources for the processor's name, so it is
- * not written here even to say it is absent.)
+ * The payment condition is the setup's own getting-paid step, for a garage
+ * that takes any driver: the payment account it RECORDED can take cards. This
+ * module holds none of it and names no processor (the test still sweeps it).
+ * What the owner also asked for -- money collection TESTED -- is not a
+ * condition yet, because nothing in the system tests a payment yet; a gate
+ * never reports satisfied what it cannot observe.
  *
  * `readout()` says which conditions hold and why not, for an operator, and
  * is the ONE place the conditions are written in this module. `activate()`
@@ -32,13 +36,20 @@
  */
 import * as repo from './repository.js';
 import { taxPosition } from './taxes.js';
+// A cycle (setup.js reads `readout` from here), used only inside functions,
+// so neither module needs the other while it loads.
+import { openingSteps } from './setup.js';
 
 export const GARAGE_ACTIVATED_EVENT_KIND = 'garage_activated';
 export const GARAGE_INACTIVE_REFUSAL_EVENT_KIND = 'garage_inactive_refusal';
 
+/**
+ * The garage cannot open yet. `unmet` is the setup steps not done, by key, in
+ * the checklist's order -- the setup read's `not_done`, exactly.
+ */
 export class NotActivatable extends Error {
   constructor(unmet) {
-    super(`the garage cannot be activated: ${unmet.map((c) => `${c.condition} -- ${c.reason}`).join('; ')}`);
+    super(`the garage cannot open yet; these setup steps are not done: ${unmet.join(', ')}`);
     this.unmet = unmet;
   }
 }
@@ -106,15 +117,16 @@ export async function readout(client, tenantId, garage, { now = null } = {}) {
 }
 
 /**
- * Activate, or refuse by name. Idempotent: an already-active garage is
- * returned as it is, with no second event. The trigger
- * `garages_activation_gate` re-checks the conditions as the row is written.
+ * Activate, or refuse naming every setup step not done. Idempotent: an
+ * already-active garage is returned as it is, with no second event. The
+ * trigger `garages_activation_gate` re-checks the three conditions the
+ * database can see as the row is written.
  */
 export async function activate(client, tenantId, garage, { actor, now = null }) {
   if (garage.activated_at) return { garage, activated: false };
+  const { notDone } = await openingSteps(client, tenantId, garage);
+  if (notDone.length) throw new NotActivatable(notDone);
   const state = await readout(client, tenantId, garage, { now });
-  const unmet = state.conditions.filter((c) => !c.met);
-  if (unmet.length) throw new NotActivatable(unmet);
   const { rows } = await client.query(
     `UPDATE garages SET activated_at = COALESCE($3::timestamptz, now())
       WHERE tenant_id = $1 AND id = $2 AND activated_at IS NULL

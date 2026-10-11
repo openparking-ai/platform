@@ -16,6 +16,7 @@ import * as terminal from './terminal.js';
 import * as signIn from './signIn.js';
 import { startSetting } from './startSettings.js';
 import { HttpError } from './errors.js';
+import { GarageTimeInvalid, localToInstant } from './garageTime.js';
 import * as changes from './changes.js';
 import * as lanes from './lanes.js';
 import * as board from './board.js';
@@ -963,8 +964,10 @@ export function createApp() {
 
   /**
    * Activate the garage: the act his ruling names, with a timestamp and the
-   * operator token that did it. Refused by name, with every unmet condition
-   * listed in `details`, while either condition is unmet. Idempotent.
+   * operator token that did it. Refused, `409 garage_not_activatable`, while
+   * any setup step except alerts is not done, every one of them listed in
+   * `details.unmet` by its step key -- the setup read's `not_done`, from the
+   * same function (src/setup.js `openingSteps`). Idempotent.
    */
   operator.post('/garages/:garageId/activate', async (req, res, next) => {
     try {
@@ -1236,6 +1239,9 @@ export function createApp() {
    */
   operator.post('/garages/:garageId/rate-plans', async (req, res, next) => {
     try {
+      // The owner's confirmation first (U7g): nothing reaches the engine, let
+      // alone the store, until somebody has said they checked the prices.
+      ratePlans.assertConfirmed(req.body);
       const document = ratePlans.planDocument(req.body?.plan);
       const out = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
@@ -1255,7 +1261,9 @@ export function createApp() {
         await changes.record(client, req.change, {
           garageId: garage.id, action: 'rate_plan.add',
           subject: { kind: 'rate_plan', id: row.id, name: row.plan_version },
-          before: null, after: { plan_version: row.plan_version, effective_from: row.effective_from },
+          // `confirmed`: the owner ticked "I checked these prices" and pressed
+          // Confirm. Who confirmed, and when, are this line's own actor and time.
+          before: null, after: { plan_version: row.plan_version, effective_from: row.effective_from, confirmed: true },
         });
         return row;
       });
@@ -1280,6 +1288,82 @@ export function createApp() {
       res.json({ rate_plans: rows.map(presentRatePlan) });
     } catch (err) {
       next(err);
+    }
+  });
+
+  /**
+   * TRY A STAY (U7g): what a car would pay, through the close's own pricing,
+   * with nothing stored. The owner checks the rates on real stays before they
+   * are saved.
+   *
+   * `stays` is 1-100 `{ entry, exit }`, each a date and time in the garage's
+   * own time (YYYY-MM-DDTHH:MM). Without `plan`, the garage's stored plans
+   * price them. With `plan`, the stored plans AND the draft, exactly as the
+   * close would see them once the draft is saved: a car that came in before
+   * the draft starts is priced by the plan it would really get.
+   *
+   * Each stay goes through `priceStay` and then `taxedPricing` -- the two
+   * functions the close calls, in the close's order, with the tax taken at the
+   * exit as the close takes it -- so the try cannot drift from what a driver
+   * is charged. Run in a READ ONLY transaction: it stores nothing, writes no
+   * event and no change-log line, and a write slipped in here fails instead of
+   * landing. A draft the engine cannot load is the store's own 400; one the
+   * store would refuse for this garage is the store's own refusal. At most 20
+   * tries a minute for each signed-in owner (or key).
+   */
+  operator.post('/garages/:garageId/rate-plans/try', async (req, res, next) => {
+    try {
+      if (!tryLimiter.take(`${req.actor.kind}:${req.actor.id}`)) {
+        throw new HttpError(429, `at most ${TRY_PER_MINUTE} tries a minute; wait a minute and try again`, 'too_many_tries');
+      }
+      const body = req.body ?? {};
+      const draft = body.plan === undefined ? null : ratePlans.planDocument(body.plan);
+      const rawStays = body.stays;
+      if (!Array.isArray(rawStays) || rawStays.length < 1 || rawStays.length > TRY_MAX_STAYS) {
+        throw bad(`stays is a list of 1 to ${TRY_MAX_STAYS} stays, each { entry, exit } in the garage's own time`);
+      }
+      // The engine first, as the store does: a draft it cannot load has no
+      // currency or start worth comparing. Findings do not stop a try -- the
+      // stays they touch come back refused, which is how the owner sees them.
+      let draftFindings = [];
+      if (draft !== null) {
+        try {
+          await ratePlans.validateWithEngine(draft);
+        } catch (err) {
+          if (!(err instanceof ratePlans.RatePlanRefused) || err.code !== 'plan_has_findings') throw err;
+          draftFindings = err.details.findings;
+        }
+      }
+      const out = await withTenant(req.tenantId, async (client) => {
+        await client.query('SET TRANSACTION READ ONLY');
+        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!garage) throw new HttpError(404, 'garage not found');
+        const stays = rawStays.map((stay, i) => tryStay(stay, i, garage.timezone));
+        const stored = await ratePlans.ratePlansForGarage(client, req.tenantId, garage.id);
+        if (draft !== null) {
+          ratePlans.assertFitsGarage(garage, draft);
+          ratePlans.assertNewBeside(stored, draft);
+        }
+        const documents = [...ratePlans.documents(stored), ...(draft === null ? [] : [draft])];
+        if (documents.length === 0) {
+          throw conflict('no_rate_plan', 'this garage has no rates yet: send the draft as plan to try it');
+        }
+        const answers = [];
+        for (const stay of stays) answers.push(await tryOne(client, req.tenantId, garage, documents, stay));
+        return { garage, answers };
+      });
+      res.json({
+        currency: out.garage.currency,
+        timezone: out.garage.timezone,
+        draft_findings: draftFindings,
+        stays: out.answers,
+      });
+    } catch (err) {
+      if (err instanceof ratePlans.EngineUnavailable) {
+        return next(new HttpError(503, `${err.message}; nothing was priced`, 'rate_engine_unavailable'));
+      }
+      if (err instanceof GarageTimeInvalid) return next(bad(err.message));
+      next(ratePlanRefusal(err));
     }
   });
 
@@ -2714,7 +2798,7 @@ export function createApp() {
    */
   operator.use(async (err, req, _res, next) => {
     const status = err?.status ?? (err?.bodyUnreadable ? 400 : 500);
-    if (!SAFE_METHODS.has(req.method) && status >= 400 && status < 500 && !err?.malformedId) {
+    if (!SAFE_METHODS.has(req.method) && !isReadPost(req) && status >= 400 && status < 500 && !err?.malformedId) {
       await changes.refused(req, err, {
         action: actionFor(req),
         request: requestFor(req),
@@ -2827,6 +2911,66 @@ function presentRatePlan(r) {
   };
 }
 
+/** How many stays one try may price, and how many tries a minute one owner may make. */
+export const TRY_MAX_STAYS = 100;
+export const TRY_PER_MINUTE = 20;
+const tryLimiter = signIn.addressLimiter({ max: TRY_PER_MINUTE, windowSeconds: 60 });
+
+/** One `{ entry, exit }` of a try, read in the garage's time and refused by name. */
+function tryStay(raw, i, timezone) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw bad(`stays[${i}] is { entry, exit }, each a date and time in the garage's own time`);
+  }
+  const entryAt = localToInstant(raw.entry, timezone, `stays[${i}].entry`);
+  const exitAt = localToInstant(raw.exit, timezone, `stays[${i}].exit`);
+  if (exitAt < entryAt) throw bad(`stays[${i}] leaves (${raw.exit}) before it came in (${raw.entry})`);
+  return { entry: raw.entry, exit: raw.exit, entryAt, exitAt };
+}
+
+/** The rule a breakdown line was written by, in the plan that priced the stay. */
+function ruleOf(documents, planVersion, ruleId) {
+  const plan = documents.find((d) => d.plan_version === planVersion);
+  return plan?.rules?.find((r) => r.id === ruleId) ?? null;
+}
+
+/**
+ * One stay of a try, priced exactly as the close prices it: `priceStay`, then
+ * `taxedPricing` at the exit. A garage whose taxes are not stated for that
+ * moment yet (rates are set before taxes) gets the price without tax and says
+ * so -- the close itself never meets that garage, because it cannot open.
+ */
+async function tryOne(client, tenantId, garage, documents, stay) {
+  const minutes = Math.ceil((stay.exitAt - stay.entryAt) / 60_000);
+  const at = { entry: stay.entry, exit: stay.exit, entry_at: stay.entryAt.toISOString(), exit_at: stay.exitAt.toISOString(), minutes };
+  const priced = await priceStay({ garage, plans: documents, session: { entry_at: stay.entryAt, currency: garage.currency }, exitAt: stay.exitAt });
+  if (priced.refusal) return { ...at, refused: true, findings: priced.refusal };
+  const { rows } = await client.query(
+    'SELECT count(*)::int AS n FROM garage_tax_sets WHERE tenant_id = $1 AND garage_id = $2 AND effective_from <= $3',
+    [tenantId, garage.id, stay.exitAt],
+  );
+  const taxesStated = rows[0].n > 0;
+  const pricing = taxesStated
+    ? await taxedPricing({ outcome: entitlement.EXIT_OUTCOMES.TRANSIENT, ...priced }, { client, tenantId, garage, currency: garage.currency, at: stay.exitAt })
+    : { ...priced, subtotalMinor: priced.feeMinor };
+  const isTax = (line) => taxes.withoutTaxLines([line]).length === 0;
+  const applied = pricing.breakdown
+    .filter((l) => l.rule_id && /\.applied$/.test(l.code))
+    .map((l) => ({ line: l, rule: ruleOf(documents, pricing.planVersion, l.rule_id) }));
+  const special = applied.find((a) => a.rule?.stage === 'QUALIFY');
+  return {
+    ...at,
+    refused: false,
+    plan_version: pricing.planVersion,
+    special: special ? { rule_id: special.rule.id, label: special.rule.label ?? null } : null,
+    adjustments: applied.filter((a) => a.rule?.stage === 'ADJUST').map((a) => ({ rule_id: a.rule.id, label: a.rule.label ?? null })),
+    rate_lines: pricing.breakdown.filter((l) => !isTax(l)),
+    tax_lines: pricing.breakdown.filter(isTax),
+    taxes_stated: taxesStated,
+    subtotal_minor: pricing.subtotalMinor,
+    fee_minor: pricing.feeMinor,
+  };
+}
+
 /** The event a close that could not be priced leaves beside the row. */
 const CLOSE_UNPRICED_EVENT_KIND = 'close_unpriced';
 
@@ -2924,12 +3068,22 @@ async function activeGarageOrRefuse({ tenantId, garageId, laneId, laneEventId, a
   );
   throw conflict(
     'garage_not_active',
-    `this garage is not active: no stay is ${action === 'open' ? 'opened' : 'closed'} here until its rate setup is complete, its transient mode is stated and its taxes are stated`,
+    `this garage is not active: no stay is ${action === 'open' ? 'opened' : 'closed'} here until its setup is done and it is opened`,
   );
 }
 
 /** The methods that change nothing: a refusal of one is not a refused change. */
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+/**
+ * The POSTs that change nothing: a read that needs a body. Not writes, so no
+ * change-log line is written for them, done or refused (U7g's try).
+ * test/change-log.test.js requires the router's non-GET routes to be exactly
+ * WRITE_ROUTES and these.
+ */
+export const READ_POSTS = Object.freeze([['POST', '/garages/:garageId/rate-plans/try']]);
+const READ_POST_PATTERNS = READ_POSTS.map(([method, path]) => [method, new RegExp(`^${path.replace(/:[A-Za-z]+/g, '[^/]+')}/?$`, 'i')]);
+const isReadPost = (req) => READ_POST_PATTERNS.some(([method, re]) => method === req.method && re.test(req.path));
 
 /**
  * EVERY OPERATOR WRITE ROUTE, with the action its change-log line names.
@@ -3065,6 +3219,7 @@ function spaceClassField(raw) {
 function ratePlanRefusal(err) {
   if (!(err instanceof ratePlans.RatePlanRefused)) return err;
   if (err.code === 'plan_invalid') return bad(err.message);
+  if (err.code === 'not_confirmed') return new HttpError(400, err.message, err.code);
   const out = conflict(err.code, err.message);
   out.details = err.details;
   return out;

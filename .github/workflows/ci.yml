@@ -297,6 +297,14 @@ jobs:
         # and requires test/bans.test.js to go red in the test that names it.
         run: npm run bans-fail-control
 
+      - name: Rates-and-open fail-control
+        # U7g. Each break removes one property -- the try priced by the
+        # close's own tax path, the try storing nothing and limited to 20 a
+        # minute, the draft priced beside the stored plans, a plan never dated
+        # back, the owner's confirmation, and opening waiting for every setup
+        # step but alerts -- and requires the test that names it to go red.
+        run: npm run rates-and-open-fail-control
+
       - name: Owner-language fail-control
         # The owner's language (0025). Each break removes one property -- the
         # admin taken from the session, never the body; only "en" or "es"; the
