@@ -136,6 +136,18 @@ documents and nothing about a person or a car. The purge does not touch it, and
 which the purge redacted a vehicle. The `rate_plan_stored` event beside it names
 an operator token, not a person, and is append-only like every event.
 
+## Pictures kept with an entry (U7f, 0033)
+
+A lane sends the pictures it took between the vend and the closing loop, and at the closing loop. They are personal
+data on the same terms as the plate. They are **deleted**, not redacted: one week after the stay that holds them
+closed, or one week after they were taken when no stay holds them (a tailgater nobody identified, a banned car
+refused at the entry). A car still inside keeps its pictures. `npm run purge` runs both rules.
+
+**A car on a banned list is held:** while it is listed, its vehicle is not redacted by the window above and its
+pictures are not deleted. Taken off the list, both rules apply again as to any other car.
+
+The arming loop's pictures are not stored anywhere, and nothing here touches them.
+
 ## What is never redacted
 
 - **Enrolled vehicles**, while enrolled.

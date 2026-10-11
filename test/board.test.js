@@ -293,6 +293,9 @@ const NAMES_A_LANE = {
   // Written at a close with the stay's own exit lane, beside its close event, which the purge never reaches (0011).
   'shadow_searches.exit_lane_id': 'history',
   'board_message_lanes.lane_id': 'board',
+  // A picture kept with an entry (0033). A lane that took one has the entry's
+  // stay or event too, which keep the lane; a picture alone goes with it.
+  'entry_pictures.lane_id': 'goes',
 };
 
 test('F1 check 3. THE SWEEP: every column that names a lane is listed, and removing a lane strands no row of any of them', async () => {
@@ -350,6 +353,17 @@ test('F1 check 3. THE SWEEP: every column that names a lane is listed, and remov
            FROM board_messages m LEFT JOIN board_message_lanes ml ON ml.message_id = m.id WHERE m.id = ANY($1::uuid[]) GROUP BY m.id`,
         [[alone.id, shared.id]])).rows);
       assert.deepEqual(left, [{ id: shared.id, lanes: [helper.id] }], `${col}: the lone message went, the other lost only this lane`);
+      continue;
+    }
+    if (fate === 'goes') {
+      await withTenant(a.tenant, (c) => c.query(
+        `INSERT INTO entry_pictures (tenant_id, garage_id, lane_id, picture_ref, event_id, taken_at, content_type, image)
+         VALUES ($1,$2,$3,'f1',gen_random_uuid()::text,now(),'image/png',$4)`,
+        [a.tenant, g.id, lane.id, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])]));
+      const pictures = () => withTenant(a.tenant, async (c) => (await c.query('SELECT count(*)::int AS n FROM entry_pictures WHERE lane_id = $1', [lane.id])).rows[0].n);
+      assert.equal(await pictures(), 1, `${col}: seeded`);
+      assert.equal((await call(base, 'DELETE', `/lanes/${lane.id}`, { as: a })).status, 204, col);
+      assert.equal(await pictures(), 0, `${col}: went with the lane`);
       continue;
     }
     await withTenant(a.tenant, (c) => seed[col](c, lane.id, helper.id));

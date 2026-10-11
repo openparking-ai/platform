@@ -91,7 +91,8 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 | `GET /api/v1/lane/rules` | what the lane caches so it can decide offline: the garage's plans whole, its space class, each linked module's register, the open stays with a cursor — the slow cadence |
 | `GET /api/v1/lane/stays?since=<cursor>` | every stay changed since the cursor, closed rows included — the fast cadence; without `since`, the full open set; every answer also carries the lane's own `lane` state and `board` |
 | `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` |
-| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor` |
+| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater` (U7f) |
+| `POST /api/v1/lane/pictures` | a picture kept with an entry (U7f): `{picture_ref, event_id, taken_at, image}`, the image base64, a JPEG or a PNG, at most 3 MiB; idempotent on `picture_ref` |
 | `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation`; carries and echoes an optional `descriptor` |
 
 ### A stay is identified by a plate or by a ticket — exactly one
@@ -703,6 +704,33 @@ the application may `SELECT` and `INSERT`, and a trigger refuses `UPDATE`,
 holds a password, key, lane computer code, cookie or session value: a line is
 built from named fields, and `src/changes.js` refuses one that holds a
 credential. `npm run setup-fail-control` breaks each property in turn.
+
+### Pictures, tailgaters and banned cars (U7f, 0033)
+
+His answers, 2026-10-11: pictures at the closing loop and between the vend and it, kept one week after the car
+leaves; a tailgater whose identity is read is a stay like any other and pays at the exit; banning tailgaters is
+the owner's choice in the location setup, off until they turn it on, and so is whether the list covers this
+garage or all their garages; a ban lasts until someone takes the car off; no car is put on the list by hand.
+
+- **Pictures** (`entry_pictures`) are kept against the lane's event id of the entry record: a stay's open, a
+  tailgater nobody identified, a banned car refused. `npm run purge` removes them one week after the stay that
+  holds them closed, or one week after they were taken when no stay holds them. A car still inside keeps its
+  pictures, and so does a car on the list. The arming loop's pictures are not stored, here or anywhere.
+- **A tailgater stay** is opened with `tailgater: true` and prices at the exit as any other.
+- **Two settings** on `PATCH /garages/:id`, off by default: `ban_tailgaters` (true or false) and `ban_reach`
+  (`garage` or `all`).
+- **The list** (`banned_vehicles`): with `ban_tailgaters` on, a tailgater stay opened with a `descriptor` is
+  listed. Nothing else lists a car. A ban reaches its own garage, or every garage of the account when the garage
+  it was listed at says `all`. Each lane gets the bans that reach it on `GET /lane/rules` as `banned:
+  [{id, descriptor}]`, and refuses a car whose descriptor matches one.
+- **While listed**, the car's vehicle is not redacted and its pictures are not removed. Taken off, both follow
+  the normal rules.
+
+| | |
+|---|---|
+| `GET /garages/:id/banned` | the two settings and every car whose ban reaches this garage, each with its pictures |
+| `POST /garages/:id/banned/:banId/remove` | takes a car off the list; one change-log line, `garage.banned_car_remove` |
+| `GET /garages/:id/banned/:banId/pictures/:pictureId` | one picture, as the image, `no-store` |
 
 ### Alerts: who gets which alert, and how
 

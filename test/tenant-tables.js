@@ -13,6 +13,37 @@
 
 export const TENANT_TABLES = [
   {
+    table: 'entry_pictures',
+    // A picture kept with an entry (0033): each its own picture_ref, so rows
+    // collide with nothing but a policy.
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO entry_pictures (tenant_id, garage_id, lane_id, picture_ref, event_id, taken_at, content_type, image)
+         VALUES ($1, $2, $3, gen_random_uuid()::text, gen_random_uuid()::text, now(), 'image/png', '\\x89504e470d0a1a0a'::bytea)
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+  },
+  {
+    table: 'banned_vehicles',
+    // Each row lists its own tailgater stay (0033).
+    insert: (c, t, w) =>
+      c.query(
+        `WITH v AS (
+           INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'BAN-' || gen_random_uuid()) RETURNING id
+         ), s AS (
+           INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                                 open_event_id, entry_confirmation, tailgater)
+           SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD', gen_random_uuid()::text,
+                  'confirmed', true FROM v
+           RETURNING id
+         )
+         INSERT INTO banned_vehicles (tenant_id, garage_id, session_id) SELECT $1, $2, s.id FROM s
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+  },
+  {
     table: 'garages',
     insert: (c, t) =>
       c.query(

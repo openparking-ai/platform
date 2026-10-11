@@ -392,6 +392,27 @@ const WRITES = [
     state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM board_messages WHERE id = $1', [s.m.id]),
   },
   {
+    action: 'garage.banned_car_remove',
+    // A car is listed only as a tailgater (0033); the row is written here as
+    // that open would write it, and taken off by the route.
+    setup: async () => {
+      const g = await newGarage(base, a);
+      const lane = await newLane(base, a, g.id, 'North', 'entry');
+      const ban = await withTenant(a.tenant, async (c) => (await c.query(
+        `WITH v AS (INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'BAN-' || gen_random_uuid()) RETURNING id),
+              s AS (INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                                          open_event_id, entry_confirmation, entry_descriptor, tailgater)
+                    SELECT $1, $2, v.id, $3, now(), 'USD', gen_random_uuid()::text, 'confirmed', 'opvid-opa-id/2:ban', true FROM v
+                    RETURNING id)
+         INSERT INTO banned_vehicles (tenant_id, garage_id, session_id) SELECT $1, $2, s.id FROM s RETURNING id`,
+        [a.tenant, g.id, lane.id])).rows[0]);
+      return { g, ban };
+    },
+    run: (s) => call(base, 'POST', `/garages/${s.g.id}/banned/${s.ban.id}/remove`, { as: a }),
+    line: (l, s) => assert.deepEqual([l.subject_id, l.before, l.after], [s.g.id, { banned: true }, { banned: false }]),
+    state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM banned_vehicles WHERE id = $1', [s.ban.id]),
+  },
+  {
     action: 'lane.board_prices',
     setup: async () => {
       const g = await newGarage(base, a);
@@ -429,18 +450,19 @@ function routeTable(expressApp) {
   return out;
 }
 
-test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 30 -- and every one has a recipe here, or is always refused', () => {
+test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 31 -- and every one has a recipe here, or is always refused', () => {
   const writes = routeTable(expressApp).filter((r) => r.mount === '/api/v1' && r.method !== 'GET').map((r) => `${r.method} ${r.path}`);
   assert.deepEqual(writes.sort(), WRITE_ROUTES.map(([m, p]) => `${m} ${p}`).sort());
   // 22 from U4, U4b's four: a person added, changed, removed, and what they
   // get; and U4c's four: a board message added, changed, removed, and a
   // lane's price switch.
-  assert.equal(WRITE_ROUTES.length, 30);
+  // And U7f's one: a banned car taken off the list.
+  assert.equal(WRITE_ROUTES.length, 31);
   const covered = new Set([...WRITES.map((w) => w.action), ...ALWAYS_REFUSED]);
   assert.deepEqual(WRITE_ROUTES.map(([, , action]) => action).filter((x) => !covered.has(x)), [], 'a write route with no recipe here');
   // The owner's one write outside the operator router: the language.
   assert.deepEqual(routeTable(expressApp).filter((r) => r.mount === '/api/v1/auth' && r.method === 'PUT').map((r) => r.path), ['/language']);
-  assert.equal(WRITES.length, 30, '29 operator writes that can succeed, and the language: 31 writes with the retired rates route');
+  assert.equal(WRITES.length, 31, '30 operator writes that can succeed, and the language: 32 writes with the retired rates route');
 });
 
 test('EVERY WRITE: one change, exactly one line -- who, what, before and after -- by the session, and by the key the same way', async () => {
