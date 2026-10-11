@@ -15,6 +15,7 @@
  *   listed_aged_out       a listed car's pictures go with the week
  *   listed_redacted       a listed car's vehicle is redacted by the retention window
  *   added_by_hand         a route that puts a car on the list
+ *   listed_unread         a tailgater with no identity read is listed (gate F5)
  *
  * The arming loop's pictures have no control here: none is stored anywhere,
  * so there is no picture for the week rule to take by mistake.
@@ -83,6 +84,11 @@ const BREAKS = [
     why: 'a route that puts a car on the list',
     red: ['NO CAR IS LISTED BY HAND'],
     edits: [{ file: 'src/app.js', from: "  ['POST', '/garages/:garageId/banned/:banId/remove', 'garage.banned_car_remove'],\n", to: "  ['POST', '/garages/:garageId/banned/:banId/remove', 'garage.banned_car_remove'],\n  ['POST', '/garages/:garageId/banned', 'garage.banned_car_add'],\n" }],
+  },  {
+    name: 'listed_unread',
+    why: 'a tailgater with no identity read is listed',
+    red: ['THE SWITCH'],
+    edits: [{ file: 'src/bans.js', from: 'if (!session.tailgater || !garage.ban_tailgaters || !session.entry_descriptor) return false;', to: 'if (!session.tailgater || !garage.ban_tailgaters) return false;' }],
   },
 ];
 

@@ -189,12 +189,18 @@ test('3. THE SWITCH: off lists nothing, on lists the tailgater; never a car the 
   assert.deepEqual([updated.ban_tailgaters, updated.ban_reach], [true, 'garage']);
   const listed = await openStay(g, { tailgater: true });
   await openStay(g, { tailgater: false });
-  await openStay(g, { tailgater: true, descriptor: null });
+  const unread = await openStay(g, { tailgater: true, descriptor: null });
   const banned = (await rules(g.entry)).banned;
   assert.equal(banned.length, 1, JSON.stringify(banned));
   assert.equal(banned[0].descriptor, listed.descriptor);
   assert.notEqual(banned[0].descriptor, whileOff.descriptor);
   assert.deepEqual(Object.keys(banned[0]).sort(), ['descriptor', 'id']);
+  // What the owner sees (U7f gate, F5): the lane's list hides a row with no
+  // descriptor, so the owner's list is read too -- the one listed car, and
+  // never the tailgater whose identity was not read.
+  const owner = await (await op('GET', `/garages/${g.id}/banned`)).json();
+  assert.deepEqual(owner.cars.map((c) => c.plate), [listed.plate], JSON.stringify(owner.cars));
+  assert.ok(!owner.cars.some((c) => c.plate === unread.plate), 'no car listed without an identity read');
 
   const refused = await op('PATCH', `/garages/${g.id}`, { ban_reach: 'everywhere' });
   assert.equal(refused.status, 400);
