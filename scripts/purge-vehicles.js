@@ -7,15 +7,21 @@
  */
 import { pool } from '../src/db.js';
 import { listTenantIds, redactExpiredVehicles } from '../src/retention.js';
+import { withTenant } from '../src/db.js';
+import { removeExpiredPictures } from '../src/bans.js';
 
 const dryRun = process.argv.includes('--dry-run');
 const tenants = await listTenantIds(pool);
 
 let total = 0;
+let pictures = 0;
 for (const tenantId of tenants) {
   const result = await redactExpiredVehicles(tenantId, { dryRun });
   const n = dryRun ? result.wouldRedact : result.redacted;
   total += n;
+  // The pictures kept with an entry (0033): one week after the car left.
+  // Never in a dry run.
+  if (!dryRun) pictures += await withTenant(tenantId, (client) => removeExpiredPictures(client, tenantId));
   if (n > 0 || process.env.VERBOSE) {
     console.log(
       `${tenantId.slice(0, 8)}  retention=${result.retentionDays}d  ` +
@@ -23,5 +29,5 @@ for (const tenantId of tenants) {
     );
   }
 }
-console.log(`${tenants.length} tenant(s); ${dryRun ? 'would redact' : 'redacted'} ${total} vehicle(s).`);
+console.log(`${tenants.length} tenant(s); ${dryRun ? 'would redact' : 'redacted'} ${total} vehicle(s)${dryRun ? '' : `; removed ${pictures} picture(s)`}.`);
 await pool.end();

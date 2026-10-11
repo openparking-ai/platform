@@ -289,6 +289,14 @@ jobs:
         # suite and the isolation suite to go red.
         run: npm run garage-reads-fail-control
 
+      - name: Pictures-and-bans fail-control
+        # U7f (0033). Each break removes one property -- the week rule after
+        # the exit, a car inside keeping its pictures, a tailgater stay marked,
+        # the owner's switch, the reach, removal, a listed car kept whole (its
+        # pictures and its vehicle), and no route that lists a car by hand --
+        # and requires test/bans.test.js to go red in the test that names it.
+        run: npm run bans-fail-control
+
       - name: Owner-language fail-control
         # The owner's language (0025). Each break removes one property -- the
         # admin taken from the session, never the body; only "en" or "es"; the

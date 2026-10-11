@@ -60,6 +60,12 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
         AND v.redacted_at IS NULL
         AND NOT EXISTS (
               SELECT 1 FROM sessions s WHERE s.vehicle_id = v.id AND s.exit_at IS NULL)
+        -- A car on a banned list (0033) is kept whole while it is listed:
+        -- its plate, its descriptor and its stay. Taken off, it ages out here
+        -- as any other.
+        AND NOT EXISTS (
+              SELECT 1 FROM banned_vehicles b JOIN sessions s ON s.id = b.session_id
+               WHERE s.vehicle_id = v.id)
         AND COALESCE(
               (SELECT max(s.exit_at) FROM sessions s WHERE s.vehicle_id = v.id),
               v.last_seen_at

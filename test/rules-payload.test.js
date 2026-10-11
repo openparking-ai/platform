@@ -135,7 +135,7 @@ test('the payload carries the plans whole, the space class, the entitlements, th
   const g = await garage({ plans: 3 });
   const payload = await rules(g.entry);
   assert.deepEqual(Object.keys(payload).sort(), [
-    'active', 'board', 'currency', 'default_action', 'direction', 'entitlements', 'garage_id', 'lane', 'lane_id',
+    'active', 'banned', 'board', 'currency', 'default_action', 'direction', 'entitlements', 'garage_id', 'lane', 'lane_id',
     'rate_plans', 'space_class', 'stays', 'synced_at', 'tax_sets', 'timezone',
   ]);
   // The asking lane, open (0026): closing it is covered in lane-setup.test.js.

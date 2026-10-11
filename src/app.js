@@ -23,6 +23,7 @@ import { SCREEN_CHARACTERS } from './screenText.js';
 import { MESSAGE_MAX } from './lanes.js';
 import * as setup from './setup.js';
 import * as alerts from './alerts.js';
+import * as bans from './bans.js';
 import { garageCurrency, garageName, garageTimezone } from './garageFields.js';
 
 const bad = (message) => new HttpError(400, message);
@@ -81,6 +82,8 @@ export const ID_PARAMS = Object.freeze({
     changeId: () => new HttpError(404, 'change not found'),
     contactId: () => new HttpError(404, 'alert contact not found', 'alert_contact_not_found'),
     messageId: () => new HttpError(404, 'board message not found', 'board_message_not_found'),
+    banId: () => new HttpError(404, 'banned car not found', 'banned_car_not_found'),
+    pictureId: () => new HttpError(404, 'picture not found'),
   }),
   lane: Object.freeze({
     sessionId: () => conflict('stay_not_open', STAY_NOT_OPEN),
@@ -591,6 +594,9 @@ function eventKind(value) {
   return value;
 }
 
+/** Where a garage's banned list reaches (0033): this garage, or every garage of the account. */
+const BAN_REACHES = Object.freeze(['garage', 'all']);
+
 function defaultAction(value, { required }) {
   if (value === undefined || value === null) {
     if (required) throw bad(`default_action is required and must be one of ${DEFAULT_ACTIONS.join(', ')}`);
@@ -684,7 +690,11 @@ export function createApp() {
   // Any failure to read a body is marked as one, so it is answered in one
   // fixed sentence (below), whatever the path.
   const json = express.json({ limit: '1mb' });
-  app.use((req, res, next) => json(req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined)));
+  // A lane's picture (U7f) is the one larger body: up to PICTURE_MAX_BYTES,
+  // base64 in JSON. Every other path keeps the one limit.
+  const pictureJson = express.json({ limit: '5mb' });
+  app.use((req, res, next) => (req.path === '/api/v1/lane/pictures' ? pictureJson : json)(
+    req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined)));
 
   app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
@@ -889,8 +899,19 @@ export function createApp() {
     try {
       const action = defaultAction(req.body?.default_action, { required: false });
       const transient = transientField(req.body?.transient_available, { required: false });
-      if (action === undefined && transient === undefined) {
-        throw bad('default_action or transient_available is required');
+      // The location setup's two settings for tailgaters (0033, U7f).
+      const banTailgaters = req.body?.ban_tailgaters;
+      if (banTailgaters !== undefined && typeof banTailgaters !== 'boolean') {
+        throw bad('ban_tailgaters must be true or false when given');
+      }
+      const banReach = req.body?.ban_reach;
+      if (banReach !== undefined && !BAN_REACHES.includes(banReach)) {
+        throw bad(`ban_reach must be one of ${BAN_REACHES.join(', ')} when given`);
+      }
+      const given = { default_action: action, transient_available: transient, ban_tailgaters: banTailgaters, ban_reach: banReach };
+      const fields = Object.keys(given).filter((f) => given[f] !== undefined);
+      if (fields.length === 0) {
+        throw bad('default_action, transient_available, ban_tailgaters or ban_reach is required');
       }
       const garage = await changeTx(req, async (client) => {
         // Read first, locked: the line says what each field was.
@@ -901,14 +922,12 @@ export function createApp() {
         if (!was[0]) throw new HttpError(404, 'garage not found');
         const sets = [];
         const values = [req.tenantId, req.params.garageId];
-        if (action !== undefined) { values.push(action); sets.push(`default_action = $${values.length}`); }
-        if (transient !== undefined) { values.push(transient); sets.push(`transient_available = $${values.length}`); }
+        for (const f of fields) { values.push(given[f]); sets.push(`${f} = $${values.length}`); }
         const { rows } = await client.query(
           `UPDATE garages SET ${sets.join(', ')}
             WHERE tenant_id = $1 AND id = $2 RETURNING *`,
           values,
         );
-        const fields = [...(action !== undefined ? ['default_action'] : []), ...(transient !== undefined ? ['transient_available'] : [])];
         await changes.record(client, req.change, {
           garageId: rows[0].id,
           action: 'garage.update',
@@ -1575,7 +1594,8 @@ export function createApp() {
         const open = await repo.openStaysForLane(client, tenantId, garageId);
         const laneState = await lanes.laneState(client, tenantId, laneId);
         const boardState = await board.forLane(client, tenantId, laneId);
-        return { garage, plans, taxSets, stays: { cursor, open }, laneState, boardState };
+        const banned = await bans.forLane(client, tenantId, garageId);
+        return { garage, plans, taxSets, stays: { cursor, open }, laneState, boardState, banned };
       });
       if (!payload.garage) throw new HttpError(404, 'garage not found');
       // Outside the transaction: two subprocesses, and nothing of theirs is
@@ -1610,6 +1630,11 @@ export function createApp() {
         tax_sets: payload.taxSets,
         entitlements,
         stays: payload.stays,
+        // The cars this lane refuses (0033, U7f): each ban that reaches this
+        // garage, by its id and the car's descriptor. The lane compares an
+        // arriving car's descriptor against these the way the exit search
+        // compares them, and refuses a match with reason `banned`.
+        banned: payload.banned,
         synced_at: new Date().toISOString(),
       });
     } catch (err) {
@@ -1752,6 +1777,11 @@ export function createApp() {
       // read.
       const { plate, ticketRef } = laneIdentity(req.body);
       const entryConfirmation = confirmation(req.body?.entry_confirmation, 'entry_confirmation');
+      // A car through the gate that no vend let in, whose identity the lane
+      // read at the closing loop (U7f): a stay like any other, which pays at
+      // the exit -- and, where the garage bans tailgaters, a car on its list.
+      const tailgater = req.body?.tailgater ?? false;
+      if (typeof tailgater !== 'boolean') throw bad('tailgater must be true or false when given');
       // Required, not optional. Without it there is no key to be idempotent on
       // and the only thing left to check is state -- which is exactly how a
       // replay arriving after the car has left opens a second, phantom session.
@@ -1768,7 +1798,7 @@ export function createApp() {
         const vehicle = await repo.upsertVehicle(client, tenantId, {
           plate, ticketRef, plateRegion, seenAt: entryAt, make, model, color, attributes,
         });
-        return repo.openSession(client, tenantId, {
+        const opened = await repo.openSession(client, tenantId, {
           garageId,
           vehicleId: vehicle.id,
           laneId,
@@ -1777,7 +1807,10 @@ export function createApp() {
           openEventId: String(openEventId),
           entryConfirmation,
           entryDescriptor,
+          tailgater,
         });
+        if (opened.created) await bans.listIfBanned(client, tenantId, { garage, session: opened.session });
+        return opened;
       });
 
       // The row that was written, echoed whole -- `entry_confirmation` and
@@ -1796,6 +1829,45 @@ export function createApp() {
       if (err.code === 'EVENT_ID_VEHICLE_CONFLICT') {
         return next(conflict('event_id_reused', 'event_id already used for a different vehicle'));
       }
+      next(err);
+    }
+  });
+
+  /**
+   * A PICTURE KEPT WITH AN ENTRY (0033, U7f). Body:
+   *   {picture_ref, event_id, taken_at, image}
+   * `image` is the picture as base64, a JPEG or a PNG by its first bytes, at
+   * most PICTURE_MAX_BYTES; `event_id` is the lane's id of the entry record it
+   * belongs to (a stay's open, a tailgater nobody identified, a banned car
+   * refused); `picture_ref` is the lane's own id for it, so a resend is the
+   * same picture. Kept one week after the car left (src/bans.js).
+   */
+  lane.post('/pictures', async (req, res, next) => {
+    try {
+      const { tenantId, garageId, laneId } = req.device;
+      const body = req.body ?? {};
+      const text = (value, label, max) => {
+        if (typeof value !== 'string' || value.length === 0 || value.length > max) {
+          throw bad(`${label} is required, a string of at most ${max} characters`);
+        }
+        return value;
+      };
+      const pictureRef = text(body.picture_ref, 'picture_ref', 64);
+      const eventId = text(body.event_id, 'event_id', 200);
+      const takenAt = refuseFuture(parseTime(body.taken_at, 'taken_at'), 'taken_at');
+      if (typeof body.image !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(body.image)) {
+        throw bad('image is required, base64');
+      }
+      const image = Buffer.from(body.image, 'base64');
+      if (image.length === 0 || image.length > bans.PICTURE_MAX_BYTES) {
+        throw bad(`image must be at most ${bans.PICTURE_MAX_BYTES} bytes`);
+      }
+      const contentType = bans.pictureType(image);
+      if (!contentType) throw bad('image must be a JPEG or a PNG');
+      const { created } = await withTenant(tenantId, (client) =>
+        bans.storePicture(client, tenantId, { garageId, laneId, pictureRef, eventId, takenAt, contentType, image }));
+      res.status(created ? 201 : 200).json({ picture_ref: pictureRef, event_id: eventId, created });
+    } catch (err) {
       next(err);
     }
   });
@@ -2424,6 +2496,66 @@ export function createApp() {
     return garage;
   };
 
+  /**
+   * THE BANNED CARS (0033, U7f). The garage's two settings, and every car
+   * whose ban reaches it -- listed here, or at a garage of the account that
+   * bans across all its garages -- each with its pictures. A read.
+   */
+  operator.get('/garages/:garageId/banned', async (req, res, next) => {
+    try {
+      const out = await withTenant(req.tenantId, async (client) => {
+        await ownGarage(client, req);
+        return bans.forOwner(client, req.tenantId, req.params.garageId);
+      });
+      res.json(out);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * Take a car off the list. There is no route that puts one on it: a car is
+   * listed only as a tailgater, where the garage bans them. Its stay and its
+   * pictures then age out by the normal rules.
+   */
+  operator.post('/garages/:garageId/banned/:banId/remove', async (req, res, next) => {
+    try {
+      await changeTx(req, async (client) => {
+        const garage = await ownGarage(client, req);
+        const ban = await bans.reaching(client, req.tenantId, garage.id, req.params.banId);
+        if (!ban) throw new HttpError(404, 'banned car not found', 'banned_car_not_found');
+        if (!(await bans.remove(client, req.tenantId, ban.id))) {
+          throw new HttpError(404, 'banned car not found', 'banned_car_not_found');
+        }
+        await changes.record(client, req.change, {
+          garageId: ban.garage_id,
+          action: 'garage.banned_car_remove',
+          subject: { kind: 'garage', id: ban.garage_id, name: ban.garage_name },
+          before: { banned: true },
+          after: { banned: false },
+        });
+      });
+      res.json({ removed: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** One picture of a banned car whose ban reaches this garage, as the image itself. */
+  operator.get('/garages/:garageId/banned/:banId/pictures/:pictureId', async (req, res, next) => {
+    try {
+      const picture = await withTenant(req.tenantId, async (client) => {
+        await ownGarage(client, req);
+        return bans.pictureOfBan(client, req.tenantId, req.params.garageId, req.params.banId, req.params.pictureId);
+      });
+      if (!picture) throw new HttpError(404, 'picture not found');
+      res.set({ 'Content-Type': picture.content_type, 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' });
+      res.send(picture.image);
+    } catch (err) {
+      next(err);
+    }
+  });
+
   /** The alerts, in order, and the garage's people with what each gets. A read. */
   operator.get('/garages/:garageId/alerts', async (req, res, next) => {
     try {
@@ -2835,6 +2967,7 @@ export const WRITE_ROUTES = Object.freeze([
   ['PATCH', '/garages/:garageId/board-messages/:messageId', 'board_message.change'],
   ['DELETE', '/garages/:garageId/board-messages/:messageId', 'board_message.remove'],
   ['PUT', '/lanes/:laneId/board-prices', 'lane.board_prices'],
+  ['POST', '/garages/:garageId/banned/:banId/remove', 'garage.banned_car_remove'],
 ]);
 
 const WRITE_PATTERNS = WRITE_ROUTES.map(([method, path, action]) => [
