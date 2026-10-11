@@ -133,14 +133,15 @@ redacts it on the same window — see
 A ticket is not an entry. A driver can pull up, take one and drive away, and a
 vend with nothing behind it is not an arrival at all — so every abandoned
 approach used to become a phantom occupant, counted as inside and never seen
-again. The lane now creates a pending entry at the vend and promotes it when two
-loops after the barrier see a vehicle cross them forward.
+again. The lane now creates a pending entry at the vend and promotes it when the
+loop after the barrier sees the vehicle: the gate's own closing loop, read through
+its detector's second output, or two confirmation loops crossed forward.
 
 `entry_confirmation` is **required and never defaulted**, and it says which:
 
 | | |
 |---|---|
-| `confirmed` | two loops after the barrier saw a vehicle cross them forward |
+| `confirmed` | the gate's own closing loop read a vehicle after the vend, inside the lane's window (the standard installation, `closing_loops: 1`); or two loops after the barrier saw it cross them forward (`closing_loops: 2`). The lane's `entry_confirmed` event says which, in its reason and its `geometry_assumed`. One loop does not see which way the car then went: a car that reaches it and backs out keeps an open stay with no exit |
 | `unconfirmable` | that lane has no closing loops, so nothing could confirm or refute it |
 
 The response **echoes the value back**, and that is a contract term rather than a
