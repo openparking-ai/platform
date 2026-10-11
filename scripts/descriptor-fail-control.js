@@ -99,9 +99,9 @@ const BREAKS = [
     why: 'the INSERT writes null for the descriptor the route accepted',
     file: 'src/repository.js',
     from: `      [tenantId, garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation,
-       entryDescriptor],`,
+       entryDescriptor, tailgater],`,
     to: `      [tenantId, garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation,
-       null],`,
+       null, tailgater],`,
   },
   {
     name: 'not_echoed',
