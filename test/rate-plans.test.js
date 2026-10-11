@@ -163,7 +163,8 @@ test('the read returns EVERY plan of the garage, oldest effective date first, an
 
 test('a garage with no plans reads an empty list; an unknown garage is 404 on both routes', async () => {
   const garage = await newGarage();
-  assert.deepEqual(await (await list(garage)).json(), { rate_plans: [] });
+  // With the space class every stay here is priced as (U7g): the Rates form builds plans with it.
+  assert.deepEqual(await (await list(garage)).json(), { rate_plans: [], space_class: 'standard' });
   assert.equal((await list(randomUUID())).status, 404);
   assert.equal((await store(randomUUID(), plan())).status, 404);
 });

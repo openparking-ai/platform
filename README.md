@@ -838,7 +838,7 @@ curl -H "authorization: Bearer $OPERATOR_TOKEN" -H 'content-type: application/js
   -d '{"plan": { ...the plan document, whole... }, "confirmed": true}' \
   http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans     # 201, the row and the document
 curl -H "authorization: Bearer $OPERATOR_TOKEN" \
-  http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans     # every plan of the garage
+  http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans     # every plan of the garage, and the space class its stays are priced as
 ```
 
 What the store does, and does not do — the reasons are in `migrations/0012_rate_plans.sql`:

@@ -1280,12 +1280,14 @@ export function createApp() {
    */
   operator.get('/garages/:garageId/rate-plans', async (req, res, next) => {
     try {
-      const rows = await withTenant(req.tenantId, async (client) => {
+      const out = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
-        return ratePlans.ratePlansForGarage(client, req.tenantId, garage.id);
+        return { garage, rows: await ratePlans.ratePlansForGarage(client, req.tenantId, garage.id) };
       });
-      res.json({ rate_plans: rows.map(presentRatePlan) });
+      // The space class every stay here is priced as (U7g): a plan must
+      // declare it, and the owner's Rates form builds the plan with it.
+      res.json({ rate_plans: out.rows.map(presentRatePlan), space_class: out.garage.space_class });
     } catch (err) {
       next(err);
     }
