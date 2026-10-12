@@ -23,7 +23,7 @@ import assert from 'node:assert/strict';
 import pg from 'pg';
 import { pool, withTenant, storePlan, flatHourlyPlan, stateTaxes, superuserClient } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
-import { WRITE_ROUTES } from '../src/app.js';
+import { WRITE_ROUTES, READ_POSTS } from '../src/app.js';
 import * as changes from '../src/changes.js';
 import { startRateEngine } from './rate-engine.js';
 import { startStripeStub } from './stripe-stub.js';
@@ -97,8 +97,27 @@ async function paidGarage() {
   return { g, exit, account: r.json.stripe_account.account_id };
 }
 
+/**
+ * A pass-only garage every setup step of which is done but opening (U7g:
+ * opening waits for the whole setup): a plan, taxes, a way in and a way out,
+ * each with a computer heard from just now.
+ */
+async function readyToOpen(name = undefined) {
+  const g = await newGarage(base, a, { transient_available: false, ...(name ? { name } : {}) });
+  for (const [laneName, direction] of [['Gate in', 'entry'], ['Gate out', 'exit']]) {
+    const lane = await newLane(base, a, g.id, laneName, direction);
+    await withTenant(a.tenant, (c) => c.query(
+      `INSERT INTO lane_devices (tenant_id, lane_id, name, token_hash, last_seen_at) VALUES ($1, $2, 'pi', $3, now())`,
+      [a.tenant, lane.id, hashToken(generateDeviceToken())],
+    ));
+  }
+  await withTenant(a.tenant, async (c) => { await storePlan(c, a.tenant, g.id, flatHourlyPlan()); await stateTaxes(c, a.tenant, g.id); });
+  return g;
+}
+
 let planN = 0;
-const plan = () => flatHourlyPlan({ version: `log-plan-${(planN += 1)}`, effectiveFrom: new Date(Date.UTC(2020, 0, 1) + planN * 60_000).toISOString() });
+// In the future: the store refuses a plan that starts in the past (U7g).
+const plan = () => flatHourlyPlan({ version: `log-plan-${(planN += 1)}`, effectiveFrom: new Date(Date.UTC(2040, 0, 1) + planN * 60_000).toISOString() });
 
 /**
  * Every write, as a recipe: how to set it up fresh, the request that makes the
@@ -125,11 +144,7 @@ const WRITES = [
   },
   {
     action: 'garage.open',
-    setup: async () => {
-      const g = await newGarage(base, a, { transient_available: false });
-      await withTenant(a.tenant, async (c) => { await storePlan(c, a.tenant, g.id, flatHourlyPlan()); await stateTaxes(c, a.tenant, g.id); });
-      return { g };
-    },
+    setup: async () => ({ g: await readyToOpen() }),
     run: (s) => call(base, 'POST', `/garages/${s.g.id}/activate`, { as: a }),
     line: (l) => assert.deepEqual([l.before, l.after], [{ open: false }, { open: true }]),
     state: (s) => one(a.tenant, 'SELECT activated_at FROM garages WHERE id = $1', [s.g.id]),
@@ -220,8 +235,8 @@ const WRITES = [
   {
     action: 'rate_plan.add',
     setup: async () => ({ g: await newGarage(base, a), plan: plan() }),
-    run: (s) => call(base, 'POST', `/garages/${s.g.id}/rate-plans`, { as: a, body: { plan: s.plan } }),
-    line: (l, s) => assert.deepEqual([l.before, l.after.plan_version], [null, s.plan.plan_version]),
+    run: (s) => call(base, 'POST', `/garages/${s.g.id}/rate-plans`, { as: a, body: { plan: s.plan, confirmed: true } }),
+    line: (l, s) => assert.deepEqual([l.before, l.after.plan_version, l.after.confirmed], [null, s.plan.plan_version, true]),
     state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM rate_plans WHERE garage_id = $1', [s.g.id]),
   },
   {
@@ -451,8 +466,12 @@ function routeTable(expressApp) {
 }
 
 test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 31 -- and every one has a recipe here, or is always refused', () => {
+  const reads = READ_POSTS.map(([m, p]) => `${m} ${p}`);
   const writes = routeTable(expressApp).filter((r) => r.mount === '/api/v1' && r.method !== 'GET').map((r) => `${r.method} ${r.path}`);
-  assert.deepEqual(writes.sort(), WRITE_ROUTES.map(([m, p]) => `${m} ${p}`).sort());
+  assert.deepEqual(writes.filter((w) => !reads.includes(w)).sort(), WRITE_ROUTES.map(([m, p]) => `${m} ${p}`).sort());
+  // And the one POST that changes nothing (U7g's try): a read with a body.
+  assert.deepEqual(reads, ['POST /garages/:garageId/rate-plans/try']);
+  assert.ok(writes.includes(reads[0]), 'the read POST is on the router');
   // 22 from U4, U4b's four: a person added, changed, removed, and what they
   // get; and U4c's four: a board message added, changed, removed, and a
   // lane's price switch.
@@ -712,8 +731,7 @@ test('NOTHING CHANGED, NO LINE: every route asked for what is already so writes 
   secrets.add(k);
   const kid = (await one(a.tenant, `INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'Spare key',$2) RETURNING id`, [a.tenant, hashToken(k)])).id;
   assert.equal((await call(base, 'POST', `/operator-tokens/${kid}/revoke`, { as: a })).status, 200);
-  const open = await newGarage(base, a, { transient_available: false, name: 'Open Garage' });
-  await withTenant(a.tenant, async (c) => { await storePlan(c, a.tenant, open.id, flatHourlyPlan()); await stateTaxes(c, a.tenant, open.id); });
+  const open = await readyToOpen('Open Garage');
   assert.equal((await call(base, 'POST', `/garages/${open.id}/activate`, { as: a })).status, 201);
   const paid = await paidGarage();
   assert.equal((await call(base, 'POST', `/garages/${paid.g.id}/stripe-account/refresh`, { as: a })).status, 200);

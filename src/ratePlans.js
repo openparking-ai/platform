@@ -23,10 +23,14 @@
  *             finding is still a finding -- the engine's own rule, a decision
  *             is an acknowledgement and not a price -- so it refuses too.
  *   store     the document, whole, with the engine contract version that
- *             validated it. Refusals by name for the things only the store can
- *             see: the garage's currency (the document restates it, never sets
- *             it), a version name already used, an effective instant already
- *             taken.
+ *             validated it -- and only once the owner confirmed it (U7g,
+ *             `assertConfirmed`). Refusals by name for the things only the
+ *             store can see: the garage's currency (the document restates it,
+ *             never sets it), a version name already used, an effective instant
+ *             already taken, and a start in the past (U7g, `assertStartsNow`).
+ *   try       (U7g, the route in app.js) a draft is checked the store's way --
+ *             `assertFitsGarage`, `assertNewBeside` -- and priced beside the
+ *             stored plans through the close's own functions; nothing stored.
  *   read      EVERY plan of the garage, oldest effective date first. No
  *             selection here -- the engine's `select_plan` does that and its
  *             own test holds the entry-time rule. `documents()` is the
@@ -163,15 +167,38 @@ export function planDocument(raw) {
 }
 
 /**
- * Store one plan for one garage, inside the caller's tenant transaction, and
- * record that it happened.
- *
- * `garage` is the row the caller already loaded (it needed it for the 404);
- * its `currency` is the one place currency lives. The engine has ALREADY said
- * the plan is whole -- `validated.schemaVersion` is its word -- and this
- * function does not call it again.
+ * How far before this server's clock a plan may say it starts: the owner's
+ * screen and this server read two clocks, and "Now" pressed on one is a few
+ * seconds in the past on the other. Anything earlier is a plan dated back.
  */
-export async function storeRatePlan(client, tenantId, { garage, document, validated, actor, now = null }) {
+export const START_ALLOWANCE_MS = 60_000;
+
+/**
+ * A plan never starts in the past (U7g, Defect 2). The engine prices a stay on
+ * the plan in force at ENTRY, so a plan dated one hour back is in force for a
+ * car that came in half an hour ago, and that car's close is priced by it --
+ * measured: 2.50 became 10.00. "A rate change never reaches back into a car
+ * that is already parked" holds only while every plan starts after it is
+ * saved. Called after the engine loaded the document, so `effective_from` is
+ * an instant the engine accepted.
+ */
+export function assertStartsNow(document, { now = Date.now() } = {}) {
+  const start = Date.parse(document.effective_from);
+  if (Number.isFinite(start) && start < now - START_ALLOWANCE_MS) {
+    throw new RatePlanRefused(
+      'plan_starts_in_the_past',
+      `the plan starts at ${document.effective_from}, more than ${START_ALLOWANCE_MS / 1000}s before this server's clock ` +
+        `(${new Date(now).toISOString()}); a plan dated back would price cars that are already parked, so it starts now or later`,
+    );
+  }
+}
+
+/**
+ * What only the garage can say about a document: its money and the space
+ * class every stay here is priced as. Shared by the store and by the try, so
+ * a draft the store would refuse is refused the same way when it is tried.
+ */
+export function assertFitsGarage(garage, document) {
   if (document.currency !== garage.currency) {
     throw new RatePlanRefused(
       'plan_currency_disagrees_with_garage',
@@ -191,6 +218,57 @@ export async function storeRatePlan(client, tenantId, { garage, document, valida
         `and the plan declares only: ${classes.map((c) => JSON.stringify(c)).join(', ') || 'nothing'}`,
     );
   }
+}
+
+/**
+ * The store's two refusals about the OTHER plans, said before anything is
+ * written, for a draft that is only being tried: a version name already used,
+ * an effective instant already taken. The store itself learns both from the
+ * database's constraints; this reads the same two facts from `stored`.
+ */
+export function assertNewBeside(stored, document) {
+  if (stored.some((r) => r.plan_version === document.plan_version)) {
+    throw new RatePlanRefused(
+      'plan_version_exists',
+      `this garage already holds a plan named ${JSON.stringify(document.plan_version)}; a changed plan is a new version`,
+    );
+  }
+  const start = Date.parse(document.effective_from);
+  if (stored.some((r) => new Date(r.effective_from).getTime() === start)) {
+    throw new RatePlanRefused(
+      'plan_effective_from_taken',
+      `this garage already holds a plan taking effect at ${document.effective_from}; two versions at one instant ` +
+        'would make the version in force at entry ambiguous, which the engine refuses on every stay from then on',
+    );
+  }
+}
+
+/**
+ * The owner's confirmation (U7g): nothing is saved until the owner has seen
+ * the prices and said so. Every caller sends `confirmed: true`, the admin and
+ * a key alike; anything else is refused before the engine is asked.
+ */
+export function assertConfirmed(body) {
+  if (body?.confirmed !== true) {
+    throw new RatePlanRefused(
+      'not_confirmed',
+      'rates are saved only once the owner has checked the prices they charge and confirmed them: send confirmed: true',
+    );
+  }
+}
+
+/**
+ * Store one plan for one garage, inside the caller's tenant transaction, and
+ * record that it happened.
+ *
+ * `garage` is the row the caller already loaded (it needed it for the 404);
+ * its `currency` is the one place currency lives. The engine has ALREADY said
+ * the plan is whole -- `validated.schemaVersion` is its word -- and this
+ * function does not call it again.
+ */
+export async function storeRatePlan(client, tenantId, { garage, document, validated, actor, now = null }) {
+  assertFitsGarage(garage, document);
+  assertStartsNow(document, { now: now ? new Date(now).getTime() : Date.now() });
   let row;
   try {
     const { rows } = await client.query(

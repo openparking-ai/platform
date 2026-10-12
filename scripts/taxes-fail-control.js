@@ -107,8 +107,9 @@ const SOURCE_BREAKS = [
     name: 'outage_not_named',
     why: 'no engine is an unnamed 500',
     file: 'src/app.js',
-    from: '  if (err instanceof ratePlans.EngineUnavailable) {',
-    to: '  if (false) {',
+    // The tax route's own line: U7g's try names the same outage in its own catch.
+    from: 'function taxSetRefusal(err) {\n  if (err instanceof ratePlans.EngineUnavailable) {',
+    to: 'function taxSetRefusal(err) {\n  if (false) {',
   },
   {
     name: 'request_spelling_stored',

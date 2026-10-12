@@ -303,7 +303,7 @@ test("the stay is priced as the garage's space class, and a plan that does not d
   const res = await fetch(`${base}/api/v1/garages/${g.id}/rate-plans`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
-    body: JSON.stringify({ plan: flatHourlyPlan({ version: 'standard-only', effectiveFrom: '2027-01-01T00:00:00Z' }) }),
+    body: JSON.stringify({ plan: flatHourlyPlan({ version: 'standard-only', effectiveFrom: '2037-01-01T00:00:00Z' }), confirmed: true }),
   });
   assert.equal(res.status, 409);
   const body = await res.json();
@@ -313,7 +313,7 @@ test("the stay is priced as the garage's space class, and a plan that does not d
   const ok = await fetch(`${base}/api/v1/garages/${g.id}/rate-plans`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
-    body: JSON.stringify({ plan: flatHourlyPlan({ version: 'vip-only', spaceClass: 'vip', effectiveFrom: '2027-01-01T00:00:00Z' }) }),
+    body: JSON.stringify({ plan: flatHourlyPlan({ version: 'vip-only', spaceClass: 'vip', effectiveFrom: '2037-01-01T00:00:00Z' }), confirmed: true }),
   });
   assert.equal(ok.status, 201, JSON.stringify(await ok.clone().json()));
 });

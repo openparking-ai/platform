@@ -120,7 +120,7 @@ const SOURCE_BREAKS = [
     why: 'a refused write writes no line',
     suite: LOG,
     red: ['REFUSED ATTEMPTS land in the right log'],
-    edits: [{ file: 'src/app.js', from: "    if (!SAFE_METHODS.has(req.method) && status >= 400 && status < 500 && !err?.malformedId) {", to: '    if (false) {' }],
+    edits: [{ file: 'src/app.js', from: "    if (!SAFE_METHODS.has(req.method) && !isReadPost(req) && status >= 400 && status < 500 && !err?.malformedId) {", to: '    if (false) {' }],
   },
   {
     name: 'key_in_line',
