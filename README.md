@@ -878,8 +878,31 @@ What the store does, and does not do — the reasons are in `migrations/0012_rat
   force at entry, so "a rate change never reaches back into a car that is
   already parked" holds only while every plan starts after it is saved. The
   60 s are for the owner's screen and this server reading two clocks.
-- **Append-only by grant, like `events`.** A changed price is a new version.
-  Storing one is recorded as a `rate_plan_stored` event naming the operator token.
+- **Append-only by grant, like `events` — with one narrow door (U7i fix 1,
+  0034).** A changed price is a new version. Storing one is recorded as a
+  `rate_plan_stored` event naming the operator token. The one change a stored
+  plan ever takes is its **withdrawal, and only before it starts**: a plan whose
+  `effective_from` has not come has priced nothing. The application role may set
+  `withdrawn_at` and `withdrawn_by` and nothing else; a trigger refuses
+  withdrawing a plan that has started, withdrawing one twice, and every other
+  UPDATE; DELETE stays refused by the grant.
+- **A change carried into rates scheduled later (U7i fix 1).** The save takes an
+  optional `"carry": [{"withdraw": "<plan id>", "plan": { ...its replacement... }}]`:
+  each later version, not started yet, that today's change is carried into. In
+  one transaction each named plan is withdrawn (`409 plan_already_started` for
+  one that has started), the save's plan is stored, and each replacement is
+  validated and stored at the instant of the plan it replaces
+  (`409 carry_start_differs` otherwise); any refusal refuses the whole save. An
+  entry with no `plan` is replaced by the save's own plan, which must then start
+  at that plan's instant. Each withdrawal writes a `rate_plan.withdraw`
+  change-log line and each replacement its `rate_plan.add` line. "One effective
+  instant per garage" counts only plans not withdrawn; a version name is never
+  used twice, withdrawn or not.
+- **Withdrawn plans never price.** `ratePlansForGarage` is the one function that
+  selects the plans that price; the close, the try, `/lane/rules`, the reconcile
+  and the opening readout all use it (`test/rate-plan-readers.test.js` sweeps the
+  source for every reader of `rate_plans`). The rate-plans read still returns a
+  withdrawn plan, with `withdrawn_at` and `withdrawn_by`, for history.
 - **A closed stay keeps `plan_version`, `breakdown` and `space_class` beside
   `fee_minor`** — the version that priced it, the engine's plain-English ledger
   and the class it was priced as, together or not at all.
@@ -898,7 +921,9 @@ What a car would pay, before the owner saves anything. `stays` is 1 to 100
 happens twice is the first of the two. Without `plan` the garage's stored plans
 price them; with `plan`, the stored plans **and** the draft, exactly as the
 close will see them once it is saved — a car that came in before the draft
-starts is priced by the plan it would really get.
+starts is priced by the plan it would really get. With `carry` beside `plan`
+(the save's own shape, U7i fix 1), the plans are priced as that save would
+leave them: each withdrawn later version out, its replacement in.
 
 - **The close's own path.** Each stay goes through `priceStay`, then
   `taxedPricing` with the tax taken at the exit, the two functions the close

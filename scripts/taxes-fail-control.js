@@ -252,17 +252,20 @@ CREATE CONSTRAINT TRIGGER garage_tax_rules_hold_their_stated_rules
       },
     ],
   },
+  // The gate's function runs as 0034 last defined it (U7i fix 1 counts only
+  // the plans not withdrawn): a break in 0022's copy would be overwritten
+  // before any test saw it, so the two gate breaks plant in 0034.
   {
     name: 'gate_ignores_taxes',
     why: 'the trigger activates a garage whose taxes are unstated',
     edits: [
       {
-        file: '0022_garage_tax_sets.sql',
+        file: '0034_rate_plans_withdrawn_before_they_start.sql',
         from: "    IF tax_sets_stated = 0 THEN\n      RAISE EXCEPTION 'garages: cannot activate % -- its taxes are unstated', NEW.id",
         to: "    IF false THEN\n      RAISE EXCEPTION 'garages: cannot activate % -- its taxes are unstated', NEW.id",
       },
       {
-        file: '0022_garage_tax_sets.sql',
+        file: '0034_rate_plans_withdrawn_before_they_start.sql',
         from: '    IF tax_sets_in_force = 0 THEN',
         to: '    IF false THEN',
       },
@@ -273,7 +276,7 @@ CREATE CONSTRAINT TRIGGER garage_tax_rules_hold_their_stated_rules
     why: 'the trigger counts stated tax sets, not sets in force',
     edits: [
       {
-        file: '0022_garage_tax_sets.sql',
+        file: '0034_rate_plans_withdrawn_before_they_start.sql',
         from: '    SELECT count(*), count(*) FILTER (WHERE effective_from <= now())\n      INTO tax_sets_stated, tax_sets_in_force',
         to: '    SELECT count(*), count(*)\n      INTO tax_sets_stated, tax_sets_in_force',
       },

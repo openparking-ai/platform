@@ -332,3 +332,28 @@ test('THE TRY TAKES THE SAME CARRY: a stay after the later date is priced by the
   const unknown = await op('POST', `/garages/${g.id}/rate-plans/try`, { plan: plan(500, 'x-try', later(60_000)), stays: [stay], carry: [{ withdraw: randomUUID(), plan: plan(1, 'y-try', start) }] });
   assert.equal(unknown.json.code, 'plan_not_found');
 });
+
+test("A carry reaches only this garage's plans: another garage's, or another account's, is plan_not_found and left as it was", async () => {
+  const op = as(await key());
+  const g = await garage();
+  const other = await garage();
+  const theirs = await op('POST', `/garages/${other.id}/rate-plans`, { plan: plan(900, 'other-garage-later', later(2 * 86_400_000)), confirmed: true });
+  assert.equal(theirs.status, 201);
+  // Another account, with a later plan of its own.
+  const tenantB = await createTenant('carry-b');
+  const gB = await withTenant(tenantB, async (c) => (await c.query(
+    `INSERT INTO garages (tenant_id, name, timezone, currency, transient_available) VALUES ($1, 'B', $2, 'USD', true) RETURNING id`, [tenantB, ZONE])).rows[0].id);
+  const planB = await withTenant(tenantB, (c) => storePlan(c, tenantB, gB, plan(900, 'tenant-b-later', later(2 * 86_400_000))));
+  for (const [what, id, start] of [['another garage', theirs.json.rate_plan.id, theirs.json.rate_plan.effective_from], ['another account', planB, null]]) {
+    const res = await op('POST', `/garages/${g.id}/rate-plans`, { plan: plan(500, `x-${what.length}`, later(60_000)), confirmed: true, carry: [{ withdraw: id, plan: plan(1, `y-${what.length}`, start ?? later(2 * 86_400_000)) }] });
+    assert.equal(res.status, 409, `${what}: ${JSON.stringify(res.json)}`);
+    assert.equal(res.json.code, 'plan_not_found', what);
+  }
+  const stillOther = await withTenant(tenant, async (c) => (await c.query('SELECT withdrawn_at FROM rate_plans WHERE id = $1', [theirs.json.rate_plan.id])).rows[0]);
+  const stillB = await withTenant(tenantB, async (c) => (await c.query('SELECT withdrawn_at FROM rate_plans WHERE id = $1', [planB])).rows[0]);
+  assert.equal(stillOther.withdrawn_at, null);
+  assert.equal(stillB.withdrawn_at, null);
+  // And the database refuses the same withdrawal across accounts on its own: the row is not visible.
+  const crossed = await withTenant(tenant, (c) => c.query(`UPDATE rate_plans SET withdrawn_at = now(), withdrawn_by = 'key:x' WHERE id = $1`, [planB]));
+  assert.equal(crossed.rowCount, 0);
+});

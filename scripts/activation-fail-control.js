@@ -131,14 +131,15 @@ const SCHEMA_BREAKS = [
   {
     name: 'trigger_ignores_in_force',
     why: 'the trigger counts stored plans, not plans in force',
-    // 0022 replaces the gate's function with its taxes condition, so the
-    // function that runs is 0022's copy: a break in 0014's copy is overwritten
-    // before any test sees it, and this control reported PASSED (dead) until
-    // it was re-pointed here. The anchor names the plan counts, because 0022
-    // counts tax sets with the same SELECT line.
+    // 0022 replaced the gate's function with its taxes condition, and 0034
+    // (U7i fix 1) replaced it again to count only the plans not withdrawn, so
+    // the function that runs is 0034's copy: a break in an earlier copy is
+    // overwritten before any test sees it, and this control reported PASSED
+    // (dead) each time until it was re-pointed. The anchor names the plan
+    // counts, because the gate counts tax sets with the same SELECT line.
     edits: [
       {
-        file: '0022_garage_tax_sets.sql',
+        file: '0034_rate_plans_withdrawn_before_they_start.sql',
         from: '    SELECT count(*), count(*) FILTER (WHERE effective_from <= now())\n      INTO plans_stored, plans_in_force',
         to: '    SELECT count(*), count(*)\n      INTO plans_stored, plans_in_force',
       },
