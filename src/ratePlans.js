@@ -224,10 +224,12 @@ export function assertFitsGarage(garage, document) {
  * The store's two refusals about the OTHER plans, said before anything is
  * written, for a draft that is only being tried: a version name already used,
  * an effective instant already taken. The store itself learns both from the
- * database's constraints; this reads the same two facts from `stored`.
+ * database's constraints; this reads the same two facts: the instant from
+ * `stored` (the plans that price), the name from `history` (every plan ever
+ * stored -- 0034 keeps a withdrawn plan's name taken).
  */
-export function assertNewBeside(stored, document) {
-  if (stored.some((r) => r.plan_version === document.plan_version)) {
+export function assertNewBeside(stored, document, history = stored) {
+  if (history.some((r) => r.plan_version === document.plan_version)) {
     throw new RatePlanRefused(
       'plan_version_exists',
       `this garage already holds a plan named ${JSON.stringify(document.plan_version)}; a changed plan is a new version`,
@@ -319,19 +321,142 @@ export async function storeRatePlan(client, tenantId, { garage, document, valida
 }
 
 /**
- * Every plan of the garage. Oldest effective date first, for a human reading
- * the list; the ORDER decides nothing -- the engine chooses by entry time and
- * refuses a tie whichever order the list arrives in.
+ * THE PLANS THAT PRICE: every plan of the garage that was not withdrawn
+ * (0034). This is the one place the platform selects them, and every path
+ * that hands plans on -- the close, the try, `/lane/rules`, `/lane/stays`,
+ * the reconcile, the opening readout -- goes through it
+ * (scripts/rate-plan-readers.js lists every reader of `rate_plans` and holds
+ * that). A withdrawn plan never started, so it priced nothing; leaving it out
+ * is not a choice among versions -- the engine still chooses by entry time.
+ * Oldest effective date first, for a human reading the list; the ORDER
+ * decides nothing -- the engine refuses a tie whichever order it arrives in.
  */
 export async function ratePlansForGarage(client, tenantId, garageId) {
   const { rows } = await client.query(
     `SELECT id, garage_id, plan_version, effective_from, document, engine_schema_version, created_at
        FROM rate_plans
-      WHERE tenant_id = $1 AND garage_id = $2
+      WHERE tenant_id = $1 AND garage_id = $2 AND withdrawn_at IS NULL
       ORDER BY effective_from, plan_version`,
     [tenantId, garageId],
   );
   return rows;
+}
+
+/**
+ * Every plan the garage ever stored, withdrawn ones too, marked: the history
+ * the owner reads ("replaced before it started"). NEVER handed to the engine
+ * -- `ratePlansForGarage` is what prices. Also what the try checks a draft's
+ * version name against: a name is never used twice, withdrawn or not.
+ */
+export async function ratePlanHistory(client, tenantId, garageId) {
+  const { rows } = await client.query(
+    `SELECT id, garage_id, plan_version, effective_from, document, engine_schema_version, created_at,
+            withdrawn_at, withdrawn_by
+       FROM rate_plans
+      WHERE tenant_id = $1 AND garage_id = $2
+      ORDER BY effective_from, plan_version, created_at`,
+    [tenantId, garageId],
+  );
+  return rows;
+}
+
+/** At most this many later versions are carried in one save. */
+export const CARRY_MAX = 50;
+
+/**
+ * The save's `carry` (U7i fix 1): `[{ withdraw: <plan id>, plan: <document> }]`,
+ * each a later version, not started yet, that today's change is carried into.
+ * Absent is none. `plan` left out means the save's own plan replaces it -- a
+ * change saved to start exactly when that later version would (the owner
+ * changing a special that starts with it); it is `null` here. Only the shape
+ * is read here; whether each plan may be withdrawn is the store's to say, in
+ * the save's own transaction.
+ */
+export function carryList(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw) || raw.length > CARRY_MAX) {
+    throw new RatePlanRefused('plan_invalid', `carry is a list of at most ${CARRY_MAX} { withdraw, plan }: each a later version and the plan that replaces it`);
+  }
+  const seen = new Set();
+  const out = raw.map((c, i) => {
+    if (!c || typeof c !== 'object' || Array.isArray(c) || typeof c.withdraw !== 'string' || !UUID.test(c.withdraw)) {
+      throw new RatePlanRefused('plan_invalid', `carry[${i}] is { withdraw, plan }: withdraw the id of a stored plan that has not started, plan its replacement`);
+    }
+    if (seen.has(c.withdraw)) {
+      throw new RatePlanRefused('plan_invalid', `carry names plan ${c.withdraw} twice; a plan is replaced once`);
+    }
+    seen.add(c.withdraw);
+    return { withdraw: c.withdraw, plan: c.plan === undefined || c.plan === null ? null : planDocument(c.plan) };
+  });
+  if (out.filter((c) => c.plan === null).length > 1) {
+    throw new RatePlanRefused('plan_invalid', 'carry names more than one plan the save itself replaces; the save starts at one instant');
+  }
+  return out;
+}
+
+/**
+ * The plans a try prices with, as they will be once a save with this `carry`
+ * is stored: the plans that price, less each one the carry withdraws, plus
+ * its replacement, plus the draft. The same list the store will leave behind.
+ */
+export function asTheyWillBe(stored, draft, carry) {
+  const gone = new Set(carry.map((c) => c.withdraw));
+  for (const c of carry) {
+    if (!stored.some((r) => r.id === c.withdraw)) {
+      throw new RatePlanRefused('plan_not_found', `this garage holds no plan ${c.withdraw} that prices; a carry replaces a later version not started yet`);
+    }
+  }
+  return [
+    ...documents(stored.filter((r) => !gone.has(r.id))),
+    ...(draft === null ? [] : [draft]),
+    ...carry.filter((c) => c.plan !== null).map((c) => c.plan),
+  ];
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Withdraw one plan of this garage that has not started (0034), and return
+ * it as it was. Refused by name: a plan that is not this garage's, one
+ * already withdrawn, and one that has started (`plan_already_started`) --
+ * that one may have priced a stay and is never touched. The trigger refuses
+ * the same three; this says it first, with a sentence.
+ */
+export async function withdrawRatePlan(client, tenantId, { garage, planId, actor }) {
+  const { rows } = await client.query(
+    `SELECT id, plan_version, effective_from, withdrawn_at, effective_from <= clock_timestamp() AS started
+       FROM rate_plans WHERE tenant_id = $1 AND garage_id = $2 AND id = $3 FOR UPDATE`,
+    [tenantId, garage.id, planId],
+  );
+  const plan = rows[0];
+  if (!plan) {
+    throw new RatePlanRefused('plan_not_found', `this garage holds no plan ${planId} to replace`);
+  }
+  if (plan.withdrawn_at !== null) {
+    throw new RatePlanRefused('plan_already_withdrawn', `the plan ${JSON.stringify(plan.plan_version)} was already replaced`);
+  }
+  if (plan.started) {
+    throw new RatePlanRefused(
+      'plan_already_started',
+      `the plan ${JSON.stringify(plan.plan_version)} started at ${new Date(plan.effective_from).toISOString()} and may have priced a stay; ` +
+        'a plan that has started is never withdrawn',
+    );
+  }
+  try {
+    const out = await client.query(
+      `UPDATE rate_plans SET withdrawn_at = clock_timestamp(), withdrawn_by = $4
+        WHERE tenant_id = $1 AND garage_id = $2 AND id = $3
+        RETURNING id, garage_id, plan_version, effective_from, document, engine_schema_version, created_at, withdrawn_at, withdrawn_by`,
+      [tenantId, garage.id, planId, actor],
+    );
+    return out.rows[0];
+  } catch (err) {
+    // Started between the read and the write: the trigger's word, by name.
+    if (err.code === '23514' && err.constraint === 'rate_plans_withdrawn_before_start') {
+      throw new RatePlanRefused('plan_already_started', `the plan ${JSON.stringify(plan.plan_version)} has started; a plan that has started is never withdrawn`);
+    }
+    throw err;
+  }
 }
 
 /** What `quote()` takes as `plans`: the documents, whole, and nothing of ours. */

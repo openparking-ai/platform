@@ -430,6 +430,9 @@ test('the store holds no personal data, and the purge that redacts a vehicle lea
   const names = columns.map((c) => c.column_name);
   assert.deepEqual(names, [
     'id', 'tenant_id', 'garage_id', 'plan_version', 'effective_from', 'document', 'engine_schema_version', 'created_at',
+    // 0034: who withdrew a plan before it started is an actor id
+    // (`owner:<id>` / `key:<id>`), as the change log names one -- no name.
+    'withdrawn_at', 'withdrawn_by',
   ]);
   const identity = /plate|ticket|vehicle|email|phone|descriptor|owner|driver/i;
   assert.deepEqual(names.filter((n) => identity.test(n)), [], 'a column that names a person or a car');

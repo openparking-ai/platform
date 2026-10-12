@@ -73,8 +73,8 @@ const BREAKS = [
     red: ['THE DRAFT BESIDE THE STORED PLANS'],
     edits: [{
       file: 'src/app.js',
-      from: '        const documents = [...ratePlans.documents(stored), ...(draft === null ? [] : [draft])];',
-      to: '        const documents = draft === null ? ratePlans.documents(stored) : [draft];',
+      from: '        const documents = ratePlans.asTheyWillBe(stored, draft, carry);\n',
+      to: '        const documents = draft === null ? ratePlans.documents(stored) : [draft];\n',
     }],
   },
   {

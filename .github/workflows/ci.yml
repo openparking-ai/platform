@@ -305,6 +305,15 @@ jobs:
         # step but alerts -- and requires the test that names it to go red.
         run: npm run rates-and-open-fail-control
 
+      - name: Carry fail-control
+        # U7i fix 1 (0034). Each break removes one property -- a started plan
+        # never withdrawn (the route and the trigger), withdrawn plans never
+        # priced, one function selecting the plans that price (a direct reader
+        # caught by the source sweep), the opening gate and readout counting
+        # only those, and a save's carry all or nothing -- and requires the
+        # test that names it to go red.
+        run: npm run carry-fail-control
+
       - name: Owner-language fail-control
         # The owner's language (0025). Each break removes one property -- the
         # admin taken from the session, never the body; only "en" or "es"; the

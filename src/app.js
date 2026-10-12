@@ -1243,19 +1243,39 @@ export function createApp() {
       // alone the store, until somebody has said they checked the prices.
       ratePlans.assertConfirmed(req.body);
       const document = ratePlans.planDocument(req.body?.plan);
+      const carry = ratePlans.carryList(req.body?.carry);
       const out = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
+        const actor = `operator_token:${req.operatorTokenId}`;
+        // CARRIED INTO THE LATER VERSIONS (U7i fix 1): each later version
+        // named in `carry` is withdrawn -- refused by name if it has started
+        // -- before anything is stored, so its replacement may take its
+        // instant. One transaction: any refusal below refuses the whole save,
+        // the withdrawals with it.
+        const withdrawn = [];
+        for (const c of carry) {
+          const old = await ratePlans.withdrawRatePlan(client, req.tenantId, {
+            garage, planId: c.withdraw, actor: `${req.actor.kind}:${req.actor.id}`,
+          });
+          // A replacement starts when the plan it replaces would have: the
+          // owner's later date is theirs, and a carry does not move it. With
+          // no plan of its own, the save's plan is the replacement.
+          const replacement = c.plan ?? document;
+          if (Date.parse(replacement.effective_from) !== new Date(old.effective_from).getTime()) {
+            throw new ratePlans.RatePlanRefused(
+              'carry_start_differs',
+              `the plan replacing ${JSON.stringify(old.plan_version)} starts at ${replacement.effective_from}; ` +
+                `it replaces a plan starting at ${new Date(old.effective_from).toISOString()} and starts then too`,
+            );
+          }
+          withdrawn.push(old);
+        }
         // Validated BEFORE it is stored, by the only thing that knows what a
         // plan means. The currency check sits after it deliberately: a
         // document the engine cannot load has no currency worth comparing.
         const validated = await ratePlans.validateWithEngine(document);
-        const row = await ratePlans.storeRatePlan(client, req.tenantId, {
-          garage,
-          document,
-          validated,
-          actor: `operator_token:${req.operatorTokenId}`,
-        });
+        const row = await ratePlans.storeRatePlan(client, req.tenantId, { garage, document, validated, actor });
         // The plan's name and when it takes effect: the document itself stays
         // where it is kept, and the line points at it.
         await changes.record(client, req.change, {
@@ -1265,9 +1285,38 @@ export function createApp() {
           // Confirm. Who confirmed, and when, are this line's own actor and time.
           before: null, after: { plan_version: row.plan_version, effective_from: row.effective_from, confirmed: true },
         });
-        return row;
+        const replacements = [];
+        for (const [i, c] of carry.entries()) {
+          const old = withdrawn[i];
+          let next = row;
+          if (c.plan !== null) {
+            const v = await ratePlans.validateWithEngine(c.plan);
+            next = await ratePlans.storeRatePlan(client, req.tenantId, { garage, document: c.plan, validated: v, actor });
+          }
+          // Two lines: the later version withdrawn, and the one replacing it
+          // stored -- each its own line, so the history reads as it happened.
+          await changes.record(client, req.change, {
+            garageId: garage.id, action: 'rate_plan.withdraw',
+            subject: { kind: 'rate_plan', id: old.id, name: old.plan_version },
+            before: { plan_version: old.plan_version, effective_from: old.effective_from },
+            after: { withdrawn_at: old.withdrawn_at, replaced_by: next.id, replaced_by_version: next.plan_version },
+          });
+          if (c.plan !== null) {
+            await changes.record(client, req.change, {
+              garageId: garage.id, action: 'rate_plan.add',
+              subject: { kind: 'rate_plan', id: next.id, name: next.plan_version },
+              before: null,
+              after: { plan_version: next.plan_version, effective_from: next.effective_from, confirmed: true, replaces: old.id },
+            });
+          }
+          replacements.push({ withdrawn: old, stored: next });
+        }
+        return { row, replacements };
       });
-      res.status(201).json({ rate_plan: presentRatePlan(out) });
+      res.status(201).json({
+        rate_plan: presentRatePlan(out.row),
+        carried: out.replacements.map((r) => ({ withdrawn: presentRatePlan(r.withdrawn), rate_plan: presentRatePlan(r.stored) })),
+      });
     } catch (err) {
       next(ratePlanRefusal(err));
     }
@@ -1283,7 +1332,9 @@ export function createApp() {
       const out = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
-        return { garage, rows: await ratePlans.ratePlansForGarage(client, req.tenantId, garage.id) };
+        // The history, withdrawn plans marked (0034): read here and never
+        // priced -- the close and the try price from `ratePlansForGarage`.
+        return { garage, rows: await ratePlans.ratePlanHistory(client, req.tenantId, garage.id) };
       });
       // The space class every stay here is priced as (U7g): a plan must
       // declare it, and the owner's Rates form builds the plan with it.
@@ -1320,6 +1371,10 @@ export function createApp() {
       }
       const body = req.body ?? {};
       const draft = body.plan === undefined ? null : ratePlans.planDocument(body.plan);
+      // U7i fix 1: the same carry a save takes, so a try prices the plans
+      // exactly as that save would leave them.
+      const carry = ratePlans.carryList(body.carry);
+      if (carry.length && draft === null) throw bad('carry is tried with the plan it is saved with: send plan too');
       const rawStays = body.stays;
       if (!Array.isArray(rawStays) || rawStays.length < 1 || rawStays.length > TRY_MAX_STAYS) {
         throw bad(`stays is a list of 1 to ${TRY_MAX_STAYS} stays, each { entry, exit } in the garage's own time`);
@@ -1328,12 +1383,13 @@ export function createApp() {
       // currency or start worth comparing. Findings do not stop a try -- the
       // stays they touch come back refused, which is how the owner sees them.
       let draftFindings = [];
-      if (draft !== null) {
+      for (const doc of [draft, ...carry.map((c) => c.plan)]) {
+        if (doc === null) continue;
         try {
-          await ratePlans.validateWithEngine(draft);
+          await ratePlans.validateWithEngine(doc);
         } catch (err) {
           if (!(err instanceof ratePlans.RatePlanRefused) || err.code !== 'plan_has_findings') throw err;
-          draftFindings = err.details.findings;
+          draftFindings = [...draftFindings, ...err.details.findings];
         }
       }
       const out = await withTenant(req.tenantId, async (client) => {
@@ -1342,11 +1398,21 @@ export function createApp() {
         if (!garage) throw new HttpError(404, 'garage not found');
         const stays = rawStays.map((stay, i) => tryStay(stay, i, garage.timezone));
         const stored = await ratePlans.ratePlansForGarage(client, req.tenantId, garage.id);
+        // A carry names plans that price here, or nothing is tried.
+        const documents = ratePlans.asTheyWillBe(stored, draft, carry);
         if (draft !== null) {
-          ratePlans.assertFitsGarage(garage, draft);
-          ratePlans.assertNewBeside(stored, draft);
+          // Each new plan checked the store's way, against the plans that
+          // price less those this carry withdraws: the instant against those,
+          // the name against every plan ever stored (a name is never used
+          // twice, withdrawn or not).
+          const gone = new Set(carry.map((c) => c.withdraw));
+          const staying = stored.filter((r) => !gone.has(r.id));
+          const history = await ratePlans.ratePlanHistory(client, req.tenantId, garage.id);
+          for (const doc of [draft, ...carry.map((c) => c.plan).filter((d) => d !== null)]) {
+            ratePlans.assertFitsGarage(garage, doc);
+            ratePlans.assertNewBeside(staying, doc, history);
+          }
         }
-        const documents = [...ratePlans.documents(stored), ...(draft === null ? [] : [draft])];
         if (documents.length === 0) {
           throw conflict('no_rate_plan', 'this garage has no rates yet: send the draft as plan to try it');
         }
@@ -2909,6 +2975,9 @@ function presentRatePlan(r) {
     effective_from: r.effective_from,
     engine_schema_version: r.engine_schema_version,
     created_at: r.created_at,
+    // 0034: a plan replaced before it started. Never priced; kept for history.
+    withdrawn_at: r.withdrawn_at ?? null,
+    withdrawn_by: r.withdrawn_by ?? null,
     plan: r.document,
   };
 }

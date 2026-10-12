@@ -36,6 +36,7 @@
  */
 import * as repo from './repository.js';
 import { taxPosition } from './taxes.js';
+import { ratePlansForGarage } from './ratePlans.js';
 // A cycle (setup.js reads `readout` from here), used only inside functions,
 // so neither module needs the other while it loads.
 import { openingSteps } from './setup.js';
@@ -56,15 +57,15 @@ export class NotActivatable extends Error {
 
 /** What the gate sees for one garage, right now. */
 export async function readout(client, tenantId, garage, { now = null } = {}) {
-  const { rows } = await client.query(
-    `SELECT count(*)::int AS stored,
-            count(*) FILTER (WHERE effective_from <= COALESCE($3::timestamptz, now()))::int AS in_force,
-            min(effective_from) AS earliest
-       FROM rate_plans
-      WHERE tenant_id = $1 AND garage_id = $2`,
-    [tenantId, garage.id, now],
-  );
-  const plans = rows[0];
+  // The plans that price, through the one function that selects them
+  // (src/ratePlans.js): a plan withdrawn before it started is not counted.
+  const priced = await ratePlansForGarage(client, tenantId, garage.id);
+  const at = now ? new Date(now).getTime() : Date.now();
+  const plans = {
+    stored: priced.length,
+    in_force: priced.filter((p) => new Date(p.effective_from).getTime() <= at).length,
+    earliest: priced.length ? priced[0].effective_from : null,
+  };
   const taxes = await taxPosition(client, tenantId, garage.id, { now });
   const conditions = [
     {

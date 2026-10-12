@@ -100,9 +100,9 @@ const SOURCE_BREAKS = [
     name: 'read_returns_one',
     why: 'the read returns one plan where the garage has several',
     file: 'src/ratePlans.js',
-    from: `      WHERE tenant_id = $1 AND garage_id = $2
+    from: `      WHERE tenant_id = $1 AND garage_id = $2 AND withdrawn_at IS NULL
       ORDER BY effective_from, plan_version\`,`,
-    to: `      WHERE tenant_id = $1 AND garage_id = $2
+    to: `      WHERE tenant_id = $1 AND garage_id = $2 AND withdrawn_at IS NULL
       ORDER BY effective_from DESC, plan_version LIMIT 1\`,`,
   },
   {
