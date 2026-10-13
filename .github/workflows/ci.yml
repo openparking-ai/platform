@@ -289,6 +289,14 @@ jobs:
         # suite and the isolation suite to go red.
         run: npm run garage-reads-fail-control
 
+      - name: Past-stays fail-control
+        # A garage's past stays. Each break removes one property -- the 404
+        # for another tenant's garage, no plate, descriptor or stay id in the
+        # answer, the range and page bounds, `to` exclusive, the cursor's
+        # tie-break, an offset required, the cursor checked -- and requires
+        # test/past-stays.test.js to go red.
+        run: npm run past-stays-fail-control
+
       - name: Pictures-and-bans fail-control
         # U7f (0033). Each break removes one property -- the week rule after
         # the exit, a car inside keeping its pictures, a tailgater stay marked,

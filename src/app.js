@@ -11,6 +11,7 @@ import * as taxes from './taxes.js';
 import * as entitlement from './entitlement.js';
 import * as validations from './validations.js';
 import { reconcile } from './reconcile.js';
+import * as pastStays from './pastStays.js';
 import * as stripeAccount from './stripeAccount.js';
 import * as terminal from './terminal.js';
 import * as signIn from './signIn.js';
@@ -1609,6 +1610,30 @@ export function createApp() {
         reconcile(client, req.tenantId, req.params.garageId, { since, maxHours }),
       );
       res.json(report);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * A garage's past stays (src/pastStays.js): the stays that closed in a
+   * stated range, paged, with no vehicle identity. Read-only.
+   */
+  operator.get('/garages/:garageId/stays/closed', async (req, res, next) => {
+    try {
+      const asked = pastStays.readQuery(req.query);
+      const page = await withTenant(req.tenantId, async (client) => {
+        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        if (!garage) throw new HttpError(404, 'garage not found');
+        return pastStays.closedStays(client, req.tenantId, req.params.garageId, asked);
+      });
+      res.json({
+        garage_id: req.params.garageId,
+        from: asked.from.toISOString(),
+        to: asked.to.toISOString(),
+        limit: asked.limit,
+        ...page,
+      });
     } catch (err) {
       next(err);
     }
