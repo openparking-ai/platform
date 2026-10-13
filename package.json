@@ -47,6 +47,7 @@
     "measure-scrypt": "node scripts/measure-scrypt.js",
     "owner-sign-in-fail-control": "node scripts/owner-sign-in-fail-control.js",
     "garage-reads-fail-control": "node scripts/garage-reads-fail-control.js",
+    "past-stays-fail-control": "node scripts/past-stays-fail-control.js",
     "owner-language-fail-control": "node scripts/owner-language-fail-control.js",
     "setup-fail-control": "node scripts/setup-fail-control.js",
     "alerts-fail-control": "node scripts/alerts-fail-control.js",

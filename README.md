@@ -578,6 +578,27 @@ each query as well as by row-level security; another tenant's garage is `404`.
 credential hash is ever in an answer. `npm run garage-reads-fail-control`
 breaks each property in turn.
 
+### A garage's past stays
+
+    GET /api/v1/garages/<id>/stays/closed?from=<instant>&to=<instant>[&limit=<n>][&after=<next>]
+        {garage_id, from, to, limit, next,
+         stays: [{entry_at, exit_at, fee_minor, subtotal_minor, currency, exit_outcome, pricing_refused}]}
+
+The garage's own history: the stays that **closed** in `[from, to)`, oldest exit
+first, a page at a time (`next` is the `after` for the following page, `null`
+on the last). Read-only; it writes and corrects nothing. **No vehicle identity**
+is in it — no plate, ticket, descriptor, picture, vehicle id or stay id. `from`
+and `to` are instants with their offset; the garage's time zone is on the
+garage, and the reader buckets by local day. The range is at most 93 days and a
+page at most 5000 stays (1000 when `limit` is not given); outside either bound,
+or with a cursor that is not one this route gave, it is refused `400` with a
+code (`range_invalid`, `range_too_long`, `page_size_invalid`, `cursor_invalid`).
+`exit_outcome` is null on a stay priced by the old hourly rate (0015);
+`fee_minor` is null on a covered stay and on one whose pricing was refused
+(`pricing_refused`), which is not a stay that paid nothing.
+`test/past-stays.test.js` holds each; `npm run past-stays-fail-control` breaks
+each in turn.
+
 ### Making a garage
 
     POST /api/v1/garages   {name, timezone, currency, default_action?, space_class?, transient_available?}   201 {garage}
