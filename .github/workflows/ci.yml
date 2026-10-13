@@ -448,7 +448,10 @@ jobs:
         # that cannot activate while its taxes are unstated -- at the route and
         # at the trigger. Nothing computes a percentage. Each property is
         # broken in turn -- one of them a single character -- plus six schema
-        # statements never created, and the suite must go red.
+        # statements never created, and the suite must go red. And a body
+        # whose bytes are not UTF-8, refused before it is decoded so a label
+        # is never kept as U+FFFD: the check, and each of the five parsers it
+        # is passed to, broken in turn on the suite that sends such a body.
         run: npm run taxes-fail-control
 
       - name: Setup fail-control

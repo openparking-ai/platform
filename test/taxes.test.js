@@ -12,7 +12,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { createApp } from '../src/app.js';
+import { createApp, BODY_UNREADABLE } from '../src/app.js';
 import { pool, withTenant, createTenant, stateTaxes } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { TAX_SET_STATED_EVENT_KIND } from '../src/taxes.js';
@@ -277,6 +277,66 @@ test('a storage refusal is its own kind: the engine said valid, and the platform
   const res = await state(g.id, { effective_from: at, rules: [{ ...CITY, percent_bp: 2 ** 31 - 1, sequence: 2 ** 31 - 1 }] });
   assert.equal(res.status, 201);
   assert.equal((await read(g.id))[0].rules[0].percent_bp, 2 ** 31 - 1);
+});
+
+// The bytes the operator sent, as sent: `id` or `label` carrying `bytes` raw,
+// inside an otherwise ordinary set. JSON.stringify could never send these.
+const rawSet = (field, bytes, at) => Buffer.concat([
+  Buffer.from(`{"tax_set":{"effective_from":"${at}","rules":[{"id":"city`),
+  Buffer.from(field === 'id' ? bytes : []),
+  Buffer.from('","label":"City parking tax'),
+  Buffer.from(field === 'label' ? bytes : []),
+  Buffer.from('","percent_bp":1850,"rounding":"nearest","sequence":1}]}}'),
+]);
+const stateRaw = (garageId, bytes, contentType = 'application/json') =>
+  fetch(`${base}/api/v1/garages/${garageId}/tax-sets`, {
+    method: 'POST',
+    headers: { 'content-type': contentType, authorization: `Bearer ${operatorToken}` },
+    body: bytes,
+  });
+/** The garage's rows in both tax tables, counted as this tenant: what a refusal must leave as it was. */
+const taxRows = (garageId) => withTenant(tenant, async (c) => (await c.query(
+  `SELECT (SELECT count(*)::int FROM garage_tax_sets WHERE tenant_id = $1 AND garage_id = $2) AS sets,
+          (SELECT count(*)::int FROM garage_tax_rules r JOIN garage_tax_sets s ON s.id = r.tax_set_id
+            WHERE r.tenant_id = $1 AND s.garage_id = $2) AS rules,
+          (SELECT count(*)::int FROM garage_tax_rules r JOIN garage_tax_sets s ON s.id = r.tax_set_id
+            WHERE r.tenant_id = $1 AND s.garage_id = $2 AND (r.rule_id || r.label) LIKE '%' || chr(65533) || '%') AS replaced`,
+  [tenant, garageId])).rows[0]);
+
+test('a label or id the operator sent as bytes that are not UTF-8 is refused before it is read, and nothing is stored -- never kept as U+FFFD', async () => {
+  const g = await newGarage();
+  const at = '2026-02-01T00:00:00Z';
+  // The eight measured on #37: each one used to answer 201 and store U+FFFD.
+  const bad = { FF: [0xff], 'overlong C0 AF': [0xc0, 0xaf], 'truncated E2 82': [0xe2, 0x82], 'CESU surrogate ED A0 80': [0xed, 0xa0, 0x80] };
+  const cases = [];
+  // Each at its own instant, so a set wrongly kept is never hidden behind another
+  // refused for sharing its instant.
+  const day = (i) => `2026-02-${String(10 + i).padStart(2, '0')}T00:00:00Z`;
+  for (const field of ['id', 'label']) {
+    for (const [name, bytes] of Object.entries(bad)) cases.push([`${field} x ${name}`, rawSet(field, bytes, day(cases.length))]);
+  }
+  // An ordinary set in another charset: refused, because this platform reads
+  // UTF-8 only (src/utf8Body.js says why), and nothing is stored.
+  cases.push(['charset=utf-16le', Buffer.from(JSON.stringify({ tax_set: { effective_from: day(cases.length), rules: [CITY] } }), 'utf16le'), 'application/json; charset=utf-16le']);
+  assert.equal(cases.length, 9);
+  const answers = [];
+  for (const [name, bytes, contentType] of cases) answers.push([name, await stateRaw(g.id, bytes, contentType)]);
+  // The table first: what a refusal must prove is that nothing was kept.
+  assert.deepEqual(await taxRows(g.id), { sets: 0, rules: 0, replaced: 0 }, 'garage_tax_sets and garage_tax_rules hold nothing for this garage');
+  for (const [name, res] of answers) {
+    assert.equal(res.status, 400, name);
+    assert.equal(await res.text(), JSON.stringify(BODY_UNREADABLE), name);
+    assert.equal(res.headers.get('cache-control'), 'no-store', name);
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff', name);
+  }
+  // CONTROL, same garage, same run: valid UTF-8 the operator typed -- a euro sign, and a
+  // U+FFFD they really sent, which is their text -- sent as raw bytes the same way, stores
+  // exactly, and the count sees it.
+  const typed = Buffer.from([0xe2, 0x82, 0xac, 0x20, 0xef, 0xbf, 0xbd]);
+  const ok = await stateRaw(g.id, rawSet('label', typed, at));
+  assert.equal(ok.status, 201, await ok.clone().text());
+  assert.deepEqual(await taxRows(g.id), { sets: 1, rules: 1, replaced: 1 }, 'the control stored, and the U+FFFD count finds the one the operator typed');
+  assert.equal((await read(g.id))[0].rules[0].label, 'City parking tax\u20ac \ufffd');
 });
 
 test('an instant the engine reads and the store cannot give back is a storage refusal, not a set that never loads', async () => {

@@ -17,7 +17,7 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { createApp, WRITE_ROUTES } from '../src/app.js';
+import { createApp, WRITE_ROUTES, BODY_UNREADABLE } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
@@ -139,6 +139,43 @@ test('1. a picture is kept by its entry: a JPEG or a PNG by its bytes, a resend 
   // The control: the stored bytes are the bytes sent, typed by their first bytes.
   const row = await withTenant(tenant, async (c) => (await c.query('SELECT content_type, image FROM entry_pictures WHERE tenant_id = $1 AND picture_ref = $2', [tenant, ref])).rows[0]);
   assert.deepEqual([row.content_type, Buffer.compare(row.image, JPEG)], ['image/jpeg', 0]);
+});
+
+test('1. A LANE BODY THAT IS NOT UTF-8 is refused before it is read, on the picture path and the others: nothing stored, and the same bodies in UTF-8 store', async () => {
+  const g = await garage();
+  const raw = (token, path, text, bytes) => {
+    const [head, tail, ...more] = text.split('@BYTE@');
+    assert.equal(more.length, 0, 'one marker');
+    return fetch(`${base}/api/v1/lane${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: Buffer.concat([Buffer.from(head), Buffer.from(bytes), Buffer.from(tail)]),
+    });
+  };
+  const stays = (eventId) =>
+    withTenant(tenant, async (c) => (await c.query('SELECT count(*)::int AS n FROM sessions WHERE tenant_id = $1 AND open_event_id = $2', [tenant, eventId])).rows[0].n);
+  // A stay's plate with a byte that is not UTF-8: read lossily, a plate nobody read.
+  const eventId = randomUUID();
+  const open = JSON.stringify({ event_id: eventId, plate: 'T@BYTE@X1', entry_at: ago(2), entry_confirmation: 'confirmed' });
+  const badOpen = await raw(g.entry, '/sessions/open', open, [0xff]);
+  assert.equal(badOpen.status, 400);
+  assert.equal(await badOpen.text(), JSON.stringify(BODY_UNREADABLE));
+  assert.equal(await stays(eventId), 0, 'no stay opened');
+  // CONTROL: the same body, the byte a valid letter, opens it.
+  assert.equal((await raw(g.entry, '/sessions/open', open, [0x41])).status, 201);
+  assert.equal(await stays(eventId), 1);
+  // The picture path, on its own 5mb parser: a ~4 MB body with one byte that is not UTF-8.
+  const ref = randomUUID();
+  const big = JSON.stringify({ picture_ref: `${ref}@BYTE@`, event_id: eventId, taken_at: ago(2), image: Buffer.concat([JPEG, Buffer.alloc(3 * 1024 * 1024 - JPEG.length)]).toString('base64') });
+  assert.ok(big.length > 4 * 1024 * 1024, 'larger than the 1mb parser takes');
+  const badPicture = await raw(g.entry, '/pictures', big, [0xed, 0xa0, 0x80]);
+  assert.equal(badPicture.status, 400);
+  assert.equal(await badPicture.text(), JSON.stringify(BODY_UNREADABLE));
+  assert.equal(await pictureCount(eventId), 0, 'no picture kept');
+  // CONTROL: a valid picture of the same size is kept.
+  const good = await asLane(g.entry, '/pictures', { picture_ref: ref, event_id: eventId, taken_at: ago(2), image: Buffer.concat([JPEG, Buffer.alloc(3 * 1024 * 1024 - JPEG.length)]).toString('base64') });
+  assert.equal(good.status, 201, await good.clone().text());
+  assert.equal(await pictureCount(eventId), 1);
 });
 
 test('1. ONE WEEK AFTER THE CAR LEFT: kept while inside, kept six and a half days after the exit, gone seven and a half days after; a picture no stay holds goes a week after it was taken', async () => {

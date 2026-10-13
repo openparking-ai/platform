@@ -194,6 +194,10 @@ test('anything but "en" or "es" is refused by name, and the row is unchanged', a
     ['a body that is not JSON', { raw: 'language=en', headers: { 'content-type': 'application/x-www-form-urlencoded' } }],
     ['broken JSON', { raw: '{"language": "en"' }],
     ['no body', { raw: '' }],
+    // Read lossily, this is {"language":"en"} beside a key with U+FFFD in it, and
+    // it would be taken: refused because its bytes are not UTF-8, before anything reads it.
+    ['a byte that is not UTF-8 beside a good language', { raw: Buffer.concat([Buffer.from('{"language":"en","x'), Buffer.from([0xff]), Buffer.from('":1}')]) }],
+    ['a body declaring another charset', { raw: Buffer.from('{"language":"en"}', 'utf16le'), headers: { 'content-type': 'application/json; charset=utf-16le' } }],
   ];
   for (const [what, extra] of refused) {
     const r = await call('PUT', '/api/v1/auth/language', { cookie: token, origin: ADMIN_ORIGIN, ...extra });

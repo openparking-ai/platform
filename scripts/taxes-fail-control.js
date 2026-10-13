@@ -42,6 +42,21 @@
  *   stated_counts_as_in_force  a tax set stated for next month satisfies the
  *                              readout.
  *
+ * The bytes of a body (src/utf8Body.js): a body that is not UTF-8 is refused
+ * before the parser decodes it, so a label is never stored as U+FFFD. Each
+ * parser is broken in turn, on the suite that sends it such a body.
+ *
+ *   utf8_decoded_lossily       the strict decode is gone: an operator's
+ *                              mis-encoded label reaches garage_tax_rules as
+ *                              U+FFFD (the test counts it there).
+ *   other_charset_taken        a body declaring utf-16 is decoded as utf-16:
+ *                              valid UTF-8 bytes become a lone surrogate.
+ *   operator_parser_unchecked  the app's 1mb parser has no verify.
+ *   picture_parser_unchecked   the lane's 5mb picture parser has no verify.
+ *   sign_in_parser_unchecked   sign-in's own parser has no verify.
+ *   language_parser_unchecked  the language door's parser has no verify.
+ *   link_doors_parser_unchecked the invite and reset doors' parser has no verify.
+ *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0022, so the property genuinely never existed.
  *
@@ -206,6 +221,59 @@ const SOURCE_BREAKS = [
     from: "      condition: 'taxes_stated',\n      met: taxes.in_force > 0,",
     to: "      condition: 'taxes_stated',\n      met: taxes.stated > 0,",
   },
+  {
+    name: 'utf8_decoded_lossily',
+    why: 'a label that is not UTF-8 is stored as U+FFFD',
+    file: 'src/utf8Body.js',
+    from: '  decoder.decode(bytes);\n',
+    to: '',
+  },
+  {
+    name: 'other_charset_taken',
+    why: 'a body declaring utf-16 is read as utf-16',
+    file: 'src/utf8Body.js',
+    from: "  if (charset !== 'utf-8') throw",
+    to: '  if (false) throw',
+  },
+  {
+    name: 'operator_parser_unchecked',
+    why: "the app's 1mb parser does not judge the bytes",
+    file: 'src/app.js',
+    from: "express.json({ limit: '1mb', verify: verifyUtf8 })",
+    to: "express.json({ limit: '1mb' })",
+  },
+  {
+    name: 'picture_parser_unchecked',
+    why: "the lane's picture parser does not judge the bytes",
+    file: 'src/app.js',
+    from: "express.json({ limit: '5mb', verify: verifyUtf8 })",
+    to: "express.json({ limit: '5mb' })",
+    suite: ['--test', '--test-name-pattern=A LANE BODY THAT IS NOT UTF-8', 'test/bans.test.js'],
+  },
+  {
+    name: 'sign_in_parser_unchecked',
+    why: "sign-in's parser does not judge the bytes",
+    file: 'src/signIn.js',
+    from: "express.json({ limit: '4kb', verify: verifyUtf8 })",
+    to: "express.json({ limit: '4kb' })",
+    suite: ['--test', '--test-name-pattern=A BODY THAT LIES ABOUT ITS ENCODING', 'test/owner-sign-in.test.js'],
+  },
+  {
+    name: 'language_parser_unchecked',
+    why: "the language door's parser does not judge the bytes",
+    file: 'src/signIn.js',
+    from: "express.json({ limit: '256b', strict: true, verify: verifyUtf8 })",
+    to: "express.json({ limit: '256b', strict: true })",
+    suite: ['--test', '--test-name-pattern=anything but "en" or "es"', 'test/owner-language.test.js'],
+  },
+  {
+    name: 'link_doors_parser_unchecked',
+    why: "the invite and reset doors' parser does not judge the bytes",
+    file: 'src/accountDoors.js',
+    from: "express.json({ limit: '16kb', strict: true, verify: verifyUtf8 })",
+    to: "express.json({ limit: '16kb', strict: true })",
+    suite: ['--test', '--test-name-pattern=THE DOORS ARE OFF', 'test/account-links.test.js'],
+  },
 ];
 
 const SCHEMA_BREAKS = [
@@ -303,8 +371,8 @@ function stage() {
   return dir;
 }
 
-function run(dir, extraEnv = {}) {
-  return spawnSync(process.execPath, SUITE, {
+function run(dir, extraEnv = {}, suite = SUITE) {
+  return spawnSync(process.execPath, suite, {
     cwd: dir,
     env: { ...process.env, ...extraEnv },
     stdio: 'pipe',
@@ -409,14 +477,20 @@ let failures = 0;
 const intactDir = stage();
 try {
   console.log('== control A: the suite must PASS intact ==');
-  const intact = run(intactDir);
-  if (intact.status === 0) {
-    console.log(`  control A OK — ${summarise(intact)}`);
-  } else {
-    console.error(`  CONTROL A FAILED — the suite does not pass even intact: ${summarise(intact)}`);
-    console.error(intact.stdout);
-    console.error(intact.stderr);
-    failures += 1;
+  // And each narrower suite a break names, which must also run at least one
+  // test: a name that matches nothing passes, and would measure nothing.
+  const suites = [SUITE, ...new Set(SOURCE_BREAKS.filter((b) => b.suite).map((b) => b.suite))];
+  for (const suite of suites) {
+    const intact = run(intactDir, {}, suite);
+    const ran = Number(summarise(intact).split(' ')[0]);
+    if (intact.status === 0 && ran > 0) {
+      console.log(`  control A OK — ${summarise(intact)} (${suite.at(-1)})`);
+    } else {
+      console.error(`  CONTROL A FAILED — ${suite.at(-1)} does not pass intact, or ran nothing: ${summarise(intact)}`);
+      console.error(intact.stdout);
+      console.error(intact.stderr);
+      failures += 1;
+    }
   }
 } finally {
   rmSync(intactDir, { recursive: true, force: true });
@@ -433,7 +507,7 @@ for (const brk of SOURCE_BREAKS) {
       failures += 1;
       continue;
     }
-    const broken = run(dir);
+    const broken = run(dir, {}, brk.suite);
     if (broken.status === 0) {
       console.error(
         `  ${brk.name.padEnd(26)} *** PASSED WHEN ${brk.why.toUpperCase()} —` +

@@ -471,6 +471,17 @@ body is read before its 401. A body that cannot be read answers one sentence,
 on every path in any letter case, never the parser's own words, which quote
 what was sent.
 
+**A body whose bytes are not UTF-8 is a body that cannot be read.** It is
+refused before anything decodes it, so a byte the caller sent is never stored
+as `U+FFFD` in its place: `400 body_unreadable` on the operator and lane
+surfaces, and each sign-in, language, invite and reset door's own unreadable
+sentence under `/api/v1/auth`. A `U+FFFD` the caller actually sent is valid
+UTF-8 and is their text. This platform reads UTF-8 only, deliberately: a body
+that declares another charset, `utf-16` among them, is refused the same way,
+because bytes that are valid UTF-8 can still read as UTF-16 to a lone
+surrogate, which is stored as `U+FFFD` too. One check, `src/utf8Body.js`, on
+every JSON parser here.
+
 `test/owner-sign-in.test.js`, `test/admin-cli.test.js` and
 `test/owner-sign-in-output.test.js` hold each of these; `npm run
 owner-sign-in-fail-control` breaks each one in turn.
@@ -1093,6 +1104,9 @@ curl -H "authorization: Bearer $OPERATOR_TOKEN" \
   cannot hold — a NUL byte, a number past PostgreSQL's `integer`, an instant
   `timestamptz` cannot hold or give back — is `409 tax_set_not_storable`,
   naming the field and the limit, and never worded as a judgement of the set.
+  A rule's `id` or `label` sent as bytes that are not UTF-8 never gets this
+  far: the body is refused unread (see "The owner signs in"), and nothing is
+  stored.
   The instant is stored as the engine read it, to the microsecond, and read
   back in UTC to the microsecond.
 - **Every stored list loads.** Before the save commits, the garage's whole list

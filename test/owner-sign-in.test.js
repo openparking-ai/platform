@@ -930,6 +930,17 @@ test('A BODY THAT LIES ABOUT ITS ENCODING: under /api/v1/auth any body that cann
     assert.equal(r.status, 400, JSON.stringify(headers));
     assert.deepEqual(r.json, signIn.UNREADABLE, JSON.stringify(headers));
   }
+  // Bytes that are not UTF-8: read lossily, a password with U+FFFD in it, answered as a
+  // wrong password. Refused before it is read, in sign-in's own sentence.
+  for (const [name, raw, headers] of [
+    ['not UTF-8', Buffer.concat([Buffer.from(`{"email":"x@example.com","password":"${PASSWORD}`), Buffer.from([0xc0, 0xaf]), Buffer.from('"}')]), {}],
+    ['declared utf-16le', Buffer.from(`{"email":"x@example.com","password":"${PASSWORD}"}`, 'utf16le'), { 'content-type': 'application/json; charset=utf-16le' }],
+  ]) {
+    const r = await call(main.base, 'POST', '/api/v1/auth/sign-in', { raw, headers: { 'content-type': 'application/json', ...headers } });
+    assert.equal(r.status, 400, name);
+    assert.deepEqual(r.json, signIn.UNREADABLE, name);
+    assert.deepEqual(r.cookies, [], name);
+  }
   for (const path of ['/api/v1/auth/nope', '/api/v1/auth/sign-in/more', '/api/v1/auth/']) {
     for (const headers of [{}, { 'content-encoding': 'gzip' }]) {
       const r = await call(main.base, 'POST', path, { raw: 'not gzip, not json', headers: { 'content-type': 'application/json', ...headers } });
@@ -956,6 +967,9 @@ test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, not JSON, oversized or
     { name: 'oversized', raw: JSON.stringify({ name: `Echo-Me-Back${'x'.repeat(1024 * 1024)}` }), headers: {}, status: 413, body: BODY_TOO_LARGE },
     { name: 'not gzip', raw: '{"name":"Echo-Me-Back"}', headers: { 'content-encoding': 'gzip' }, status: 400, body: BODY_UNREADABLE },
     { name: 'bad charset', raw: '{"name":"Echo-Me-Back"}', headers: { 'content-type': 'application/json; charset=koi8-r' }, status: 400, body: BODY_UNREADABLE },
+    // Read lossily, a name with U+FFFD in it that nobody sent.
+    { name: 'not UTF-8', raw: Buffer.concat([Buffer.from('{"name":"Echo-Me-Back'), Buffer.from([0xed, 0xa0, 0x80]), Buffer.from('"}')]), headers: {}, status: 400, body: BODY_UNREADABLE },
+    { name: 'utf-16', raw: Buffer.from('{"name":"Echo-Me-Back"}', 'utf16le'), headers: { 'content-type': 'application/json; charset=utf-16le' }, status: 400, body: BODY_UNREADABLE },
   ];
   const wrong = [];
   let answers = 0;

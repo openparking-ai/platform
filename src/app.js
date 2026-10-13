@@ -27,6 +27,7 @@ import * as setup from './setup.js';
 import * as alerts from './alerts.js';
 import * as bans from './bans.js';
 import { garageCurrency, garageName, garageTimezone } from './garageFields.js';
+import { verifyUtf8 } from './utf8Body.js';
 
 const bad = (message) => new HttpError(400, message);
 
@@ -690,11 +691,12 @@ export function createApp() {
   app.use('/api/v1/auth', signIn.createAuthRouter(authSettings));
 
   // Any failure to read a body is marked as one, so it is answered in one
-  // fixed sentence (below), whatever the path.
-  const json = express.json({ limit: '1mb' });
+  // fixed sentence (below), whatever the path. A body that is not UTF-8 is
+  // one (src/utf8Body.js): refused before it is decoded, never stored as U+FFFD.
+  const json = express.json({ limit: '1mb', verify: verifyUtf8 });
   // A lane's picture (U7f) is the one larger body: up to PICTURE_MAX_BYTES,
   // base64 in JSON. Every other path keeps the one limit.
-  const pictureJson = express.json({ limit: '5mb' });
+  const pictureJson = express.json({ limit: '5mb', verify: verifyUtf8 });
   app.use((req, res, next) => (req.path === '/api/v1/lane/pictures' ? pictureJson : json)(
     req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined)));
 
