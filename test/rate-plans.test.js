@@ -57,8 +57,10 @@ function plan(overrides = {}) {
   return {
     ...structuredClone(flatLot),
     plan_version: `flat-${stamp}`,
-    // In the future: the store refuses a plan that starts in the past (U7g).
-    effective_from: new Date(Date.UTC(2036, 0, 1) - Math.floor(Math.random() * 1e10)).toISOString(),
+    // Now, give or take: the store refuses a plan that starts in the past (U7g)
+    // and one that starts later than it is saved (U7i). A few seconds back, at
+    // random, so two plans of one garage do not share an instant.
+    effective_from: new Date(Date.now() - Math.floor(Math.random() * 40_000)).toISOString(),
     ...overrides,
   };
 }
@@ -72,8 +74,12 @@ async function newGarage(currency = 'USD') {
   );
 }
 
-const store = (garageId, document) =>
-  fetch(`${base}/api/v1/garages/${garageId}/rate-plans`, asOperator(operatorToken, { plan: document, confirmed: true }));
+/** The id of the garage's newest plan, or null: what a save says it was checked against (U7i, `based_on`). */
+const newestId = (garageId) =>
+  withTenant(tenant, async (c) => (await ratePlans.newestRatePlan(c, tenant, garageId))?.id ?? null).catch(() => null);
+
+const store = async (garageId, document) =>
+  fetch(`${base}/api/v1/garages/${garageId}/rate-plans`, asOperator(operatorToken, { plan: document, confirmed: true, based_on: await newestId(garageId) }));
 const list = (garageId) => fetch(`${base}/api/v1/garages/${garageId}/rate-plans`, asOperator(operatorToken));
 
 const countFor = (garageId) =>
@@ -132,11 +138,8 @@ test('a whole plan is stored, and reads back equal to what went in', async () =>
 test('the read returns EVERY plan of the garage, oldest effective date first, and none of another garage', async () => {
   const garage = await newGarage();
   const other = await newGarage();
-  const docs = [
-    plan({ effective_from: '2036-03-01T00:00:00-05:00' }),
-    plan({ effective_from: '2036-01-01T00:00:00-05:00' }),
-    plan({ effective_from: '2036-02-01T00:00:00-05:00' }),
-  ];
+  const ago = (s) => new Date(Date.now() - s * 1000).toISOString();
+  const docs = [plan({ effective_from: ago(10) }), plan({ effective_from: ago(50) }), plan({ effective_from: ago(30) })];
   for (const d of docs) assert.equal((await store(garage, d)).status, 201);
   assert.equal((await store(other, plan())).status, 201);
 
@@ -309,15 +312,17 @@ test('a version name already used by the garage is refused by name', async () =>
 
 test('two versions taking effect at one instant are refused at write time, the ambiguity the engine refuses at quote time', async () => {
   const garage = await newGarage();
-  const at = '2036-06-01T00:00:00-04:00';
+  // Whole seconds, so the same instant can be written with another offset.
+  const ms = Math.floor((Date.now() - 20_000) / 1000) * 1000;
+  const at = new Date(ms).toISOString();
   assert.equal((await store(garage, plan({ effective_from: at }))).status, 201);
   // The same instant, written differently: the key is the instant, not the text.
-  const res = await store(garage, plan({ effective_from: '2036-06-01T04:00:00Z' }));
+  const res = await store(garage, plan({ effective_from: new Date(ms - 4 * 3600_000).toISOString().replace('Z', '').slice(0, 19) + '-04:00' }));
   assert.equal(res.status, 409);
   assert.equal((await res.json()).code, 'plan_effective_from_taken');
   assert.equal(await countFor(garage), 1);
   // CONTROL: a later instant is a new version and lands.
-  assert.equal((await store(garage, plan({ effective_from: '2036-06-02T00:00:00-04:00' }))).status, 201);
+  assert.equal((await store(garage, plan({ effective_from: new Date(ms + 1000).toISOString() }))).status, 201);
 });
 
 // --- no engine is a refusal, never an acceptance --------------------------------------

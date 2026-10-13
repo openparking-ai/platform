@@ -38,6 +38,14 @@
  *   breakdown_dropped      the close writes the plan_version and not the
  *                          breakdown: a fee with a version and no
  *                          explanation.
+ *   later_start_accepted   (U7i P1) a plan that starts an hour after it is
+ *                          saved is stored: rates scheduled for a later date
+ *                          again, invisible until they take over.
+ *   based_on_ignored       (U7i P2) a save checked against rates that are no
+ *                          longer the newest is stored over them.
+ *   save_unlocked          (U7i P2) the newest rates are read without the
+ *                          garage's lock: two saves on the same rates at the
+ *                          same moment both land.
  *   retention_rewrites_plans
  *                          the purge reaches into the plan store, with the
  *                          grant widened so it can (a schema edit and a
@@ -140,6 +148,27 @@ const SOURCE_BREAKS = [
     from: `     priced && pricing.breakdown !== null && pricing.breakdown !== undefined ? JSON.stringify(pricing.breakdown) : null,`,
     to: `     priced && pricing.breakdown !== null && pricing.breakdown !== undefined ? JSON.stringify(pricing.breakdown.slice(0, 1)) : null,`,
   },
+  {
+    name: 'later_start_accepted',
+    why: 'a plan starting later than it is saved is stored: rates scheduled again (U7i P1)',
+    file: 'src/ratePlans.js',
+    from: '  if (Number.isFinite(start) && start > now + START_ALLOWANCE_MS) {',
+    to: '  if (false) {',
+  },
+  {
+    name: 'based_on_ignored',
+    why: 'a save checked against rates no longer the newest is stored (U7i P2)',
+    file: 'src/ratePlans.js',
+    from: '  if ((basedOn === null ? null : String(basedOn)) !== have) {',
+    to: '  if (false) {',
+  },
+  {
+    name: 'save_unlocked',
+    why: "two saves on the same rates both pass: the newest is read without the garage's lock (U7i P2)",
+    file: 'src/app.js',
+    from: '        await ratePlans.lockGarageRates(client, garage.id);\n',
+    to: '',
+  },
 ];
 
 const GRANT_LINE = 'GRANT SELECT, INSERT ON rate_plans TO openparking_app;';
@@ -201,7 +230,7 @@ const SCHEMA_BREAKS = [
   },
 ];
 
-const SUITE = ['--test', 'test/rate-plans.test.js'];
+const SUITE = ['--test', 'test/rate-plans.test.js', 'test/rate-plan-start.test.js'];
 
 function stage() {
   const dir = mkdtempSync(join(tmpdir(), 'openparking-rate-plans-control-'));

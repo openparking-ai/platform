@@ -19,6 +19,10 @@
  *   - a plan dated 2 minutes back is `409 plan_starts_in_the_past`;
  *   - a plan dated now is stored (60 s of clock difference between the
  *     owner's screen and this server are allowed for).
+ *
+ * U7i, nothing scheduled: a plan starting later than it is saved is
+ * `422 rates_start_when_saved`, and a save checked against rates that are no
+ * longer the newest is `409 rates_changed_since_check` -- both storing nothing.
  */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -27,6 +31,7 @@ import { createApp } from '../src/app.js';
 import { pool, withTenant, createTenant, flatHourlyPlan, stateTaxes, storePlan } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
+import * as ratePlans from '../src/ratePlans.js';
 
 let engine;
 let server;
@@ -88,7 +93,11 @@ async function garage() {
   });
 }
 
-const save = (garageId, document) => op('POST', `/garages/${garageId}/rate-plans`, { plan: document, confirmed: true });
+/** The id of the garage's newest plan, or null: what a save says it was checked against (U7i). */
+const newestId = (garageId) => withTenant(tenant, async (c) => (await ratePlans.newestRatePlan(c, tenant, garageId))?.id ?? null);
+
+const save = async (garageId, document, basedOn) =>
+  op('POST', `/garages/${garageId}/rate-plans`, { plan: document, confirmed: true, based_on: basedOn === undefined ? await newestId(garageId) : basedOn });
 
 test('THE MEASUREMENT: a plan dated one hour back does not price a car that came in 30 minutes ago', async () => {
   const g = await garage();
@@ -126,4 +135,72 @@ test('a plan dated 2 minutes back is refused by name; one dated now is stored', 
   assert.equal(now.status, 201, JSON.stringify(await now.clone().json()));
   const second = await save(g.id, flatHourlyPlan({ version: 'v-second', effectiveFrom: new Date(Date.now() - 1_000).toISOString() }));
   assert.equal(second.status, 201, JSON.stringify(await second.clone().json()));
+});
+
+// --- U7i: nothing scheduled, and the rates checked are still the newest ---------
+
+const count = (garageId) => withTenant(tenant, async (c) => Number((await c.query('SELECT count(*) FROM rate_plans WHERE garage_id = $1', [garageId])).rows[0].count));
+
+test('U7i P1: a plan that starts one hour after it is saved is refused by name, and nothing is stored', async () => {
+  const g = await garage();
+  const later = await save(g.id, flatHourlyPlan({ version: 'v-later', effectiveFrom: new Date(Date.now() + 3600_000).toISOString() }));
+  assert.equal(later.status, 422);
+  const body = await later.json();
+  assert.equal(body.code, 'rates_start_when_saved');
+  assert.match(body.error, /after this server's clock/);
+  // Two minutes ahead is past the 60 s allowed for clocks, too.
+  assert.equal((await save(g.id, flatHourlyPlan({ version: 'v-2min', effectiveFrom: new Date(Date.now() + 120_000).toISOString() }))).status, 422);
+  assert.equal(await count(g.id), 0, 'a plan starting later was stored');
+  // CONTROL: the same plan starting now, and 30 s ahead (a screen's clock running fast), are stored.
+  const now = await save(g.id, flatHourlyPlan({ version: 'v-now', effectiveFrom: new Date().toISOString() }));
+  assert.equal(now.status, 201, JSON.stringify(await now.clone().json()));
+  const ahead = await save(g.id, flatHourlyPlan({ version: 'v-ahead', effectiveFrom: new Date(Date.now() + 30_000).toISOString() }));
+  assert.equal(ahead.status, 201, JSON.stringify(await ahead.clone().json()));
+});
+
+test('U7i P2: a save checked against rates that are no longer the newest is refused, and nothing is stored', async () => {
+  const g = await garage();
+  // The first rates of a garage are checked against none.
+  assert.equal((await save(g.id, flatHourlyPlan({ version: 'v-first', effectiveFrom: new Date(Date.now() - 20_000).toISOString() }), null)).status, 201);
+  const first = await newestId(g.id);
+  // A second owner saves while the first is checking...
+  assert.equal((await save(g.id, flatHourlyPlan({ version: 'v-other', effectiveFrom: new Date(Date.now() - 10_000).toISOString() }), first)).status, 201);
+  // ...and the first confirms what they checked against the first rates.
+  const stale = await save(g.id, flatHourlyPlan({ version: 'v-mine', hourlyMinor: 900, effectiveFrom: new Date().toISOString() }), first);
+  assert.equal(stale.status, 409);
+  const body = await stale.json();
+  assert.equal(body.code, 'rates_changed_since_check');
+  assert.equal(await count(g.id), 2, 'the stale save was stored');
+  // Checked against none, on a garage that has rates: refused too; so is a body with no based_on at all.
+  assert.equal((await save(g.id, flatHourlyPlan({ version: 'v-none', effectiveFrom: new Date().toISOString() }), null)).status, 409);
+  const missing = await op('POST', `/garages/${g.id}/rate-plans`, { plan: flatHourlyPlan({ version: 'v-missing', effectiveFrom: new Date().toISOString() }), confirmed: true });
+  assert.equal(missing.status, 409);
+  assert.equal((await missing.json()).code, 'rates_changed_since_check');
+  assert.equal(await count(g.id), 2);
+  // CONTROL: checked again, against the newest, the same plan is stored.
+  const fresh = await save(g.id, flatHourlyPlan({ version: 'v-mine', hourlyMinor: 900, effectiveFrom: new Date().toISOString() }), await newestId(g.id));
+  assert.equal(fresh.status, 201, JSON.stringify(await fresh.clone().json()));
+});
+
+test('U7i P2: a save waits for one in flight on the same garage, then sees it and is refused', async () => {
+  const g = await garage();
+  assert.equal((await save(g.id, flatHourlyPlan({ version: 'v-base', effectiveFrom: new Date(Date.now() - 20_000).toISOString() }), null)).status, 201);
+  const base = await newestId(g.id);
+  // Another save in flight: its transaction holds the garage's rates and has
+  // stored its plan, not yet committed. The route's save, checked against the
+  // same base, must wait for it -- and then find it is no longer the newest.
+  let route;
+  let settledEarly = false;
+  await withTenant(tenant, async (c) => {
+    await ratePlans.lockGarageRates(c, g.id);
+    await storePlan(c, tenant, g.id, flatHourlyPlan({ version: 'v-in-flight', effectiveFrom: new Date(Date.now() - 5_000).toISOString() }));
+    route = save(g.id, flatHourlyPlan({ version: 'v-second', hourlyMinor: 900, effectiveFrom: new Date().toISOString() }), base);
+    route.then(() => { settledEarly = true; }, () => { settledEarly = true; });
+    await new Promise((r) => setTimeout(r, 750));
+    assert.equal(settledEarly, false, 'the second save did not wait for the one in flight');
+  });
+  const res = await route;
+  assert.equal(res.status, 409, JSON.stringify(await res.clone().json()));
+  assert.equal((await res.json()).code, 'rates_changed_since_check');
+  assert.equal(await count(g.id), 2, 'both saves were stored on the same rates');
 });

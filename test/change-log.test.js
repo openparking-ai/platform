@@ -26,6 +26,7 @@ import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { WRITE_ROUTES, READ_POSTS } from '../src/app.js';
 import * as changes from '../src/changes.js';
 import { startRateEngine } from './rate-engine.js';
+import { newestRatePlan } from '../src/ratePlans.js';
 import { startStripeStub } from './stripe-stub.js';
 import { startServer, owner, call, newGarage, newLane, linesOf, secrets, signIn, ADMIN_ORIGIN, FOREIGN_ORIGIN } from './u4-world.js';
 
@@ -116,8 +117,10 @@ async function readyToOpen(name = undefined) {
 }
 
 let planN = 0;
-// In the future: the store refuses a plan that starts in the past (U7g).
-const plan = () => flatHourlyPlan({ version: `log-plan-${(planN += 1)}`, effectiveFrom: new Date(Date.UTC(2040, 0, 1) + planN * 60_000).toISOString() });
+// Now: the store refuses a plan that starts in the past (U7g) or later than it is saved (U7i).
+const plan = () => flatHourlyPlan({ version: `log-plan-${(planN += 1)}`, effectiveFrom: new Date().toISOString() });
+/** The garage's newest plan's id: what a save says it was checked against (U7i, `based_on`). */
+const newestPlanId = (tenantId, garageId) => withTenant(tenantId, async (c) => (await newestRatePlan(c, tenantId, garageId))?.id ?? null);
 
 /**
  * Every write, as a recipe: how to set it up fresh, the request that makes the
@@ -234,8 +237,11 @@ const WRITES = [
   },
   {
     action: 'rate_plan.add',
-    setup: async () => ({ g: await newGarage(base, a), plan: plan() }),
-    run: (s) => call(base, 'POST', `/garages/${s.g.id}/rate-plans`, { as: a, body: { plan: s.plan, confirmed: true } }),
+    setup: async () => {
+      const g = await newGarage(base, a);
+      return { g, plan: plan(), basedOn: await newestPlanId(a.tenant, g.id) };
+    },
+    run: (s) => call(base, 'POST', `/garages/${s.g.id}/rate-plans`, { as: a, body: { plan: s.plan, confirmed: true, based_on: s.basedOn } }),
     line: (l, s) => assert.deepEqual([l.before, l.after.plan_version, l.after.confirmed], [null, s.plan.plan_version, true]),
     state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM rate_plans WHERE garage_id = $1', [s.g.id]),
   },
