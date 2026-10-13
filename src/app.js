@@ -1236,6 +1236,13 @@ export function createApp() {
    * The close route prices from what is stored here (0013): every plan of
    * the garage goes to the engine, unfiltered, and the engine picks the
    * version in force at entry.
+   *
+   * U7i: nothing is scheduled. A plan starts when it is saved -- later than
+   * this server's clock (beyond the clock allowance) is `422
+   * rates_start_when_saved` -- and `based_on` names the rates the owner
+   * checked these against (the id of the plan in force, null for none): any
+   * other plan stored since is `409 rates_changed_since_check`. Nothing is
+   * stored on either.
    */
   operator.post('/garages/:garageId/rate-plans', async (req, res, next) => {
     try {
@@ -1250,6 +1257,12 @@ export function createApp() {
         // plan means. The currency check sits after it deliberately: a
         // document the engine cannot load has no currency worth comparing.
         const validated = await ratePlans.validateWithEngine(document);
+        // Nothing scheduled (U7i): new rates start when they are saved.
+        ratePlans.assertStartsWhenSaved(document);
+        // The rates the owner checked are still the newest (U7i): decided
+        // here, in the transaction that inserts, behind the garage's lock.
+        await ratePlans.lockGarageRates(client, garage.id);
+        ratePlans.assertBasedOnNewest(req.body, await ratePlans.newestRatePlan(client, req.tenantId, garage.id));
         const row = await ratePlans.storeRatePlan(client, req.tenantId, {
           garage,
           document,
@@ -3222,6 +3235,7 @@ function ratePlanRefusal(err) {
   if (!(err instanceof ratePlans.RatePlanRefused)) return err;
   if (err.code === 'plan_invalid') return bad(err.message);
   if (err.code === 'not_confirmed') return new HttpError(400, err.message, err.code);
+  if (err.code === 'rates_start_when_saved') return new HttpError(422, err.message, err.code);
   const out = conflict(err.code, err.message);
   out.details = err.details;
   return out;

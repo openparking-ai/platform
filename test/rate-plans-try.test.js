@@ -344,7 +344,7 @@ test('a draft with a gap is still tried: the stay it touches comes back refused,
 test('saving needs confirmed: true from every caller, and the line records that it was confirmed', async () => {
   const op = as(await key());
   const g = await garage();
-  const plan = draftPlan({ version: 'confirm-me', effectiveFrom: new Date(Date.now() + 86_400_000).toISOString() });
+  const plan = draftPlan({ version: 'confirm-me', effectiveFrom: new Date().toISOString() });
   for (const body of [{ plan }, { plan, confirmed: false }, { plan, confirmed: 'true' }, { plan, confirmed: 1 }]) {
     const res = await op('POST', `/garages/${g.id}/rate-plans`, body);
     assert.equal(res.status, 400, JSON.stringify(body.confirmed));

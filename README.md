@@ -835,7 +835,7 @@ the platform is the engine's first caller, and this is the store.
 
 ```sh
 curl -H "authorization: Bearer $OPERATOR_TOKEN" -H 'content-type: application/json' \
-  -d '{"plan": { ...the plan document, whole... }, "confirmed": true}' \
+  -d '{"plan": { ...the plan document, whole... }, "confirmed": true, "based_on": null}' \
   http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans     # 201, the row and the document
 curl -H "authorization: Bearer $OPERATOR_TOKEN" \
   http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans     # every plan of the garage, and the space class its stays are priced as
@@ -878,6 +878,18 @@ What the store does, and does not do — the reasons are in `migrations/0012_rat
   force at entry, so "a rate change never reaches back into a car that is
   already parked" holds only while every plan starts after it is saved. The
   60 s are for the owner's screen and this server reading two clocks.
+- **Nothing is scheduled: a plan starts when it is saved (U7i).** An
+  `effective_from` more than the same 60 s after this server's clock is
+  `422 rates_start_when_saved`. A plan waiting for a later date would take over
+  on its day with no screen showing it; a save is charged to cars that come in
+  from the moment it is confirmed, and a car already parked keeps the plan it
+  came in under.
+- **The rates checked are still the newest (U7i).** The body carries
+  `"based_on"`: the id of the plan in force when the owner's prices were worked
+  out (`null` for a garage with none). Any other plan stored since — another
+  owner saving while this one was checking — is `409 rates_changed_since_check`
+  and nothing is stored. Decided in the transaction that inserts, behind a lock
+  held per garage, so two saves on the same rates cannot both pass.
 - **Append-only by grant, like `events`.** A changed price is a new version.
   Storing one is recorded as a `rate_plan_stored` event naming the operator token.
 - **A closed stay keeps `plan_version`, `breakdown` and `space_class` beside

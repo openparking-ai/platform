@@ -30,6 +30,7 @@ import { createApp, CLOSE_UNPRICED_EVENT_KIND } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
+import { newestRatePlan } from '../src/ratePlans.js';
 
 let engine;
 let server;
@@ -299,11 +300,13 @@ test("the stay is priced as the garage's space class, and a plan that does not d
   assert.equal(session.fee_minor, 700, "the vip rule priced it, not the standard one");
   assert.ok(session.breakdown.some((l) => l.rule_id === 'vip'));
 
-  // The store refuses a plan that would refuse every exit here.
+  // The store refuses a plan that would refuse every exit here. Saved now,
+  // checked against the garage's newest rates (U7i).
+  const newest = await withTenant(tenant, async (c) => (await newestRatePlan(c, tenant, g.id))?.id ?? null);
   const res = await fetch(`${base}/api/v1/garages/${g.id}/rate-plans`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
-    body: JSON.stringify({ plan: flatHourlyPlan({ version: 'standard-only', effectiveFrom: '2037-01-01T00:00:00Z' }), confirmed: true }),
+    body: JSON.stringify({ plan: flatHourlyPlan({ version: 'standard-only', effectiveFrom: new Date().toISOString() }), confirmed: true, based_on: newest }),
   });
   assert.equal(res.status, 409);
   const body = await res.json();
@@ -313,7 +316,7 @@ test("the stay is priced as the garage's space class, and a plan that does not d
   const ok = await fetch(`${base}/api/v1/garages/${g.id}/rate-plans`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
-    body: JSON.stringify({ plan: flatHourlyPlan({ version: 'vip-only', spaceClass: 'vip', effectiveFrom: '2037-01-01T00:00:00Z' }), confirmed: true }),
+    body: JSON.stringify({ plan: flatHourlyPlan({ version: 'vip-only', spaceClass: 'vip', effectiveFrom: new Date().toISOString() }), confirmed: true, based_on: newest }),
   });
   assert.equal(ok.status, 201, JSON.stringify(await ok.clone().json()));
 });

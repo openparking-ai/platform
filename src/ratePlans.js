@@ -27,7 +27,10 @@
  *             `assertConfirmed`). Refusals by name for the things only the
  *             store can see: the garage's currency (the document restates it,
  *             never sets it), a version name already used, an effective instant
- *             already taken, and a start in the past (U7g, `assertStartsNow`).
+ *             already taken, a start in the past (U7g, `assertStartsNow`), a
+ *             start later than the save (U7i, `assertStartsWhenSaved`), and
+ *             rates that changed while these were checked (U7i,
+ *             `assertBasedOnNewest`).
  *   try       (U7g, the route in app.js) a draft is checked the store's way --
  *             `assertFitsGarage`, `assertNewBeside` -- and priced beside the
  *             stored plans through the close's own functions; nothing stored.
@@ -194,6 +197,67 @@ export function assertStartsNow(document, { now = Date.now() } = {}) {
 }
 
 /**
+ * New rates start when they are saved (U7i): nothing is scheduled. "A rate
+ * change applies to cars that come in after it is confirmed" holds only while
+ * no plan waits for a later date, invisible on every screen until it takes
+ * over. The same 60 s of clock difference the back-dating refusal allows for
+ * is allowed here, the other way: the owner's screen may run a little ahead.
+ */
+export function assertStartsWhenSaved(document, { now = Date.now() } = {}) {
+  const start = Date.parse(document.effective_from);
+  if (Number.isFinite(start) && start > now + START_ALLOWANCE_MS) {
+    throw new RatePlanRefused(
+      'rates_start_when_saved',
+      `the plan starts at ${document.effective_from}, more than ${START_ALLOWANCE_MS / 1000}s after this server's clock ` +
+        `(${new Date(now).toISOString()}); rates start when they are saved, so send the moment they were confirmed`,
+    );
+  }
+}
+
+/**
+ * The rates the owner checked are still the newest (U7i): `based_on` is the
+ * id of the plan in force when the check page priced the new rates, or null
+ * for a garage with none. Anything else stored since -- another owner's save
+ * while this one was checking -- refuses, and nothing is stored: the page
+ * says so, reads the rates again and prices again. `newest` is the garage's
+ * plan with the latest start; with no plan starting later than it is saved,
+ * that is the plan in force now. Read inside the save's own transaction,
+ * after the garage's lock, so two saves cannot both pass on the same rates.
+ */
+export function assertBasedOnNewest(body, newest) {
+  const basedOn = body?.based_on ?? null;
+  const have = newest ? String(newest.id) : null;
+  if ((basedOn === null ? null : String(basedOn)) !== have) {
+    throw new RatePlanRefused(
+      'rates_changed_since_check',
+      `the rates changed while these were being checked: the newest rates are ${have === null ? 'none' : `#${have}`}, ` +
+        `and these were checked against ${basedOn === null ? 'none' : `#${basedOn}`}; read the rates again and check the prices again`,
+    );
+  }
+}
+
+/** The garage's plan with the latest start, or null. One save at a time per garage: the caller holds `lockGarageRates`. */
+export async function newestRatePlan(client, tenantId, garageId) {
+  const { rows } = await client.query(
+    `SELECT id, plan_version, effective_from FROM rate_plans
+      WHERE tenant_id = $1 AND garage_id = $2
+      ORDER BY effective_from DESC, id DESC LIMIT 1`,
+    [tenantId, garageId],
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Holds the garage's rates for the rest of the transaction: a second save of
+ * the same garage waits here until the first commits, then reads its plan as
+ * the newest. A transaction-scoped advisory lock, so it needs no UPDATE right
+ * on any table and is let go at COMMIT or ROLLBACK.
+ */
+export async function lockGarageRates(client, garageId) {
+  await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('rate_plans:' || $1::text, 0))`, [garageId]);
+}
+
+/**
  * What only the garage can say about a document: its money and the space
  * class every stay here is priced as. Shared by the store and by the try, so
  * a draft the store would refuse is refused the same way when it is tried.
@@ -269,6 +333,7 @@ export function assertConfirmed(body) {
 export async function storeRatePlan(client, tenantId, { garage, document, validated, actor, now = null }) {
   assertFitsGarage(garage, document);
   assertStartsNow(document, { now: now ? new Date(now).getTime() : Date.now() });
+  assertStartsWhenSaved(document, { now: now ? new Date(now).getTime() : Date.now() });
   let row;
   try {
     const { rows } = await client.query(
