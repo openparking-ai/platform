@@ -474,8 +474,9 @@ what was sent.
 **A body whose bytes are not UTF-8 is a body that cannot be read.** It is
 refused before anything decodes it, so a byte the caller sent is never stored
 as `U+FFFD` in its place: `400 body_unreadable` on the operator and lane
-surfaces, and each sign-in, language, invite and reset door's own unreadable
-sentence under `/api/v1/auth`. A `U+FFFD` the caller actually sent is valid
+surfaces, each sign-in, invite and reset door's own unreadable sentence under
+`/api/v1/auth`, and the language door's own `400 language_refused`. A `U+FFFD`
+the caller actually sent is valid
 UTF-8 and is their text. This platform reads UTF-8 only, deliberately: a body
 that declares another charset, `utf-16` among them, is refused the same way,
 because bytes that are valid UTF-8 can still read as UTF-16 to a lone
