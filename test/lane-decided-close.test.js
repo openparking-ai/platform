@@ -186,6 +186,7 @@ test('a close carrying a priced decision writes the lane\'s numbers and does not
     plan_version: 'flat-250-USD',
     currency: 'USD',
     fee_minor: 425,
+    occupancy_at_entry_bp: null,
     session_id: id,
     synced_at: decision.computed_from,
   });
@@ -253,6 +254,8 @@ test('a decision about a different stay, another currency, another class or an u
     ['other currency', (id) => pricedDecision(id, { currency: 'EUR' }), /prices in EUR/],
     ['other class', (id) => pricedDecision(id, { spaceClass: 'compact' }), /space class compact/],
     ['unknown plan', (id) => pricedDecision(id, { planVersion: 'v-nobody' }), /plan version v-nobody/],
+    // 0034: the stay opened with no figure (this garage states no spaces); a lane that priced it on one did not price this stay.
+    ['other figure', (id) => ({ ...pricedDecision(id), occupancy_at_entry_bp: 5000 }), /5000 bp full at entry; the stay's own figure is null/],
   ];
   for (const [label, make, why] of cases) {
     const car = plate('MISM');

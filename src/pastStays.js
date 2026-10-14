@@ -103,7 +103,7 @@ export async function closedStays(client, tenantId, garageId, { from, to, limit,
   const { rows } = await client.query(
     `SELECT s.id, to_json(s.exit_at) #>> '{}' AS exit_key,
             s.entry_at, s.exit_at, s.fee_minor, s.subtotal_minor, s.currency, s.exit_outcome,
-            (s.pricing_refusal IS NOT NULL) AS pricing_refused
+            (s.pricing_refusal IS NOT NULL) AS pricing_refused, s.occupancy_at_entry_bp
        FROM sessions s
       WHERE s.tenant_id = $1 AND s.garage_id = $2
         AND s.exit_at >= $3 AND s.exit_at < $4
@@ -135,5 +135,7 @@ function present(row) {
     currency: row.currency,
     exit_outcome: row.exit_outcome,
     pricing_refused: row.pricing_refused,
+    // How full the garage was when the car came in (0034), or null.
+    occupancy_at_entry_bp: row.occupancy_at_entry_bp,
   };
 }

@@ -26,7 +26,7 @@ import { MESSAGE_MAX } from './lanes.js';
 import * as setup from './setup.js';
 import * as alerts from './alerts.js';
 import * as bans from './bans.js';
-import { garageCurrency, garageName, garageTimezone } from './garageFields.js';
+import { garageCurrency, garageName, garageSpaces, garageTimezone } from './garageFields.js';
 import { verifyUtf8 } from './utf8Body.js';
 
 const bad = (message) => new HttpError(400, message);
@@ -489,6 +489,15 @@ function consumableDecision(decision, { open, garage, planVersions, taxFacts }) 
   if (!planVersions.includes(decision.plan_version)) {
     return { consume: false, reason: `the decision names plan version ${decision.plan_version}, which this garage does not hold` };
   }
+  // HOW FULL AT ENTRY (0034). A lane says which figure it priced the stay on;
+  // one that is not the stay's own -- a lane that dropped it, or held an older
+  // copy -- is not taken, and the close prices on the stay's own.
+  if (decision.occupancy_at_entry_bp !== undefined && (decision.occupancy_at_entry_bp ?? null) !== (open.occupancy_at_entry_bp ?? null)) {
+    return {
+      consume: false,
+      reason: `the decision priced the stay at ${JSON.stringify(decision.occupancy_at_entry_bp)} bp full at entry; the stay's own figure is ${JSON.stringify(open.occupancy_at_entry_bp ?? null)}`,
+    };
+  }
   // TAX ON THE STAY (0023). A lane older than it wrote an untaxed fee; the
   // close prices for itself rather than write that number onto the row.
   if (decision.subtotal_minor === undefined || decision.tax_sets_held === undefined) {
@@ -912,10 +921,13 @@ export function createApp() {
       if (banReach !== undefined && !BAN_REACHES.includes(banReach)) {
         throw bad(`ban_reach must be one of ${BAN_REACHES.join(', ')} when given`);
       }
-      const given = { default_action: action, transient_available: transient, ban_tailgaters: banTailgaters, ban_reach: banReach };
+      // The garage's number of spaces (0034): the garage map writes its count of
+      // switched-on spots here, or the owner types it on the Garages page.
+      const spaces = req.body?.spaces === undefined ? undefined : garageSpaces(req.body.spaces);
+      const given = { default_action: action, transient_available: transient, ban_tailgaters: banTailgaters, ban_reach: banReach, spaces };
       const fields = Object.keys(given).filter((f) => given[f] !== undefined);
       if (fields.length === 0) {
-        throw bad('default_action, transient_available, ban_tailgaters or ban_reach is required');
+        throw bad('default_action, transient_available, ban_tailgaters, ban_reach or spaces is required');
       }
       const garage = await changeTx(req, async (client) => {
         // Read first, locked: the line says what each field was.
@@ -924,6 +936,23 @@ export function createApp() {
           [req.tenantId, req.params.garageId],
         );
         if (!was[0]) throw new HttpError(404, 'garage not found');
+        if (spaces === null && was[0].spaces !== null) {
+          // Rates with a fill rule price on the number of spaces: it is not
+          // taken away under them. Decided behind the garage's rates lock, the
+          // one a save of new rates holds, so the two cannot cross.
+          await ratePlans.lockGarageRates(client, was[0].id);
+          const newest = await ratePlans.newestRatePlan(client, req.tenantId, was[0].id);
+          const { rows: plan } = newest
+            ? await client.query('SELECT document FROM rate_plans WHERE tenant_id = $1 AND id = $2', [req.tenantId, newest.id])
+            : { rows: [] };
+          if (plan[0] && ratePlans.hasFillRule(plan[0].document)) {
+            throw conflict(
+              'spaces_needed_by_fill_rule',
+              'the rates in force raise the price when the garage is full, which needs the number of spaces; ' +
+                'change the rates first, then clear it. Nothing was changed.',
+            );
+          }
+        }
         const sets = [];
         const values = [req.tenantId, req.params.garageId];
         for (const f of fields) { values.push(given[f]); sets.push(`${f} = $${values.length}`); }
@@ -1253,8 +1282,9 @@ export function createApp() {
       // alone the store, until somebody has said they checked the prices.
       ratePlans.assertConfirmed(req.body);
       const document = ratePlans.planDocument(req.body?.plan);
+      ratePlans.assertFillAnswers(document);
       const out = await withTenant(req.tenantId, async (client) => {
-        const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
+        let garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
         // Validated BEFORE it is stored, by the only thing that knows what a
         // plan means. The currency check sits after it deliberately: a
@@ -1265,6 +1295,10 @@ export function createApp() {
         // The rates the owner checked are still the newest (U7i): decided
         // here, in the transaction that inserts, behind the garage's lock.
         await ratePlans.lockGarageRates(client, garage.id);
+        // Read again behind the lock: the number of spaces a fill rule needs
+        // is cleared only behind this same lock (PATCH /garages/:id).
+        garage = await repo.getGarage(client, req.tenantId, garage.id);
+        ratePlans.assertFitsGarage(garage, document);
         ratePlans.assertBasedOnNewest(req.body, await ratePlans.newestRatePlan(client, req.tenantId, garage.id));
         const row = await ratePlans.storeRatePlan(client, req.tenantId, {
           garage,
@@ -1336,6 +1370,7 @@ export function createApp() {
       }
       const body = req.body ?? {};
       const draft = body.plan === undefined ? null : ratePlans.planDocument(body.plan);
+      if (draft !== null) ratePlans.assertFillAnswers(draft);
       const rawStays = body.stays;
       if (!Array.isArray(rawStays) || rawStays.length < 1 || rawStays.length > TRY_MAX_STAYS) {
         throw bad(`stays is a list of 1 to ${TRY_MAX_STAYS} stays, each { entry, exit } in the garage's own time`);
@@ -1734,6 +1769,10 @@ export function createApp() {
         timezone: payload.garage.timezone,
         currency: payload.garage.currency,
         space_class: payload.garage.space_class,
+        // The garage's number of spaces (0034), or null: the lane's price board
+        // prices a car coming in now on how full the garage is now, the figure
+        // the open will freeze onto it.
+        spaces: payload.garage.spaces ?? null,
         // The garage's own value, not a literal. It was a literal until 0004,
         // which meant a garage that wanted the strict behaviour could not have
         // it -- the lane supports 'deny' and always has, and nothing could
@@ -2291,6 +2330,7 @@ export function createApp() {
             plan_version: localDecision.plan_version ?? null,
             currency: localDecision.currency ?? open.currency,
             fee_minor: localDecision.fee_minor ?? null,
+            occupancy_at_entry_bp: localDecision.occupancy_at_entry_bp ?? null,
             session_id: localDecision.session_id ?? open.id,
             synced_at: localDecision.computed_from,
           };
@@ -2966,7 +3006,14 @@ function tryStay(raw, i, timezone) {
   const entryAt = localToInstant(raw.entry, timezone, `stays[${i}].entry`);
   const exitAt = localToInstant(raw.exit, timezone, `stays[${i}].exit`);
   if (exitAt < entryAt) throw bad(`stays[${i}] leaves (${raw.exit}) before it came in (${raw.entry})`);
-  return { entry: raw.entry, exit: raw.exit, entryAt, exitAt };
+  // How full the garage was when this car came in, for rates with a fill rule
+  // (0034): a whole number of basis points of full, 0 to 10000, or left out --
+  // and then a fill rule cannot price the stay, and says so, as at the close.
+  const occupancy = raw.occupancy_at_entry_bp;
+  if (occupancy !== undefined && occupancy !== null && !(Number.isInteger(occupancy) && occupancy >= 0 && occupancy <= 10000)) {
+    throw bad(`stays[${i}].occupancy_at_entry_bp is how full the garage was at entry: a whole number from 0 to 10000 (basis points of full)`);
+  }
+  return { entry: raw.entry, exit: raw.exit, entryAt, exitAt, occupancyAtEntryBp: occupancy ?? null };
 }
 
 /** The rule a breakdown line was written by, in the plan that priced the stay. */
@@ -2984,7 +3031,9 @@ function ruleOf(documents, planVersion, ruleId) {
 async function tryOne(client, tenantId, garage, documents, stay) {
   const minutes = Math.ceil((stay.exitAt - stay.entryAt) / 60_000);
   const at = { entry: stay.entry, exit: stay.exit, entry_at: stay.entryAt.toISOString(), exit_at: stay.exitAt.toISOString(), minutes };
-  const priced = await priceStay({ garage, plans: documents, session: { entry_at: stay.entryAt, currency: garage.currency }, exitAt: stay.exitAt });
+  if (stay.occupancyAtEntryBp !== null) at.occupancy_at_entry_bp = stay.occupancyAtEntryBp;
+  const session = { entry_at: stay.entryAt, currency: garage.currency, occupancy_at_entry_bp: stay.occupancyAtEntryBp };
+  const priced = await priceStay({ garage, plans: documents, session, exitAt: stay.exitAt });
   if (priced.refusal) return { ...at, refused: true, findings: priced.refusal };
   const { rows } = await client.query(
     'SELECT count(*)::int AS n FROM garage_tax_sets WHERE tenant_id = $1 AND garage_id = $2 AND effective_from <= $3',
@@ -3043,6 +3092,9 @@ async function priceStay({ garage, plans, session, exitAt }) {
       spaceClass: garage.space_class,
       entryAt: session.entry_at,
       exitAt,
+      // The stay's own figure, frozen when it opened (0034): the price never
+      // moves with how full the garage is when the car leaves.
+      occupancyAtEntryBp: session.occupancy_at_entry_bp ?? null,
     });
     if (quote.currency !== session.currency) {
       // Cannot happen -- the store refuses a plan in another currency -- and

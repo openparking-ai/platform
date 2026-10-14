@@ -74,19 +74,19 @@ after(async () => {
   await pool.end();
 });
 
-test('GET /garages: the tenant\'s garages, oldest first, with exactly id, name, time zone, currency and whether each is live', async () => {
+test('GET /garages: the tenant\'s garages, oldest first, with exactly id, name, time zone, currency, whether each is live and its number of spaces', async () => {
   const r = await get('/garages');
   assert.equal(r.status, 200);
   assert.deepEqual(r.json.garages, [
-    { id: world.garage, name: 'Test Garage', timezone: 'America/New_York', currency: 'USD', live: true },
-    { id: r.json.garages[1].id, name: 'Not Yet Live', timezone: 'Europe/London', currency: 'GBP', live: false },
+    { id: world.garage, name: 'Test Garage', timezone: 'America/New_York', currency: 'USD', live: true, spaces: null },
+    { id: r.json.garages[1].id, name: 'Not Yet Live', timezone: 'Europe/London', currency: 'GBP', live: false, spaces: null },
   ]);
 });
 
 test('GET /garages/:id: one garage, the same shape; an unknown one is 404', async () => {
   const r = await get(`/garages/${world.garage}`);
   assert.equal(r.status, 200);
-  assert.deepEqual(r.json.garage, { id: world.garage, name: 'Test Garage', timezone: 'America/New_York', currency: 'USD', live: true });
+  assert.deepEqual(r.json.garage, { id: world.garage, name: 'Test Garage', timezone: 'America/New_York', currency: 'USD', live: true, spaces: null });
   const missing = await get('/garages/00000000-0000-4000-8000-000000000000');
   assert.equal(missing.status, 404);
   assert.deepEqual(missing.json, { error: 'garage not found' });

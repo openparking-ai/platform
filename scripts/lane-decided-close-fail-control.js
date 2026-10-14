@@ -24,6 +24,8 @@
  *                          the evidence.
  *   ignored_not_kept       a decision the close did not take is dropped
  *                          instead of kept on the record with its reason.
+ *   figure_mismatch_taken  a decision priced on another figure of how full
+ *                          the garage was at entry is written as the fee.
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0017, so the property genuinely never existed.
@@ -94,6 +96,13 @@ const SOURCE_BREAKS = [
     file: 'src/app.js',
     from: '            asked.record.local_decision_ignored = { reason: consumable.reason, local_decision: localDecision };',
     to: '            void consumable;',
+  },
+  {
+    name: 'figure_mismatch_taken',
+    why: 'a decision priced on another figure of how full the garage was at entry is written as the fee',
+    file: 'src/app.js',
+    from: "  if (decision.occupancy_at_entry_bp !== undefined && (decision.occupancy_at_entry_bp ?? null) !== (open.occupancy_at_entry_bp ?? null)) {",
+    to: '  if (false) {',
   },
 ];
 

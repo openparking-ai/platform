@@ -136,8 +136,10 @@ test('the payload carries the plans whole, the space class, the entitlements, th
   const payload = await rules(g.entry);
   assert.deepEqual(Object.keys(payload).sort(), [
     'active', 'banned', 'board', 'currency', 'default_action', 'direction', 'entitlements', 'garage_id', 'lane', 'lane_id',
-    'rate_plans', 'space_class', 'stays', 'synced_at', 'tax_sets', 'timezone',
+    'rate_plans', 'space_class', 'spaces', 'stays', 'synced_at', 'tax_sets', 'timezone',
   ]);
+  // The garage's number of spaces (0034): this garage states none.
+  assert.equal(payload.spaces, null);
   // The asking lane, open (0026): closing it is covered in lane-setup.test.js.
   assert.deepEqual(payload.lane, { state: 'open', reason: null, message: null, closed_at: null });
   // Its board (0030): no price switch and no message yet; covered in board.test.js.
@@ -239,7 +241,7 @@ test('the open stays travel with a cursor, closed ones do not, and the delta car
     [a, true, '2026-09-10T12:00:00.000Z', 'E'],
     [b, true, '2026-09-10T12:05:00.000Z', 'E'],
   ]);
-  assert.deepEqual(Object.keys(first.stays.open[0]).sort(), ['change_seq', 'entry_at', 'entry_lane', 'open', 'plate', 'plate_region', 'session_id', 'ticket_ref']);
+  assert.deepEqual(Object.keys(first.stays.open[0]).sort(), ['change_seq', 'entry_at', 'entry_lane', 'occupancy_at_entry_bp', 'open', 'plate', 'plate_region', 'session_id', 'ticket_ref']);
   assert.match(first.stays.cursor, /^\d+$/);
   assert.equal(first.stays.cursor, first.stays.open[1].change_seq, 'the cursor is the highest value the garage holds');
   // The stay route without `since` is the same set and the same cursor.

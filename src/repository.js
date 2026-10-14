@@ -124,6 +124,13 @@ export async function openSession(
   const existing = await findOpenSession(client, tenantId, garageId, vehicleId);
   if (existing) return { session: existing, created: false };
 
+  // HOW FULL THE GARAGE WAS WHEN THIS CAR CAME IN (0034), counted behind the
+  // garage's lock: a second open of the same garage waits here until this one
+  // commits, then counts this car too -- two lanes opening at once see n and
+  // n+1, never n twice. Read here and nowhere else; no lane sends it.
+  await lockGarageOpens(client, garageId);
+  const occupancyAtEntryBp = await occupancyNow(client, tenantId, garageId);
+
   // The check above handles the ordinary replay. This savepoint handles the
   // race: two lanes, or a retry arriving while the first request is still in
   // flight. Without it, the unique violation aborts the whole transaction and
@@ -133,11 +140,12 @@ export async function openSession(
   try {
     const { rows } = await client.query(
       `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
-                             open_event_id, entry_confirmation, entry_descriptor, tailgater)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                             open_event_id, entry_confirmation, entry_descriptor, tailgater,
+                             occupancy_at_entry_bp)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
       [tenantId, garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation,
-       entryDescriptor, tailgater],
+       entryDescriptor, tailgater, occupancyAtEntryBp],
     );
     await client.query('RELEASE SAVEPOINT open_session');
     return { session: rows[0], created: true };
@@ -153,6 +161,44 @@ export async function openSession(
     if (!raced) throw err;
     return { session: raced, created: false };
   }
+}
+
+/**
+ * How full, in basis points of full, `inside` cars make a garage of `spaces`:
+ * floor(10000 x inside / spaces), and never more than 10000 -- a map changed
+ * under cars still inside can leave more cars than spaces, and that is full.
+ * Null when the garage has no number of spaces: nothing is guessed.
+ */
+export function occupancyBp(inside, spaces) {
+  if (spaces === null || spaces === undefined) return null;
+  return Math.min(10000, Math.floor((10000 * inside) / spaces));
+}
+
+/**
+ * One open at a time per garage, for the rest of the transaction: the count of
+ * cars inside is taken behind it, so two opens at once count each other. A
+ * transaction-scoped advisory lock, let go at COMMIT or ROLLBACK.
+ */
+export async function lockGarageOpens(client, garageId) {
+  await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('garage_opens:' || $1::text, 0))`, [garageId]);
+}
+
+/**
+ * How full the garage is now: every car inside -- every open stay, whatever
+ * kind of space it is in -- against the garage's number of spaces (0034).
+ * Null when the garage has none.
+ */
+export async function occupancyNow(client, tenantId, garageId) {
+  const { rows } = await client.query(
+    `SELECT g.spaces,
+            (SELECT count(*)::int FROM sessions s
+              WHERE s.tenant_id = g.tenant_id AND s.garage_id = g.id AND s.exit_at IS NULL) AS inside
+       FROM garages g
+      WHERE g.tenant_id = $1 AND g.id = $2`,
+    [tenantId, garageId],
+  );
+  if (!rows[0]) return null;
+  return occupancyBp(rows[0].inside, rows[0].spaces);
 }
 
 /**
@@ -228,7 +274,7 @@ export async function closeSession(
 export async function laneDecidedSessions(client, tenantId, garageId, since) {
   const { rows } = await client.query(
     `SELECT id, entry_at, exit_at, currency, fee_minor, plan_version, space_class,
-            exit_outcome, decision_inputs, entitlement, breakdown
+            exit_outcome, decision_inputs, entitlement, breakdown, occupancy_at_entry_bp
        FROM sessions
       WHERE tenant_id = $1 AND garage_id = $2 AND decided_by = 'lane' AND exit_at >= $3
       ORDER BY exit_at`,
@@ -254,7 +300,8 @@ export async function laneDecidedSessions(client, tenantId, garageId, since) {
 export async function uncheckedLaneDecisions(client, tenantId, limit) {
   const { rows } = await client.query(
     `SELECT id, garage_id, exit_lane_id, entry_at, exit_at, currency, fee_minor, plan_version,
-            space_class, exit_outcome, decision_inputs, entitlement, close_event_id, breakdown
+            space_class, exit_outcome, decision_inputs, entitlement, close_event_id, breakdown,
+            occupancy_at_entry_bp
        FROM sessions
       WHERE tenant_id = $1 AND decided_by = 'lane' AND decision_checked_at IS NULL
       ORDER BY exit_at, id
@@ -321,7 +368,7 @@ export async function stayCursor(client, tenantId, garageId) {
 // below is a fail-control anchor, and a second copy of it would catch the
 // plant meant for the listing.
 const STAY_COLUMNS = `s.id, s.entry_at, s.exit_at, s.change_seq::text AS change_seq,
-            l.name AS entry_lane, v.plate, v.ticket_ref, v.plate_region`;
+            s.occupancy_at_entry_bp, l.name AS entry_lane, v.plate, v.ticket_ref, v.plate_region`;
 const stayRow = (r) => ({
   session_id: r.id,
   open: r.exit_at === null,
@@ -331,6 +378,9 @@ const stayRow = (r) => ({
   entry_at: r.entry_at,
   entry_lane: r.entry_lane,
   change_seq: r.change_seq,
+  // How full the garage was when this car came in (0034), or null: the lane
+  // prices the stay on it, as the close does, so the two agree to the cent.
+  occupancy_at_entry_bp: r.occupancy_at_entry_bp,
 });
 
 /** Every open stay of the garage, in cursor order: the full set a reader starts from. */
@@ -376,13 +426,14 @@ export async function stayChangesSince(client, tenantId, garageId, since, limit)
  * it is live -- activated (0014) -- and nothing else.
  */
 export function presentGarage(row) {
-  return { id: row.id, name: row.name, timezone: row.timezone, currency: row.currency, live: row.activated_at !== null };
+  // `spaces`: the garage's number of spaces (0034), or null when nothing has said it.
+  return { id: row.id, name: row.name, timezone: row.timezone, currency: row.currency, live: row.activated_at !== null, spaces: row.spaces ?? null };
 }
 
 /** The tenant's garages, oldest first. */
 export async function garagesForTenant(client, tenantId) {
   const { rows } = await client.query(
-    'SELECT id, name, timezone, currency, activated_at FROM garages WHERE tenant_id = $1 ORDER BY created_at, id',
+    'SELECT id, name, timezone, currency, activated_at, spaces FROM garages WHERE tenant_id = $1 ORDER BY created_at, id',
     [tenantId],
   );
   return rows;
