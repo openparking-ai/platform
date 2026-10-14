@@ -689,6 +689,8 @@ function refuseFuture(at, label, now = new Date()) {
 
 export function createApp() {
   const app = express();
+  // No answer names the framework (OWASP information exposure).
+  app.disable('x-powered-by');
   const authSettings = signIn.readAuthSettings();
   if (authSettings.trustProxy !== null) app.set('trust proxy', authSettings.trustProxy);
 

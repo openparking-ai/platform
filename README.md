@@ -367,8 +367,12 @@ the session is written. There is no change-password route yet;
 that comes with the account page.
 
 **The cookie** is `op_session`: `HttpOnly` (page script can never read it),
-`Secure`, `SameSite=Strict`, `Path=/api`, no `Domain`. So **the admin site is
-served from the same origin as `/api`** — there is no CORS here. `Secure` may be
+`Secure`, `SameSite=Strict`, `Path=/`, no `Domain`. So **the admin site is
+served from the same origin as `/api`** — there is no CORS here. `Path=/` (it was
+`/api` until 2026-10-15) so that owner pages served beside the admin, such as the
+garage map at `/garage-map/`, can be gated at the proxy by `GET /api/v1/auth/me`;
+every set and clear also removes a `Path=/api` cookie an earlier version left, since
+a browser holding both would send `op_session` twice, which reads as no session. `Secure` may be
 turned off only by `SESSION_COOKIE_INSECURE=true`, for plain-http local
 development, and `serve` says so out loud when it is.
 
