@@ -31,8 +31,8 @@ const SOURCE_BREAKS = [
     name: 'list_predicate_removed',
     why: "the garage list reads every tenant's garages",
     file: 'src/repository.js',
-    from: "'SELECT id, name, timezone, currency, activated_at FROM garages WHERE tenant_id = $1 ORDER BY created_at, id'",
-    to: "'SELECT id, name, timezone, currency, activated_at FROM garages WHERE $1::uuid IS NOT NULL ORDER BY created_at, id'",
+    from: "'SELECT id, name, timezone, currency, activated_at, spaces FROM garages WHERE tenant_id = $1 ORDER BY created_at, id'",
+    to: "'SELECT id, name, timezone, currency, activated_at, spaces FROM garages WHERE $1::uuid IS NOT NULL ORDER BY created_at, id'",
   },
   {
     name: 'garage_predicate_removed',
@@ -59,8 +59,8 @@ const SOURCE_BREAKS = [
     name: 'live_wrong',
     why: 'every garage is said to be live',
     file: 'src/repository.js',
-    from: 'live: row.activated_at !== null };',
-    to: 'live: true };',
+    from: 'live: row.activated_at !== null, spaces: row.spaces ?? null };',
+    to: 'live: true, spaces: row.spaces ?? null };',
   },
   {
     name: 'garage_extra_fields',

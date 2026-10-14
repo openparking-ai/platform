@@ -257,6 +257,37 @@ export async function lockGarageRates(client, garageId) {
   await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('rate_plans:' || $1::text, 0))`, [garageId]);
 }
 
+/** The rule type that prices on how full the garage was at entry (rate-engine schema 6). */
+export const FILL_RULE_TYPE = 'fill_level';
+/** The owner's two answers a fill rule states, each "yes" or "no" and nothing else (the engine's F54). */
+export const FILL_ANSWERS = Object.freeze(['raises_specials', 'raises_vip_extra']);
+
+/** Whether a plan document carries a fill rule. */
+export function hasFillRule(document) {
+  return Array.isArray(document?.rules) && document.rules.some((r) => r?.type === FILL_RULE_TYPE);
+}
+
+/**
+ * A fill rule states both of the owner's answers, each "yes" or "no". The
+ * engine refuses one that does not, by name, and so does the store, before
+ * the engine is asked: the refusal reaches the owner's screen by its own code
+ * (`fill_rule_answers_missing`), and nothing is stored.
+ */
+export function assertFillAnswers(document) {
+  const rules = Array.isArray(document?.rules) ? document.rules : [];
+  for (const rule of rules) {
+    if (rule?.type !== FILL_RULE_TYPE) continue;
+    const missing = FILL_ANSWERS.filter((k) => rule[k] !== 'yes' && rule[k] !== 'no');
+    if (missing.length) {
+      throw new RatePlanRefused(
+        'fill_rule_answers_missing',
+        `the rule that raises the price when the garage is full (${JSON.stringify(rule.id ?? null)}) must say ` +
+          `${missing.join(' and ')}, each "yes" or "no"; nothing was stored`,
+      );
+    }
+  }
+}
+
 /**
  * What only the garage can say about a document: its money and the space
  * class every stay here is priced as. Shared by the store and by the try, so
@@ -274,6 +305,16 @@ export function assertFitsGarage(garage, document) {
   // Every stay in this garage is priced as the garage's class (0013), so a
   // plan that does not declare it would refuse every exit -- caught here, in
   // front of an operator, and not at 3 a.m. at the barrier.
+  // A fill rule prices on how full the garage was at entry, which needs the
+  // garage's number of spaces (0034). Without one, every stay it covers would
+  // be refused at the barrier: refused here instead, in front of the owner.
+  if (hasFillRule(document) && (garage.spaces === null || garage.spaces === undefined)) {
+    throw new RatePlanRefused(
+      'plan_needs_spaces',
+      'these rates raise the price when the garage is full, and this garage has no number of spaces yet: ' +
+        'set the number of spaces on the Garages page, or build the garage map, first; nothing was stored',
+    );
+  }
   const classes = Array.isArray(document.space_classes) ? document.space_classes : [];
   if (!classes.includes(garage.space_class)) {
     throw new RatePlanRefused(
@@ -424,7 +465,7 @@ export function documents(rows) {
  * recorded as unpriced on the strength of a request this platform built wrong.
  */
 export async function quoteWithEngine(
-  { plans, currency, spaceClass, entryAt, exitAt },
+  { plans, currency, spaceClass, entryAt, exitAt, occupancyAtEntryBp = null },
   { url = rateEngineUrl(), timeoutMs = 10_000 } = {},
 ) {
   if (!url) throw new EngineUnavailable('RATE_ENGINE_URL is not set; the close prices through the engine and nothing else');
@@ -440,6 +481,10 @@ export async function quoteWithEngine(
         space_class: spaceClass,
         entry_at: entryAt.toISOString(),
         exit_at: exitAt.toISOString(),
+        // How full the garage was when the car came in (0034), when this
+        // platform knows it. Without it, a plan with a fill rule is refused by
+        // the engine, by name (GAP_NO_OCCUPANCY_AT_ENTRY): never a guess.
+        ...(occupancyAtEntryBp === null || occupancyAtEntryBp === undefined ? {} : { occupancy_at_entry_bp: occupancyAtEntryBp }),
       }),
       signal: AbortSignal.timeout(timeoutMs),
     });

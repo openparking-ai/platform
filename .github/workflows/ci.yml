@@ -297,6 +297,16 @@ jobs:
         # test/past-stays.test.js to go red.
         run: npm run past-stays-fail-control
 
+      - name: Fill-rule fail-control
+        # The fill rule's figures (0034). Each break removes one property --
+        # the per-garage lock on opens, closed stays not counted, the figure
+        # rounded down and held to full, no lane setting it, the close and the
+        # reconciler handing it to the engine, the number of spaces checked and
+        # not cleared under a fill rule, the store refusing a fill rule with no
+        # spaces or a missing answer, the lane feed, past stays and try
+        # carrying it -- and requires test/fill-rule.test.js to go red.
+        run: npm run fill-rule-fail-control
+
       - name: Pictures-and-bans fail-control
         # U7f (0033). Each break removes one property -- the week rule after
         # the exit, a car inside keeping its pictures, a tailgater stay marked,

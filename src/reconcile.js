@@ -232,6 +232,9 @@ export async function laneDecidedCloses(client, tenantId, garageId, since, { quo
         spaceClass: inputs.space_class ?? row.space_class,
         entryAt: new Date(inputs.entry_at ?? row.entry_at),
         exitAt: new Date(inputs.exit_at ?? row.exit_at),
+        // The stay's own figure, as the close prices on it (0034): a lane that
+        // priced on another reads as a divergence, never as agreement.
+        occupancyAtEntryBp: row.occupancy_at_entry_bp ?? null,
       });
     } catch (err) {
       report.unrecomputable.push({
@@ -296,6 +299,9 @@ export async function checkOneDecision(client, tenantId, row, { documents, ask, 
         spaceClass: inputs.space_class ?? row.space_class,
         entryAt: new Date(inputs.entry_at ?? row.entry_at),
         exitAt: new Date(inputs.exit_at ?? row.exit_at),
+        // The stay's own figure, as the close prices on it (0034): a lane that
+        // priced on another reads as a divergence, never as agreement.
+        occupancyAtEntryBp: row.occupancy_at_entry_bp ?? null,
       });
     } catch (err) {
       refusal = {

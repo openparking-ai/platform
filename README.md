@@ -594,7 +594,8 @@ breaks each property in turn.
 
     GET /api/v1/garages/<id>/stays/closed?from=<instant>&to=<instant>[&limit=<n>][&after=<next>]
         {garage_id, from, to, limit, next,
-         stays: [{entry_at, exit_at, fee_minor, subtotal_minor, currency, exit_outcome, pricing_refused}]}
+         stays: [{entry_at, exit_at, fee_minor, subtotal_minor, currency, exit_outcome, pricing_refused,
+                  occupancy_at_entry_bp}]}
 
 The garage's own history: the stays that **closed** in `[from, to)`, oldest exit
 first, a page at a time (`next` is the `after` for the following page, `null`
@@ -1069,6 +1070,39 @@ the lane's event id. `/lane/rules` carries `active` so a lane can see it.
 What the gate does not reach: a stay that outlived the plan that covered it. It
 still arrives at the exit with no price, and the unpriced close above is its
 backstop. `npm run activation-fail-control` breaks each property in turn.
+
+### How full the garage was when the car came in (0034)
+
+The engine's **fill rule** ("when the garage is at least X% full, the time-based
+charge is Y% more", rate-engine schema 6) prices on how full the garage was **at
+the moment the car came in**, and nothing about a stay's price moves after
+that. The engine counts nothing; this platform counts, and hands it the figure.
+
+- **`garages.spaces`**: the garage's number of spaces, a whole number from 1 to
+  100000, or null. `PATCH /garages/:id {spaces}` (the owner's session or a key,
+  a change-log line with what it was); `GET /garages` and `GET /garages/:id`
+  return it. The garage map writes its count of switched-on spots here; without
+  a map the owner types it. Anything else is `400 garage_spaces_refused`.
+- **`sessions.occupancy_at_entry_bp`**: `floor(10000 x cars inside / spaces)`,
+  at most 10000, set when the stay opens: every open stay of the garage, any
+  kind of space, before this one. Counted inside the open's transaction behind
+  a per-garage lock, so two lanes opening at once count each other (n and n+1,
+  never n twice). Null when the garage has no `spaces`. **No lane sets it**:
+  one sent on the open or in an event is ignored.
+- **The close, the try and the reconciler** hand the engine the stay's own
+  figure. The lane's copy of the open stays (`GET /lane/rules`, `/lane/stays`)
+  carries it, and `/lane/rules` carries `spaces`, so a lane pricing offline
+  agrees with the close to the cent; a lane decision priced on another figure
+  is not taken. A try takes `occupancy_at_entry_bp` per stay (0 to 10000).
+- **Refused, nothing stored**: rates with a fill rule for a garage with no
+  `spaces` (`409 plan_needs_spaces`, at the store and the try); a fill rule
+  that does not state both of the owner's answers, `raises_specials` and
+  `raises_vip_extra`, each `"yes"` or `"no"` (`409 fill_rule_answers_missing`,
+  before the engine is asked, which refuses it too); clearing `spaces` while the
+  rates in force have a fill rule (`409 spaces_needed_by_fill_rule`).
+
+`test/fill-rule.test.js` holds each; `npm run fill-rule-fail-control` breaks
+each in turn.
 
 ### A garage's taxes
 

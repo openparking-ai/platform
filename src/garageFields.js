@@ -45,3 +45,18 @@ export async function garageTimezone(db, raw) {
   }
   throw bad('timezone must be a time zone name this platform knows, such as "America/New_York"', 'garage_timezone_refused');
 }
+
+//: The most spaces a garage may say it has: far past any garage, and well
+//: inside what the column and a basis-point figure work with.
+export const GARAGE_SPACES_MAX = 100000;
+
+/**
+ * The garage's number of spaces (0034): a whole number from 1 to
+ * GARAGE_SPACES_MAX, or null to say the garage has none stated. Zero, a
+ * negative, a fraction, text or true is refused by name, and nothing changes.
+ */
+export function garageSpaces(raw) {
+  if (raw === null) return null;
+  if (Number.isInteger(raw) && raw >= 1 && raw <= GARAGE_SPACES_MAX) return raw;
+  throw bad(`spaces must be a whole number from 1 to ${GARAGE_SPACES_MAX}, or null`, 'garage_spaces_refused');
+}
