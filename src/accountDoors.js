@@ -34,6 +34,7 @@ import express from 'express';
 import { hashPassword, passwordRuleBroken } from './passwords.js';
 import { sendEmail, EmailNotSent } from './email.js';
 import { acceptedNotice, resetEmail } from './emailText.js';
+import { verifyUtf8 } from './utf8Body.js';
 import {
   acceptInvite, completeReset, findInvite, findReset, requestReset, resetLink,
 } from './invites.js';
@@ -120,7 +121,7 @@ export function mountAccountDoors(router, { settings, email, line, answer, signI
     door, signIn.addressLimiter({ max: settings.linkAttemptsPerAddress, windowSeconds: settings.linkAttemptsWindowSeconds }),
   ]));
   // Room for a password at its longest, every character escaped.
-  const json = express.json({ limit: '16kb', strict: true });
+  const json = express.json({ limit: '16kb', strict: true, verify: verifyUtf8 });
 
   /** A failure inside a door: logged by what it is, answered at the floor in one sentence. */
   const failed = async (req, res, where, err) => {

@@ -631,6 +631,19 @@ test('THE DOORS ARE OFF with no admin origin (409), refuse a foreign Origin (403
       assert.deepEqual(garbled.json, doors.UNREADABLE[door], path);
       assert.equal(holdsSecret(garbled.text, token), false, `${path} repeated the token`);
     }
+    // Read lossily, a token or an email with U+FFFD in it, of the door's shape: refused
+    // before it is read, in the door's own sentence.
+    const text = JSON.stringify(body).replace(/"(token|email)":"/, '"$1":"\u0000');
+    const at = text.indexOf('\u0000');
+    for (const [name, raw, headers] of [
+      ['not UTF-8', Buffer.concat([Buffer.from(text.slice(0, at)), Buffer.from([0xff]), Buffer.from(text.slice(at + 1))]), {}],
+      ['declared utf-16le', Buffer.from(JSON.stringify(body), 'utf16le'), { 'content-type': 'application/json; charset=utf-16le' }],
+    ]) {
+      const encoded = await call(main.base, path, { raw, headers });
+      assert.equal(encoded.status, 400, `${path} ${name}`);
+      assert.deepEqual(encoded.json, doors.UNREADABLE[door], `${path} ${name}`);
+      assert.equal(holdsSecret(encoded.text, token), false, `${path} repeated the token`);
+    }
     const notJson = await call(main.base, path, { raw: JSON.stringify(body), headers: { 'content-type': 'text/plain' } });
     assert.equal(notJson.status, 400, path);
     assert.equal(notJson.headers.get('cache-control'), 'no-store', path);

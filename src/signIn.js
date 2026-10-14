@@ -69,6 +69,7 @@ import { generateDeviceToken, hashToken } from './auth.js';
 import { dummyHash, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
 import { mountAccountDoors } from './accountDoors.js';
 import { readEmailSettings } from './email.js';
+import { verifyUtf8 } from './utf8Body.js';
 
 export const COOKIE = 'op_session';
 export const MAX_FAILED = 10;
@@ -454,7 +455,7 @@ function logFailure(where, err) {
 }
 
 /** Sign-in's body, read on that route only: any failure to read it is the one unreadable sentence. */
-const jsonBody = express.json({ limit: '4kb' });
+const jsonBody = express.json({ limit: '4kb', verify: verifyUtf8 });
 function readSignInBody(req, res, next) {
   jsonBody(req, res, (err) => next(err ? Object.assign(new Error('the sign-in body could not be read', { cause: err }), { unreadable: true }) : undefined));
 }
@@ -464,7 +465,7 @@ function readSignInBody(req, res, next) {
  * read it -- not JSON, too long, broken -- is the one language refusal. Nothing
  * longer than a language and its key is ever a language, so the limit is small.
  */
-const languageJson = express.json({ limit: '256b', strict: true });
+const languageJson = express.json({ limit: '256b', strict: true, verify: verifyUtf8 });
 function readLanguageBody(req, res, next) {
   languageJson(req, res, (err) => next(err ? Object.assign(new Error('the language body could not be read', { cause: err }), { languageRefused: true }) : undefined));
 }
