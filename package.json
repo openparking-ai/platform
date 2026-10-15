@@ -55,6 +55,7 @@
     "board-fail-control": "node scripts/board-fail-control.js",
     "account-links-fail-control": "node scripts/account-links-fail-control.js",
     "garage-checks-fail-control": "node scripts/garage-checks-fail-control.js",
+    "db-restart-fail-control": "node scripts/db-restart-fail-control.js",
     "bans-fail-control": "node scripts/bans-fail-control.js",
     "rates-and-open-fail-control": "node scripts/rates-and-open-fail-control.js",
     "check-screen-characters": "node scripts/check-screen-characters.js",

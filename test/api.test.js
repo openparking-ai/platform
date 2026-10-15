@@ -74,7 +74,7 @@ after(async () => {
 
 // --- authentication -------------------------------------------------------
 
-test('healthz needs nothing', async () => {
+test('healthz needs no credential', async () => {
   assert.equal((await fetch(`${base}/healthz`)).status, 200);
 });
 

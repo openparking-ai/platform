@@ -73,7 +73,7 @@ const op = (method, path, body) =>
 test('the real entrypoint starts and serves with no Connect configured', async () => {
   const res = await fetch(`${base}/healthz`);
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { ok: true });
+  assert.deepEqual(await res.json(), { ok: true, db: 'connected' });
 });
 
 test('an ordinary operator route behaves as always', async () => {

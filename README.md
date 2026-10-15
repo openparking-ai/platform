@@ -1575,6 +1575,26 @@ sign-in as ONE source -- so one caller's flood takes everyone's refused
 attempts onto a single too-many line. The bound still holds; it can no longer
 tell callers apart.
 
+### When the database goes away
+
+A Postgres restart, a failover or an ended backend (57P01) does not end the
+platform. A request whose connection is lost before its COMMIT is sent is run
+once more on a fresh connection: Postgres rolled the first try back, so a
+change and its change-log line are written once, together, or not at all.
+Then, still unreachable, it is answered `503 database_unavailable`, "Nothing
+was changed", with `Retry-After: 5`. A connection lost while the COMMIT is on
+its way is not tried again, because it may have been saved: `503
+database_unavailable_saving` tells the caller to look before sending it again.
+A lane treats both as any 5xx and sends again; its opens and closes are keyed
+by their event ids. The few transactions that do something outside this
+database before they commit -- an invite's email, a validation claim, a shadow
+search -- are not tried twice. `/healthz` asks the database: `503
+{"ok":false,"db":"unreachable"}` while it cannot be reached, `200
+{"ok":true,"db":"connected"}` again when it can, with no restart. The log
+names the code only. `test/db-restart.test.js` runs the real process while its
+connections are ended under load; `npm run db-restart-fail-control` breaks
+each part in turn.
+
 ## Vehicle identity and retention
 
 The database stores real vehicle identity — plate, make, model, colour — because

@@ -138,7 +138,8 @@ export async function runShadowSearches(tenantId, { search, thresholds, limit = 
   const summary = { tenantId, pending: pending.length, searched: 0, failed: 0 };
   for (const id of pending) {
     try {
-      await withTenant(tenantId, (client) => runOne(client, tenantId, id, { search, thresholds, now }));
+      // The identity service is asked inside the transaction: not asked twice.
+      await withTenant(tenantId, (client) => runOne(client, tenantId, id, { search, thresholds, now }), { retry: false });
       summary.searched += 1;
     } catch (err) {
       summary.failed += 1;

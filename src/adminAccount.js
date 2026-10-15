@@ -15,7 +15,7 @@
  */
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { pool, withTenant } from './db.js';
+import { pool, query, withTenant } from './db.js';
 import { hashPassword, passwordRuleBroken } from './passwords.js';
 
 export class AdminCommandRefused extends Error {}
@@ -157,7 +157,7 @@ export async function createAdmin({ tenantId, email, password }) {
 /** A new password for the admin `email` names; every session revoked, every lock cleared. */
 export async function resetAdminPassword({ email, password }) {
   const normal = normalEmail(email);
-  const user = (await pool.query('SELECT user_id, tenant_id FROM resolve_operator_user($1)', [normal])).rows[0];
+  const user = (await query('SELECT user_id, tenant_id FROM resolve_operator_user($1)', [normal])).rows[0];
   if (!user) throw new AdminCommandRefused('no admin has that email');
   const hash = await hashPassword(password);
   return withTenant(user.tenant_id, async (c) => {

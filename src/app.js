@@ -1,6 +1,8 @@
 import express from 'express';
 import { randomUUID } from 'node:crypto';
-import { pool, withTenant } from './db.js';
+import {
+  DatabaseUnavailable, UNAVAILABLE_RETRY_AFTER, databaseAnswers, pool, query, unavailableAnswer, withTenant,
+} from './db.js';
 import { bearerFrom, generateDeviceToken, hashToken } from './auth.js';
 import { assertMinor, toMinor } from './money.js';
 import * as repo from './repository.js';
@@ -711,7 +713,12 @@ export function createApp() {
   app.use((req, res, next) => (req.path === '/api/v1/lane/pictures' ? pictureJson : json)(
     req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined)));
 
-  app.get('/healthz', (_req, res) => res.json({ ok: true }));
+  // Says whether the database answers NOW: 503 while it cannot be reached, 200
+  // again when it can, with no restart between.
+  app.get('/healthz', async (_req, res) => {
+    if (await databaseAnswers()) return res.json({ ok: true, db: 'connected' });
+    return res.status(503).json({ ok: false, db: 'unreachable' });
+  });
 
   // -------------------------------------------------------------------------
   // Operator surface.
@@ -745,7 +752,7 @@ export function createApp() {
         // What came with the request, kept for the change log's refusal line
         // (src/changes.js), which sends only its hash to the database.
         req.credential = { kind: 'key', token };
-        const { rows } = await pool.query('SELECT * FROM resolve_operator_token($1)', [hashToken(token)]);
+        const { rows } = await query('SELECT * FROM resolve_operator_token($1)', [hashToken(token)]);
         if (rows.length === 0) throw new HttpError(401, 'unknown or revoked operator token');
         req.tenantId = rows[0].tenant_id;
         req.operatorTokenId = rows[0].token_id;
@@ -782,8 +789,12 @@ export function createApp() {
    * line cannot commit. The one request with no line is one `record` found
    * changed nothing (the same before and after): it writes no line at all.
    */
-  const changeTx = (req, fn) =>
-    withTenant(req.tenantId, async (client) => {
+  const changeTx = (req, fn) => {
+    // A try lost to the database is rolled back and run again (src/db.js):
+    // what the lost try said about the change log goes with it.
+    const unchanged = req.change.unchanged;
+    return withTenant(req.tenantId, async (client) => {
+      req.change.unchanged = unchanged;
       const before = req.change.count;
       const out = await fn(client);
       const lines = req.change.count - before;
@@ -792,6 +803,7 @@ export function createApp() {
       }
       return out;
     });
+  };
 
   /**
    * A write whose change ran in a module's own transactions (the payment
@@ -809,7 +821,7 @@ export function createApp() {
       // store it (src/garageFields.js): never a bare 500, never taken unread.
       const name = garageName(raw.name);
       const currency = garageCurrency(raw.currency);
-      const timezone = await garageTimezone(pool, raw.timezone);
+      const timezone = await garageTimezone({ query }, raw.timezone);
       // Optional. A garage that says nothing gets the column default, which is
       // the value this platform has always served.
       const action = defaultAction(req.body?.default_action, { required: false });
@@ -1693,7 +1705,7 @@ export function createApp() {
       // belongs to, so this lookup cannot run under a tenant policy. It goes
       // through resolve_lane_device(), which is SECURITY DEFINER for exactly
       // that reason. See migration 0002.
-      const { rows } = await pool.query('SELECT * FROM resolve_lane_device($1)', [hashToken(token)]);
+      const { rows } = await query('SELECT * FROM resolve_lane_device($1)', [hashToken(token)]);
       if (rows.length === 0) throw new HttpError(401, 'unknown or revoked device token');
 
       req.device = {
@@ -2113,6 +2125,8 @@ export function createApp() {
       // `claiming`, the door is asked -- a claim held elsewhere for this stay
       // given back first -- and `held` written only after it answered. A
       // rollback from here on leaves `claiming`, which no close records.
+      // Not tried twice when the database connection is lost (src/db.js): the
+      // door commits in its own database, and a second try would ask it again.
       const out = await withTenant(tenantId, async (client) => {
         const stay = await repo.lockOpenStay(client, tenantId, garageId, sessionId);
         if (!stay) {
@@ -2158,7 +2172,7 @@ export function createApp() {
           ]);
         }
         return { ...claimed, replay: false, tax };
-      });
+      }, { retry: false });
       res.status(200).json({ validation: presentClaim(out) });
     } catch (err) {
       next(err);
@@ -2915,6 +2929,12 @@ export function createApp() {
       res.set('Cache-Control', 'no-store');
       res.set('X-Content-Type-Options', 'nosniff');
       return err.status === 413 ? res.status(413).json(BODY_TOO_LARGE) : res.status(400).json(BODY_UNREADABLE);
+    }
+    // The database could not be reached (src/db.js): a 503 in plain words,
+    // which a lane re-sends and a page shows. Already logged by its code.
+    if (err instanceof DatabaseUnavailable) {
+      res.set('Retry-After', UNAVAILABLE_RETRY_AFTER);
+      return res.status(503).json(unavailableAnswer(err, req.method));
     }
     const status = err.status ?? 500;
     // A NAMED 5xx is ours and says what failed upstream -- Stripe refused, or
