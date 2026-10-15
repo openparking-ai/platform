@@ -35,6 +35,7 @@ import { hashPassword, passwordRuleBroken } from './passwords.js';
 import { sendEmail, EmailNotSent } from './email.js';
 import { acceptedNotice, resetEmail } from './emailText.js';
 import { verifyUtf8 } from './utf8Body.js';
+import { DatabaseUnavailable, unavailableAnswer } from './db.js';
 import {
   acceptInvite, completeReset, findInvite, findReset, requestReset, resetLink,
 } from './invites.js';
@@ -125,6 +126,11 @@ export function mountAccountDoors(router, { settings, email, line, answer, signI
 
   /** A failure inside a door: logged by what it is, answered at the floor in one sentence. */
   const failed = async (req, res, where, err) => {
+    // The database could not be reached (src/db.js): already logged by its code.
+    if (err instanceof DatabaseUnavailable) {
+      if (!res.headersSent) await answer(req, res, 503, unavailableAnswer(err, req.method));
+      return;
+    }
     logFailure(where, err);
     if (!res.headersSent) await answer(req, res, 500, { error: 'internal error' });
   };

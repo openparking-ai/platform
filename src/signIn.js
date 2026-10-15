@@ -63,7 +63,7 @@
 import express from 'express';
 import { isIP, isIPv6 } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { pool, withTenant } from './db.js';
+import { DatabaseUnavailable, query, unavailableAnswer, withTenant } from './db.js';
 import * as changes from './changes.js';
 import { generateDeviceToken, hashToken } from './auth.js';
 import { dummyHash, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
@@ -329,7 +329,7 @@ export function sessionToken(req) {
 /** The live session a token names, its use recorded; or null when it has ended or never was. */
 export async function resolveSession(token, settings) {
   if (!token) return null;
-  const { rows } = await pool.query('SELECT * FROM resolve_operator_session($1, $2)', [hashToken(token), settings.idleSeconds]);
+  const { rows } = await query('SELECT * FROM resolve_operator_session($1, $2)', [hashToken(token), settings.idleSeconds]);
   return rows[0] ?? null;
 }
 
@@ -526,7 +526,7 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
       leave = line.enter(address);
       if (!leave) return await refuse(req, res, 503, BUSY);
 
-      const found = (await pool.query('SELECT * FROM resolve_operator_user($1)', [body.email])).rows[0] ?? null;
+      const found = (await query('SELECT * FROM resolve_operator_user($1)', [body.email])).rows[0] ?? null;
       const user = found ?? NOBODY;
       const lock = await internals.lockOf(user, address);
       const locked = Boolean(lock?.locked_until && new Date(lock.locked_until) > new Date());
@@ -671,6 +671,12 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
     if (err?.languageRefused) {
       await refusedLanguage(req, 400, LANGUAGE_REFUSED);
       return res.status(400).json(LANGUAGE_REFUSED);
+    }
+    // The database could not be reached (src/db.js): its plain 503, held to
+    // the floor on sign-in like every other sign-in answer.
+    if (err instanceof DatabaseUnavailable) {
+      if (onSignIn) return refuse(req, res, 503, unavailableAnswer(err, req.method));
+      return res.status(503).set('Retry-After', '2').json(unavailableAnswer(err, req.method));
     }
     if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);
     // A stored hash this code does not know is named here, PasswordHashUnrecognised.

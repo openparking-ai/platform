@@ -516,6 +516,14 @@ jobs:
         # must go red.
         run: npm run garage-checks-fail-control
 
+      - name: Database-restart fail-control
+        # test/db-restart.test.js runs the real platform while its database
+        # connections are ended under load. Each part of surviving that --
+        # the listener on every client, the pool's own, the one second try,
+        # no second COMMIT, the 503, /healthz asking the database -- taken out
+        # of a copy must turn the file red; the client listener five runs of five.
+        run: npm run db-restart-fail-control
+
 
   sign-in-control:
     name: sign-in-control (${{ matrix.shard }}/8)

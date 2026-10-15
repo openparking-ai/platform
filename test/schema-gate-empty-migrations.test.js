@@ -149,7 +149,7 @@ test("the same tree with the build's real migrations serves", async () => {
 
     assert.deepEqual(
       payload,
-      { ok: true },
+      { ok: true, db: 'connected' },
       `it did not serve with every migration present (exit ${gone ? await exited : 'still running'}). Output:\n${output}`,
     );
   } finally {

@@ -19,7 +19,7 @@
  * every sign-in lock on it.
  */
 import { randomBytes, randomUUID } from 'node:crypto';
-import { pool, withTenant } from './db.js';
+import { query, withTenant } from './db.js';
 import { hashToken } from './auth.js';
 import { AdminCommandRefused, normalEmail } from './adminAccount.js';
 import { assertCanSend, EmailNotSent, sendEmail } from './email.js';
@@ -53,14 +53,14 @@ export function linkStatus(row, now = new Date()) {
 /** The invite a token names, and its status. A token not of the invite's shape names none. */
 export async function findInvite(token) {
   if (typeof token !== 'string' || !INVITE_TOKEN.test(token)) return { status: 'invalid', invite: null };
-  const invite = (await pool.query('SELECT * FROM resolve_operator_invite($1)', [hashToken(token)])).rows[0] ?? null;
+  const invite = (await query('SELECT * FROM resolve_operator_invite($1)', [hashToken(token)])).rows[0] ?? null;
   return { status: linkStatus(invite), invite };
 }
 
 /** The reset a token names, and its status. */
 export async function findReset(token) {
   if (typeof token !== 'string' || !RESET_TOKEN.test(token)) return { status: 'invalid', reset: null };
-  const reset = (await pool.query('SELECT * FROM resolve_operator_password_reset($1)', [hashToken(token)])).rows[0] ?? null;
+  const reset = (await query('SELECT * FROM resolve_operator_password_reset($1)', [hashToken(token)])).rows[0] ?? null;
   return { status: linkStatus(reset), reset };
 }
 
@@ -114,7 +114,7 @@ function readyToSend({ adminOrigin, email }) {
 }
 
 async function refuseAnAdmin(email) {
-  const { rows } = await pool.query('SELECT 1 FROM resolve_operator_user($1)', [email]);
+  const { rows } = await query('SELECT 1 FROM resolve_operator_user($1)', [email]);
   if (rows.length) throw new AdminCommandRefused('that email already names an admin; nothing was changed');
 }
 
@@ -154,12 +154,14 @@ export async function inviteAdmin({ name, email, language }, settings) {
   const tenantId = randomUUID();
   const token = newInviteToken();
   try {
+    // The email goes out inside the transaction: a second try after a lost
+    // connection would send a second one, so there is none (src/db.js).
     const expiresAt = await withTenant(tenantId, async (c) => {
       await c.query('INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $3)', [tenantId, slugOf(company, tenantId), company]);
       const ends = await insertInvite(c, { tenantId, email: address, language: lang, token });
       await sendInvite(settings, { email: address, language: lang, company, token, expiresAt: ends });
       return ends;
-    });
+    }, { retry: false });
     return { email: address, tenantId, expiresAt };
   } catch (err) {
     if (err.constraint === 'operator_invites_one_live_per_email') {
@@ -178,10 +180,11 @@ export async function resendInvite({ email, language }, settings) {
   if (language !== undefined) languageOf(language);
   readyToSend(settings);
   await refuseAnAdmin(address);
-  const live = (await pool.query('SELECT * FROM resolve_operator_invite_for_email($1)', [address])).rows[0];
+  const live = (await query('SELECT * FROM resolve_operator_invite_for_email($1)', [address])).rows[0];
   if (!live) throw new AdminCommandRefused('no invite is waiting for that email; nothing was changed');
   const lang = languageOf(language, live.language);
   const token = newInviteToken();
+  // As above: the email is sent inside the transaction, so it is not tried twice.
   const expiresAt = await withTenant(live.tenant_id, async (c) => {
     const replaced = await c.query(
       `UPDATE operator_invites SET replaced_at = now()
@@ -193,7 +196,7 @@ export async function resendInvite({ email, language }, settings) {
     const ends = await insertInvite(c, { tenantId: live.tenant_id, email: address, language: lang, token });
     await sendInvite(settings, { email: address, language: lang, company, token, expiresAt: ends });
     return ends;
-  });
+  }, { retry: false });
   return { email: address, tenantId: live.tenant_id, expiresAt };
 }
 
@@ -239,7 +242,7 @@ export async function acceptInvite(invite, { passwordHash, language }) {
  * nothing (`nobody` is sign-in's NOBODY). Answers what to send, or null.
  */
 export async function requestReset(email, nobody) {
-  const found = (await pool.query('SELECT * FROM resolve_operator_user($1)', [email])).rows[0] ?? null;
+  const found = (await query('SELECT * FROM resolve_operator_user($1)', [email])).rows[0] ?? null;
   const user = found ?? nobody;
   const token = newResetToken();
   const made = await withTenant(user.tenant_id, async (c) => {
