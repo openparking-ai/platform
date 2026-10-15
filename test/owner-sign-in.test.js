@@ -83,6 +83,12 @@ async function call(base, method, path, { body, raw, headers = {}, cookie, origi
   return { status: res.status, text, json, headers: res.headers, cookies };
 }
 
+/** The removal of the session cookie an earlier version set at Path=/api. */
+const isLegacyClear = (c) => {
+  const parts = c.split(';').map((p) => p.trim());
+  return parts[0] === `${signIn.COOKIE}=` && parts.includes('Path=/api') && parts.includes('Max-Age=0') && parts.includes('HttpOnly');
+};
+
 const tokenOf = (r) => {
   const c = r.cookies.find((x) => x.startsWith(`${signIn.COOKIE}=`));
   return c ? c.split(';')[0].slice(signIn.COOKIE.length + 1) : null;
@@ -150,13 +156,19 @@ test('a sign-in sets the cookie with all five properties, answers who and until 
   const who = await owner('si-ok');
   const r = await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email.toUpperCase(), password: PASSWORD }, origin: ADMIN_ORIGIN });
   assert.equal(r.status, 200, r.text);
-  assert.equal(r.cookies.length, 1);
+  // The session cookie first, then the removal of the one an earlier version set at Path=/api:
+  // a browser holding both would send op_session twice, which sessionToken answers as none.
+  assert.equal(r.cookies.length, 2);
+  assert.ok(isLegacyClear(r.cookies[1]), `the Path=/api cookie is removed: ${r.cookies[1]}`);
   const parts = r.cookies[0].split(';').map((p) => p.trim());
   const attrs = parts.slice(1).map((p) => p.split('=')[0].toLowerCase());
   assert.ok(attrs.includes('httponly'), 'HttpOnly');
   assert.ok(attrs.includes('secure'), 'Secure');
   assert.ok(parts.includes('SameSite=Strict'), 'SameSite=Strict');
-  assert.ok(parts.includes('Path=/api'), 'Path=/api');
+  // Path=/ (2026-10-15, deploy fix 1): the owner's pages on this origin (/garage-map/) are
+  // gated at the proxy by GET /api/v1/auth/me, so the cookie must reach them.
+  assert.ok(parts.includes('Path=/'), 'Path=/');
+  assert.ok(!parts.includes('Path=/api'), 'not Path=/api');
   assert.ok(!attrs.includes('domain'), 'no Domain');
   const token = tokenOf(r);
   assert.match(token, /^opl_[A-Za-z0-9_-]{43}$/);
@@ -349,6 +361,8 @@ test('SESSIONS END — sign-out revokes the row; the token presented again is re
   const out = await call(main.base, 'POST', '/api/v1/auth/sign-out', { cookie: token, origin: ADMIN_ORIGIN });
   assert.equal(out.status, 204);
   assert.ok(out.cookies.some((c) => c.includes('Max-Age=0')));
+  assert.ok(out.cookies.some((c) => c.split(';').map((p) => p.trim()).includes('Path=/') && c.includes('Max-Age=0')), 'the Path=/ cookie is cleared');
+  assert.ok(out.cookies.some(isLegacyClear), 'the Path=/api cookie is cleared');
   const row = (await admin.query('SELECT revoked_at FROM operator_tokens WHERE token_hash = $1', [hashToken(token)])).rows[0];
   assert.notEqual(row.revoked_at, null);
   assert.equal((await garageRead(main.base, who, token)).status, 401);
@@ -1108,4 +1122,21 @@ test('NOTHING SECRET IN ANY RESPONSE: no body this file received holds a passwor
   assert.deepEqual(found, []);
   assert.ok(setCookies.length > 10);
   assert.deepEqual(setCookies.filter((c) => !/;\s*Secure(;|$)/.test(c)), [], 'every Set-Cookie carries Secure');
+});
+
+test('no answer names the framework: X-Powered-By is never sent (deploy fix 1, F2)', async () => {
+  const who = await owner('si-powered');
+  const signedInAnswer = await call(main.base, 'POST', '/api/v1/auth/sign-in', { body: { email: who.email, password: PASSWORD }, origin: ADMIN_ORIGIN });
+  assert.equal(signedInAnswer.status, 200);
+  const answers = [
+    signedInAnswer,
+    await call(main.base, 'GET', '/api/v1/auth/me'),
+    await call(main.base, 'GET', '/api/v1/no-such-door'),
+    await call(main.base, 'GET', '/api/v1/auth/me', { cookie: tokenOf(signedInAnswer) }),
+  ];
+  // A success, a refusal, a door that does not exist (whatever it answers), and a signed-in read.
+  assert.equal(answers[1].status, 401);
+  assert.ok(answers[2].status >= 400, `no-such-door: ${answers[2].status}`);
+  assert.equal(answers[3].status, 200);
+  for (const a of answers) assert.equal(a.headers.get('x-powered-by'), null, `status ${a.status}`);
 });

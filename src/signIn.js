@@ -292,13 +292,26 @@ export function hashLine({ max, perAddress }) {
 // The cookie.
 // ---------------------------------------------------------------------------
 
-function cookieAttributes(settings, maxAge) {
-  return `Path=/api; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${settings.cookieSecure ? '; Secure' : ''}`;
+// Path=/ (2026-10-15): the owner's pages served on this origin beside the admin
+// (the garage map at /garage-map/) are gated at the proxy by GET /api/v1/auth/me,
+// so the cookie must reach them. Still HttpOnly, SameSite=Strict, Secure, no Domain.
+function cookieAttributes(settings, maxAge, path = '/') {
+  return `Path=${path}; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${settings.cookieSecure ? '; Secure' : ''}`;
 }
-export const setCookie = (res, settings, token) =>
+// An earlier version set the cookie at Path=/api. A browser holding that one and
+// a Path=/ one sends op_session twice to /api, which sessionToken answers as no
+// session: so every set and every clear also removes the Path=/api one, after
+// the session cookie (callers read the first Set-Cookie as the session's).
+const clearLegacy = (res, settings) =>
+  res.append('Set-Cookie', `${COOKIE}=; ${cookieAttributes(settings, 0, '/api')}`);
+export const setCookie = (res, settings, token) => {
   res.append('Set-Cookie', `${COOKIE}=${token}; ${cookieAttributes(settings, settings.maxSeconds)}`);
-export const clearCookie = (res, settings) =>
+  clearLegacy(res, settings);
+};
+export const clearCookie = (res, settings) => {
   res.append('Set-Cookie', `${COOKIE}=; ${cookieAttributes(settings, 0)}`);
+  clearLegacy(res, settings);
+};
 
 /**
  * The session token in the request's cookie, or null. A request carrying the
