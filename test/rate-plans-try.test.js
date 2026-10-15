@@ -357,7 +357,7 @@ test('saving needs confirmed: true from every caller, and the line records that 
   assert.equal(ok.status, 201, JSON.stringify(await ok.clone().json()));
   assert.equal(await count(), 1);
   const line = await withTenant(tenant, async (c) => (await c.query(
-    `SELECT action, after, actor_kind, at FROM garage_changes WHERE garage_id = $1 AND action = 'rate_plan.add'`, [g.id],
+    `SELECT action, after, actor_kind, at FROM garage_changes WHERE garage_id = $1 AND outcome = 'done' AND action = 'rate_plan.add'`, [g.id],
   )).rows[0]);
   assert.equal(line.after.confirmed, true);
   assert.equal(line.actor_kind, 'key');

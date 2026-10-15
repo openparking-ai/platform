@@ -672,13 +672,13 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
       await refusedLanguage(req, 400, LANGUAGE_REFUSED);
       return res.status(400).json(LANGUAGE_REFUSED);
     }
-    if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);
     // The database could not be reached (src/db.js): its plain 503, held to
     // the floor on sign-in like every other sign-in answer.
     if (err instanceof DatabaseUnavailable) {
       if (onSignIn) return refuse(req, res, 503, unavailableAnswer(err, req.method));
       return res.status(503).set('Retry-After', '2').json(unavailableAnswer(err, req.method));
     }
+    if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);
     // A stored hash this code does not know is named here, PasswordHashUnrecognised.
     logFailure(req.path.replace(/^\//, ''), err);
     if (onSignIn) return refuse(req, res, 500, { error: 'internal error' });
