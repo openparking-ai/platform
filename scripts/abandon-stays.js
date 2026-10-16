@@ -15,6 +15,11 @@
  *
  * There is no default for <n>: how long is too long is the operator's call
  * for the garage in front of them.
+ *
+ * Until a stay closes it is a car inside, however long ago it came in: the
+ * fill rule's "how full at entry" counts it, and so do the checks on the
+ * garage's number of spaces. Nothing ages it out. Ending it here takes it out
+ * of that count from this moment, with a line in the change log.
  */
 import { pool } from '../src/db.js';
 import { abandonStays } from '../src/stays.js';

@@ -15,6 +15,10 @@
  *               inside -- so the stay's time inside runs on to the car's next
  *               entry here (src/repository.js `endedStayAt`).
  *
+ * Either end takes the stay out of the count of cars inside from its
+ * `exit_at` (src/repository.js `insideAt`). Nothing else does but an exit: a
+ * stay nothing ends or closes is a car inside, however long ago it came in.
+ *
  * Each end is written three times: on the stay (`ended`), as an event beside
  * it, and as a line in the garage's change log, by the platform. A late close
  * whose exit falls inside an ended stay still closes and prices it

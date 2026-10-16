@@ -304,7 +304,9 @@ jobs:
         # reconciler handing it to the engine, the number of spaces checked and
         # not cleared under a fill rule, the store refusing a fill rule with no
         # spaces or a missing answer, the lane feed, past stays and try
-        # carrying it -- and requires test/fill-rule.test.js to go red.
+        # carrying it, and a car inside until its stay closes (no age-out; a
+        # superseded or abandoned stay out of the count) -- and requires
+        # test/fill-rule.test.js to go red.
         run: npm run fill-rule-fail-control
 
       - name: Stay-lifecycle fail-control

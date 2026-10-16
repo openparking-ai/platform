@@ -12,7 +12,8 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { createApp } from '../src/app.js';
-import { occupancyBp } from '../src/repository.js';
+import { occupancyBp, insideAt } from '../src/repository.js';
+import { abandonStays } from '../src/stays.js';
 import { laneDecidedCloses } from '../src/reconcile.js';
 import { pool, withTenant, createTenant, storePlan, flatHourlyPlan, activateGarage, superuserClient } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
@@ -160,14 +161,53 @@ test('AT THE CAR\'S OWN ENTRY: an open a lane delivers late is counted against t
   assert.equal(await figureOf(c.id), 0, 'nobody was inside at 11:00');
 });
 
-test('A STAY NOTHING CLOSES STOPS COUNTING: one that came in OCCUPANCY_MAX_STAY_HOURS (24) or more before an entry is not inside it', async () => {
+// A car is inside from the moment it goes in until it comes out (0035): no
+// stay ages out of the count, and no setting makes one.
+
+test('A CAR IS INSIDE UNTIL IT COMES OUT: a stay nothing closes is still counted a day on, and a month on', async () => {
   const g = await garage({ spaces: 4 });
-  // An orphan: in on the 8th, never closed.
-  await opened(await open(g.entry, plate('ORPHAN'), '2026-09-08T12:00:00Z'));
-  const x = await opened(await open(g.entry, plate('X'), '2026-09-09T11:00:00Z'));
-  assert.equal(await figureOf(x.id), 2500, 'twenty-three hours on, it is still counted');
-  const y = await opened(await open(g.entry, plate('Y'), '2026-09-09T13:00:00Z'));
-  assert.equal(await figureOf(y.id), 2500, 'twenty-five hours on, the orphan is not counted; X is');
+  // An orphan: in on 1 July, and nothing ever closes it.
+  await opened(await open(g.entry, plate('ORPHAN'), '2026-07-01T12:00:00Z'));
+  const x = await opened(await open(g.entry, plate('X'), '2026-07-02T13:00:00Z'));
+  assert.equal(await figureOf(x.id), 2500, 'twenty-five hours on, the orphan is still inside');
+  const y = await opened(await open(g.entry, plate('Y'), '2026-08-01T12:00:00Z'));
+  assert.equal(await figureOf(y.id), 5000, 'a month on, the orphan and X are still inside');
+  // A deployment that still sets the age-out it once had is not read.
+  const was = process.env.OCCUPANCY_MAX_STAY_HOURS;
+  process.env.OCCUPANCY_MAX_STAY_HOURS = '1';
+  try {
+    const z = await opened(await open(g.entry, plate('Z'), '2026-08-01T14:00:00Z'));
+    assert.equal(await figureOf(z.id), 7500, 'the orphan, X and Y');
+  } finally {
+    if (was === undefined) delete process.env.OCCUPANCY_MAX_STAY_HOURS;
+    else process.env.OCCUPANCY_MAX_STAY_HOURS = was;
+  }
+});
+
+test('A STAY LEAVES THE COUNT ONLY WHEN IT CLOSES: at its exit, when its car comes in again, or when an operator ends it', async () => {
+  const g = await garage({ spaces: 10 });
+  const inside = async (at) => (await withTenant(tenant, (c) => insideAt(c, tenant, g.id, at))).inside;
+  const [exits, returns, abandoned, never] = [plate('EXITS'), plate('RETURNS'), plate('ABANDON'), plate('NEVER')];
+  const firstVisit = await opened(await open(g.entry, returns, '2026-07-10T12:00:00Z'));
+  const orphan = await opened(await open(g.entry, abandoned, '2026-07-10T12:00:00Z'));
+  for (const car of [exits, never]) await opened(await open(g.entry, car, '2026-07-10T12:00:00Z'));
+  // Its exit, two days on.
+  assert.equal((await close(g.exit, exits, '2026-07-12T12:00:00Z')).status, 200);
+  // The same car in again, three days on: the old stay is ended as superseded
+  // at that entry, and the new one is inside.
+  const secondVisit = await opened(await open(g.entry2, returns, '2026-07-13T12:00:00Z'));
+  assert.notEqual(secondVisit.id, firstVisit.id);
+  // An operator ends the orphan as abandoned, four days on.
+  const { ended } = await abandonStays(tenant, g.id, {
+    olderThanHours: 1, sessionIds: [orphan.id], apply: true, now: new Date('2026-07-14T12:00:00Z'),
+  });
+  assert.deepEqual(ended.map((s) => s.id), [orphan.id]);
+
+  assert.equal(await inside('2026-07-11T12:00:00Z'), 4, 'a day on, all four are inside');
+  assert.equal(await inside('2026-07-12T13:00:00Z'), 3, 'one left at its exit');
+  assert.equal(await inside('2026-07-13T13:00:00Z'), 3, 'the returning car once: its old stay left when it came in again');
+  assert.equal(await inside('2026-07-14T13:00:00Z'), 2, 'the abandoned stay left when the operator ended it');
+  assert.equal(await inside(new Date()), 2, 'months on, the one nothing closed and the second visit are still inside');
 });
 
 test('more cars inside than spaces (the map changed under them): the figure is 10000, never more', async () => {
@@ -366,6 +406,31 @@ test('THE NUMBER OF SPACES IS NOT CLEARED UNDER AN OLDER FILL RULE that can stil
   assert.equal(cleared.status, 200, await cleared.clone().text());
 });
 
+test('A CAR STILL INSIDE DAYS ON holds the number of spaces: not cleared under the fill rule it came in on, not taken below it, until an operator ends its stay', async () => {
+  // Rates with a fill rule, then plain rates from two days ago; three cars
+  // came in three days ago, under the fill rule, and nothing closed them.
+  const daysAgo = (n) => new Date(Date.now() - n * 86_400_000).toISOString();
+  const g = await garage({ spaces: 3, plan: fillPlan({ version: 'fill-days' }) });
+  await withTenant(tenant, (c) => storePlan(c, tenant, g.id, flatHourlyPlan({ hourlyMinor: 1000, version: 'plain-days', effectiveFrom: daysAgo(2) })));
+  for (const car of [plate('DAYS'), plate('DAYS'), plate('DAYS')]) await opened(await open(g.entry, car, daysAgo(3)));
+  const cleared = await op('PATCH', `/garages/${g.id}`, { spaces: null });
+  assert.equal(cleared.status, 409);
+  assert.equal((await cleared.json()).code, 'spaces_needed_by_fill_rule');
+  const lower = await op('PATCH', `/garages/${g.id}`, { spaces: 2 });
+  assert.equal(lower.status, 409);
+  const body = await lower.json();
+  assert.equal(body.code, 'spaces_below_cars_inside');
+  assert.match(body.error, /3 cars are inside/);
+  assert.equal((await (await op('GET', `/garages/${g.id}`)).json()).garage.spaces, 3);
+  // CONTROL: once an operator ends the three, both are taken.
+  const { ended } = await abandonStays(tenant, g.id, { olderThanHours: 48, apply: true });
+  assert.equal(ended.length, 3);
+  const taken = await op('PATCH', `/garages/${g.id}`, { spaces: 2 });
+  assert.equal(taken.status, 200, await taken.clone().text());
+  const gone = await op('PATCH', `/garages/${g.id}`, { spaces: null });
+  assert.equal(gone.status, 200, await gone.clone().text());
+});
+
 // --- the price ----------------------------------------------------------------------
 
 test('the close prices on the figure the car came in with: below the threshold not raised, at it raised by the percent', async () => {
@@ -387,8 +452,7 @@ test('the close prices on the figure the car came in with: below the threshold n
 
 test('cars inside keep their price: one in at 70% stays unraised after the rates gain a fill rule and the garage fills', async () => {
   const g = await garage({ spaces: 10 });
-  // Fifty minutes ago: inside the hours a stay is counted for (0035), and
-  // under the hour a plain stay is priced at.
+  // Fifty minutes ago: under the hour a plain stay is priced at.
   const earlier = new Date(Date.now() - 50 * 60_000).toISOString();
   for (let i = 0; i < 7; i += 1) await opened(await open(g.entry, plate('F'), earlier));
   const early = plate('EARLY');

@@ -25,13 +25,11 @@ export const START_SETTINGS = Object.freeze({
   // How far apart two entries of one car may be and still be one arrival (a
   // second lane reading it, or a back-out and a second approach): the open
   // already there is the answer. Further apart, the earlier stay is ended as
-  // superseded (src/repository.js `openSession`). An hour at most.
+  // superseded (src/repository.js `openSession`). An hour at most. This is
+  // the returning-car rule only: nothing here ages a stay out of the count of
+  // cars inside. A car is inside until its stay closes, however long that
+  // takes (src/repository.js `insideAt`).
   REAPPROACH_MINUTES: { min: 1, max: 60, fallback: 10 },
-  // How long a car is counted inside when nothing closed its stay: the fill
-  // rule's "how full at entry" counts only stays that came in less than this
-  // before (src/repository.js `occupancyAt`), so a stay that never closed
-  // stops counting. A year at most.
-  OCCUPANCY_MAX_STAY_HOURS: { min: 1, max: 8760, fallback: 24 },
 });
 
 /** The value, or `why` it is not one. Unset is the default. */

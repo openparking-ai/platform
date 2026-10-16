@@ -892,8 +892,11 @@ back-out at a one-loop lane). So:
   stays of the garage that came in more than `<n>` hours ago, listed by id and
   entry time (never a plate); with `--apply`, each **ended as abandoned** at
   that moment, unpriced, with its event and a change-log line `stay.abandon`.
-  `<n>` has no default. A stay abandoned while its car was in fact still
-  inside is closed and priced by the car's real exit when it comes (above).
+  `<n>` has no default. Until then an orphan is a car inside, however long
+  ago it came in: the fill rule's figure counts it, and so do the checks on
+  the number of spaces (0034, below). Ending it takes it out of that count. A
+  stay abandoned while its car was in fact still inside is closed and priced
+  by the car's real exit when it comes (above).
 
 An ended stay is the sixth shape of a closed stay (0035): no exit lane, close
 event, exit confirmation or descriptor, outcome or fee. The past stays carry
@@ -1153,10 +1156,13 @@ that. The engine counts nothing; this platform counts, and hands it the figure.
   (0035): every stay of the garage, any kind of space, that came in by then
   and had not left by then — so an open a lane delivers late is counted
   against the cars that were in when the car was, not when its open arrived.
-  **A stay that came in `OCCUPANCY_MAX_STAY_HOURS` or more before is not
-  counted**, closed or not: a stay nothing closes stops counting then and never
-  holds the garage at "full" (a start setting, 24 unless the deployment sets
-  it, 1 to 8760). Counted inside the open's transaction behind a per-garage
+  **A car is inside from the moment it goes in until it comes out**: nothing
+  ages a stay out of the count, and there is no setting for it. A stay leaves
+  the count only when it closes: its exit; the same car coming in again, which
+  ends the old stay as superseded at that entry; or an operator ending it as
+  abandoned (`npm run abandon-stays`, a change-log line `stay.abandon`). A
+  late close of an ended stay (above) gives it the car's real exit, and the
+  count follows that. Counted inside the open's transaction behind a per-garage
   lock, so two lanes opening at once count each other (n and n+1, never n
   twice). Null when the garage has no `spaces`. **No lane sets it**: one sent
   on the open or in an event is ignored.
@@ -1171,9 +1177,10 @@ that. The engine counts nothing; this platform counts, and hands it the figure.
   `raises_vip_extra`, each `"yes"` or `"no"` (`409 fill_rule_answers_missing`,
   before the engine is asked, which refuses it too); clearing `spaces` while
   any plan with a fill rule can still price a stay — the plan in force at the
-  entry of any stay still counted inside, or 60 s ago, and every plan after it
+  entry of any stay still open, or 60 s ago, and every plan after it
   (`409 spaces_needed_by_fill_rule`); a number of spaces below the cars inside
-  now (`409 spaces_below_cars_inside`); and a lower number while such a plan
+  now (`409 spaces_below_cars_inside`) — an orphan stay counts in both until it
+  closes or an operator ends it; and a lower number while such a plan
   can price, unless the request says `spaces_confirmed: true` — the owner's
   word that it is right, which the garage map's "use the map's count" step
   and the admin's Garages page send once the owner confirms the lower number

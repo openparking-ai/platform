@@ -706,17 +706,18 @@ function refuseFuture(at, label, now = new Date()) {
  * THE NUMBER OF SPACES, BEFORE IT CHANGES (0035): the cars inside now, counted
  * as the fill rule counts them (`repo.insideAt`), and the garage's plans with
  * a fill rule that can still price a stay -- every plan in force at, or
- * after, the entry of the oldest stay still counted inside, or 60 s ago
+ * after, the entry of the oldest stay still open, or 60 s ago
  * (START_ALLOWANCE_MS), whichever is earlier: a lane's late open and a plan
- * that starts within the owner's clock difference are priced by them too.
+ * that starts within the owner's clock difference are priced by them too. An
+ * open stay is a car inside however long ago it came in, so it holds both
+ * checks until it closes, is superseded, or an operator ends it.
  */
 async function spacesGuard(client, tenantId, garageId, now = new Date()) {
   const inside = (await repo.insideAt(client, tenantId, garageId, now))?.inside ?? 0;
   const { rows } = await client.query(
     `SELECT min(entry_at) AS earliest FROM sessions
-      WHERE tenant_id = $1 AND garage_id = $2 AND exit_at IS NULL
-        AND entry_at > $3::timestamptz - make_interval(hours => $4)`,
-    [tenantId, garageId, now, repo.occupancyMaxStayHours()],
+      WHERE tenant_id = $1 AND garage_id = $2 AND exit_at IS NULL`,
+    [tenantId, garageId],
   );
   const since = new Date(Math.min(now.getTime() - ratePlans.START_ALLOWANCE_MS, rows[0].earliest?.getTime() ?? Infinity));
   const plans = ratePlans.plansInForceSince(await ratePlans.ratePlansForGarage(client, tenantId, garageId), since);

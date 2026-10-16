@@ -25,7 +25,10 @@
  *   reconciler_no_figure    the reconciler re-prices without the stay's figure.
  *   rules_without_spaces    the lane's rules carry no number of spaces.
  *   counted_at_receipt      the cars inside are counted when the open arrives (0035).
- *   orphans_never_age       a stay that never closes is counted for ever (0035).
+ *   orphans_age_out         a stay nothing closes stops counting a day after it came in (0035).
+ *   guard_ages_out          the checks on the number of spaces forget such a stay after a day (0035).
+ *   superseded_still_inside a stay ended because its car came in again is still counted (0035).
+ *   abandoned_still_inside  a stay an operator ended is still counted (0035).
  *   spaces_below_cars_inside  the number of spaces is taken below the cars inside (0035).
  *   lowering_unconfirmed    a lower number under a fill rule needs no word (0035).
  *   clear_asks_newest_only  clearing the number of spaces asks only the newest plan (0035).
@@ -117,16 +120,41 @@ const SOURCE_BREAKS = [
     name: 'counted_at_receipt',
     why: 'the cars inside are counted when the open arrives, not at the car\'s entry',
     file: 'src/repository.js',
-    from: '                AND s.entry_at <= $3 AND s.entry_at > $3::timestamptz - make_interval(hours => $4)\n                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
-    to: '                AND s.exit_at IS NULL AND $3::timestamptz IS NOT NULL AND $4::int IS NOT NULL) AS inside',
+    from: '                AND s.entry_at <= $3\n                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
+    to: '                AND s.exit_at IS NULL AND $3::timestamptz IS NOT NULL) AS inside',
   },
   {
-    // OP-NODE-002 (0035): a stay nothing closes is counted for ever.
-    name: 'orphans_never_age',
-    why: 'a stay that never closes is counted inside for ever',
+    // 0035: a car is inside from the moment it goes in until it comes out.
+    // The day's age-out this pull request first had, put back in the count.
+    name: 'orphans_age_out',
+    why: 'a stay nothing closes stops counting a day after it came in',
     file: 'src/repository.js',
-    from: ' AND s.entry_at > $3::timestamptz - make_interval(hours => $4)\n',
-    to: ' AND $4::int IS NOT NULL\n',
+    from: '                AND s.entry_at <= $3\n',
+    to: "                AND s.entry_at <= $3 AND s.entry_at > $3::timestamptz - interval '24 hours'\n",
+  },
+  {
+    // 0035: the same age-out, put back in the checks on the number of spaces.
+    name: 'guard_ages_out',
+    why: 'the checks on the number of spaces forget a stay nothing closed a day after it came in',
+    file: 'src/app.js',
+    from: '      WHERE tenant_id = $1 AND garage_id = $2 AND exit_at IS NULL`,\n    [tenantId, garageId],\n',
+    to: "      WHERE tenant_id = $1 AND garage_id = $2 AND exit_at IS NULL\n        AND entry_at > now() - interval '24 hours'`,\n    [tenantId, garageId],\n",
+  },
+  {
+    // 0035: a stay ended because its car came in again stays in the count.
+    name: 'superseded_still_inside',
+    why: 'a stay ended because its car came in again is still counted inside',
+    file: 'src/repository.js',
+    from: '                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
+    to: "                AND (s.exit_at IS NULL OR s.exit_at > $3 OR s.ended->>'reason' = 'superseded')) AS inside",
+  },
+  {
+    // 0035: a stay an operator ended stays in the count.
+    name: 'abandoned_still_inside',
+    why: 'a stay an operator ended is still counted inside',
+    file: 'src/repository.js',
+    from: '                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
+    to: "                AND (s.exit_at IS NULL OR s.exit_at > $3 OR s.ended->>'reason' = 'abandoned')) AS inside",
   },
   {
     // OP-NODE-003 (0035): any lower number is taken, below the cars inside.

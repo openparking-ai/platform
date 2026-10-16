@@ -208,9 +208,6 @@ async function nextStayOf(client, tenantId, garageId, vehicleId, at) {
 /** How far apart two entries of one car may be and still be one arrival (src/startSettings.js). */
 export const reapproachMinutes = () => startSetting('REAPPROACH_MINUTES');
 
-/** How long a car counts as inside when nothing closed its stay (src/startSettings.js). */
-export const occupancyMaxStayHours = () => startSetting('OCCUPANCY_MAX_STAY_HOURS');
-
 /** What `sessions.ended` holds (0035): the reason, when, and what the caller adds. */
 function endedRecord(reason, record = {}) {
   return { reason, at: new Date().toISOString(), ...record };
@@ -366,22 +363,26 @@ export async function lockGarageOpens(client, garageId) {
  * every stay, whatever kind of space it is in, that came in by then and had
  * not left by then -- counted at the car's own entry, so an open a lane
  * delivers late is counted against the cars that were in when the car was,
- * not when its open arrived. A stay that came in OCCUPANCY_MAX_STAY_HOURS or
- * more before is not counted, closed or not: a stay nothing ever closes stops
- * counting then, and never holds the garage at "full". A stay that came in at
- * the same instant counts if it was recorded first, so two lanes opening at
- * once still see n and n+1.
+ * not when its open arrived.
+ *
+ * A CAR IS INSIDE FROM THE MOMENT IT GOES IN UNTIL IT COMES OUT. Nothing ages
+ * a stay out of the count, however long ago it came in. A stay leaves it only
+ * when it closes: at its exit; when the same car comes in again and the old
+ * stay is ended as superseded at that entry (`openSession`); or when an
+ * operator ends it as abandoned (src/stays.js `abandonStays`), on the record.
+ * A stay that came in at the same instant counts if it was recorded first, so
+ * two lanes opening at once still see n and n+1.
  */
 export async function insideAt(client, tenantId, garageId, at) {
   const { rows } = await client.query(
     `SELECT g.spaces,
             (SELECT count(*)::int FROM sessions s
               WHERE s.tenant_id = g.tenant_id AND s.garage_id = g.id
-                AND s.entry_at <= $3 AND s.entry_at > $3::timestamptz - make_interval(hours => $4)
+                AND s.entry_at <= $3
                 AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside
        FROM garages g
       WHERE g.tenant_id = $1 AND g.id = $2`,
-    [tenantId, garageId, at, occupancyMaxStayHours()],
+    [tenantId, garageId, at],
   );
   return rows[0] ?? null;
 }

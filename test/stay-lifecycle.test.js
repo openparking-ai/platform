@@ -28,6 +28,7 @@ import { createApp } from '../src/app.js';
 import { pool, withTenant, createTenant, storePlan, flatHourlyPlan, activateGarage, superuserClient, buildWorld } from './helpers.js';
 import { redactExpiredVehicles } from '../src/retention.js';
 import { abandonStays } from '../src/stays.js';
+import { insideAt } from '../src/repository.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
 
@@ -391,6 +392,9 @@ test('abandon-stays lists the open stays older than the hours given, changes not
   assert.doesNotMatch(dry.stdout, new RegExp(fresh.body.session.id));
   assert.ok(!dry.stdout.includes(car), 'no plate in the output');
   assert.equal((await row(old.body.session.id)).exit_at, null, 'nothing changed without --apply');
+  // Until it is ended, the orphan is a car inside, beside the one of an hour ago.
+  const insideNow = async () => (await withTenant(tenant, (c) => insideAt(c, tenant, g.id, new Date()))).inside;
+  assert.equal(await insideNow(), 2);
   const applied = run('--older-than-hours', '24', '--apply');
   assert.equal(applied.status, 0, applied.stderr);
   assert.match(applied.stdout, /1 open stay\(s\) older than 24 h ended as abandoned/);
@@ -400,6 +404,7 @@ test('abandon-stays lists the open stays older than the hours given, changes not
   assert.equal((await row(fresh.body.session.id)).exit_at, null, 'a stay inside the hours is left alone');
   assert.equal((await eventsOf('stay_ended', ended.id)).length, 1);
   assert.deepEqual((await linesAbout(ended.id)).map((l) => [l.action, l.actor_kind]), [['stay.abandon', 'platform']]);
+  assert.equal(await insideNow(), 1, 'the abandoned stay has left the count; the other is still inside');
   // A late close inside it still prices it.
   const late = await json(await close(g.exit, car, new Date(ended.entry_at.getTime() + 30 * 60_000).toISOString()));
   assert.equal(late.status, 200, JSON.stringify(late.body));
