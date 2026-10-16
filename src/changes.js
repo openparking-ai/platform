@@ -129,9 +129,9 @@ export function context(req, secrets = []) {
 }
 
 /**
- * The platform itself as who made a change (0035): a stay it ended because a
- * lane saw the car come in again, or that an operator ended from the command
- * line. No id and no name; the line's action says which.
+ * The platform itself as who made a change (0035): a stay an operator ended
+ * as abandoned from the command line (`stay.abandon`). No id and no name. A
+ * stay superseded because a lane saw the car come in again is not a line.
  */
 export function platformContext(tenantId) {
   return { tenantId, actor: { kind: 'platform', id: null, name: null }, count: 0, unchanged: false, secrets: [], private: [] };

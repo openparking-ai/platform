@@ -206,8 +206,9 @@ A stay the platform ends (`sessions.ended`, superseded or abandoned) is a
 closed stay like any other here: it no longer holds its vehicle back from the
 purge, as an open stay does, and its `exit_at` starts the window. The
 `stay_ended` and `ended_stay_closed` events carry session ids, not a plate, and
-are append-only like every event; the change-log line for an ended stay names
-the stay by its id and no vehicle (the database refuses a name on it).
+are append-only like every event; the change-log line for an abandoned stay
+names the stay by its id and no vehicle (the database refuses a name on it). A
+superseded stay has no change-log line.
 
 ## No real data in this repository
 

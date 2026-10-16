@@ -2079,7 +2079,8 @@ export function createApp() {
         if (opened.created) await bans.listIfBanned(client, tenantId, { garage, session: opened.session });
         // THE STAY THIS ENTRY ENDED (0035) -- the car's earlier stay nothing
         // closed, or this one when it is an earlier visit arriving late --
-        // with its event and its change-log line, in this transaction.
+        // with its event, in this transaction. No change-log line: no one
+        // did it (src/stays.js `recordEnded`).
         for (const ended of opened.superseded) await stays.recordEnded(client, tenantId, ended, { laneId });
         if (opened.created && opened.session.ended) await stays.recordEnded(client, tenantId, opened.session, { laneId });
         // A CLOSE THAT CAME FIRST (0035): the exit kept for this stay, read

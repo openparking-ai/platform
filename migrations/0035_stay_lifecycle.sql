@@ -35,9 +35,11 @@
 --   sessions_vehicle_entry_idx  a car's stays in entry order, for the open
 --                    and the close above.
 --   garage_changes   the platform itself as who did it (`platform`: a stay
---                    ended because a lane saw the car come in again, or from
---                    the operator's command line), and a stay as what it was
---                    done to (`stay`). A line about a stay names no vehicle.
+--                    the operator ended as abandoned from the command line,
+--                    `stay.abandon`), and a stay as what it was done to
+--                    (`stay`). A line about a stay names no vehicle. A
+--                    superseded stay is not a line: `ended` and its event
+--                    record it.
 --
 -- Nothing is backfilled: no stay is ended by this migration.
 --

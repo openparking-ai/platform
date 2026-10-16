@@ -19,8 +19,9 @@
  * `exit_at` (src/repository.js `insideAt`). Nothing else does but an exit: a
  * stay nothing ends or closes is a car inside, however long ago it came in.
  *
- * Each end is written three times: on the stay (`ended`), as an event beside
- * it, and as a line in the garage's change log, by the platform. A late close
+ * Each end is written on the stay (`ended`) and as an event beside it. An
+ * abandon, which an operator did, is also a line in the garage's change log,
+ * by the platform; a supersede, which no one did, is not. A late close
  * whose exit falls inside an ended stay still closes and prices it
  * (src/app.js `stayForExit`), and the event says so: for an abandoned stay,
  * that includes an exit after the moment it was abandoned.
@@ -44,9 +45,11 @@ export const ENDED_STAY_CLOSED_EVENT_KIND = 'ended_stay_closed';
 export const EXIT_BEFORE_ENTRY_EVENT_KIND = 'exit_before_entry';
 
 /**
- * The event and the change-log line for a stay just ended, on `client`, in
- * the transaction that ended it. `laneId` is the lane whose read ended it, or
- * null. The line names the stay by its id and no vehicle.
+ * The event for a stay just ended, on `client`, in the transaction that ended
+ * it, and for an abandoned stay its change-log line. `laneId` is the lane
+ * whose read ended it, or null. The line names the stay by its id and no
+ * vehicle. A superseded stay gets no line: no one did it, and `ended` and
+ * the event already record it.
  */
 export async function recordEnded(client, tenantId, stay, { laneId = null } = {}) {
   const { reason } = stay.ended;
@@ -67,9 +70,10 @@ export async function recordEnded(client, tenantId, stay, { laneId = null } = {}
       },
     },
   ]);
+  if (reason !== 'abandoned') return;
   await changes.record(client, changes.platformContext(tenantId), {
     garageId: stay.garage_id,
-    action: reason === 'superseded' ? 'stay.supersede' : 'stay.abandon',
+    action: 'stay.abandon',
     subject: { kind: 'stay', id: stay.id, name: null },
     before: { state: 'open', entry_at: stay.entry_at },
     after: { state: reason, exit_at: stay.exit_at },

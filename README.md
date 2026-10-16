@@ -853,8 +853,8 @@ back-out at a one-loop lane). So:
   or a back-out and a second approach — and the open answers with the stay
   already open. Further apart, the earlier stay was never closed: it is
   **ended as superseded** behind the garage's open lock, unpriced, with
-  `exit_at` the later entry (the car had left by then), an event `stay_ended`
-  and a change-log line `stay.supersede` by the platform naming no vehicle; the
+  `exit_at` the later entry (the car had left by then) and an event
+  `stay_ended`, and no change-log line (no one did it); the
   new visit gets its own stay and is billed from its own entry. An entry
   earlier than a stay of the car already here, open or closed, is an earlier
   visit delivered late: it is stored already ended, superseded by the next of

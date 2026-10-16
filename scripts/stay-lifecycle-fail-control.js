@@ -12,7 +12,7 @@
  *   folded_into_old_stay    a returning car is put on its own old open stay again.
  *   one_arrival_unseen      entries minutes apart are two visits, not one arrival.
  *   later_stay_unseen       an earlier visit arriving after the next one closed is left open.
- *   end_never_recorded      a superseded stay has no event and no change-log line.
+ *   end_never_recorded      a superseded stay has no `stay_ended` event.
  *   late_close_misses_end   a late close for a superseded stay finds nothing to close.
  *   close_refused_not_kept  a close before its open is refused, and lost.
  *   kept_never_delivered    the open never closes from the exit kept for it.
@@ -57,7 +57,7 @@ const SOURCE_BREAKS = [
   },
   {
     name: 'end_never_recorded',
-    why: 'a superseded stay has no event and no change-log line',
+    why: 'a superseded stay has no stay_ended event',
     file: 'src/app.js',
     from: '        for (const ended of opened.superseded) await stays.recordEnded(client, tenantId, ended, { laneId });\n',
     to: '',

@@ -134,15 +134,15 @@ test('OPENS A DAY APART: the new visit gets its own stay and is billed from its 
   assert.equal(old.ended.by_session, monday.body.session.id);
   assert.equal(old.exit_at.toISOString(), '2026-09-14T12:00:00.000Z', 'gone by the later entry');
   assert.deepEqual([old.fee_minor, old.exit_outcome, old.exit_lane_id, old.close_event_id], [null, null, null, null]);
-  // An event beside it, and a line in the change log by the platform naming no car.
-  const [ev] = await eventsOf('stay_ended', old.id);
-  assert.equal(ev.detail.reason, 'superseded');
-  assert.equal(ev.lane_id, g.entryLane);
-  const lines = await linesAbout(old.id);
-  assert.deepEqual(lines.map((l) => [l.action, l.actor_kind, l.actor_id, l.actor_name, l.subject_name]),
-    [['stay.supersede', 'platform', null, null, null]]);
-  assert.equal(lines[0].after.state, 'superseded');
-  assert.ok(!JSON.stringify(lines[0]).includes(car), 'the line names no vehicle');
+  // An event beside it, naming no car; and no line in the change log: no one
+  // did this.
+  const evs = await eventsOf('stay_ended', old.id);
+  assert.equal(evs.length, 1);
+  assert.equal(evs[0].detail.reason, 'superseded');
+  assert.equal(evs[0].lane_id, g.entryLane);
+  assert.ok(!JSON.stringify(evs[0].detail).includes(car), 'the event names no vehicle');
+  assert.deepEqual(await linesAbout(old.id), [], 'a superseded stay is not a change-log line');
+  assert.deepEqual(await linesAbout(monday.body.session.id), []);
 });
 
 test('A QUICK RE-APPROACH: two entries of one car minutes apart are one arrival, and the stay already open is the answer', async () => {
@@ -182,6 +182,8 @@ test('AN EARLIER VISIT ARRIVING LATE: its open is stored ended by the stay open 
   assert.equal(friday.status, 201);
   assert.equal(friday.body.session.ended.reason, 'superseded');
   assert.equal(friday.body.session.ended.by_session, monday.body.session.id);
+  assert.equal((await eventsOf('stay_ended', friday.body.session.id)).length, 1);
+  assert.deepEqual(await linesAbout(friday.body.session.id), [], 'a superseded stay is not a change-log line');
   assert.equal((await row(monday.body.session.id)).exit_at, null, 'the stay open now stays open');
   const late = await json(await close(g.exit, car, '2026-09-11T13:00:00Z'));
   assert.equal(late.body.session.id, friday.body.session.id);
