@@ -354,39 +354,6 @@ test('the number of spaces is not taken away from rates that need it; it can be 
   assert.equal((await cleared.json()).garage.spaces, null);
 });
 
-test('THE NUMBER OF SPACES IS NOT TAKEN BELOW THE CARS INSIDE NOW: refused by name, and nothing changes', async () => {
-  const g = await garage({ spaces: 10 });
-  const recently = new Date(Date.now() - 30 * 60_000).toISOString();
-  for (const car of [plate('I'), plate('J'), plate('K')]) await opened(await open(g.entry, car, recently));
-  const res = await op('PATCH', `/garages/${g.id}`, { spaces: 2 });
-  assert.equal(res.status, 409);
-  const body = await res.json();
-  assert.equal(body.code, 'spaces_below_cars_inside');
-  assert.match(body.error, /3 cars are inside/);
-  assert.equal((await (await op('GET', `/garages/${g.id}`)).json()).garage.spaces, 10);
-  // CONTROL: as many spaces as cars inside is taken.
-  assert.equal((await op('PATCH', `/garages/${g.id}`, { spaces: 3 })).status, 200);
-});
-
-test('A LOWER NUMBER OF SPACES UNDER A FILL RULE needs the owner\'s word: refused without spaces_confirmed, taken with it; a higher one needs nothing', async () => {
-  const g = await garage({ spaces: 300, plan: fillPlan() });
-  const lower = await op('PATCH', `/garages/${g.id}`, { spaces: 40 });
-  assert.equal(lower.status, 409);
-  assert.equal((await lower.json()).code, 'spaces_lowering_not_confirmed');
-  assert.equal((await (await op('GET', `/garages/${g.id}`)).json()).garage.spaces, 300);
-  for (const bad of ['yes', 1, {}]) {
-    const r = await op('PATCH', `/garages/${g.id}`, { spaces: 40, spaces_confirmed: bad });
-    assert.equal(r.status, 400, JSON.stringify(bad));
-  }
-  const confirmed = await op('PATCH', `/garages/${g.id}`, { spaces: 40, spaces_confirmed: true });
-  assert.equal(confirmed.status, 200, await confirmed.clone().text());
-  assert.equal((await confirmed.json()).garage.spaces, 40);
-  assert.equal((await op('PATCH', `/garages/${g.id}`, { spaces: 50 })).status, 200, 'raising needs no word');
-  // CONTROL: a garage whose rates have no fill rule lowers it plainly.
-  const plain = await garage({ spaces: 300 });
-  assert.equal((await op('PATCH', `/garages/${plain.id}`, { spaces: 40 })).status, 200);
-});
-
 test('THE NUMBER OF SPACES IS NOT CLEARED UNDER AN OLDER FILL RULE that can still price a stay, though the newest rates have none', async () => {
   // Rates with a fill rule, then plain rates from two hours ago; a car came in
   // three hours ago, under the fill rule, and is still inside.
@@ -406,7 +373,7 @@ test('THE NUMBER OF SPACES IS NOT CLEARED UNDER AN OLDER FILL RULE that can stil
   assert.equal(cleared.status, 200, await cleared.clone().text());
 });
 
-test('A CAR STILL INSIDE DAYS ON holds the number of spaces: not cleared under the fill rule it came in on, not taken below it, until an operator ends its stay', async () => {
+test('A CAR STILL INSIDE DAYS ON holds the number of spaces: not cleared under the fill rule it came in on, until an operator ends its stay', async () => {
   // Rates with a fill rule, then plain rates from two days ago; three cars
   // came in three days ago, under the fill rule, and nothing closed them.
   const daysAgo = (n) => new Date(Date.now() - n * 86_400_000).toISOString();
@@ -416,17 +383,15 @@ test('A CAR STILL INSIDE DAYS ON holds the number of spaces: not cleared under t
   const cleared = await op('PATCH', `/garages/${g.id}`, { spaces: null });
   assert.equal(cleared.status, 409);
   assert.equal((await cleared.json()).code, 'spaces_needed_by_fill_rule');
-  const lower = await op('PATCH', `/garages/${g.id}`, { spaces: 2 });
-  assert.equal(lower.status, 409);
-  const body = await lower.json();
-  assert.equal(body.code, 'spaces_below_cars_inside');
-  assert.match(body.error, /3 cars are inside/);
   assert.equal((await (await op('GET', `/garages/${g.id}`)).json()).garage.spaces, 3);
-  // CONTROL: once an operator ends the three, both are taken.
+  // CONTROL: a lower number is taken as it always was, below the cars inside
+  // and under the fill rule, with nothing more asked; only clearing is held.
+  const lower = await op('PATCH', `/garages/${g.id}`, { spaces: 2 });
+  assert.equal(lower.status, 200, await lower.clone().text());
+  assert.equal((await lower.json()).garage.spaces, 2);
+  // CONTROL: once an operator ends the three, it clears.
   const { ended } = await abandonStays(tenant, g.id, { olderThanHours: 48, apply: true });
   assert.equal(ended.length, 3);
-  const taken = await op('PATCH', `/garages/${g.id}`, { spaces: 2 });
-  assert.equal(taken.status, 200, await taken.clone().text());
   const gone = await op('PATCH', `/garages/${g.id}`, { spaces: null });
   assert.equal(gone.status, 200, await gone.clone().text());
 });

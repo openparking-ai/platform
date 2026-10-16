@@ -703,17 +703,15 @@ function refuseFuture(at, label, now = new Date()) {
 }
 
 /**
- * THE NUMBER OF SPACES, BEFORE IT CHANGES (0035): the cars inside now, counted
- * as the fill rule counts them (`repo.insideAt`), and the garage's plans with
+ * THE NUMBER OF SPACES, BEFORE IT IS CLEARED (0035): the garage's plans with
  * a fill rule that can still price a stay -- every plan in force at, or
  * after, the entry of the oldest stay still open, or 60 s ago
  * (START_ALLOWANCE_MS), whichever is earlier: a lane's late open and a plan
  * that starts within the owner's clock difference are priced by them too. An
- * open stay is a car inside however long ago it came in, so it holds both
- * checks until it closes, is superseded, or an operator ends it.
+ * open stay is a car inside however long ago it came in, so it holds the
+ * check until it closes, is superseded, or an operator ends it.
  */
 async function spacesGuard(client, tenantId, garageId, now = new Date()) {
-  const inside = (await repo.insideAt(client, tenantId, garageId, now))?.inside ?? 0;
   const { rows } = await client.query(
     `SELECT min(entry_at) AS earliest FROM sessions
       WHERE tenant_id = $1 AND garage_id = $2 AND exit_at IS NULL`,
@@ -721,7 +719,7 @@ async function spacesGuard(client, tenantId, garageId, now = new Date()) {
   );
   const since = new Date(Math.min(now.getTime() - ratePlans.START_ALLOWANCE_MS, rows[0].earliest?.getTime() ?? Infinity));
   const plans = ratePlans.plansInForceSince(await ratePlans.ratePlansForGarage(client, tenantId, garageId), since);
-  return { inside, fillPlans: plans.filter((p) => ratePlans.hasFillRule(p.document)) };
+  return { fillPlans: plans.filter((p) => ratePlans.hasFillRule(p.document)) };
 }
 
 /**
@@ -1029,11 +1027,6 @@ export function createApp() {
       // The garage's number of spaces (0034): the garage map writes its count of
       // switched-on spots here, or the owner types it on the Garages page.
       const spaces = req.body?.spaces === undefined ? undefined : garageSpaces(req.body.spaces);
-      // The owner's word that a LOWER number of spaces is right while rates
-      // with a fill rule can price on it (0035): the garage map's "use the
-      // map's count" step sends it. Not stored; nothing else reads it.
-      const spacesConfirmed = req.body?.spaces_confirmed ?? false;
-      if (typeof spacesConfirmed !== 'boolean') throw bad('spaces_confirmed must be true or false when given');
       const given = { default_action: action, transient_available: transient, ban_tailgaters: banTailgaters, ban_reach: banReach, spaces };
       const fields = Object.keys(given).filter((f) => given[f] !== undefined);
       if (fields.length === 0) {
@@ -1046,34 +1039,19 @@ export function createApp() {
           [req.tenantId, req.params.garageId],
         );
         if (!was[0]) throw new HttpError(404, 'garage not found');
-        if (spaces !== undefined && spaces !== was[0].spaces) {
-          // Rates with a fill rule price on the number of spaces. Decided
+        if (spaces === null && was[0].spaces !== null) {
+          // Rates with a fill rule price on the number of spaces: it is not
+          // taken away under them -- under ANY plan with a fill rule that can
+          // still price a stay here, not only the newest (0035). Decided
           // behind the garage's rates lock, the one a save of new rates
           // holds, so the two cannot cross.
           await ratePlans.lockGarageRates(client, was[0].id);
           const guard = await spacesGuard(client, req.tenantId, was[0].id);
-          if (spaces === null && guard.fillPlans.length > 0) {
-            // Not taken away under ANY plan with a fill rule that can still
-            // price a stay here -- not only the newest (0035).
+          if (guard.fillPlans.length > 0) {
             throw conflict(
               'spaces_needed_by_fill_rule',
               'the rates in force raise the price when the garage is full, which needs the number of spaces; ' +
                 'change the rates first, then clear it. Nothing was changed.',
-            );
-          }
-          if (spaces !== null && spaces < guard.inside) {
-            throw conflict(
-              'spaces_below_cars_inside',
-              `${guard.inside} cars are inside the garage now, more than ${spaces} spaces; ` +
-                'the number of spaces cannot be lower than the cars inside. Nothing was changed.',
-            );
-          }
-          if (spaces !== null && was[0].spaces !== null && spaces < was[0].spaces && guard.fillPlans.length > 0 && !spacesConfirmed) {
-            throw conflict(
-              'spaces_lowering_not_confirmed',
-              `the rates raise the price when the garage is full, and ${spaces} spaces instead of ${was[0].spaces} ` +
-                'makes it full sooner; send spaces_confirmed: true once the owner has said the lower number is right. ' +
-                'Nothing was changed.',
             );
           }
         }

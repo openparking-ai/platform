@@ -893,10 +893,10 @@ back-out at a one-loop lane). So:
   entry time (never a plate); with `--apply`, each **ended as abandoned** at
   that moment, unpriced, with its event and a change-log line `stay.abandon`.
   `<n>` has no default. Until then an orphan is a car inside, however long
-  ago it came in: the fill rule's figure counts it, and so do the checks on
-  the number of spaces (0034, below). Ending it takes it out of that count. A
-  stay abandoned while its car was in fact still inside is closed and priced
-  by the car's real exit when it comes (above).
+  ago it came in: the fill rule's figure counts it, and so does the check on
+  clearing the number of spaces (0034, below). Ending it takes it out of that
+  count. A stay abandoned while its car was in fact still inside is closed and
+  priced by the car's real exit when it comes (above).
 
 An ended stay is the sixth shape of a closed stay (0035): no exit lane, close
 event, exit confirmation or descriptor, outcome or fee. The past stays carry
@@ -1178,15 +1178,9 @@ that. The engine counts nothing; this platform counts, and hands it the figure.
   before the engine is asked, which refuses it too); clearing `spaces` while
   any plan with a fill rule can still price a stay — the plan in force at the
   entry of any stay still open, or 60 s ago, and every plan after it
-  (`409 spaces_needed_by_fill_rule`); a number of spaces below the cars inside
-  now (`409 spaces_below_cars_inside`) — an orphan stay counts in both until it
-  closes or an operator ends it; and a lower number while such a plan
-  can price, unless the request says `spaces_confirmed: true` — the owner's
-  word that it is right, which the garage map's "use the map's count" step
-  and the admin's Garages page send once the owner confirms the lower number
-  (`409 spaces_lowering_not_confirmed`; `spaces_confirmed` is true or false
-  and stored nowhere). A client that sends a number of spaces needs words for
-  both of these refusals.
+  (`409 spaces_needed_by_fill_rule`) — an orphan stay holds it until it closes
+  or an operator ends it. A lower number of spaces is taken as before, with
+  nothing more asked.
 
 `test/fill-rule.test.js` holds each; `npm run fill-rule-fail-control` breaks
 each in turn.

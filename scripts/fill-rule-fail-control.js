@@ -26,11 +26,9 @@
  *   rules_without_spaces    the lane's rules carry no number of spaces.
  *   counted_at_receipt      the cars inside are counted when the open arrives (0035).
  *   orphans_age_out         a stay nothing closes stops counting a day after it came in (0035).
- *   guard_ages_out          the checks on the number of spaces forget such a stay after a day (0035).
+ *   guard_ages_out          the check on clearing the number of spaces forgets such a stay after a day (0035).
  *   superseded_still_inside a stay ended because its car came in again is still counted (0035).
  *   abandoned_still_inside  a stay an operator ended is still counted (0035).
- *   spaces_below_cars_inside  the number of spaces is taken below the cars inside (0035).
- *   lowering_unconfirmed    a lower number under a fill rule needs no word (0035).
  *   clear_asks_newest_only  clearing the number of spaces asks only the newest plan (0035).
  */
 import { spawnSync } from 'node:child_process';
@@ -112,7 +110,7 @@ const SOURCE_BREAKS = [
     name: 'spaces_cleared_under',
     why: 'the number of spaces is cleared under rates that need it',
     file: 'src/app.js',
-    from: '          if (spaces === null && guard.fillPlans.length > 0) {',
+    from: '          if (guard.fillPlans.length > 0) {',
     to: '          if (false) {',
   },
   {
@@ -133,9 +131,9 @@ const SOURCE_BREAKS = [
     to: "                AND s.entry_at <= $3 AND s.entry_at > $3::timestamptz - interval '24 hours'\n",
   },
   {
-    // 0035: the same age-out, put back in the checks on the number of spaces.
+    // 0035: the same age-out, put back in the check on clearing the number of spaces.
     name: 'guard_ages_out',
-    why: 'the checks on the number of spaces forget a stay nothing closed a day after it came in',
+    why: 'the check on clearing the number of spaces forgets a stay nothing closed a day after it came in',
     file: 'src/app.js',
     from: '      WHERE tenant_id = $1 AND garage_id = $2 AND exit_at IS NULL`,\n    [tenantId, garageId],\n',
     to: "      WHERE tenant_id = $1 AND garage_id = $2 AND exit_at IS NULL\n        AND entry_at > now() - interval '24 hours'`,\n    [tenantId, garageId],\n",
@@ -155,22 +153,6 @@ const SOURCE_BREAKS = [
     file: 'src/repository.js',
     from: '                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
     to: "                AND (s.exit_at IS NULL OR s.exit_at > $3 OR s.ended->>'reason' = 'abandoned')) AS inside",
-  },
-  {
-    // OP-NODE-003 (0035): any lower number is taken, below the cars inside.
-    name: 'spaces_below_cars_inside',
-    why: 'the number of spaces is taken below the cars inside now',
-    file: 'src/app.js',
-    from: '          if (spaces !== null && spaces < guard.inside) {',
-    to: '          if (false) {',
-  },
-  {
-    // OP-NODE-003 (0035): a lower number under a fill rule needs no word.
-    name: 'lowering_unconfirmed',
-    why: 'a lower number of spaces under a fill rule is taken without the owner\'s word',
-    file: 'src/app.js',
-    from: ' && guard.fillPlans.length > 0 && !spacesConfirmed) {',
-    to: ' && false) {',
   },
   {
     // OP-NODE-004 (0035): only the newest plan is asked, as before.
