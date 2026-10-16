@@ -11,12 +11,15 @@
  *               its `exit_at` is that later entry. Nothing is billed for it.
  *   abandoned   an operator ended an open stay nothing closed, from the
  *               command line (scripts/abandon-stays.js), at the moment they
- *               did.
+ *               did. That moment is no sign the car left -- it may still be
+ *               inside -- so the stay's time inside runs on to the car's next
+ *               entry here (src/repository.js `endedStayAt`).
  *
  * Each end is written three times: on the stay (`ended`), as an event beside
  * it, and as a line in the garage's change log, by the platform. A late close
  * whose exit falls inside an ended stay still closes and prices it
- * (src/app.js `stayForExit`), and the event says so.
+ * (src/app.js `stayForExit`), and the event says so: for an abandoned stay,
+ * that includes an exit after the moment it was abandoned.
  *
  * PENDING EXITS. A close that finds no stay to close is kept as it was sent
  * and answered 202, never refused: the lane drops a refusal, and the exit

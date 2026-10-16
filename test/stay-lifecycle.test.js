@@ -9,8 +9,13 @@
  *   OP-NODE-005  a close that reaches the platform before its open is kept
  *                (202) and the open closes and prices itself from it; an exit
  *                a little before its entry, the two lanes' clocks apart, is
- *                that stay's exit; a named stay that is not open is a 404
- *                with a name.
+ *                that stay's exit, whether the close names the stay or not; a
+ *                close naming a superseded stay still prices it; a named stay
+ *                that is not open is a 404 with a name.
+ *   OP-NODE-002  the operator's command line ends orphan stays as abandoned,
+ *                and a stay abandoned while its car was still inside is
+ *                closed and priced by the car's real exit, up to the car's
+ *                next entry.
  *
  * The engine is the real one at its pin; the plan is 10.00 an hour, every
  * part hour rounded up, no maximum.
@@ -22,6 +27,7 @@ import { spawnSync } from 'node:child_process';
 import { createApp } from '../src/app.js';
 import { pool, withTenant, createTenant, storePlan, flatHourlyPlan, activateGarage, superuserClient, buildWorld } from './helpers.js';
 import { redactExpiredVehicles } from '../src/retention.js';
+import { abandonStays } from '../src/stays.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
 
@@ -58,6 +64,9 @@ const eventsOf = async (kind, sessionId) =>
 const linesAbout = async (sessionId) =>
   (await withTenant(tenant, (c) => c.query(
     "SELECT * FROM garage_changes WHERE subject_kind = 'stay' AND subject_id = $1 ORDER BY at", [sessionId]))).rows;
+const keptOf = async (car) =>
+  (await withTenant(tenant, (c) => c.query(
+    'SELECT count(*)::int AS n FROM pending_exits p JOIN vehicles v ON v.id = p.vehicle_id WHERE v.plate = $1', [car]))).rows[0].n;
 
 /** An active garage with two entry lanes and an exit lane, its plan 10.00 an hour. */
 async function garage() {
@@ -299,6 +308,47 @@ test('THE LANES\' CLOCKS APART: an exit up to twice the drift before its entry c
   assert.equal((await row(t.body.session.id)).exit_at, null);
 });
 
+// An online exit lane looks the stay up at the barrier and NAMES it on the
+// close, so a lane that is connected takes the named path, not the plate's.
+
+test('A NAMED CLOSE ON A SLOW CLOCK: a close naming its stay, up to twice the drift before the entry, closes it at its entry, with an event; further before, it is a stale exit', async () => {
+  const g = await garage();
+  const car = plate('NCLOCK');
+  const s = await json(await open(g.entry, car, '2026-09-10T12:01:40Z'));
+  const id = s.body.session.id;
+  // CONTROL, the far side of the limit: ten minutes before the named stay's
+  // entry is not a slow clock, and the close refuses it as before.
+  const far = await json(await close(g.exit, car, '2026-09-10T11:51:40Z', { session_id: id }));
+  assert.deepEqual([far.status, far.body.code], [409, 'stale_exit']);
+  // 80 s before the entry, the two lanes' clocks apart: that stay's exit.
+  const closeEvent = randomUUID();
+  const out = await json(await close(g.exit, car, '2026-09-10T12:00:20Z', { session_id: id, event_id: closeEvent }));
+  assert.equal(out.status, 200, JSON.stringify(out.body));
+  assert.equal(out.body.session.id, id);
+  assert.equal(out.body.session.exit_at, '2026-09-10T12:01:40.000Z', 'closed at its entry');
+  assert.equal(out.body.session.close_event_id, closeEvent);
+  const [ev] = await eventsOf('exit_before_entry', id);
+  assert.equal(ev.detail.exit_at_sent, '2026-09-10T12:00:20.000Z');
+  assert.equal(ev.detail.close_event_id, closeEvent);
+});
+
+test('A NAMED LATE CLOSE FOR A SUPERSEDED STAY: a close naming the stay its exit falls inside closes and prices it, and the end is cleared', async () => {
+  const g = await garage();
+  const car = plate('NLATE');
+  const friday = await json(await open(g.entry, car, '2026-09-11T12:00:00Z'));
+  // The exit lane named Friday's stay at the barrier, then went offline; by
+  // the time its close arrives, Monday's entry has ended that stay.
+  const monday = await json(await open(g.entry, car, '2026-09-14T12:00:00Z'));
+  assert.equal((await row(friday.body.session.id)).ended.reason, 'superseded');
+  const late = await json(await close(g.exit, car, '2026-09-11T14:30:00Z', { session_id: friday.body.session.id }));
+  assert.equal(late.status, 200, JSON.stringify(late.body));
+  assert.equal(late.body.session.id, friday.body.session.id);
+  assert.equal(late.body.session.subtotal_minor, 3000, 'two and a half hours on Friday');
+  assert.equal(late.body.session.ended, null);
+  assert.equal((await eventsOf('ended_stay_closed', friday.body.session.id)).length, 1);
+  assert.equal((await row(monday.body.session.id)).exit_at, null, "Monday's stay is untouched");
+});
+
 test('a second exit inside a visit already closed is a stale exit (409), by name, and keeps nothing', async () => {
   const g = await garage();
   const car = plate('TWICE');
@@ -355,6 +405,60 @@ test('abandon-stays lists the open stays older than the hours given, changes not
   assert.equal(late.status, 200, JSON.stringify(late.body));
   assert.equal(late.body.session.id, ended.id);
   assert.equal(late.body.session.subtotal_minor, 1000);
+});
+
+// An abandoned stay's `exit_at` is only the moment the operator ran the
+// command line; it does not show the car left (a superseded stay's does: the
+// car came in again then). So its window runs to the car's next entry.
+
+test('AN ABANDONED STAY ITS CAR WAS STILL IN: a close after the abandon moment closes and prices it, and nothing is kept', async () => {
+  const g = await garage();
+  const car = plate('STILL');
+  const now = Date.now();
+  const hoursAgo = (h) => new Date(now - h * 3600_000);
+  const s = await json(await open(g.entry, car, hoursAgo(30).toISOString()));
+  // Ended two hours ago, as an orphan; the car was in fact still inside.
+  const { ended } = await abandonStays(tenant, g.id, { olderThanHours: 24, apply: true, now: hoursAgo(2) });
+  assert.deepEqual(ended.map((x) => x.id), [s.body.session.id]);
+  // It leaves an hour ago.
+  const out = await json(await close(g.exit, car, hoursAgo(1).toISOString()));
+  assert.equal(out.status, 200, JSON.stringify(out.body));
+  assert.equal(out.body.session.id, s.body.session.id);
+  assert.equal(out.body.session.exit_at, hoursAgo(1).toISOString());
+  assert.equal(out.body.session.subtotal_minor, 29_000, 'twenty-nine hours, entry to exit');
+  assert.equal(out.body.session.ended, null);
+  const [ev] = await eventsOf('ended_stay_closed', s.body.session.id);
+  assert.equal(ev.detail.ended.reason, 'abandoned');
+  assert.equal(await keptOf(car), 0, 'closed, not kept');
+});
+
+test("an abandoned stay is its car's until the car's next entry: an exit inside a later stay is not its, one before that entry is, named or not", async () => {
+  const g = await garage();
+  const car = plate('BOUND');
+  const now = Date.now();
+  const hoursAgo = (h) => new Date(now - h * 3600_000).toISOString();
+  const first = await json(await open(g.entry, car, hoursAgo(30)));
+  const id = first.body.session.id;
+  await abandonStays(tenant, g.id, { olderThanHours: 5, sessionIds: [id], apply: true, now: new Date(now - 20 * 3600_000) });
+  assert.equal((await row(id)).ended.reason, 'abandoned');
+  // The car comes in again ten hours ago and leaves an hour later: a stay of its own.
+  const second = await json(await open(g.entry, car, hoursAgo(10)));
+  assert.equal(second.status, 201);
+  assert.notEqual(second.body.session.id, id);
+  const left = await json(await close(g.exit, car, hoursAgo(9)));
+  assert.deepEqual([left.status, left.body.session.id], [200, second.body.session.id]);
+  // CONTROL: a second exit inside that later stay is a stale exit, and does
+  // not reach back to the abandoned one.
+  const stale = await json(await close(g.exit, car, hoursAgo(9.5)));
+  assert.deepEqual([stale.status, stale.body.code], [409, 'stale_exit']);
+  assert.equal((await row(id)).ended.reason, 'abandoned');
+  // An exit after the abandon moment and before the car's next entry is the
+  // abandoned stay's own -- here named, as a lane that looked it up sends it.
+  const out = await json(await close(g.exit, car, hoursAgo(15), { session_id: id }));
+  assert.equal(out.status, 200, JSON.stringify(out.body));
+  assert.equal(out.body.session.id, id);
+  assert.equal(out.body.session.subtotal_minor, 15_000, 'fifteen hours, entry to exit');
+  assert.equal(out.body.session.ended, null);
 });
 
 test('the database holds the ended shape: no exit lane, close event, confirmation, outcome or fee beside an end', async () => {

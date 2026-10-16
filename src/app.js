@@ -728,7 +728,10 @@ async function spacesGuard(client, tenantId, garageId, now = new Date()) {
  *
  *   { open, exitAt }   the stay to close -- open, or ENDED with the exit
  *                      inside it (a late close for a superseded or abandoned
- *                      stay) -- and the instant to close it at: the exit's
+ *                      stay; an abandoned one's time inside runs to the
+ *                      car's next entry, `repo.endedStayAt`, since it was
+ *                      ended with no sign the car had left) -- and the
+ *                      instant to close it at: the exit's
  *                      own, or the stay's entry when the exit came up to
  *                      LANE_CLOCKS_APART_MS before it (`clampedFrom` then
  *                      says what the lane sent).

@@ -9,7 +9,9 @@
  * plate. Nothing changes without --apply. With it, each is ENDED as
  * abandoned: closed unpriced at this moment, with its event and a line in the
  * garage's change log, by the platform. A late close whose exit falls inside
- * the stay still closes and prices it.
+ * the stay still closes and prices it -- and so does an exit after this
+ * moment, before the car's next entry: a stay abandoned while its car was in
+ * fact still inside is priced by the car's real exit.
  *
  * There is no default for <n>: how long is too long is the operator's call
  * for the garage in front of them.

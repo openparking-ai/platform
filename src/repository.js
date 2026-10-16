@@ -245,14 +245,26 @@ export async function endStay(client, tenantId, sessionId, { reason, exitAt, rec
 /**
  * The ENDED stay (0035) whose time inside holds `at`: of this car, or the one
  * named. A late close is that stay's exit.
+ *
+ * A SUPERSEDED stay's time inside runs to its `exit_at`, the later entry
+ * that ended it: the car had left by then. An ABANDONED stay's `exit_at` is
+ * only the moment an operator ran the command line, which says nothing of
+ * when the car left -- it may still have been inside -- so its time inside
+ * runs to the car's next entry at this garage, or on with none: an exit that
+ * would have closed the stay had nobody abandoned it still closes it.
  */
 export async function endedStayAt(client, tenantId, garageId, { vehicleId = null, sessionId = null }, at) {
   const { rows } = await client.query(
-    `SELECT * FROM sessions
-      WHERE tenant_id = $1 AND garage_id = $2 AND ended IS NOT NULL
-        AND ($3::uuid IS NULL OR vehicle_id = $3) AND ($4::uuid IS NULL OR id = $4)
-        AND entry_at <= $5 AND exit_at >= $5
-      ORDER BY entry_at DESC, id DESC
+    `SELECT s.* FROM sessions s
+      WHERE s.tenant_id = $1 AND s.garage_id = $2 AND s.ended IS NOT NULL
+        AND ($3::uuid IS NULL OR s.vehicle_id = $3) AND ($4::uuid IS NULL OR s.id = $4)
+        AND s.entry_at <= $5
+        AND CASE WHEN s.ended->>'reason' = 'abandoned'
+                 THEN NOT EXISTS (SELECT 1 FROM sessions n
+                                   WHERE n.tenant_id = s.tenant_id AND n.garage_id = s.garage_id AND n.vehicle_id = s.vehicle_id
+                                     AND n.entry_at > s.entry_at AND n.entry_at <= $5)
+                 ELSE s.exit_at >= $5 END
+      ORDER BY s.entry_at DESC, s.id DESC
       LIMIT 1`,
     [tenantId, garageId, vehicleId, sessionId, at],
   );

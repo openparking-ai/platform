@@ -862,7 +862,11 @@ back-out at a one-loop lane). So:
   leave free.
 - **A late close still prices an ended stay.** A close whose exit falls inside
   an ended stay of its car (or names it) closes it as any close would, priced,
-  and clears `ended`; the event `ended_stay_closed` says so.
+  and clears `ended`; the event `ended_stay_closed` says so. A superseded
+  stay's time inside ends at the later entry that ended it. An abandoned
+  stay's runs on to the car's next entry here, or on with none: the moment the
+  operator ended it is no sign the car had left, so an exit after that moment
+  still closes and prices it.
 - **A close before its open is kept.** A close that finds no stay to close is
   kept (`pending_exits`, once per close event) and answered `202` with
   `pending_exit` and `closed: false`; sent again, the same. The open whose
@@ -888,7 +892,8 @@ back-out at a one-loop lane). So:
   stays of the garage that came in more than `<n>` hours ago, listed by id and
   entry time (never a plate); with `--apply`, each **ended as abandoned** at
   that moment, unpriced, with its event and a change-log line `stay.abandon`.
-  `<n>` has no default.
+  `<n>` has no default. A stay abandoned while its car was in fact still
+  inside is closed and priced by the car's real exit when it comes (above).
 
 An ended stay is the sixth shape of a closed stay (0035): no exit lane, close
 event, exit confirmation or descriptor, outcome or fee. The past stays carry
@@ -1171,8 +1176,10 @@ that. The engine counts nothing; this platform counts, and hands it the figure.
   now (`409 spaces_below_cars_inside`); and a lower number while such a plan
   can price, unless the request says `spaces_confirmed: true` — the owner's
   word that it is right, which the garage map's "use the map's count" step
-  sends (`409 spaces_lowering_not_confirmed`; `spaces_confirmed` is true or
-  false and stored nowhere).
+  and the admin's Garages page send once the owner confirms the lower number
+  (`409 spaces_lowering_not_confirmed`; `spaces_confirmed` is true or false
+  and stored nowhere). A client that sends a number of spaces needs words for
+  both of these refusals.
 
 `test/fill-rule.test.js` holds each; `npm run fill-rule-fail-control` breaks
 each in turn.

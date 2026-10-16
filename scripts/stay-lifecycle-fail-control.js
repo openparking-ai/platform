@@ -20,6 +20,10 @@
  *   clocks_never_apart      an exit read on a slow clock is not its stay's exit.
  *   kept_exit_never_purged  the purge leaves what a kept exit carries beside a redacted vehicle.
  *   named_404_unnamed       a named stay that is not open is refused with no name.
+ *   named_clocks_never_apart  a close NAMING its stay, read on a slow clock, is a stale exit.
+ *   named_late_close_misses_end  a close naming a superseded stay finds nothing to close.
+ *   abandoned_close_kept    an exit after the abandon moment is kept, never closing the stay.
+ *   abandoned_unbounded     an abandoned stay takes exits past the car's next entry.
  */
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -108,6 +112,38 @@ const SOURCE_BREAKS = [
     from: "throw new HttpError(404, 'the named session is not open in this garage', 'session_not_open');",
     to: "throw new HttpError(404, 'the named session is not open in this garage');",
   },
+  {
+    // The named path is the one an online lane takes: it looks the stay up
+    // at the barrier and sends its id.
+    name: 'named_clocks_never_apart',
+    why: 'a close naming its stay, read on a slow clock, is refused as a stale exit',
+    file: 'src/app.js',
+    from: '      return withinClocks(named);',
+    to: '      return { open: named, exitAt };',
+  },
+  {
+    name: 'named_late_close_misses_end',
+    why: 'a close naming a superseded stay finds nothing to close',
+    file: 'src/app.js',
+    from: ')\n        ?? (await repo.endedStayAt(client, tenantId, garageId, { sessionId }, exitAt));',
+    to: ');',
+  },
+  {
+    // OP-NODE-002: the abandoned stay's window as it was, ending at the
+    // moment the operator ran the command line.
+    name: 'abandoned_close_kept',
+    why: 'an exit after the abandon moment is kept and never closes the stay',
+    file: 'src/repository.js',
+    from: "        AND CASE WHEN s.ended->>'reason' = 'abandoned'\n",
+    to: '        AND CASE WHEN false\n',
+  },
+  {
+    name: 'abandoned_unbounded',
+    why: "an abandoned stay takes exits past the car's next entry",
+    file: 'src/repository.js',
+    from: 'AND n.entry_at > s.entry_at AND n.entry_at <= $5)',
+    to: 'AND false)',
+  },
 ];
 
 const SUITE = ['--test', 'test/stay-lifecycle.test.js'];
@@ -172,16 +208,16 @@ for (const brk of SOURCE_BREAKS) {
   const dir = stage();
   try {
     if (!plant(dir, brk)) {
-      console.error(`  ${brk.name.padEnd(24)} *** ANCHOR NOT FOUND EXACTLY ONCE in ${brk.file} ***`);
+      console.error(`  ${brk.name.padEnd(28)} *** ANCHOR NOT FOUND EXACTLY ONCE in ${brk.file} ***`);
       failures += 1;
       continue;
     }
     const broken = run(dir);
     if (broken.status === 0) {
-      console.error(`  ${brk.name.padEnd(24)} *** PASSED WHEN ${brk.why.toUpperCase()} — the suite is not measuring this ***`);
+      console.error(`  ${brk.name.padEnd(28)} *** PASSED WHEN ${brk.why.toUpperCase()} — the suite is not measuring this ***`);
       failures += 1;
     } else {
-      console.log(`  ${brk.name.padEnd(24)} fails as required when ${brk.why} — ${summarise(broken)}`);
+      console.log(`  ${brk.name.padEnd(28)} fails as required when ${brk.why} — ${summarise(broken)}`);
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
