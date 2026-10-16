@@ -91,9 +91,9 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 | `GET /api/v1/lane/rules` | what the lane caches so it can decide offline: the garage's plans whole, its space class, each linked module's register, the open stays with a cursor — the slow cadence |
 | `GET /api/v1/lane/stays?since=<cursor>` | every stay changed since the cursor, closed rows included — the fast cadence; without `since`, the full open set; every answer also carries the lane's own `lane` state and `board` |
 | `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` |
-| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater` (U7f) |
+| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater` (U7f); a car's second entry more than `REAPPROACH_MINUTES` after its open stay's gets a stay of its own (0035, below) |
 | `POST /api/v1/lane/pictures` | a picture kept with an entry (U7f): `{picture_ref, event_id, taken_at, image}`, the image base64, a JPEG or a PNG, at most 3 MiB; idempotent on `picture_ref` |
-| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation`; carries and echoes an optional `descriptor` |
+| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation`; carries and echoes an optional `descriptor`; one that finds no stay to close is kept and answered `202` with `pending_exit` (0035, below) |
 
 ### A stay is identified by a plate or by a ticket — exactly one
 
@@ -841,6 +841,62 @@ per-site assumption: the one place it is set is `LANE_QUIET_MINUTES`, which the
 deployment declares, and only the setup and lanes reads apply it. `revoked_at` is in the listing beside it, because a
 revoked device that stops being seen is not a fault. `token_hash` is not.
 
+### A stay no exit closed, and an exit before its entry (0035)
+
+Lanes deliver their own queues after an outage, in no order between them, and
+some exits are never seen (a misread plate, a car following a payer out, a
+back-out at a one-loop lane). So:
+
+- **A car that comes back gets a stay of its own.** Two entries of one car at
+  one garage up to `REAPPROACH_MINUTES` apart (a start setting, 10 unless the
+  deployment sets it, 1 to 60) are one arrival — a second lane reading the car,
+  or a back-out and a second approach — and the open answers with the stay
+  already open. Further apart, the earlier stay was never closed: it is
+  **ended as superseded** behind the garage's open lock, unpriced, with
+  `exit_at` the later entry (the car had left by then), an event `stay_ended`
+  and a change-log line `stay.supersede` by the platform naming no vehicle; the
+  new visit gets its own stay and is billed from its own entry. An entry
+  earlier than a stay of the car already here, open or closed, is an earlier
+  visit delivered late: it is stored already ended, superseded by the next of
+  them. Nothing is refused: the lane drops a refusal, and the new visit would
+  leave free.
+- **A late close still prices an ended stay.** A close whose exit falls inside
+  an ended stay of its car (or names it) closes it as any close would, priced,
+  and clears `ended`; the event `ended_stay_closed` says so.
+- **A close before its open is kept.** A close that finds no stay to close is
+  kept (`pending_exits`, once per close event) and answered `202` with
+  `pending_exit` and `closed: false`; sent again, the same. The open whose
+  entry comes before it, and before the car's next stay, delivers it again
+  through the close route, as the exit lane that sent it, and the stay closes
+  and prices itself from it; the open's answer is then that closed stay, with
+  `pending_exit`. A close that cannot be made then (an engine or a module that
+  cannot answer) fails the open as a `5xx`, so the lane sends the open again.
+- **How far apart two lanes' clocks may be.** A lane may run
+  `MAX_CLOCK_SKEW_SECONDS` ahead of this server (refused beyond that, `409
+  clock_skew`), and the same is taken the other way, behind it: an entry lane
+  and an exit lane may then be twice that apart. An exit up to that much before
+  its stay's entry is that stay's exit: it closes at the entry, and the event
+  `exit_before_entry` keeps the time sent. Further before, it is judged against
+  the stays it could belong to: an ended one it falls inside, a stay already
+  closed (`409 stale_exit`: a second exit for a recorded visit), or none yet
+  (kept, as above).
+- **The 404s are named**: a close naming a stay that is neither open nor ended
+  around its exit is `404 session_not_open`; `GET /lane/sessions/open` with
+  nothing open is `404 no_open_stay`.
+- **An operator ends an orphan** with `npm run abandon-stays -- <tenant-id>
+  <garage-id> --older-than-hours <n> [--session <id>]... [--apply]`: the open
+  stays of the garage that came in more than `<n>` hours ago, listed by id and
+  entry time (never a plate); with `--apply`, each **ended as abandoned** at
+  that moment, unpriced, with its event and a change-log line `stay.abandon`.
+  `<n>` has no default.
+
+An ended stay is the sixth shape of a closed stay (0035): no exit lane, close
+event, exit confirmation or descriptor, outcome or fee. The past stays carry
+`ended` (`superseded`, `abandoned` or null). A validation claim an ended stay
+still held is handed to the release, as a close hands one it did not record.
+`test/stay-lifecycle.test.js` holds each; `npm run stay-lifecycle-fail-control`
+breaks each in turn.
+
 ### Every conflict names itself
 
 A `409` is this platform's **terminal** refusal: a lane classifies `5xx` as
@@ -1088,11 +1144,17 @@ that. The engine counts nothing; this platform counts, and hands it the figure.
   return it. The garage map writes its count of switched-on spots here; without
   a map the owner types it. Anything else is `400 garage_spaces_refused`.
 - **`sessions.occupancy_at_entry_bp`**: `floor(10000 x cars inside / spaces)`,
-  at most 10000, set when the stay opens: every open stay of the garage, any
-  kind of space, before this one. Counted inside the open's transaction behind
-  a per-garage lock, so two lanes opening at once count each other (n and n+1,
-  never n twice). Null when the garage has no `spaces`. **No lane sets it**:
-  one sent on the open or in an event is ignored.
+  at most 10000, set when the stay opens, **counted at the car's own entry**
+  (0035): every stay of the garage, any kind of space, that came in by then
+  and had not left by then — so an open a lane delivers late is counted
+  against the cars that were in when the car was, not when its open arrived.
+  **A stay that came in `OCCUPANCY_MAX_STAY_HOURS` or more before is not
+  counted**, closed or not: a stay nothing closes stops counting then and never
+  holds the garage at "full" (a start setting, 24 unless the deployment sets
+  it, 1 to 8760). Counted inside the open's transaction behind a per-garage
+  lock, so two lanes opening at once count each other (n and n+1, never n
+  twice). Null when the garage has no `spaces`. **No lane sets it**: one sent
+  on the open or in an event is ignored.
 - **The close, the try and the reconciler** hand the engine the stay's own
   figure. The lane's copy of the open stays (`GET /lane/rules`, `/lane/stays`)
   carries it, and `/lane/rules` carries `spaces`, so a lane pricing offline
@@ -1102,8 +1164,15 @@ that. The engine counts nothing; this platform counts, and hands it the figure.
   `spaces` (`409 plan_needs_spaces`, at the store and the try); a fill rule
   that does not state both of the owner's answers, `raises_specials` and
   `raises_vip_extra`, each `"yes"` or `"no"` (`409 fill_rule_answers_missing`,
-  before the engine is asked, which refuses it too); clearing `spaces` while the
-  rates in force have a fill rule (`409 spaces_needed_by_fill_rule`).
+  before the engine is asked, which refuses it too); clearing `spaces` while
+  any plan with a fill rule can still price a stay — the plan in force at the
+  entry of any stay still counted inside, or 60 s ago, and every plan after it
+  (`409 spaces_needed_by_fill_rule`); a number of spaces below the cars inside
+  now (`409 spaces_below_cars_inside`); and a lower number while such a plan
+  can price, unless the request says `spaces_confirmed: true` — the owner's
+  word that it is right, which the garage map's "use the map's count" step
+  sends (`409 spaces_lowering_not_confirmed`; `spaces_confirmed` is true or
+  false and stored nowhere).
 
 `test/fill-rule.test.js` holds each; `npm run fill-rule-fail-control` breaks
 each in turn.

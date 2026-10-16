@@ -184,7 +184,7 @@ test('a close that carries no descriptor snapshots nothing', async () => {
   assert.deepEqual(await shadowRows('close_event_id = $2', [closeEvent]), []);
 });
 
-test('a close that matches nothing (404) inserts no row — the tailgater is not in any figure', async () => {
+test('a close that matches nothing (kept, 202) inserts no row — the tailgater is not in any figure', async () => {
   const closeEvent = randomUUID();
   const res = await closeExit({
     event_id: closeEvent,
@@ -193,7 +193,8 @@ test('a close that matches nothing (404) inserts no row — the tailgater is not
     exit_confirmation: 'confirmed',
     descriptor: descriptor('NEVERIN-OUT'),
   });
-  assert.equal(res.status, 404);
+  // Kept for an open that has not arrived (0035), and snapshotted by nothing.
+  assert.equal(res.status, 202);
   assert.deepEqual(await shadowRows('close_event_id = $2', [closeEvent]), []);
 });
 

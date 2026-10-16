@@ -28,6 +28,7 @@ import { MESSAGE_MAX } from './lanes.js';
 import * as setup from './setup.js';
 import * as alerts from './alerts.js';
 import * as bans from './bans.js';
+import * as stays from './stays.js';
 import { garageCurrency, garageName, garageSpaces, garageTimezone } from './garageFields.js';
 import { verifyUtf8 } from './utf8Body.js';
 
@@ -664,6 +665,18 @@ export const CLOCK_SKEW = 'clock_skew';
 const MAX_CLOCK_SKEW_SECONDS = startSetting('MAX_CLOCK_SKEW_SECONDS');
 
 /**
+ * HOW FAR APART TWO LANES' CLOCKS MAY BE (0035): each lane may run up to
+ * MAX_CLOCK_SKEW_SECONDS ahead of this server, and the platform takes the same
+ * drift the other way, behind it, so an entry lane and an exit lane may be
+ * twice that apart. An exit up to this much before its stay's entry is that
+ * stay's exit read on a slow clock -- closed at the entry, with an event that
+ * says so -- and not a stale exit from an earlier visit. A lane time further
+ * in the past than that is still taken as the past (a lane that was offline
+ * sends old times), and is judged against the stays it could belong to.
+ */
+const LANE_CLOCKS_APART_MS = 2 * MAX_CLOCK_SKEW_SECONDS * 1000;
+
+/**
  * Refuse a lane time that has not happened yet.
  *
  * 409 and not 400, for the reason the stale exit is a 409: the lane classifies
@@ -687,6 +700,80 @@ function refuseFuture(at, label, now = new Date()) {
     );
   }
   return at;
+}
+
+/**
+ * THE NUMBER OF SPACES, BEFORE IT CHANGES (0035): the cars inside now, counted
+ * as the fill rule counts them (`repo.insideAt`), and the garage's plans with
+ * a fill rule that can still price a stay -- every plan in force at, or
+ * after, the entry of the oldest stay still counted inside, or 60 s ago
+ * (START_ALLOWANCE_MS), whichever is earlier: a lane's late open and a plan
+ * that starts within the owner's clock difference are priced by them too.
+ */
+async function spacesGuard(client, tenantId, garageId, now = new Date()) {
+  const inside = (await repo.insideAt(client, tenantId, garageId, now))?.inside ?? 0;
+  const { rows } = await client.query(
+    `SELECT min(entry_at) AS earliest FROM sessions
+      WHERE tenant_id = $1 AND garage_id = $2 AND exit_at IS NULL
+        AND entry_at > $3::timestamptz - make_interval(hours => $4)`,
+    [tenantId, garageId, now, repo.occupancyMaxStayHours()],
+  );
+  const since = new Date(Math.min(now.getTime() - ratePlans.START_ALLOWANCE_MS, rows[0].earliest?.getTime() ?? Infinity));
+  const plans = ratePlans.plansInForceSince(await ratePlans.ratePlansForGarage(client, tenantId, garageId), since);
+  return { inside, fillPlans: plans.filter((p) => ratePlans.hasFillRule(p.document)) };
+}
+
+/**
+ * WHICH STAY AN EXIT CLOSES (0035), inside the close's transaction. One of:
+ *
+ *   { open, exitAt }   the stay to close -- open, or ENDED with the exit
+ *                      inside it (a late close for a superseded or abandoned
+ *                      stay) -- and the instant to close it at: the exit's
+ *                      own, or the stay's entry when the exit came up to
+ *                      LANE_CLOCKS_APART_MS before it (`clampedFrom` then
+ *                      says what the lane sent).
+ *   { pending }        no stay this exit can close, so it is KEPT
+ *                      (`keep`, once per close event) for the open that has
+ *                      not arrived yet. Decided again behind the garage's
+ *                      open lock before it is kept, so an open committing at
+ *                      the same moment is either seen here or sees this.
+ *
+ * Refused: a named stay that is neither open nor ended around the exit
+ * (404 `session_not_open`), and an exit inside a stay of the car that an exit
+ * already closed (409 `stale_exit`: a second exit for a recorded visit). A
+ * named stay whose entry is later than the exit by more than the clocks may
+ * be apart is refused by the close itself, as before.
+ */
+async function stayForExit(client, { tenantId, garageId, vehicle, sessionId, exitAt, keep }) {
+  const withinClocks = (open) =>
+    exitAt < open.entry_at && open.entry_at - exitAt <= LANE_CLOCKS_APART_MS
+      ? { open, exitAt: open.entry_at, clampedFrom: exitAt }
+      : { open, exitAt };
+  const decide = async () => {
+    if (sessionId) {
+      const named = (await repo.findOpenSessionById(client, tenantId, garageId, sessionId))
+        ?? (await repo.endedStayAt(client, tenantId, garageId, { sessionId }, exitAt));
+      if (!named) throw new HttpError(404, 'the named session is not open in this garage', 'session_not_open');
+      return withinClocks(named);
+    }
+    const open = await repo.findOpenSession(client, tenantId, garageId, vehicle.id);
+    if (open && exitAt >= open.entry_at) return { open, exitAt };
+    const ended = await repo.endedStayAt(client, tenantId, garageId, { vehicleId: vehicle.id }, exitAt);
+    if (ended) return { open: ended, exitAt };
+    if (open && open.entry_at - exitAt <= LANE_CLOCKS_APART_MS) return withinClocks(open);
+    if (await repo.closedStayAt(client, tenantId, garageId, vehicle.id, exitAt, LANE_CLOCKS_APART_MS)) {
+      // A stale exit from a visit already closed: closing anything with it
+      // would be wrong, and a 5xx would be re-sent forever. 409 is terminal.
+      throw conflict('stale_exit', 'this exit falls inside a stay already closed — a stale exit from an earlier visit');
+    }
+    return { pending: true };
+  };
+  const first = await decide();
+  if (!first.pending) return first;
+  await repo.lockGarageOpens(client, garageId);
+  const again = await decide();
+  if (!again.pending) return again;
+  return repo.keepPendingExit(client, tenantId, keep);
 }
 
 export function createApp() {
@@ -938,6 +1025,11 @@ export function createApp() {
       // The garage's number of spaces (0034): the garage map writes its count of
       // switched-on spots here, or the owner types it on the Garages page.
       const spaces = req.body?.spaces === undefined ? undefined : garageSpaces(req.body.spaces);
+      // The owner's word that a LOWER number of spaces is right while rates
+      // with a fill rule can price on it (0035): the garage map's "use the
+      // map's count" step sends it. Not stored; nothing else reads it.
+      const spacesConfirmed = req.body?.spaces_confirmed ?? false;
+      if (typeof spacesConfirmed !== 'boolean') throw bad('spaces_confirmed must be true or false when given');
       const given = { default_action: action, transient_available: transient, ban_tailgaters: banTailgaters, ban_reach: banReach, spaces };
       const fields = Object.keys(given).filter((f) => given[f] !== undefined);
       if (fields.length === 0) {
@@ -950,20 +1042,34 @@ export function createApp() {
           [req.tenantId, req.params.garageId],
         );
         if (!was[0]) throw new HttpError(404, 'garage not found');
-        if (spaces === null && was[0].spaces !== null) {
-          // Rates with a fill rule price on the number of spaces: it is not
-          // taken away under them. Decided behind the garage's rates lock, the
-          // one a save of new rates holds, so the two cannot cross.
+        if (spaces !== undefined && spaces !== was[0].spaces) {
+          // Rates with a fill rule price on the number of spaces. Decided
+          // behind the garage's rates lock, the one a save of new rates
+          // holds, so the two cannot cross.
           await ratePlans.lockGarageRates(client, was[0].id);
-          const newest = await ratePlans.newestRatePlan(client, req.tenantId, was[0].id);
-          const { rows: plan } = newest
-            ? await client.query('SELECT document FROM rate_plans WHERE tenant_id = $1 AND id = $2', [req.tenantId, newest.id])
-            : { rows: [] };
-          if (plan[0] && ratePlans.hasFillRule(plan[0].document)) {
+          const guard = await spacesGuard(client, req.tenantId, was[0].id);
+          if (spaces === null && guard.fillPlans.length > 0) {
+            // Not taken away under ANY plan with a fill rule that can still
+            // price a stay here -- not only the newest (0035).
             throw conflict(
               'spaces_needed_by_fill_rule',
               'the rates in force raise the price when the garage is full, which needs the number of spaces; ' +
                 'change the rates first, then clear it. Nothing was changed.',
+            );
+          }
+          if (spaces !== null && spaces < guard.inside) {
+            throw conflict(
+              'spaces_below_cars_inside',
+              `${guard.inside} cars are inside the garage now, more than ${spaces} spaces; ` +
+                'the number of spaces cannot be lower than the cars inside. Nothing was changed.',
+            );
+          }
+          if (spaces !== null && was[0].spaces !== null && spaces < was[0].spaces && guard.fillPlans.length > 0 && !spacesConfirmed) {
+            throw conflict(
+              'spaces_lowering_not_confirmed',
+              `the rates raise the price when the garage is full, and ${spaces} spaces instead of ${was[0].spaces} ` +
+                'makes it full sooner; send spaces_confirmed: true once the owner has said the lower number is right. ' +
+                'Nothing was changed.',
             );
           }
         }
@@ -1922,7 +2028,7 @@ export function createApp() {
       const session = await withTenant(tenantId, (client) =>
         repo.findOpenSessionByIdentity(client, tenantId, garageId, identity),
       );
-      if (!session) throw new HttpError(404, 'no open session for this vehicle');
+      if (!session) throw new HttpError(404, 'no open session for this vehicle', 'no_open_stay');
       res.json({ session: presentSession(session) });
     } catch (err) {
       next(err);
@@ -1989,8 +2095,38 @@ export function createApp() {
           tailgater,
         });
         if (opened.created) await bans.listIfBanned(client, tenantId, { garage, session: opened.session });
+        // THE STAY THIS ENTRY ENDED (0035) -- the car's earlier stay nothing
+        // closed, or this one when it is an earlier visit arriving late --
+        // with its event and its change-log line, in this transaction.
+        for (const ended of opened.superseded) await stays.recordEnded(client, tenantId, ended, { laneId });
+        if (opened.created && opened.session.ended) await stays.recordEnded(client, tenantId, opened.session, { laneId });
+        // A CLOSE THAT CAME FIRST (0035): the exit kept for this stay, read
+        // behind the garage's open lock the open holds. On a replay too, so an
+        // open retried because that close could not be made now finds it again.
+        opened.pendingExit = opened.session.exit_at === null || opened.session.ended
+          ? await repo.pendingExitFor(client, tenantId, opened.session, LANE_CLOCKS_APART_MS)
+          : null;
         return opened;
       });
+      await stays.releaseAfterEnd(tenantId, result.superseded);
+
+      // The kept exit, delivered again now the stay is committed. A close
+      // that cannot be made now -- an engine or a module that cannot answer
+      // -- fails this open too, as a 5xx, so the lane sends the open again
+      // and the replay finds the same kept exit. One the close refused stays
+      // kept, said in the log, and the open is answered as it is.
+      let session = result.session;
+      let pendingExit = null;
+      if (result.pendingExit) {
+        const delivered = await deliverPendingExit(tenantId, result.pendingExit);
+        if (delivered.error && (delivered.error.status ?? 500) >= 500) throw delivered.error;
+        if (delivered.error) {
+          console.error(`[lane] kept exit ${result.pendingExit.id} was refused when delivered again: ${delivered.error.code ?? delivered.error.status} ${delivered.error.message}`);
+        } else if (delivered.status === 200) {
+          pendingExit = stays.presentPendingExit(result.pendingExit);
+          session = await withTenant(tenantId, (client) => repo.getSession(client, tenantId, result.session.id));
+        }
+      }
 
       // The row that was written, echoed whole -- `entry_confirmation` and
       // `entry_descriptor` with it.
@@ -2001,8 +2137,9 @@ export function createApp() {
       // field from this response would be indistinguishable, to a lane, from
       // deploying against a platform that cannot record it.
       res.status(result.created ? 201 : 200).json({
-        session: presentSession(result.session),
+        session: presentSession(session),
         created: result.created,
+        ...(pendingExit ? { pending_exit: pendingExit } : {}),
       });
     } catch (err) {
       if (err.code === 'EVENT_ID_VEHICLE_CONFLICT') {
@@ -2182,8 +2319,14 @@ export function createApp() {
   /**
    * Exit. Computes the fee and freezes it, along with the rate that produced it.
    * Idempotent: closing an already-closed session returns it unchanged.
+   *
+   * A close that finds no stay to close (0035) is KEPT and answered 202 with
+   * `pending_exit`, never refused: the lane drops a refusal, and that exit
+   * would be lost for good. The open it belongs to delivers it again, through
+   * this same function (`deliverPendingExit`), and the stay closes then.
    */
-  lane.post('/sessions/close', async (req, res, next) => {
+  lane.post('/sessions/close', closeRoute);
+  async function closeRoute(req, res, next) {
     try {
       const { tenantId, garageId, laneId, direction } = req.device;
       if (direction !== 'exit') {
@@ -2213,7 +2356,7 @@ export function createApp() {
         'exit_confirmation',
         EXIT_CONFIRMATIONS,
       );
-      const exitAt = refuseFuture(parseTime(req.body?.exit_at, 'exit_at'), 'exit_at');
+      let exitAt = refuseFuture(parseTime(req.body?.exit_at, 'exit_at'), 'exit_at');
 
       // THE GATE (0014), at the other end: an inactive garage closes no stay.
       // Activation is monotonic, so a stay that exists was opened at an
@@ -2229,6 +2372,12 @@ export function createApp() {
         // guess that goes wrong the moment a vehicle visits twice.
         const already = await repo.findSessionByCloseEvent(client, tenantId, String(closeEventId));
         if (already) return { session: already, closed: false, replay: true };
+        // A close kept as a pending exit, sent again: the one kept is the
+        // answer. Not when the open delivers it again: then it closes.
+        if (!req.pendingExit) {
+          const kept = await repo.pendingExitByCloseEvent(client, tenantId, String(closeEventId));
+          if (kept) return { pending: kept, closed: false, replay: true };
+        }
 
         const vehicle = await repo.upsertVehicle(client, tenantId, {
           plate, ticketRef, seenAt: exitAt,
@@ -2237,18 +2386,47 @@ export function createApp() {
         // When the lane names the session, that is the session -- no guessing
         // from a plate, so a stale exit from an earlier visit can never land on
         // a later one. When it does not (it was offline at the exit), fall back
-        // to the plate with the ordering guard below.
-        const open = sessionId
-          ? await repo.findOpenSessionById(client, tenantId, garageId, sessionId)
-          : await repo.findOpenSession(client, tenantId, garageId, vehicle.id);
-
-        if (!open) {
-          throw new HttpError(
-            404,
-            sessionId
-              ? 'the named session is not open in this garage'
-              : 'no open session for this vehicle',
-          );
+        // to the plate: the car's open stay, the ended stay the exit falls
+        // inside, or nothing yet -- and then the exit is kept (`stayForExit`).
+        const found = await stayForExit(client, {
+          tenantId, garageId, vehicle, sessionId, exitAt,
+          keep: {
+            garageId, vehicleId: vehicle.id, laneId, closeEventId: String(closeEventId), exitAt, exitConfirmation,
+            exitDescriptor, localDecision, readerShown,
+          },
+        });
+        if (found.pending) return { pending: found.pending, closed: false, replay: found.replay };
+        const open = found.open;
+        if (found.clampedFrom) {
+          // The two lanes' clocks apart, not a stale exit (LANE_CLOCKS_APART_MS):
+          // the stay closes at its own entry, and the event keeps what was sent.
+          exitAt = found.exitAt;
+          await repo.appendEvents(client, tenantId, [
+            {
+              garageId,
+              laneId,
+              eventId: `exit_before_entry:${String(closeEventId)}`,
+              kind: stays.EXIT_BEFORE_ENTRY_EVENT_KIND,
+              occurredAt: exitAt,
+              detail: {
+                actor: 'platform:close', session_id: open.id, close_event_id: String(closeEventId),
+                exit_at_sent: found.clampedFrom, entry_at: open.entry_at, clocks_apart_ms: LANE_CLOCKS_APART_MS,
+              },
+            },
+          ]);
+        }
+        if (open.ended) {
+          // An ended stay this exit falls inside, closed after all.
+          await repo.appendEvents(client, tenantId, [
+            {
+              garageId,
+              laneId,
+              eventId: `ended_stay_closed:${String(closeEventId)}`,
+              kind: stays.ENDED_STAY_CLOSED_EVENT_KIND,
+              occurredAt: exitAt,
+              detail: { actor: 'platform:close', session_id: open.id, close_event_id: String(closeEventId), ended: open.ended },
+            },
+          ]);
         }
         if (sessionId && open.vehicle_id !== vehicle.id) {
           throw conflict('session_vehicle_mismatch', 'the named session belongs to a different vehicle');
@@ -2510,6 +2688,14 @@ export function createApp() {
         return { session: closed, closed: true, replay: false, releaseAfter: validated.releaseAfter };
       });
 
+      // KEPT (0035): no stay to close yet. 202, with what was kept -- a lane
+      // that sends it again is answered the same, and the open it belongs to
+      // closes from it.
+      if (out.pending) {
+        res.status(202).json({ pending_exit: stays.presentPendingExit(out.pending), closed: false, replay: out.replay });
+        return;
+      }
+
       // The release the close decided on, asked AFTER the close committed
       // (A2.3). A door that cannot answer now leaves `releasing` for the
       // sweep; the stay is closed either way and the lane is not asked to
@@ -2529,7 +2715,40 @@ export function createApp() {
     } catch (err) {
       next(err);
     }
-  });
+  }
+
+  /**
+   * A CLOSE THAT CAME BEFORE ITS OPEN (0035), delivered again: through the
+   * close route itself, as the exit lane that sent it, with what it sent --
+   * so every rule of a close applies to it unchanged. Answers what the close
+   * answered: `{ status, body }`, or `{ error }` when it refused or failed.
+   */
+  async function deliverPendingExit(tenantId, pending) {
+    const { vehicle, lane } = await withTenant(tenantId, async (client) => ({
+      vehicle: (await client.query('SELECT plate, ticket_ref FROM vehicles WHERE tenant_id = $1 AND id = $2', [tenantId, pending.vehicle_id])).rows[0],
+      lane: (await client.query('SELECT id, garage_id, direction FROM lanes WHERE tenant_id = $1 AND id = $2', [tenantId, pending.lane_id])).rows[0],
+    }));
+    const body = {
+      event_id: pending.close_event_id,
+      ...(vehicle.ticket_ref ? { ticket_ref: vehicle.ticket_ref } : { plate: vehicle.plate }),
+      exit_at: pending.exit_at.toISOString(),
+      exit_confirmation: pending.exit_confirmation,
+      ...(pending.exit_descriptor === null ? {} : { descriptor: pending.exit_descriptor }),
+      ...(pending.local_decision === null ? {} : { local_decision: pending.local_decision }),
+      ...(pending.reader_shown === null ? {} : { reader_shown: pending.reader_shown }),
+    };
+    const answer = {};
+    const res = {
+      status(code) { answer.status = code; return res; },
+      json(payload) { answer.body = payload; return res; },
+    };
+    await closeRoute(
+      { device: { tenantId, garageId: lane.garage_id, laneId: lane.id, direction: lane.direction }, body, pendingExit: pending },
+      res,
+      (err) => { answer.error = err; },
+    );
+    return answer;
+  }
 
   /**
    * State a garage's taxes from an instant: a tax set, whole (0022).

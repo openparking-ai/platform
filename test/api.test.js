@@ -334,12 +334,22 @@ test('a device may only do the job of the lane it is on', async () => {
   assert.equal(wrongClose.status, 409);
 });
 
-test('closing a vehicle that never entered is a 404, not a phantom session', async () => {
+test('closing a vehicle that never entered is kept as a pending exit (202), not a phantom session', async () => {
+  // Kept for the open that may still arrive (0035) -- the exit lane's queue
+  // can deliver before the entry lane's -- and no stay is made from it.
+  const plate = `GHOST-${randomUUID().slice(0, 8)}`;
   const res = await fetch(
     `${base}/api/v1/lane/sessions/close`,
-    asDevice(exitToken, { plate: `GHOST-${randomUUID().slice(0, 8)}`, exit_confirmation: 'confirmed', exit_at: new Date().toISOString() }),
+    asDevice(exitToken, { plate, exit_confirmation: 'confirmed', exit_at: new Date().toISOString() }),
   );
-  assert.equal(res.status, 404);
+  assert.equal(res.status, 202);
+  const body = await res.json();
+  assert.equal(body.closed, false);
+  assert.equal(body.pending_exit.exit_confirmation, 'confirmed');
+  const stays = await withTenant(tenant, async (c) =>
+    (await c.query('SELECT count(*)::int AS n FROM sessions s JOIN vehicles v ON v.id = s.vehicle_id WHERE v.plate = $1', [plate])).rows[0].n,
+  );
+  assert.equal(stays, 0, 'no session of any kind for a car that never entered');
 });
 
 // --- operator surface -----------------------------------------------------

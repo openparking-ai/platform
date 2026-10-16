@@ -137,8 +137,37 @@ test('each car is counted against the cars already inside when it came in, every
   for (const car of cars) figures.push(await figureOf((await opened(await open(g.entry, car))).id));
   assert.deepEqual(figures, [0, 2500, 5000]);
   assert.equal((await close(g.exit, cars[0])).status, 200);
+  // D came in at 12:00 too, and its open arrives after A's close (15:00): at
+  // D's entry, A was still inside (0035) -- A, B and C, not B and C.
   const d = await opened(await open(g.entry, plate('D')));
-  assert.equal(await figureOf(d.id), 5000, 'A has left: B and C were inside');
+  assert.equal(await figureOf(d.id), 7500, 'A, B and C were inside when D came in');
+  // After A and B left: C and D inside when E came in at 16:00.
+  assert.equal((await close(g.exit, cars[1])).status, 200);
+  const e = await opened(await open(g.entry, plate('E'), '2026-09-10T16:00:00Z'));
+  assert.equal(await figureOf(e.id), 5000, 'A and B had left: C and D were inside');
+});
+
+test('AT THE CAR\'S OWN ENTRY: an open a lane delivers late is counted against the cars that were in when it came in, not when it arrived', async () => {
+  const g = await garage({ spaces: 4 });
+  const a = plate('A');
+  await opened(await open(g.entry, a, '2026-09-10T12:00:00Z'));
+  assert.equal((await close(g.exit, a, '2026-09-10T13:00:00Z')).status, 200);
+  // B came in at 12:30, while A was inside; its open arrives after A left.
+  const b = await opened(await open(g.entry2, plate('B'), '2026-09-10T12:30:00Z'));
+  assert.equal(await figureOf(b.id), 2500, 'A was inside at 12:30');
+  // C came in at 11:00, before anyone: its late open counts nobody.
+  const c = await opened(await open(g.entry2, plate('C'), '2026-09-10T11:00:00Z'));
+  assert.equal(await figureOf(c.id), 0, 'nobody was inside at 11:00');
+});
+
+test('A STAY NOTHING CLOSES STOPS COUNTING: one that came in OCCUPANCY_MAX_STAY_HOURS (24) or more before an entry is not inside it', async () => {
+  const g = await garage({ spaces: 4 });
+  // An orphan: in on the 8th, never closed.
+  await opened(await open(g.entry, plate('ORPHAN'), '2026-09-08T12:00:00Z'));
+  const x = await opened(await open(g.entry, plate('X'), '2026-09-09T11:00:00Z'));
+  assert.equal(await figureOf(x.id), 2500, 'twenty-three hours on, it is still counted');
+  const y = await opened(await open(g.entry, plate('Y'), '2026-09-09T13:00:00Z'));
+  assert.equal(await figureOf(y.id), 2500, 'twenty-five hours on, the orphan is not counted; X is');
 });
 
 test('more cars inside than spaces (the map changed under them): the figure is 10000, never more', async () => {
@@ -285,6 +314,58 @@ test('the number of spaces is not taken away from rates that need it; it can be 
   assert.equal((await cleared.json()).garage.spaces, null);
 });
 
+test('THE NUMBER OF SPACES IS NOT TAKEN BELOW THE CARS INSIDE NOW: refused by name, and nothing changes', async () => {
+  const g = await garage({ spaces: 10 });
+  const recently = new Date(Date.now() - 30 * 60_000).toISOString();
+  for (const car of [plate('I'), plate('J'), plate('K')]) await opened(await open(g.entry, car, recently));
+  const res = await op('PATCH', `/garages/${g.id}`, { spaces: 2 });
+  assert.equal(res.status, 409);
+  const body = await res.json();
+  assert.equal(body.code, 'spaces_below_cars_inside');
+  assert.match(body.error, /3 cars are inside/);
+  assert.equal((await (await op('GET', `/garages/${g.id}`)).json()).garage.spaces, 10);
+  // CONTROL: as many spaces as cars inside is taken.
+  assert.equal((await op('PATCH', `/garages/${g.id}`, { spaces: 3 })).status, 200);
+});
+
+test('A LOWER NUMBER OF SPACES UNDER A FILL RULE needs the owner\'s word: refused without spaces_confirmed, taken with it; a higher one needs nothing', async () => {
+  const g = await garage({ spaces: 300, plan: fillPlan() });
+  const lower = await op('PATCH', `/garages/${g.id}`, { spaces: 40 });
+  assert.equal(lower.status, 409);
+  assert.equal((await lower.json()).code, 'spaces_lowering_not_confirmed');
+  assert.equal((await (await op('GET', `/garages/${g.id}`)).json()).garage.spaces, 300);
+  for (const bad of ['yes', 1, {}]) {
+    const r = await op('PATCH', `/garages/${g.id}`, { spaces: 40, spaces_confirmed: bad });
+    assert.equal(r.status, 400, JSON.stringify(bad));
+  }
+  const confirmed = await op('PATCH', `/garages/${g.id}`, { spaces: 40, spaces_confirmed: true });
+  assert.equal(confirmed.status, 200, await confirmed.clone().text());
+  assert.equal((await confirmed.json()).garage.spaces, 40);
+  assert.equal((await op('PATCH', `/garages/${g.id}`, { spaces: 50 })).status, 200, 'raising needs no word');
+  // CONTROL: a garage whose rates have no fill rule lowers it plainly.
+  const plain = await garage({ spaces: 300 });
+  assert.equal((await op('PATCH', `/garages/${plain.id}`, { spaces: 40 })).status, 200);
+});
+
+test('THE NUMBER OF SPACES IS NOT CLEARED UNDER AN OLDER FILL RULE that can still price a stay, though the newest rates have none', async () => {
+  // Rates with a fill rule, then plain rates from two hours ago; a car came in
+  // three hours ago, under the fill rule, and is still inside.
+  const g = await garage({ spaces: 10, plan: fillPlan({ version: 'fill-old' }) });
+  const twoHoursAgo = new Date(Date.now() - 2 * 3600_000).toISOString();
+  await withTenant(tenant, (c) => storePlan(c, tenant, g.id, flatHourlyPlan({ hourlyMinor: 1000, version: 'plain-new', effectiveFrom: twoHoursAgo })));
+  const car = plate('UNDER');
+  await opened(await open(g.entry, car, new Date(Date.now() - 3 * 3600_000).toISOString()));
+  const res = await op('PATCH', `/garages/${g.id}`, { spaces: null });
+  assert.equal(res.status, 409);
+  assert.equal((await res.json()).code, 'spaces_needed_by_fill_rule');
+  assert.equal((await (await op('GET', `/garages/${g.id}`)).json()).garage.spaces, 10);
+  // CONTROL: once no stay inside came in under it, and the plain rates are
+  // past the start allowance, it clears.
+  assert.equal((await close(g.exit, car, new Date(Date.now() - 3600_000).toISOString())).status, 200);
+  const cleared = await op('PATCH', `/garages/${g.id}`, { spaces: null });
+  assert.equal(cleared.status, 200, await cleared.clone().text());
+});
+
 // --- the price ----------------------------------------------------------------------
 
 test('the close prices on the figure the car came in with: below the threshold not raised, at it raised by the percent', async () => {
@@ -306,9 +387,12 @@ test('the close prices on the figure the car came in with: below the threshold n
 
 test('cars inside keep their price: one in at 70% stays unraised after the rates gain a fill rule and the garage fills', async () => {
   const g = await garage({ spaces: 10 });
-  for (let i = 0; i < 7; i += 1) await opened(await open(g.entry, plate('F')));
+  // Fifty minutes ago: inside the hours a stay is counted for (0035), and
+  // under the hour a plain stay is priced at.
+  const earlier = new Date(Date.now() - 50 * 60_000).toISOString();
+  for (let i = 0; i < 7; i += 1) await opened(await open(g.entry, plate('F'), earlier));
   const early = plate('EARLY');
-  const s = await opened(await open(g.entry, early, '2026-09-10T12:00:00Z'));
+  const s = await opened(await open(g.entry, early, earlier));
   assert.equal(await figureOf(s.id), 7000);
   // New rates with a fill rule, from now on; then the garage fills past 80%.
   const { rows } = await withTenant(tenant, (c) => c.query('SELECT id FROM rate_plans WHERE garage_id = $1', [g.id]));
@@ -318,8 +402,8 @@ test('cars inside keep their price: one in at 70% stays unraised after the rates
   const t = await opened(await open(g.entry, late, now()));
   assert.equal(await figureOf(t.id), 8000);
   const leave = new Date(Date.now()).toISOString();
-  const a = await (await close(g.exit, early, '2026-09-10T15:00:00Z')).json();
-  assert.equal(a.session.subtotal_minor, 3000, 'priced by the rates in force at its entry, with no fill rule');
+  const a = await (await close(g.exit, early, leave)).json();
+  assert.equal(a.session.subtotal_minor, 1000, 'priced by the rates in force at its entry, with no fill rule');
   assert.ok(!a.session.breakdown.some((l) => l.code.startsWith('fill_level')));
   const b = await (await close(g.exit, late, leave)).json();
   assert.equal(b.session.subtotal_minor, 1200, 'the first hour at 10.00, +20%: it came in at 80% under the fill rule');

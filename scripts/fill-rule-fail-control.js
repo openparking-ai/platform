@@ -24,6 +24,11 @@
  *   try_figure_unchecked    a try hands any figure to the engine.
  *   reconciler_no_figure    the reconciler re-prices without the stay's figure.
  *   rules_without_spaces    the lane's rules carry no number of spaces.
+ *   counted_at_receipt      the cars inside are counted when the open arrives (0035).
+ *   orphans_never_age       a stay that never closes is counted for ever (0035).
+ *   spaces_below_cars_inside  the number of spaces is taken below the cars inside (0035).
+ *   lowering_unconfirmed    a lower number under a fill rule needs no word (0035).
+ *   clear_asks_newest_only  clearing the number of spaces asks only the newest plan (0035).
  */
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -37,15 +42,15 @@ const SOURCE_BREAKS = [
     name: 'opens_unlocked',
     why: 'two opens at once are not held one behind the other',
     file: 'src/repository.js',
-    from: '  await lockGarageOpens(client, garageId);\n  const occupancyAtEntryBp',
-    to: '  const occupancyAtEntryBp',
+    from: '  await lockGarageOpens(client, garageId);\n',
+    to: '',
   },
   {
     name: 'closed_counted',
     why: 'a car that has left is still counted inside',
     file: 'src/repository.js',
-    from: 'WHERE s.tenant_id = g.tenant_id AND s.garage_id = g.id AND s.exit_at IS NULL) AS inside',
-    to: 'WHERE s.tenant_id = g.tenant_id AND s.garage_id = g.id) AS inside',
+    from: '                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
+    to: ') AS inside',
   },
   {
     name: 'not_clamped',
@@ -69,7 +74,7 @@ const SOURCE_BREAKS = [
     to: '          tailgater,\n          laneFigure: req.body?.occupancy_at_entry_bp,\n        });\n        if (opened.created)',
     also: [
       { file: 'src/repository.js', from: 'entryDescriptor = null, tailgater = false },', to: 'entryDescriptor = null, tailgater = false, laneFigure },' },
-      { file: 'src/repository.js', from: '  const occupancyAtEntryBp = await occupancyNow(client, tenantId, garageId);', to: '  const occupancyAtEntryBp = laneFigure ?? await occupancyNow(client, tenantId, garageId);' },
+      { file: 'src/repository.js', from: '    const occupancyAtEntryBp = await occupancyAt(client, tenantId, garageId, entryAt);', to: '    const occupancyAtEntryBp = laneFigure ?? await occupancyAt(client, tenantId, garageId, entryAt);' },
     ],
   },
   {
@@ -104,8 +109,48 @@ const SOURCE_BREAKS = [
     name: 'spaces_cleared_under',
     why: 'the number of spaces is cleared under rates that need it',
     file: 'src/app.js',
-    from: '          if (plan[0] && ratePlans.hasFillRule(plan[0].document)) {',
+    from: '          if (spaces === null && guard.fillPlans.length > 0) {',
     to: '          if (false) {',
+  },
+  {
+    // OP-NODE-002 (0035): the figure is taken when the open ARRIVES, as it was.
+    name: 'counted_at_receipt',
+    why: 'the cars inside are counted when the open arrives, not at the car\'s entry',
+    file: 'src/repository.js',
+    from: '                AND s.entry_at <= $3 AND s.entry_at > $3::timestamptz - make_interval(hours => $4)\n                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
+    to: '                AND s.exit_at IS NULL AND $3::timestamptz IS NOT NULL AND $4::int IS NOT NULL) AS inside',
+  },
+  {
+    // OP-NODE-002 (0035): a stay nothing closes is counted for ever.
+    name: 'orphans_never_age',
+    why: 'a stay that never closes is counted inside for ever',
+    file: 'src/repository.js',
+    from: ' AND s.entry_at > $3::timestamptz - make_interval(hours => $4)\n',
+    to: ' AND $4::int IS NOT NULL\n',
+  },
+  {
+    // OP-NODE-003 (0035): any lower number is taken, below the cars inside.
+    name: 'spaces_below_cars_inside',
+    why: 'the number of spaces is taken below the cars inside now',
+    file: 'src/app.js',
+    from: '          if (spaces !== null && spaces < guard.inside) {',
+    to: '          if (false) {',
+  },
+  {
+    // OP-NODE-003 (0035): a lower number under a fill rule needs no word.
+    name: 'lowering_unconfirmed',
+    why: 'a lower number of spaces under a fill rule is taken without the owner\'s word',
+    file: 'src/app.js',
+    from: ' && guard.fillPlans.length > 0 && !spacesConfirmed) {',
+    to: ' && false) {',
+  },
+  {
+    // OP-NODE-004 (0035): only the newest plan is asked, as before.
+    name: 'clear_asks_newest_only',
+    why: 'clearing the number of spaces asks only the newest plan',
+    file: 'src/app.js',
+    from: '  const plans = ratePlans.plansInForceSince(await ratePlans.ratePlansForGarage(client, tenantId, garageId), since);',
+    to: '  const plans = (await ratePlans.ratePlansForGarage(client, tenantId, garageId)).slice(-1);',
   },
   {
     name: 'feed_without_figure',

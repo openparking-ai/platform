@@ -22,6 +22,16 @@ export const START_SETTINGS = Object.freeze({
   // How long a lane computer may go unheard before its lane counts as not
   // connected: the one place this is set (src/setup.js). A day at most.
   LANE_QUIET_MINUTES: { min: 1, max: 1440, fallback: 5 },
+  // How far apart two entries of one car may be and still be one arrival (a
+  // second lane reading it, or a back-out and a second approach): the open
+  // already there is the answer. Further apart, the earlier stay is ended as
+  // superseded (src/repository.js `openSession`). An hour at most.
+  REAPPROACH_MINUTES: { min: 1, max: 60, fallback: 10 },
+  // How long a car is counted inside when nothing closed its stay: the fill
+  // rule's "how full at entry" counts only stays that came in less than this
+  // before (src/repository.js `occupancyAt`), so a stay that never closed
+  // stops counting. A year at most.
+  OCCUPANCY_MAX_STAY_HOURS: { min: 1, max: 8760, fallback: 24 },
 });
 
 /** The value, or `why` it is not one. Unset is the default. */

@@ -172,6 +172,16 @@ const SCHEMA_BREAKS = [
         to: `ALTER TABLE sessions
   ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled CHECK (true OR`,
       },
+      // 0035 states the shapes again, with an ended stay's beside them.
+      {
+        file: '0035_stay_lifecycle.sql',
+        from: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_covered_priced_or_refused;
+ALTER TABLE sessions
+  ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused CHECK (`,
+        to: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled;
+ALTER TABLE sessions
+  ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled CHECK (true OR`,
+      },
     ],
   },
   {
