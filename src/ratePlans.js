@@ -268,22 +268,6 @@ export function hasFillRule(document) {
 }
 
 /**
- * The stored plans that can still price a stay that came in at `since` or
- * later: the plan in force at `since` and every plan after it, a plan being
- * in force from its start until the next plan's. The engine prices a stay on
- * the plan in force at its entry, so an older plan still prices a car that
- * came in under it -- one whose open a lane delivers late included.
- */
-export function plansInForceSince(rows, since) {
-  const start = (r) => new Date(r.effective_from).getTime();
-  const sorted = [...rows].sort((a, b) => start(a) - start(b));
-  return sorted.filter((row, i) => {
-    const next = sorted.slice(i + 1).find((r) => start(r) > start(row));
-    return next === undefined || start(next) > since.getTime();
-  });
-}
-
-/**
  * A fill rule states both of the owner's answers, each "yes" or "no". The
  * engine refuses one that does not, by name, and so does the store, before
  * the engine is asked: the refusal reaches the owner's screen by its own code

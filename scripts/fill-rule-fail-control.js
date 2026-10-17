@@ -26,10 +26,8 @@
  *   rules_without_spaces    the lane's rules carry no number of spaces.
  *   counted_at_receipt      the cars inside are counted when the open arrives (0035).
  *   orphans_age_out         a stay nothing closes stops counting a day after it came in (0035).
- *   guard_ages_out          the check on clearing the number of spaces forgets such a stay after a day (0035).
  *   superseded_still_inside a stay ended because its car came in again is still counted (0035).
  *   abandoned_still_inside  a stay an operator ended is still counted (0035).
- *   clear_asks_newest_only  clearing the number of spaces asks only the newest plan (0035).
  */
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -110,7 +108,7 @@ const SOURCE_BREAKS = [
     name: 'spaces_cleared_under',
     why: 'the number of spaces is cleared under rates that need it',
     file: 'src/app.js',
-    from: '          if (guard.fillPlans.length > 0) {',
+    from: '          if (plan[0] && ratePlans.hasFillRule(plan[0].document)) {',
     to: '          if (false) {',
   },
   {
@@ -131,14 +129,6 @@ const SOURCE_BREAKS = [
     to: "                AND s.entry_at <= $3 AND s.entry_at > $3::timestamptz - interval '24 hours'\n",
   },
   {
-    // 0035: the same age-out, put back in the check on clearing the number of spaces.
-    name: 'guard_ages_out',
-    why: 'the check on clearing the number of spaces forgets a stay nothing closed a day after it came in',
-    file: 'src/app.js',
-    from: '      WHERE tenant_id = $1 AND garage_id = $2 AND exit_at IS NULL`,\n    [tenantId, garageId],\n',
-    to: "      WHERE tenant_id = $1 AND garage_id = $2 AND exit_at IS NULL\n        AND entry_at > now() - interval '24 hours'`,\n    [tenantId, garageId],\n",
-  },
-  {
     // 0035: a stay ended because its car came in again stays in the count.
     name: 'superseded_still_inside',
     why: 'a stay ended because its car came in again is still counted inside',
@@ -153,14 +143,6 @@ const SOURCE_BREAKS = [
     file: 'src/repository.js',
     from: '                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
     to: "                AND (s.exit_at IS NULL OR s.exit_at > $3 OR s.ended->>'reason' = 'abandoned')) AS inside",
-  },
-  {
-    // OP-NODE-004 (0035): only the newest plan is asked, as before.
-    name: 'clear_asks_newest_only',
-    why: 'clearing the number of spaces asks only the newest plan',
-    file: 'src/app.js',
-    from: '  const plans = ratePlans.plansInForceSince(await ratePlans.ratePlansForGarage(client, tenantId, garageId), since);',
-    to: '  const plans = (await ratePlans.ratePlansForGarage(client, tenantId, garageId)).slice(-1);',
   },
   {
     name: 'feed_without_figure',

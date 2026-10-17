@@ -893,10 +893,9 @@ back-out at a one-loop lane). So:
   entry time (never a plate); with `--apply`, each **ended as abandoned** at
   that moment, unpriced, with its event and a change-log line `stay.abandon`.
   `<n>` has no default. Until then an orphan is a car inside, however long
-  ago it came in: the fill rule's figure counts it, and so does the check on
-  clearing the number of spaces (0034, below). Ending it takes it out of that
-  count. A stay abandoned while its car was in fact still inside is closed and
-  priced by the car's real exit when it comes (above).
+  ago it came in: the fill rule's figure counts it (0034, below). Ending it
+  takes it out of that count. A stay abandoned while its car was in fact still
+  inside is closed and priced by the car's real exit when it comes (above).
 
 An ended stay is the sixth shape of a closed stay (0035): no exit lane, close
 event, exit confirmation or descriptor, outcome or fee. The past stays carry
@@ -1175,12 +1174,8 @@ that. The engine counts nothing; this platform counts, and hands it the figure.
   `spaces` (`409 plan_needs_spaces`, at the store and the try); a fill rule
   that does not state both of the owner's answers, `raises_specials` and
   `raises_vip_extra`, each `"yes"` or `"no"` (`409 fill_rule_answers_missing`,
-  before the engine is asked, which refuses it too); clearing `spaces` while
-  any plan with a fill rule can still price a stay — the plan in force at the
-  entry of any stay still open, or 60 s ago, and every plan after it
-  (`409 spaces_needed_by_fill_rule`) — an orphan stay holds it until it closes
-  or an operator ends it. A lower number of spaces is taken as before, with
-  nothing more asked.
+  before the engine is asked, which refuses it too); clearing `spaces` while the
+  rates in force have a fill rule (`409 spaces_needed_by_fill_rule`).
 
 `test/fill-rule.test.js` holds each; `npm run fill-rule-fail-control` breaks
 each in turn.

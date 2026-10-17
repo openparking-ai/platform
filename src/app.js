@@ -703,26 +703,6 @@ function refuseFuture(at, label, now = new Date()) {
 }
 
 /**
- * THE NUMBER OF SPACES, BEFORE IT IS CLEARED (0035): the garage's plans with
- * a fill rule that can still price a stay -- every plan in force at, or
- * after, the entry of the oldest stay still open, or 60 s ago
- * (START_ALLOWANCE_MS), whichever is earlier: a lane's late open and a plan
- * that starts within the owner's clock difference are priced by them too. An
- * open stay is a car inside however long ago it came in, so it holds the
- * check until it closes, is superseded, or an operator ends it.
- */
-async function spacesGuard(client, tenantId, garageId, now = new Date()) {
-  const { rows } = await client.query(
-    `SELECT min(entry_at) AS earliest FROM sessions
-      WHERE tenant_id = $1 AND garage_id = $2 AND exit_at IS NULL`,
-    [tenantId, garageId],
-  );
-  const since = new Date(Math.min(now.getTime() - ratePlans.START_ALLOWANCE_MS, rows[0].earliest?.getTime() ?? Infinity));
-  const plans = ratePlans.plansInForceSince(await ratePlans.ratePlansForGarage(client, tenantId, garageId), since);
-  return { fillPlans: plans.filter((p) => ratePlans.hasFillRule(p.document)) };
-}
-
-/**
  * WHICH STAY AN EXIT CLOSES (0035), inside the close's transaction. One of:
  *
  *   { open, exitAt }   the stay to close -- open, or ENDED with the exit
@@ -1041,13 +1021,14 @@ export function createApp() {
         if (!was[0]) throw new HttpError(404, 'garage not found');
         if (spaces === null && was[0].spaces !== null) {
           // Rates with a fill rule price on the number of spaces: it is not
-          // taken away under them -- under ANY plan with a fill rule that can
-          // still price a stay here, not only the newest (0035). Decided
-          // behind the garage's rates lock, the one a save of new rates
-          // holds, so the two cannot cross.
+          // taken away under them. Decided behind the garage's rates lock, the
+          // one a save of new rates holds, so the two cannot cross.
           await ratePlans.lockGarageRates(client, was[0].id);
-          const guard = await spacesGuard(client, req.tenantId, was[0].id);
-          if (guard.fillPlans.length > 0) {
+          const newest = await ratePlans.newestRatePlan(client, req.tenantId, was[0].id);
+          const { rows: plan } = newest
+            ? await client.query('SELECT document FROM rate_plans WHERE tenant_id = $1 AND id = $2', [req.tenantId, newest.id])
+            : { rows: [] };
+          if (plan[0] && ratePlans.hasFillRule(plan[0].document)) {
             throw conflict(
               'spaces_needed_by_fill_rule',
               'the rates in force raise the price when the garage is full, which needs the number of spaces; ' +

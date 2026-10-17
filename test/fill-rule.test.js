@@ -354,48 +354,6 @@ test('the number of spaces is not taken away from rates that need it; it can be 
   assert.equal((await cleared.json()).garage.spaces, null);
 });
 
-test('THE NUMBER OF SPACES IS NOT CLEARED UNDER AN OLDER FILL RULE that can still price a stay, though the newest rates have none', async () => {
-  // Rates with a fill rule, then plain rates from two hours ago; a car came in
-  // three hours ago, under the fill rule, and is still inside.
-  const g = await garage({ spaces: 10, plan: fillPlan({ version: 'fill-old' }) });
-  const twoHoursAgo = new Date(Date.now() - 2 * 3600_000).toISOString();
-  await withTenant(tenant, (c) => storePlan(c, tenant, g.id, flatHourlyPlan({ hourlyMinor: 1000, version: 'plain-new', effectiveFrom: twoHoursAgo })));
-  const car = plate('UNDER');
-  await opened(await open(g.entry, car, new Date(Date.now() - 3 * 3600_000).toISOString()));
-  const res = await op('PATCH', `/garages/${g.id}`, { spaces: null });
-  assert.equal(res.status, 409);
-  assert.equal((await res.json()).code, 'spaces_needed_by_fill_rule');
-  assert.equal((await (await op('GET', `/garages/${g.id}`)).json()).garage.spaces, 10);
-  // CONTROL: once no stay inside came in under it, and the plain rates are
-  // past the start allowance, it clears.
-  assert.equal((await close(g.exit, car, new Date(Date.now() - 3600_000).toISOString())).status, 200);
-  const cleared = await op('PATCH', `/garages/${g.id}`, { spaces: null });
-  assert.equal(cleared.status, 200, await cleared.clone().text());
-});
-
-test('A CAR STILL INSIDE DAYS ON holds the number of spaces: not cleared under the fill rule it came in on, until an operator ends its stay', async () => {
-  // Rates with a fill rule, then plain rates from two days ago; three cars
-  // came in three days ago, under the fill rule, and nothing closed them.
-  const daysAgo = (n) => new Date(Date.now() - n * 86_400_000).toISOString();
-  const g = await garage({ spaces: 3, plan: fillPlan({ version: 'fill-days' }) });
-  await withTenant(tenant, (c) => storePlan(c, tenant, g.id, flatHourlyPlan({ hourlyMinor: 1000, version: 'plain-days', effectiveFrom: daysAgo(2) })));
-  for (const car of [plate('DAYS'), plate('DAYS'), plate('DAYS')]) await opened(await open(g.entry, car, daysAgo(3)));
-  const cleared = await op('PATCH', `/garages/${g.id}`, { spaces: null });
-  assert.equal(cleared.status, 409);
-  assert.equal((await cleared.json()).code, 'spaces_needed_by_fill_rule');
-  assert.equal((await (await op('GET', `/garages/${g.id}`)).json()).garage.spaces, 3);
-  // CONTROL: a lower number is taken as it always was, below the cars inside
-  // and under the fill rule, with nothing more asked; only clearing is held.
-  const lower = await op('PATCH', `/garages/${g.id}`, { spaces: 2 });
-  assert.equal(lower.status, 200, await lower.clone().text());
-  assert.equal((await lower.json()).garage.spaces, 2);
-  // CONTROL: once an operator ends the three, it clears.
-  const { ended } = await abandonStays(tenant, g.id, { olderThanHours: 48, apply: true });
-  assert.equal(ended.length, 3);
-  const gone = await op('PATCH', `/garages/${g.id}`, { spaces: null });
-  assert.equal(gone.status, 200, await gone.clone().text());
-});
-
 // --- the price ----------------------------------------------------------------------
 
 test('the close prices on the figure the car came in with: below the threshold not raised, at it raised by the percent', async () => {
