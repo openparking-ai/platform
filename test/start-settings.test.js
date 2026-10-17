@@ -18,6 +18,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
+import { START_SETTINGS, assertStartSettings } from '../src/startSettings.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
@@ -101,6 +102,16 @@ for (const [name, values] of Object.entries(BAD)) {
     }
   });
 }
+
+test('NO SETTING AGES A STAY OUT of the cars inside: OCCUPANCY_MAX_STAY_HOURS is not a start setting, and a value of it is neither checked nor read', () => {
+  // A car is inside until its stay closes (0035; test/fill-rule.test.js).
+  assert.equal(Object.hasOwn(START_SETTINGS, 'OCCUPANCY_MAX_STAY_HOURS'), false);
+  const read = assertStartSettings({ OCCUPANCY_MAX_STAY_HOURS: 'abc' });
+  assert.equal(Object.hasOwn(read, 'OCCUPANCY_MAX_STAY_HOURS'), false);
+  // CONTROL: the returning-car window is one, and is checked.
+  assert.equal(Object.hasOwn(START_SETTINGS, 'REAPPROACH_MINUTES'), true);
+  assert.throws(() => assertStartSettings({ REAPPROACH_MINUTES: 'abc' }), /REAPPROACH_MINUTES must be a whole number from 1 to 60/);
+});
 
 test('CONTROL: a good value of each, and each end of its range, serves through the same harness', async () => {
   for (const settings of [

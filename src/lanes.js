@@ -142,7 +142,8 @@ async function historyOf(client, tenantId, laneId) {
     `SELECT (SELECT count(*) FROM sessions WHERE tenant_id = $1 AND (entry_lane_id = $2 OR exit_lane_id = $2))::int AS stays,
             (SELECT count(*) FROM lane_devices WHERE tenant_id = $1 AND lane_id = $2)::int AS computers,
             (SELECT count(*) FROM lane_readers WHERE tenant_id = $1 AND lane_id = $2)::int AS card_readers,
-            (SELECT count(*) FROM events WHERE tenant_id = $1 AND lane_id = $2)::int AS events`,
+            (SELECT count(*) FROM events WHERE tenant_id = $1 AND lane_id = $2)::int AS events,
+            (SELECT count(*) FROM pending_exits WHERE tenant_id = $1 AND lane_id = $2)::int AS kept_exits`,
     [tenantId, laneId],
   );
   return rows[0];

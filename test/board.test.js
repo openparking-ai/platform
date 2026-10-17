@@ -292,6 +292,8 @@ const NAMES_A_LANE = {
   'lane_readers.lane_id': 'history',
   // Written at a close with the stay's own exit lane, beside its close event, which the purge never reaches (0011).
   'shadow_searches.exit_lane_id': 'history',
+  // A close kept before its open (0035): the record that it arrived.
+  'pending_exits.lane_id': 'history',
   'board_message_lanes.lane_id': 'board',
   // A picture kept with an entry (0033). A lane that took one has the entry's
   // stay or event too, which keep the lane; a picture alone goes with it.
@@ -332,6 +334,10 @@ test('F1 check 3. THE SWEEP: every column that names a lane is listed, and remov
     'lane_readers.lane_id': (c, lane) => c.query(
       `INSERT INTO lane_readers (tenant_id, garage_id, lane_id, account_id, location_id, reader_id, label, bound_by)
        VALUES ($1,$2,$3,'acct_stubF1','tml_stubF1', 'tmr_f1' || replace(gen_random_uuid()::text, '-', ''),'R','test')`, [a.tenant, g.id, lane]),
+    'pending_exits.lane_id': (c, lane) => c.query(
+      `WITH v AS (INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'F1-' || gen_random_uuid()) RETURNING id)
+       INSERT INTO pending_exits (tenant_id, garage_id, vehicle_id, lane_id, close_event_id, exit_at, exit_confirmation)
+       SELECT $1, $2, v.id, $3, gen_random_uuid()::text, now(), 'confirmed' FROM v`, [a.tenant, g.id, lane]),
     'shadow_searches.exit_lane_id': async (c, lane) => {
       // As a close writes it: the close event at this lane, the stay closed at it, the search beside them.
       const ev = `f1s-${lane}`;

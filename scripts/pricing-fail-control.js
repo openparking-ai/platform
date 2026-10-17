@@ -142,6 +142,16 @@ const SCHEMA_BREAKS = [
         to: `ALTER TABLE sessions
   ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled CHECK (true OR`,
       },
+      // 0035 states the shapes again, with an ended stay's beside them.
+      {
+        file: '0035_stay_lifecycle.sql',
+        from: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_covered_priced_or_refused;
+ALTER TABLE sessions
+  ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused CHECK (`,
+        to: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled;
+ALTER TABLE sessions
+  ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled CHECK (true OR`,
+      },
     ],
   },
   {
@@ -161,6 +171,15 @@ ALTER TABLE sessions
     (exit_at IS NOT NULL AND exit_lane_id IS NOT NULL AND close_event_id IS NOT NULL)
   );`,
         to: 'ALTER TABLE sessions DROP CONSTRAINT sessions_plan_pricing_is_complete;',
+      },
+      // 0035 states the closing facts again, with an ended stay's beside
+      // them: the closed shape keeps 0002's fee there too.
+      {
+        file: '0035_stay_lifecycle.sql',
+        from: `    (exit_at IS NOT NULL AND ended IS NULL AND exit_lane_id IS NOT NULL AND close_event_id IS NOT NULL)
+`,
+        to: `    (exit_at IS NOT NULL AND ended IS NULL AND exit_lane_id IS NOT NULL AND close_event_id IS NOT NULL AND fee_minor IS NOT NULL)
+`,
       },
     ],
   },

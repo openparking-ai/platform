@@ -24,6 +24,10 @@
  *   try_figure_unchecked    a try hands any figure to the engine.
  *   reconciler_no_figure    the reconciler re-prices without the stay's figure.
  *   rules_without_spaces    the lane's rules carry no number of spaces.
+ *   counted_at_receipt      the cars inside are counted when the open arrives (0035).
+ *   orphans_age_out         a stay nothing closes stops counting a day after it came in (0035).
+ *   superseded_still_inside a stay ended because its car came in again is still counted (0035).
+ *   abandoned_still_inside  a stay an operator ended is still counted (0035).
  */
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -37,15 +41,15 @@ const SOURCE_BREAKS = [
     name: 'opens_unlocked',
     why: 'two opens at once are not held one behind the other',
     file: 'src/repository.js',
-    from: '  await lockGarageOpens(client, garageId);\n  const occupancyAtEntryBp',
-    to: '  const occupancyAtEntryBp',
+    from: '  await lockGarageOpens(client, garageId);\n',
+    to: '',
   },
   {
     name: 'closed_counted',
     why: 'a car that has left is still counted inside',
     file: 'src/repository.js',
-    from: 'WHERE s.tenant_id = g.tenant_id AND s.garage_id = g.id AND s.exit_at IS NULL) AS inside',
-    to: 'WHERE s.tenant_id = g.tenant_id AND s.garage_id = g.id) AS inside',
+    from: '                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
+    to: ') AS inside',
   },
   {
     name: 'not_clamped',
@@ -69,7 +73,7 @@ const SOURCE_BREAKS = [
     to: '          tailgater,\n          laneFigure: req.body?.occupancy_at_entry_bp,\n        });\n        if (opened.created)',
     also: [
       { file: 'src/repository.js', from: 'entryDescriptor = null, tailgater = false },', to: 'entryDescriptor = null, tailgater = false, laneFigure },' },
-      { file: 'src/repository.js', from: '  const occupancyAtEntryBp = await occupancyNow(client, tenantId, garageId);', to: '  const occupancyAtEntryBp = laneFigure ?? await occupancyNow(client, tenantId, garageId);' },
+      { file: 'src/repository.js', from: '    const occupancyAtEntryBp = await occupancyAt(client, tenantId, garageId, entryAt);', to: '    const occupancyAtEntryBp = laneFigure ?? await occupancyAt(client, tenantId, garageId, entryAt);' },
     ],
   },
   {
@@ -106,6 +110,39 @@ const SOURCE_BREAKS = [
     file: 'src/app.js',
     from: '          if (plan[0] && ratePlans.hasFillRule(plan[0].document)) {',
     to: '          if (false) {',
+  },
+  {
+    // OP-NODE-002 (0035): the figure is taken when the open ARRIVES, as it was.
+    name: 'counted_at_receipt',
+    why: 'the cars inside are counted when the open arrives, not at the car\'s entry',
+    file: 'src/repository.js',
+    from: '                AND s.entry_at <= $3\n                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
+    to: '                AND s.exit_at IS NULL AND $3::timestamptz IS NOT NULL) AS inside',
+  },
+  {
+    // 0035: a car is inside from the moment it goes in until it comes out.
+    // The day's age-out this pull request first had, put back in the count.
+    name: 'orphans_age_out',
+    why: 'a stay nothing closes stops counting a day after it came in',
+    file: 'src/repository.js',
+    from: '                AND s.entry_at <= $3\n',
+    to: "                AND s.entry_at <= $3 AND s.entry_at > $3::timestamptz - interval '24 hours'\n",
+  },
+  {
+    // 0035: a stay ended because its car came in again stays in the count.
+    name: 'superseded_still_inside',
+    why: 'a stay ended because its car came in again is still counted inside',
+    file: 'src/repository.js',
+    from: '                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
+    to: "                AND (s.exit_at IS NULL OR s.exit_at > $3 OR s.ended->>'reason' = 'superseded')) AS inside",
+  },
+  {
+    // 0035: a stay an operator ended stays in the count.
+    name: 'abandoned_still_inside',
+    why: 'a stay an operator ended is still counted inside',
+    file: 'src/repository.js',
+    from: '                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
+    to: "                AND (s.exit_at IS NULL OR s.exit_at > $3 OR s.ended->>'reason' = 'abandoned')) AS inside",
   },
   {
     name: 'feed_without_figure',

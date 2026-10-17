@@ -304,8 +304,19 @@ jobs:
         # reconciler handing it to the engine, the number of spaces checked and
         # not cleared under a fill rule, the store refusing a fill rule with no
         # spaces or a missing answer, the lane feed, past stays and try
-        # carrying it -- and requires test/fill-rule.test.js to go red.
+        # carrying it, and a car inside until its stay closes (no age-out; a
+        # superseded or abandoned stay out of the count) -- and requires
+        # test/fill-rule.test.js to go red.
         run: npm run fill-rule-fail-control
+
+      - name: Stay-lifecycle fail-control
+        # 0035. Each break removes one property -- a returning car not put on
+        # its own old stay, entries minutes apart still one arrival, the ended
+        # stay on the record, a late close landing on it, a close before its
+        # open kept and closed from by the open (and retried with it), an exit
+        # on a slow clock taken as its stay's, the purge reaching a kept exit,
+        # the named 404 -- and requires test/stay-lifecycle.test.js to go red.
+        run: npm run stay-lifecycle-fail-control
 
       - name: Pictures-and-bans fail-control
         # U7f (0033). Each break removes one property -- the week rule after

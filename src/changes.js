@@ -43,7 +43,7 @@ import { LINE_WORDS } from './alerts.js';
 
 /** The subjects a line can be about, as the table allows them. */
 export const SUBJECTS = Object.freeze([
-  'garage', 'lane', 'computer', 'reader', 'payment_account', 'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'unknown',
+  'garage', 'lane', 'computer', 'reader', 'payment_account', 'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'stay', 'unknown',
 ]);
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -126,6 +126,15 @@ export function assertNoCredential(line, secrets = []) {
  */
 export function context(req, secrets = []) {
   return { tenantId: req.tenantId, actor: req.actor, count: 0, unchanged: false, secrets: secrets.filter(Boolean), private: [] };
+}
+
+/**
+ * The platform itself as who made a change (0035): a stay an operator ended
+ * as abandoned from the command line (`stay.abandon`). No id and no name. A
+ * stay superseded because a lane saw the car come in again is not a line.
+ */
+export function platformContext(tenantId) {
+  return { tenantId, actor: { kind: 'platform', id: null, name: null }, count: 0, unchanged: false, secrets: [], private: [] };
 }
 
 /** A value as one string, its keys in order: two values that say the same are the same string. */

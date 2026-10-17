@@ -103,7 +103,8 @@ export async function closedStays(client, tenantId, garageId, { from, to, limit,
   const { rows } = await client.query(
     `SELECT s.id, to_json(s.exit_at) #>> '{}' AS exit_key,
             s.entry_at, s.exit_at, s.fee_minor, s.subtotal_minor, s.currency, s.exit_outcome,
-            (s.pricing_refusal IS NOT NULL) AS pricing_refused, s.occupancy_at_entry_bp
+            (s.pricing_refusal IS NOT NULL) AS pricing_refused, s.occupancy_at_entry_bp,
+            s.ended->>'reason' AS ended
        FROM sessions s
       WHERE s.tenant_id = $1 AND s.garage_id = $2
         AND s.exit_at >= $3 AND s.exit_at < $4
@@ -124,7 +125,8 @@ export async function closedStays(client, tenantId, garageId, { from, to, limit,
  * The fields of a past stay, and only those. `exit_outcome` is null on a stay
  * priced by the old hourly rate, before outcomes were named (0015);
  * `fee_minor` is null on a covered stay and on one the engine refused to price
- * (`pricing_refused`), which is not a stay that paid nothing.
+ * (`pricing_refused`), which is not a stay that paid nothing -- and on one the
+ * platform ended (`ended`), whose exit nothing saw.
  */
 function present(row) {
   return {
@@ -137,5 +139,8 @@ function present(row) {
     pricing_refused: row.pricing_refused,
     // How full the garage was when the car came in (0034), or null.
     occupancy_at_entry_bp: row.occupancy_at_entry_bp,
+    // Why the platform ended the stay, when no exit closed it (0035):
+    // 'superseded' or 'abandoned', with no fee and no outcome; or null.
+    ended: row.ended,
   };
 }

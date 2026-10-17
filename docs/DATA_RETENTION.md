@@ -187,6 +187,29 @@ nothing was added to the schema that the purge does not already reach: a stay
 travels only while it is open, and an open stay's vehicle is never redacted
 (above).
 
+**Added with migration 0035:** `pending_exits` keeps a close that found no stay
+to close, for the open it belongs to. It names its vehicle by id, like a
+session, and carries what the exit lane sent: the exit's time and
+confirmation, and possibly its descriptor, the lane's decision and what the
+reader showed — the last three can describe a car or name who it was. When the
+purge redacts the vehicle it nulls those three on the vehicle's kept exits, and
+keeps the row (never deleted: it is the record that the close arrived):
+
+```
+pending_exits.exit_descriptor -> NULL
+pending_exits.local_decision  -> NULL
+pending_exits.reader_shown    -> NULL
+(exit_at, exit_confirmation, close_event_id, the lane: kept)
+```
+
+A stay the platform ends (`sessions.ended`, superseded or abandoned) is a
+closed stay like any other here: it no longer holds its vehicle back from the
+purge, as an open stay does, and its `exit_at` starts the window. The
+`stay_ended` and `ended_stay_closed` events carry session ids, not a plate, and
+are append-only like every event; the change-log line for an abandoned stay
+names the stay by its id and no vehicle (the database refuses a name on it). A
+superseded stay has no change-log line.
+
 ## No real data in this repository
 
 Separate rule, same spirit. The repository — code, docs, tests, fixtures —

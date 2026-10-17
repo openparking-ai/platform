@@ -93,6 +93,23 @@ export const TENANT_TABLES = [
       ),
   },
   {
+    table: 'pending_exits',
+    // A close kept before its open (0035): each its own vehicle and close
+    // event, so rows collide with nothing but a policy. Updated only by the
+    // purge, never deleted.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH v AS (
+           INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'P-' || gen_random_uuid()) RETURNING id
+         )
+         INSERT INTO pending_exits (tenant_id, garage_id, vehicle_id, lane_id, close_event_id, exit_at, exit_confirmation)
+         SELECT $1, $2, v.id, $3, gen_random_uuid()::text, now(), 'confirmed' FROM v
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    noDelete: true,
+  },
+  {
     table: 'shadow_searches',
     // Each row closes its own stay, and the unique key is the close event, so
     // rows do not collide with anything but a policy.

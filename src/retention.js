@@ -124,6 +124,15 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
             AND sh.session_id IN (SELECT s.id FROM sessions s WHERE s.vehicle_id = ANY($2::uuid[]))`,
         [tenantId, rows.map((r) => r.id), now],
       );
+      // A kept exit of those vehicles (0035): its descriptor, the lane's
+      // decision and what the reader showed, which can name who, nulled. Its
+      // time and confirmation are kept, as a stay's are.
+      await client.query(
+        `UPDATE pending_exits SET exit_descriptor = NULL, local_decision = NULL, reader_shown = NULL
+          WHERE tenant_id = $1 AND vehicle_id = ANY($2::uuid[])
+            AND (exit_descriptor IS NOT NULL OR local_decision IS NOT NULL OR reader_shown IS NOT NULL)`,
+        [tenantId, rows.map((r) => r.id)],
+      );
     }
     return { tenantId, retentionDays: days, redacted: rows.length, wouldRedact: rows.length };
   });

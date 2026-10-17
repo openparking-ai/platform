@@ -112,7 +112,7 @@ test('remove: a lane that was never used goes; one with a stay, a computer, a ca
     assert.equal(await snapshot(a.tenant), before, `${kind}: nothing changed`);
   }
   const stay = await call(base, 'DELETE', `/lanes/${used.stay}`, { as: a });
-  assert.deepEqual(stay.json.details, { stays: 1, computers: 0, card_readers: 0, events: 0 });
+  assert.deepEqual(stay.json.details, { stays: 1, computers: 0, card_readers: 0, events: 0, kept_exits: 0 });
 });
 
 // --- check 5: closing -------------------------------------------------------------------
