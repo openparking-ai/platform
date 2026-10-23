@@ -16,11 +16,13 @@
  *
  * Unsigned senders are told apart by address: this app trusts the loopback
  * proxy, so each request names its address in X-Forwarded-For. Each test
- * uses addresses of its own, because a source's minute spans tests.
+ * uses addresses of its own, because a source's minute spans tests -- and
+ * runs: a second run on the same database within the minute would count its
+ * attempts on the first run's lines. So every run draws its own addresses.
  */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomInt } from 'node:crypto';
 import { Agent, request } from 'node:http';
 import pg from 'pg';
 import { pool } from './helpers.js';
@@ -29,6 +31,10 @@ import { owner, call, newGarage, newLane, linesOf } from './u4-world.js';
 
 const WINDOW_MS = 60_000;
 export const REFUSED_PER_MINUTE = 20;
+
+// This run's addresses, from the benchmarking range 198.18.0.0/15.
+const RUN = randomInt(512);
+const address = (n) => `198.${18 + (RUN >> 8)}.${RUN & 255}.${n}`;
 
 let server;
 let base;
@@ -86,6 +92,8 @@ async function hammer(count, make, width = 32) {
 const bound = (ms) => (Math.ceil(ms / WINDOW_MS) + 1) * (REFUSED_PER_MINUTE + 1);
 
 const owner_ = () => new pg.Client({ connectionString: process.env.DATABASE_URL });
+/** Now by the database's clock, which stamps the lines: this computer's may run ahead of it. */
+const dbNow = async () => (await pool.query('SELECT clock_timestamp() AS t')).rows[0].t;
 async function securityFrom(address, since) {
   const client = owner_();
   await client.connect();
@@ -97,12 +105,12 @@ async function securityFrom(address, since) {
 }
 
 test("2,000 refused requests from one unsigned sender, each naming a different id, and 2,000 naming the owner's real garage: none in the owner's log, a bounded number in the security log counting every one; the owner's changes on top", async () => {
-  const SOURCE = '203.0.113.7';
-  const OTHER = '198.51.100.9';
+  const SOURCE = address(7);
+  const OTHER = address(70);
   const g = await newGarage(base, a);
   const lane = await newLane(base, a, g.id, 'Hammered lane', 'entry');
   const linesBefore = (await linesOf(a.tenant)).length;
-  const since = new Date();
+  const since = await dbNow();
   const ms = await hammer(2_000, () => send('POST', `/lanes/${randomUUID()}/close`, { reason: 'full', message: 'x' }, SOURCE).then((s) => assert.equal(s, 401)))
     + await hammer(2_000, (i) => send('PATCH', i % 2 ? `/garages/${g.id}/x${i}` : `/lanes/${lane.id}`, { name: `Taken ${i}` }, SOURCE).then((s) => assert.ok(s === 401 || s === 404, String(s))));
   await hammer(200, () => send('POST', `/lanes/${randomUUID()}/close`, {}, OTHER), 8);
@@ -123,7 +131,7 @@ test("2,000 refused requests from one unsigned sender, each naming a different i
 });
 
 test("a signed-in caller's refused attempts are bounded the same way: in its own log across every id, and in another account's garage it aims at", async () => {
-  const SOURCE = '203.0.113.8';
+  const SOURCE = address(8);
   const theirs = await newGarage(base, b);
   // More of b's lanes than a minute's lines: each a different id to aim at.
   const lanes = [];
@@ -150,7 +158,7 @@ test("this account's own cancelled key, used again and again: in this account's 
   await withTenant(a.tenant, (c) => c.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash, revoked_at) VALUES ($1, 'Stolen key', $2, now())`, [a.tenant, hashToken(old)]));
   const sinceA = new Set((await linesOf(a.tenant)).map((l) => l.id));
   const sinceB = new Set((await linesOf(b.tenant)).map((l) => l.id));
-  const ms = await hammer(1_000, () => send('POST', `/lanes/${randomUUID()}/close`, { reason: 'full', message: 'x' }, '203.0.113.10', old).then((s) => assert.equal(s, 401)));
+  const ms = await hammer(1_000, () => send('POST', `/lanes/${randomUUID()}/close`, { reason: 'full', message: 'x' }, address(10), old).then((s) => assert.equal(s, 401)));
   const inA = (await linesOf(a.tenant)).filter((l) => !sinceA.has(l.id));
   assert.equal(inA.reduce((n, l) => n + l.attempts, 0), 1_000);
   assert.ok(inA.length <= bound(ms), `${inA.length} lines`);
@@ -159,8 +167,8 @@ test("this account's own cancelled key, used again and again: in this account's 
 });
 
 test('the same refused attempt repeated is still one line, counted', async () => {
-  const SOURCE = '203.0.113.9';
-  const since = new Date();
+  const SOURCE = address(9);
+  const since = await dbNow();
   await hammer(500, () => send('POST', '/garages', { name: 'Nobody', timezone: 'UTC', currency: 'USD' }, SOURCE).then((s) => assert.equal(s, 401)));
   const rows = await securityFrom(SOURCE, since);
   assert.equal(rows.length, 1);
