@@ -65,7 +65,8 @@
   },
   "dependencies": {
     "express": "^4.21.2",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "sharp": "0.35.5"
   },
   "devDependencies": {
     "eslint": "^9.17.0",

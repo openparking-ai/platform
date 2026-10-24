@@ -2019,7 +2019,8 @@ export function createApp() {
    * most PICTURE_MAX_BYTES; `event_id` is the lane's id of the entry record it
    * belongs to (a stay's open, a tailgater nobody identified, a banned car
    * refused); `picture_ref` is the lane's own id for it, so a resend is the
-   * same picture. Kept one week after the car left (src/bans.js).
+   * same picture. Kept one week after the car left, and only as it is once
+   * decoded and written fresh (src/bans.js).
    */
   lane.post('/pictures', async (req, res, next) => {
     try {
@@ -2043,8 +2044,13 @@ export function createApp() {
       }
       const contentType = bans.pictureType(image);
       if (!contentType) throw bad('image must be a JPEG or a PNG');
+      const fresh = await bans.freshPicture(image, contentType);
+      if (!fresh) throw bad(`image does not open as a JPEG or a PNG of at most ${bans.PICTURE_MAX_PIXELS} pixels`);
+      if (fresh.length > bans.PICTURE_MAX_BYTES) {
+        throw bad(`image is more than ${bans.PICTURE_MAX_BYTES} bytes once written fresh`);
+      }
       const { created } = await withTenant(tenantId, (client) =>
-        bans.storePicture(client, tenantId, { garageId, laneId, pictureRef, eventId, takenAt, contentType, image }));
+        bans.storePicture(client, tenantId, { garageId, laneId, pictureRef, eventId, takenAt, contentType, image: fresh }));
       res.status(created ? 201 : 200).json({ picture_ref: pictureRef, event_id: eventId, created });
     } catch (err) {
       next(err);

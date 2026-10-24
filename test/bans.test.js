@@ -16,7 +16,8 @@
  */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
+import sharp from 'sharp';
 import { createApp, WRITE_ROUTES, BODY_UNREADABLE } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
@@ -30,8 +31,10 @@ let base;
 let tenant;
 let operatorToken;
 
-const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
-const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 4, 5, 6]);
+// Real pictures: every one is decoded and written fresh when it arrives.
+const plain = (width, height) => sharp({ create: { width, height, channels: 3, background: { r: 180, g: 70, b: 30 } } });
+const PNG = await plain(64, 48).png().toBuffer();
+const JPEG = await plain(64, 48).jpeg().toBuffer();
 const DAY = 24 * 60 * 60 * 1000;
 
 async function issueToken(tenantId, laneId) {
@@ -88,6 +91,8 @@ const picture = (g, eventId, { takenAt = ago(2), image = PNG, ref = randomUUID()
   asLane(g.entry, '/pictures', { picture_ref: ref, event_id: eventId, taken_at: takenAt, image: image.toString('base64') });
 const pictureCount = (eventId) =>
   withTenant(tenant, async (c) => (await c.query('SELECT count(*)::int AS n FROM entry_pictures WHERE tenant_id = $1 AND event_id = $2', [tenant, eventId])).rows[0].n);
+const kept = (ref) =>
+  withTenant(tenant, async (c) => (await c.query('SELECT content_type, image FROM entry_pictures WHERE tenant_id = $1 AND picture_ref = $2', [tenant, ref])).rows[0]);
 /** The stay closed at the exit lane, as the lane closes it, at `at`. */
 const closeAt = async (g, stay, at) => {
   const res = await asLane(g.exit, '/sessions/close', { event_id: randomUUID(), plate: stay.plate, exit_at: at, exit_confirmation: 'confirmed' });
@@ -136,9 +141,10 @@ test('1. a picture is kept by its entry: a JPEG or a PNG by its bytes, a resend 
   const future = await picture(g, eventId, { takenAt: new Date(Date.now() + DAY).toISOString() });
   assert.equal(future.status, 409, 'taken in the future: the clock-skew refusal every lane time gets');
   assert.equal(await pictureCount(eventId), 1);
-  // The control: the stored bytes are the bytes sent, typed by their first bytes.
-  const row = await withTenant(tenant, async (c) => (await c.query('SELECT content_type, image FROM entry_pictures WHERE tenant_id = $1 AND picture_ref = $2', [tenant, ref])).rows[0]);
-  assert.deepEqual([row.content_type, Buffer.compare(row.image, JPEG)], ['image/jpeg', 0]);
+  // The control: the picture kept is the one sent, typed by its first bytes, at its size.
+  const row = await kept(ref);
+  const meta = await sharp(row.image).metadata();
+  assert.deepEqual([row.content_type, meta.format, meta.width, meta.height], ['image/jpeg', 'jpeg', 64, 48]);
 });
 
 test('1. A LANE BODY THAT IS NOT UTF-8 is refused before it is read, on the picture path and the others: nothing stored, and the same bodies in UTF-8 store', async () => {
@@ -176,6 +182,78 @@ test('1. A LANE BODY THAT IS NOT UTF-8 is refused before it is read, on the pict
   const good = await asLane(g.entry, '/pictures', { picture_ref: ref, event_id: eventId, taken_at: ago(2), image: Buffer.concat([JPEG, Buffer.alloc(3 * 1024 * 1024 - JPEG.length)]).toString('base64') });
   assert.equal(good.status, 201, await good.clone().text());
   assert.equal(await pictureCount(eventId), 1);
+});
+
+// Every picture is decoded and written fresh when it arrives: nothing but the
+// image is kept, at most 2560 px on its longer side. The sizes are written out,
+// never read from the constant under test.
+test('1. a JPEG carrying EXIF and HTML after its end is kept as its image alone', async () => {
+  const g = await garage();
+  const { eventId } = await openStay(g);
+  const tagged = await sharp(await plain(640, 480).jpeg().toBuffer())
+    .withExif({ IFD0: { ImageDescription: 'EXIF-PLANTED-4417', Make: 'PlantedLane' } }).jpeg().toBuffer();
+  const planted = Buffer.concat([tagged, Buffer.from('<html><script>alert("planted")</script></html>')]);
+  assert.ok(planted.includes('EXIF-PLANTED-4417') && planted.includes('<html>'), 'the plant carries both');
+  const ref = randomUUID();
+  const sent = await picture(g, eventId, { ref, image: planted });
+  assert.equal(sent.status, 201, await sent.clone().text());
+  const { image } = await kept(ref);
+  assert.ok(!image.includes('<html') && !image.includes('alert('), 'no HTML kept');
+  assert.ok(!image.includes('EXIF-PLANTED-4417') && !image.includes('PlantedLane') && !image.includes('Exif'), 'no EXIF kept');
+  const meta = await sharp(image).metadata();
+  assert.deepEqual([meta.format, meta.exif, meta.width, meta.height], ['jpeg', undefined, 640, 480]);
+});
+
+test('1. control: a clean JPEG keeps its size', async () => {
+  const g = await garage();
+  const { eventId } = await openStay(g);
+  const ref = randomUUID();
+  const sent = await picture(g, eventId, { ref, image: await plain(1920, 1080).jpeg().toBuffer() });
+  assert.equal(sent.status, 201, await sent.clone().text());
+  const meta = await sharp((await kept(ref)).image).metadata();
+  assert.deepEqual({ format: meta.format, width: meta.width, height: meta.height }, { format: 'jpeg', width: 1920, height: 1080 });
+});
+
+test('1. a picture wider than 2560 px is kept 2560 px wide; one turned by its EXIF is kept turned upright', async () => {
+  const g = await garage();
+  const { eventId } = await openStay(g);
+  const wide = randomUUID();
+  assert.equal((await picture(g, eventId, { ref: wide, image: await plain(4000, 1000).jpeg().toBuffer() })).status, 201);
+  const wideMeta = await sharp((await kept(wide)).image).metadata();
+  assert.deepEqual([wideMeta.width, wideMeta.height], [2560, 640]);
+  const turned = randomUUID();
+  const sideways = await sharp(await plain(640, 480).jpeg().toBuffer()).withMetadata({ orientation: 6 }).jpeg().toBuffer();
+  assert.equal((await picture(g, eventId, { ref: turned, image: sideways })).status, 201);
+  const upright = await sharp((await kept(turned)).image).metadata();
+  assert.deepEqual({ width: upright.width, height: upright.height }, { width: 480, height: 640 }, 'stood upright');
+  assert.equal(upright.orientation, undefined, 'the EXIF turn was applied, not kept');
+});
+
+test('1. a picture that does not open, or opens to more than 40 million pixels, is refused and nothing is kept', async () => {
+  const g = await garage();
+  const { eventId } = await openStay(g);
+  const broken = await picture(g, eventId, { image: Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), randomBytes(2000)]) });
+  assert.equal(broken.status, 400, await broken.clone().text());
+  assert.match((await broken.json()).error, /does not open/);
+  // 7000 x 7000: 49 million pixels in a small file.
+  const bomb = await plain(7000, 7000).png({ compressionLevel: 9 }).toBuffer();
+  assert.ok(bomb.length < 3 * 1024 * 1024, `the bomb is under the byte limit (${bomb.length})`);
+  const refused = await picture(g, eventId, { image: bomb });
+  assert.equal(refused.status, 400, await refused.clone().text());
+  assert.equal(await pictureCount(eventId), 0, 'nothing kept');
+});
+
+test('1. a picture over 3 MiB once written fresh is refused by name, not failed: the table holds at most 3 MiB', async () => {
+  const g = await garage();
+  const { eventId } = await openStay(g);
+  // A palette PNG of noise: under the limit as sent, three times the size as full colour.
+  const side = 1700;
+  const noise = await sharp(randomBytes(side * side * 3), { raw: { width: side, height: side, channels: 3 } }).png({ palette: true }).toBuffer();
+  assert.ok(noise.length < 3 * 1024 * 1024, `under the limit as sent (${noise.length})`);
+  const sent = await picture(g, eventId, { image: noise });
+  assert.equal(sent.status, 400, await sent.clone().text());
+  assert.match((await sent.json()).error, /once written fresh/);
+  assert.equal(await pictureCount(eventId), 0, 'nothing kept');
 });
 
 test('1. ONE WEEK AFTER THE CAR LEFT: kept while inside, kept six and a half days after the exit, gone seven and a half days after; a picture no stay holds goes a week after it was taken', async () => {
@@ -297,7 +375,8 @@ test('5. A LISTED CAR IS KEPT WHOLE, AND A REMOVED ONE AGES OUT: the pictures an
   const shown = await op('GET', `/garages/${g.id}/banned/${car.id}/pictures/${car.pictures[0].id}`);
   assert.equal(shown.status, 200);
   assert.equal(shown.headers.get('content-type'), 'image/png');
-  assert.equal(Buffer.compare(Buffer.from(await shown.arrayBuffer()), PNG), 0);
+  const shownMeta = await sharp(Buffer.from(await shown.arrayBuffer())).metadata();
+  assert.deepEqual([shownMeta.format, shownMeta.width, shownMeta.height], ['png', 64, 48]);
 
   const removed = await op('POST', `/garages/${g.id}/banned/${car.id}/remove`);
   assert.equal(removed.status, 200, await removed.clone().text());
