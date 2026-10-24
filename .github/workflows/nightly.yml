@@ -1,0 +1,252 @@
+name: Nightly fail-controls
+
+# The repository-wide fail-controls, on main, once a night, and nothing else:
+# ci.yml's three control jobs -- the ones that take seconds (`suite`'s, here
+# `quick-controls`), `controls` and the 8 `sign-in-control` shards -- with the
+# same commands and shards, without the suite, the purge and the lint. What
+# each control breaks is said beside it in ci.yml. `same-controls` is red when
+# ci.yml runs a control this file does not, or this file one ci.yml does not.
+#
+# By hand: Actions, "Nightly fail-controls", Run workflow (on main).
+
+on:
+  schedule:
+    # 02:17 UTC every night.
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PGPASSWORD: postgres
+  SUPERUSER_URL: postgres://postgres:postgres@localhost:5432
+  DATABASE_URL: postgres://openparking_owner:ci_owner_password@localhost:5432/openparking_test
+  APP_DATABASE_URL: postgres://openparking_app:ci_password@localhost:5432/openparking_test
+  APP_DB_PASSWORD: ci_password
+
+jobs:
+  same-controls:
+    name: same-controls
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: The comparison can fail (self-test)
+        run: node .github/scripts/check-nightly-controls.js --self-test
+      - name: Every control ci.yml runs is run here, and none it does not
+        run: node .github/scripts/check-nightly-controls.js
+
+  quick-controls:
+    name: quick-controls
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: ./.github/actions/test-environment
+
+      - name: The suite runs with no Stripe Connect configured
+        run: |
+          for v in STRIPE_API_KEY STRIPE_API_BASE CONNECT_RETURN_URL CONNECT_REFRESH_URL; do
+            if [ -n "$(printenv "$v")" ]; then echo "$v is set; the suite must run without Connect"; exit 1; fi
+          done
+          echo "no Connect setting present"
+
+      - name: The suite runs with no validations door named
+        run: |
+          if [ -n "$(printenv VALIDATIONS_DOOR)" ]; then echo "VALIDATIONS_DOOR is set; the suite must run without it"; exit 1; fi
+          echo "no validations door named"
+
+      - name: RLS fail-control
+        run: npm run rls-fail-control
+      - name: Schema-gate fail-control
+        run: npm run schema-gate-control
+      - name: Devices-and-codes fail-control
+        run: npm run devices-and-codes-fail-control
+      - name: Ticket-identity fail-control
+        run: npm run ticket-identity-fail-control
+      - name: Descriptor fail-control
+        run: npm run descriptor-fail-control
+      - name: Shadow-run fail-control
+        run: npm run shadow-fail-control
+      - name: Rate-plans fail-control
+        run: npm run rate-plans-fail-control
+      - name: Pricing fail-control
+        run: npm run pricing-fail-control
+      - name: Activation-gate fail-control
+        run: npm run activation-fail-control
+      - name: Rules-payload fail-control
+        run: npm run rules-payload-fail-control
+      - name: Lane-decided-close fail-control
+        run: npm run lane-decided-close-fail-control
+      - name: Lane-decision-sweep fail-control
+        run: npm run lane-decision-sweep-fail-control
+      - name: Garage-reads fail-control
+        run: npm run garage-reads-fail-control
+      - name: Past-stays fail-control
+        run: npm run past-stays-fail-control
+      - name: Fill-rule fail-control
+        run: npm run fill-rule-fail-control
+      - name: Pictures-and-bans fail-control
+        run: npm run bans-fail-control
+      - name: Rates-and-open fail-control
+        run: npm run rates-and-open-fail-control
+      - name: Owner-language fail-control
+        run: npm run owner-language-fail-control
+      - name: Lane-reader fail-control
+        run: npm run lane-reader-fail-control
+      - name: Standalone-arm fail-control
+        run: npm run standalone-arm-fail-control
+      - name: Tax-on-the-stay fail-control
+        run: npm run tax-on-paid-fail-control
+      - name: A test file whose before throws ends red, not hung
+        run: npm run hanging-hooks-control
+
+  controls:
+    name: controls
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: ./.github/actions/test-environment
+
+      - name: The suite runs with no Stripe Connect configured
+        run: |
+          for v in STRIPE_API_KEY STRIPE_API_BASE CONNECT_RETURN_URL CONNECT_REFRESH_URL; do
+            if [ -n "$(printenv "$v")" ]; then echo "$v is set; the suite must run without Connect"; exit 1; fi
+          done
+          echo "no Connect setting present"
+
+      - name: The suite runs with no validations door named
+        run: |
+          if [ -n "$(printenv VALIDATIONS_DOOR)" ]; then echo "VALIDATIONS_DOOR is set; the suite must run without it"; exit 1; fi
+          echo "no validations door named"
+
+      - name: Exit-outcomes fail-control
+        run: npm run exit-outcomes-fail-control
+      - name: Validations fail-control
+        run: npm run validations-fail-control
+      - name: Validations-door fail-control
+        run: npm run validations-door-fail-control
+      - name: Stripe-account fail-control
+        run: npm run stripe-account-fail-control
+      - name: Taxes fail-control
+        run: npm run taxes-fail-control
+      - name: Setup fail-control
+        run: npm run setup-fail-control
+      - name: Alerts fail-control
+        run: npm run alerts-fail-control
+      - name: Board fail-control
+        run: npm run board-fail-control
+      - name: Account-links fail-control
+        run: npm run account-links-fail-control
+      - name: Garage-checks fail-control
+        run: npm run garage-checks-fail-control
+      - name: Database-restart fail-control
+        run: npm run db-restart-fail-control
+
+  sign-in-control:
+    name: sign-in-control (${{ matrix.shard }}/8)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: ./.github/actions/test-environment
+
+      - name: The suite runs with no Stripe Connect configured
+        run: |
+          for v in STRIPE_API_KEY STRIPE_API_BASE CONNECT_RETURN_URL CONNECT_REFRESH_URL; do
+            if [ -n "$(printenv "$v")" ]; then echo "$v is set; the suite must run without Connect"; exit 1; fi
+          done
+          echo "no Connect setting present"
+
+      - name: The suite runs with no validations door named
+        run: |
+          if [ -n "$(printenv VALIDATIONS_DOOR)" ]; then echo "VALIDATIONS_DOOR is set; the suite must run without it"; exit 1; fi
+          echo "no validations door named"
+
+      - name: Owner sign-in fail-control
+        run: npm run owner-sign-in-fail-control -- --shard ${{ matrix.shard }}/8
+
+      - name: Owner sign-in fail-control, this shard's report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sign-in-control-shard-${{ matrix.shard }}
+          path: sign-in-control-shard-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+          overwrite: true
+
+  nightly:
+    # Green only when every job above is, and the sign-in shards add up to one
+    # whole run: every break exactly once.
+    name: nightly
+    if: always()
+    needs: [same-controls, quick-controls, controls, sign-in-control]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every control job passed
+        env:
+          SAME_CONTROLS: ${{ needs.same-controls.result }}
+          QUICK_CONTROLS: ${{ needs.quick-controls.result }}
+          CONTROLS: ${{ needs.controls.result }}
+          SIGN_IN_CONTROL: ${{ needs.sign-in-control.result }}
+        run: |
+          echo "same-controls: $SAME_CONTROLS, quick-controls: $QUICK_CONTROLS, controls: $CONTROLS, sign-in-control: $SIGN_IN_CONTROL"
+          [ "$SAME_CONTROLS" = success ] && [ "$QUICK_CONTROLS" = success ] && [ "$CONTROLS" = success ] && [ "$SIGN_IN_CONTROL" = success ]
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sign-in-control-shard-*
+          merge-multiple: true
+          path: sign-in-control-shards
+      - name: Owner sign-in fail-control, every break exactly once
+        run: node scripts/owner-sign-in-fail-control.js --verify sign-in-control-shards
