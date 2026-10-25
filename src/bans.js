@@ -15,13 +15,64 @@
  * when a lane loads its list: this garage, or every garage of the account.
  * A lane matches a car against the list by its descriptor (the OPA ID), the
  * way the exit search compares them. Removing a ban deletes the row.
+ *
+ * WRITTEN FRESH. Every picture is decoded and written again, as the type it
+ * came in, before it is kept: what a lane sent beside the image -- EXIF,
+ * comments, bytes after its end -- is never kept or shown to the owner. It is
+ * turned upright as its EXIF said and kept at most PICTURE_MAX_SIDE pixels on
+ * its longer side.
  */
+import sharp from 'sharp';
 
 /** How long a picture is kept after the car left. His answer: one week. */
 export const PICTURE_DAYS = 7;
 
 /** The largest picture a lane may send, in bytes, as the table holds it. */
 export const PICTURE_MAX_BYTES = 3 * 1024 * 1024;
+
+/** The longer side a picture is kept at, at most: lane cameras send 1920 to 2688 wide, and a plate reads at 2560. */
+export const PICTURE_MAX_SIDE = 2560;
+
+/** The most pixels a lane picture may decode to (8000 by 5000). Its header is read first: a few bytes can declare a vast image. */
+export const PICTURE_MAX_PIXELS = 40_000_000;
+
+sharp.cache(false);
+sharp.concurrency(1);
+
+// One picture decoded at a time, whatever the number of lanes sending: a
+// picture may open to PICTURE_MAX_PIXELS x 4 bytes (160 MB), and libuv's pool
+// would otherwise decode four at once. sharp.concurrency(1) alone only keeps
+// each decode to one thread.
+let decodeQueue = Promise.resolve();
+const decodes = { now: 0, waiting: 0 };
+
+/** How many pictures are being decoded now (0 or 1), and how many wait their turn. */
+export const decoding = () => ({ ...decodes });
+
+/**
+ * The picture decoded and written fresh as `contentType` (image/jpeg or
+ * image/png): the image alone, upright, at most PICTURE_MAX_SIDE on a side.
+ * Null when the bytes do not open as a picture of at most PICTURE_MAX_PIXELS.
+ */
+export function freshPicture(bytes, contentType) {
+  decodes.waiting += 1;
+  const turn = decodeQueue.then(async () => {
+    decodes.waiting -= 1;
+    decodes.now += 1;
+    try {
+      const image = sharp(bytes, { failOn: 'error', limitInputPixels: PICTURE_MAX_PIXELS })
+        .rotate()
+        .resize({ width: PICTURE_MAX_SIDE, height: PICTURE_MAX_SIDE, fit: 'inside', withoutEnlargement: true });
+      return await (contentType === 'image/png' ? image.png() : image.jpeg({ quality: 90 })).toBuffer();
+    } catch {
+      return null;
+    } finally {
+      decodes.now -= 1;
+    }
+  });
+  decodeQueue = turn;
+  return turn;
+}
 
 /** The picture's type, from its first bytes -- never from what the sender says. */
 export function pictureType(bytes) {
