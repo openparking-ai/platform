@@ -22,6 +22,7 @@ import test, { before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { writeStandInState } from './fixtures/validations-door/state.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../src/app.js';
@@ -120,11 +121,11 @@ async function garage() {
 // --- the stand-in's state and what it was asked ------------------------------------------
 
 function setState(state) {
-  writeFileSync(STATE, JSON.stringify({ mode: 'normal', garages: {}, ...state }));
+  writeStandInState(STATE, { mode: 'normal', garages: {}, ...state });
 }
 const readState = () => JSON.parse(readFileSync(STATE, 'utf8'));
 function setMode(mode) {
-  writeFileSync(STATE, JSON.stringify({ ...readState(), mode }));
+  writeStandInState(STATE, { ...readState(), mode });
 }
 const calls = () => readFileSync(LOG, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
 const validation = (over = {}) => ({
@@ -502,7 +503,7 @@ test('REVERSE: a release the module made whose bookkeeping here did not finish i
     `UPDATE sessions SET validation = validation || '{"state":"releasing","releasing_at":"2026-09-10T13:00:00.000Z","released_by":"sweep"}'::jsonb WHERE id = $1`, [a]));
   const st = readState();
   st.garages[`${g.link.tenant_id}/${g.link.garage_id}`][0].claimed_ref = null;
-  writeFileSync(STATE, JSON.stringify(st));
+  writeStandInState(STATE, st);
 
   const second = plate('RVS2');
   const b = await opened(g, second);
@@ -530,7 +531,7 @@ test('A3: the sweep\'s release arrives AFTER the driver claimed again -- it cann
   // The hold is past its window; the sweep begins its release, and the door is slow.
   await withTenant(tenant, (c) => c.query(
     `UPDATE sessions SET validation = validation || '{"held_at":"2026-09-10T12:00:00.000Z"}'::jsonb WHERE id = $1`, [a]));
-  writeFileSync(STATE, JSON.stringify({ ...readState(), release_delay_once_ms: 1500 }));
+  writeStandInState(STATE, { ...readState(), release_delay_once_ms: 1500 });
   const sweeping = releaseStaleHolds(tenant, { holdMinutes: 30 });
   for (let i = 0; i < 50 && (await rowFor(a)).validation.state !== 'releasing'; i += 1) await new Promise((r) => setTimeout(r, 20));
   assert.equal((await rowFor(a)).validation.state, 'releasing', 'the sweep has begun its release');
@@ -564,7 +565,7 @@ test('A3: a new attempt whose release of the old claim failed still names the ol
   assert.equal((await (await claimAt(g.exit, id, PHONE, priced(id))).json()).validation.outcome, 'held');
   const claimA = (await rowFor(id)).validation.claim_id;
   // Claimed again on another fee: the old claim must be given back first, and the door cannot.
-  writeFileSync(STATE, JSON.stringify({ ...readState(), fail_release_once: true }));
+  writeStandInState(STATE, { ...readState(), fail_release_once: true });
   const later = priced(id, { feeMinor: 750, exitAt: '2026-09-10T15:00:00+00:00' });
   assert.equal((await claimAt(g.exit, id, PHONE, later)).status >= 500, true);
   const left = (await rowFor(id)).validation;
@@ -601,7 +602,7 @@ test('a claim the platform failed to hold is asked on: already_claimed is answer
   const id = await opened(g, car);
   const state = readState();
   state.garages[`${g.link.tenant_id}/${g.link.garage_id}`][0].claimed_ref = id;
-  writeFileSync(STATE, JSON.stringify(state));
+  writeStandInState(STATE, state);
   const out = (await (await claimAt(g.exit, id, PHONE, priced(id))).json()).validation;
   assert.equal(out.outcome, 'held');
   assert.equal((await rowFor(id)).validation.claimed.answer.replay, true);

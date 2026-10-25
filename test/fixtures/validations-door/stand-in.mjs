@@ -27,7 +27,8 @@
  * Every call is appended to VALIDATIONS_STANDIN_LOG as one JSON line
  * {argv, stdin}, so a test can see what arrived where.
  */
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
+import { writeStandInState } from './state.js';
 
 const statePath = process.env.VALIDATIONS_STANDIN_STATE;
 const logPath = process.env.VALIDATIONS_STANDIN_LOG;
@@ -67,14 +68,14 @@ if (!list) {
 if (verb === 'release-in-store') {
   if (state.fail_release_once) {
     delete state.fail_release_once;
-    writeFileSync(statePath, JSON.stringify(state));
+    writeStandInState(statePath, state);
     process.stderr.write('the database refused: SQLSTATE 57P01: terminating connection\n');
     process.exit(2);
   }
   if (state.release_delay_once_ms) {
     const ms = state.release_delay_once_ms;
     delete state.release_delay_once_ms;
-    writeFileSync(statePath, JSON.stringify(state));
+    writeStandInState(statePath, state);
     await new Promise((r) => setTimeout(r, ms));
     Object.assign(state, JSON.parse(readFileSync(statePath, 'utf8')));
   }
@@ -95,7 +96,7 @@ if (verb === 'release-in-store') {
   }
   held.claimed_ref = null;
   held.claim_id = null;
-  writeFileSync(statePath, JSON.stringify(state));
+  writeStandInState(statePath, state);
   print({ outcome: 'released', validation_id: 1, live_again: true });
   process.exit(0);
 }
@@ -141,7 +142,7 @@ if (verb === 'claim-in-store') {
   if (replayed) {
     // A replay under a new claim id re-names the claim: the newest attempt owns it.
     replayed.claim_id = args['--claim'];
-    writeFileSync(statePath, JSON.stringify(state));
+    writeStandInState(statePath, state);
     print(answer(replayed, true));
     process.exit(0);
   }
@@ -151,7 +152,7 @@ if (verb === 'claim-in-store') {
   }
   live.claimed_ref = args['--ref'];
   live.claim_id = args['--claim'];
-  writeFileSync(statePath, JSON.stringify(state));
+  writeStandInState(statePath, state);
   print(answer(live, false));
   process.exit(0);
 }
