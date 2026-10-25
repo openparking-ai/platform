@@ -37,21 +37,41 @@ export const PICTURE_MAX_SIDE = 2560;
 export const PICTURE_MAX_PIXELS = 40_000_000;
 
 sharp.cache(false);
+sharp.concurrency(1);
+
+// One picture decoded at a time, whatever the number of lanes sending: a
+// picture may open to PICTURE_MAX_PIXELS x 4 bytes (160 MB), and libuv's pool
+// would otherwise decode four at once. sharp.concurrency(1) alone only keeps
+// each decode to one thread.
+let decodeQueue = Promise.resolve();
+const decodes = { now: 0, waiting: 0 };
+
+/** How many pictures are being decoded now (0 or 1), and how many wait their turn. */
+export const decoding = () => ({ ...decodes });
 
 /**
  * The picture decoded and written fresh as `contentType` (image/jpeg or
  * image/png): the image alone, upright, at most PICTURE_MAX_SIDE on a side.
  * Null when the bytes do not open as a picture of at most PICTURE_MAX_PIXELS.
  */
-export async function freshPicture(bytes, contentType) {
-  try {
-    const image = sharp(bytes, { failOn: 'error', limitInputPixels: PICTURE_MAX_PIXELS })
-      .rotate()
-      .resize({ width: PICTURE_MAX_SIDE, height: PICTURE_MAX_SIDE, fit: 'inside', withoutEnlargement: true });
-    return await (contentType === 'image/png' ? image.png() : image.jpeg({ quality: 90 })).toBuffer();
-  } catch {
-    return null;
-  }
+export function freshPicture(bytes, contentType) {
+  decodes.waiting += 1;
+  const turn = decodeQueue.then(async () => {
+    decodes.waiting -= 1;
+    decodes.now += 1;
+    try {
+      const image = sharp(bytes, { failOn: 'error', limitInputPixels: PICTURE_MAX_PIXELS })
+        .rotate()
+        .resize({ width: PICTURE_MAX_SIDE, height: PICTURE_MAX_SIDE, fit: 'inside', withoutEnlargement: true });
+      return await (contentType === 'image/png' ? image.png() : image.jpeg({ quality: 90 })).toBuffer();
+    } catch {
+      return null;
+    } finally {
+      decodes.now -= 1;
+    }
+  });
+  decodeQueue = turn;
+  return turn;
 }
 
 /** The picture's type, from its first bytes -- never from what the sender says. */

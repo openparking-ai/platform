@@ -708,10 +708,14 @@ export function createApp() {
   // one (src/utf8Body.js): refused before it is decoded, never stored as U+FFFD.
   const json = express.json({ limit: '1mb', verify: verifyUtf8 });
   // A lane's picture (U7f) is the one larger body: up to PICTURE_MAX_BYTES,
-  // base64 in JSON. Every other path keeps the one limit.
+  // base64 in JSON, read by its route after the device token (below), so a
+  // body from no known device is never read. Every other path keeps the one
+  // limit.
   const pictureJson = express.json({ limit: '5mb', verify: verifyUtf8 });
-  app.use((req, res, next) => (req.path === '/api/v1/lane/pictures' ? pictureJson : json)(
-    req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined)));
+  const readPicture = (req, res, next) => pictureJson(
+    req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined));
+  app.use((req, res, next) => (req.path === '/api/v1/lane/pictures' ? next() : json(
+    req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined))));
 
   // Says whether the database answers NOW: 503 while it cannot be reached, 200
   // again when it can, with no restart between.
@@ -1696,7 +1700,7 @@ export function createApp() {
   const lane = express.Router();
   checkIds(lane, ID_PARAMS.lane);
 
-  lane.use(async (req, _res, next) => {
+  lane.use(async (req, res, next) => {
     try {
       const token = bearerFrom(req.get('authorization'));
       if (!token) throw new HttpError(401, 'device token required');
@@ -1718,6 +1722,9 @@ export function createApp() {
       pool.query('SELECT touch_lane_device($1)', [req.device.deviceId]).catch(() => {});
       next();
     } catch (err) {
+      // A picture's body is still unread here: closing the connection keeps
+      // the rest of it from being taken in.
+      if (req.path === '/pictures') res.set('Connection', 'close');
       next(err);
     }
   });
@@ -2022,7 +2029,7 @@ export function createApp() {
    * same picture. Kept one week after the car left, and only as it is once
    * decoded and written fresh (src/bans.js).
    */
-  lane.post('/pictures', async (req, res, next) => {
+  lane.post('/pictures', readPicture, async (req, res, next) => {
     try {
       const { tenantId, garageId, laneId } = req.device;
       const body = req.body ?? {};

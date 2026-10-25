@@ -16,13 +16,14 @@
  */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import { createApp, WRITE_ROUTES, BODY_UNREADABLE } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
-import { removeExpiredPictures } from '../src/bans.js';
+import { removeExpiredPictures, decoding } from '../src/bans.js';
 import { redactExpiredVehicles } from '../src/retention.js';
 
 let engine;
@@ -408,4 +409,133 @@ test('6. NO CAR IS LISTED BY HAND: no route writes to the list but the one that 
   const banned = WRITE_ROUTES.filter(([, path]) => path.includes('/banned'));
   // The control: the same search finds the remove route.
   assert.deepEqual(banned, [['POST', '/garages/:garageId/banned/:banId/remove', 'garage.banned_car_remove']]);
+});
+
+/**
+ * POST `size` bytes declared to the lane's picture route as `token`, written
+ * in 64 KB pieces; only `sendFirst` of them, the rest held back. Settles with
+ * the answer; with `{ cut }` if the server closed the connection while it was
+ * still writing; or with `{ status: null }` if neither comes within `waitMs`.
+ */
+function pictureUpload(token, size, { sendFirst = size, waitMs = 5_000 } = {}) {
+  return new Promise((resolve) => {
+    const url = new URL('/api/v1/lane/pictures', base);
+    let done = false;
+    const finish = (out) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      req.destroy();
+      resolve(out);
+    };
+    const req = http.request({
+      host: url.hostname, port: url.port, path: url.pathname, method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-length': size, authorization: `Bearer ${token}` },
+    }, (res) => {
+      let text = '';
+      res.on('data', (c) => { text += c; });
+      res.on('end', () => finish({ status: res.statusCode, connection: res.headers.connection, text }));
+    });
+    req.on('error', (err) => finish({ status: null, cut: err.code }));
+    const timer = setTimeout(() => finish({ status: null }), waitMs);
+    const piece = Buffer.alloc(64 * 1024, 0x41);
+    let sent = 0;
+    const pump = () => {
+      while (sent < sendFirst && !done) {
+        const n = Math.min(piece.length, sendFirst - sent);
+        sent += n;
+        if (!req.write(piece.subarray(0, n))) return req.once('drain', pump);
+      }
+      if (sent >= size && !done) req.end();
+    };
+    pump();
+  });
+}
+
+/** The most the process's buffers rose above where they stood, while `work` ran: sampled every millisecond. */
+async function buffersRise(work) {
+  const start = process.memoryUsage().arrayBuffers;
+  let peak = start;
+  const sample = setInterval(() => { peak = Math.max(peak, process.memoryUsage().arrayBuffers); }, 1);
+  try {
+    const out = await work();
+    peak = Math.max(peak, process.memoryUsage().arrayBuffers);
+    return { rise: peak - start, out };
+  } finally {
+    clearInterval(sample);
+  }
+}
+
+test('A15 a picture body from no known device is never read: refused before it is sent in full, and the server holds none of it', async () => {
+  const g = await garage('Unread');
+  const NEAR_LIMIT = 5 * 1024 * 1024 - 1024;
+
+  // Refused while most of the body is still unsent: the route did not wait for it.
+  const early = await pictureUpload(generateDeviceToken(), NEAR_LIMIT, { sendFirst: 256 * 1024 });
+  assert.equal(early.status, 401, `refused with 4.75 MB still unsent ${JSON.stringify(early)}`);
+  assert.equal(early.connection, 'close', 'and the connection closed, so the rest is never taken in');
+  assert.match(early.text, /unknown or revoked device token/);
+
+  // Control: a known device's picture route waits for its body, as it must to read the picture.
+  const known = await pictureUpload(g.entry, NEAR_LIMIT, { sendFirst: 256 * 1024, waitMs: 1_000 });
+  assert.equal(known.status, null, 'a known device is answered only once its body is in');
+
+  // Sent in full: the server's buffers do not rise by the body's size.
+  const unknown = await buffersRise(() => pictureUpload(generateDeviceToken(), NEAR_LIMIT));
+  // Refused either way: the answer is read, or -- the writer still sending
+  // when the server closes -- the connection is cut under it first.
+  assert.ok(unknown.out.status === 401 || ['ECONNRESET', 'EPIPE'].includes(unknown.out.cut), JSON.stringify(unknown.out));
+  // Control: the same body from a known device is read whole (and then refused as not JSON).
+  const read = await buffersRise(() => pictureUpload(g.entry, NEAR_LIMIT));
+  assert.equal(read.out.status, 400, JSON.stringify(read.out));
+  assert.deepEqual(JSON.parse(read.out.text), BODY_UNREADABLE);
+  console.log(`  buffers rose ${(unknown.rise / 1024).toFixed(0)} KB for an unknown device's ${(NEAR_LIMIT / 1024).toFixed(0)} KB (${unknown.out.status ?? unknown.out.cut}), ${(read.rise / 1024).toFixed(0)} KB for a known one's`);
+  assert.ok(read.rise >= NEAR_LIMIT, `the measure sees a body read: ${read.rise} bytes`);
+  assert.ok(unknown.rise < NEAR_LIMIT / 4, `an unknown device's body is not held: ${unknown.rise} bytes`);
+});
+
+test('A15 twenty lanes sending pictures at once: decoded one after another, and /healthz answers throughout', async () => {
+  const g = await garage('Twenty');
+  const tokens = [];
+  for (let i = 0; i < 20; i += 1) tokens.push(await issueToken(tenant, i % 2 ? g.exitLane : g.entryLane));
+  const noisy = () => sharp({ create: { width: 1200, height: 900, channels: 3, noise: { type: 'gaussian', mean: 128, sigma: 40 } } }).jpeg({ quality: 80 }).toBuffer();
+  const shots = await Promise.all(tokens.map(noisy));
+  let most = 0;
+  let mostWaiting = 0;
+  let mostInSharp = 0;
+  const sample = setInterval(() => {
+    const now = decoding();
+    most = Math.max(most, now.now);
+    mostWaiting = Math.max(mostWaiting, now.waiting);
+    mostInSharp = Math.max(mostInSharp, sharp.counters().process);
+  }, 1);
+  // /healthz asked every 100 ms while the pictures go in: each answer and when
+  // it came. The server shares this thread, so a stalled server is a gap.
+  const health = [];
+  const answeredAt = [performance.now()];
+  let answers;
+  try {
+    const all = Promise.all(tokens.map((token, i) => asLane(token, '/pictures', {
+      picture_ref: `twenty-${i}-${randomUUID()}`, event_id: randomUUID(), taken_at: ago(0.01), image: shots[i].toString('base64'),
+    }).then((r) => r.status)));
+    let over = false;
+    all.finally(() => { over = true; });
+    while (!over) {
+      health.push(await fetch(`${base}/healthz`).then((h) => h.status, (err) => `failed: ${err.cause?.code ?? err.message}`));
+      answeredAt.push(performance.now());
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    answers = await all;
+  } finally {
+    clearInterval(sample);
+  }
+  const silence = Math.max(...answeredAt.slice(1).map((t, i) => t - answeredAt[i]));
+  assert.deepEqual(answers, tokens.map(() => 201), 'every picture kept');
+  console.log(`  decoded at once at most ${most} (sharp: ${mostInSharp}); at most ${mostWaiting} waiting; /healthz silent at most ${Math.round(silence)} ms`);
+  assert.equal(most, 1, 'one picture decoded at a time');
+  assert.ok(mostInSharp <= 1, `sharp itself never had two at once: ${mostInSharp}`);
+  assert.ok(mostWaiting >= 2, `they did arrive together and wait their turn: ${mostWaiting}`);
+  assert.ok(health.length > 0 && health.every((s) => s === 200), JSON.stringify(health));
+  assert.ok(silence < 1_000, `the server went ${Math.round(silence)} ms without answering`);
+  assert.deepEqual(decoding(), { now: 0, waiting: 0 });
 });
