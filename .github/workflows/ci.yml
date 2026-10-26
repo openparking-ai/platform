@@ -508,6 +508,18 @@ jobs:
         # and its suite must go red.
         run: npm run account-links-fail-control
 
+      - name: Linked-accounts fail-control
+        # 0035: passkeys for the admin, people from a linked accounts module,
+        # a permission on every operator route, and "done by". The door is
+        # named by ACCOUNTS_DOOR alone and checked before the port opens; the
+        # password goes on stdin; could-not-decide lets nobody in; a session
+        # asks the module again and ends on another version or tenant; a
+        # passkey challenge works once and for whoever asked; every passkey
+        # refusal is one answer; a person reaches only their permissions and
+        # garages; only a key's line names anyone beside it. Each property is
+        # broken in turn and the suites must go red.
+        run: npm run linked-accounts-fail-control
+
       - name: Garage-checks fail-control
         # U7d-1: a new garage's time zone, currency and name, each refused in a
         # plain sentence before the database ("Mars/Olympus", "usd", "XYZ", a
