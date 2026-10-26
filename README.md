@@ -584,13 +584,16 @@ account-links-fail-control` breaks each one in turn.
 never the only one. The admin adds, names, lists and removes their own, behind
 their session (WebAuthn, through `@simplewebauthn/server`; migration 0035):
 
-    POST   /api/v1/auth/passkeys/options     ->  200 the creation options (a challenge)
-    POST   /api/v1/auth/passkeys             {name, response}  ->  201 {passkey: {id, name, created_at, last_used_at}}
+    POST   /api/v1/auth/passkeys/options     ->  200 {challenge_id, options}  (the creation options)
+    POST   /api/v1/auth/passkeys             {challenge_id, name, response}  ->  201 {passkey: {id, name, created_at, last_used_at}}
     GET    /api/v1/auth/passkeys             ->  200 {passkeys: [...]}
     POST   /api/v1/auth/passkeys/rename      {id, name}        ->  200 {passkey}
     POST   /api/v1/auth/passkeys/remove      {id}              ->  204
-    POST   /api/v1/auth/passkey/options      ->  200 the request options (no session needed)
-    POST   /api/v1/auth/passkey/sign-in      {response}        ->  200 as sign-in answers, and the cookie
+    POST   /api/v1/auth/passkey/options      ->  200 {challenge_id, options}  (no session needed)
+    POST   /api/v1/auth/passkey/sign-in      {challenge_id, response}  ->  200 as sign-in answers, and the cookie
+
+`options` is the WebAuthn options JSON, binary fields base64url; `response` is the
+browser's answer in the same form (`PublicKeyCredential.toJSON()`).
 
 **One relying party.** `PASSKEY_RP_ID` is a domain, and it must be the host of
 every origin in `PASSKEY_ORIGINS` or a domain above it (`example.com` for
