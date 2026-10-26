@@ -578,6 +578,144 @@ link.
 each of these, against a stand-in for the email service; `npm run
 account-links-fail-control` breaks each one in turn.
 
+### Passkeys for the admin
+
+**A passkey is optional**, and the password stays: a passkey is a second way in,
+never the only one. The admin adds, names, lists and removes their own, behind
+their session (WebAuthn, through `@simplewebauthn/server`; migration 0035):
+
+    POST   /api/v1/auth/passkeys/options     ->  200 the creation options (a challenge)
+    POST   /api/v1/auth/passkeys             {name, response}  ->  201 {passkey: {id, name, created_at, last_used_at}}
+    GET    /api/v1/auth/passkeys             ->  200 {passkeys: [...]}
+    PATCH  /api/v1/auth/passkeys/<id>        {name}            ->  200 {passkey}
+    DELETE /api/v1/auth/passkeys/<id>        ->  204
+    POST   /api/v1/auth/passkey/options      ->  200 the request options (no session needed)
+    POST   /api/v1/auth/passkey/sign-in      {response}        ->  200 as sign-in answers, and the cookie
+
+**One relying party.** `PASSKEY_RP_ID` is a domain, and it must be the host of
+every origin in `PASSKEY_ORIGINS` or a domain above it (`example.com` for
+`https://admin.example.com`); `serve` refuses any other. So one passkey works on
+every site of the deployment that shares that domain. `PASSKEY_ORIGINS` is a
+comma-separated list of origins, `ADMIN_ORIGIN` when unset. With no
+`PASSKEY_RP_ID`, passkeys are off and every passkey route answers `409
+passkeys_not_configured`.
+
+**A challenge works once**, for five minutes, held in this process: a deployment
+of more than one process must send a passkey's two steps to the same one, or the
+second is refused as if the challenge had ended. **A passkey's counter must go
+up** with every use (or stay 0 on an authenticator that keeps none): one that
+does not is a copied key and is refused, `401 passkey_refused`, and the
+passkey's own counter is not moved. A passkey sign-in keeps sign-in's floor, its
+per-address attempt limit and its `Origin` rule. Its refusals are one: an
+unknown passkey, a signature that does not check and a copied key answer the
+same. A password reset keeps the admin's passkeys; a passkey whose admin is
+removed goes with them. Adding and removing one is a line in the change log
+(`passkey.add`, `passkey.remove`), with its name, never its key.
+
+### Linked accounts: people beside the admin
+
+The admin is the only account this repository keeps. **A deployment may link a
+module that keeps other people** — managers, people who look after the money,
+people who look after one garage — and this platform asks it who they are,
+exactly as it asks a validations module about a validation: through a door the
+deployment names, never by importing anything of it.
+
+**`ACCOUNTS_DOOR` names it**, a bare command name found in `ENTITLEMENT_BIN_DIR`
+or on the PATH, and **there is no default. Unset means only the one admin**,
+exactly as before: no door is ever run, and a sign-in for any other email is
+refused as an unknown email is. The module's own database address is the
+module's, in the environment it is given; a password goes to it on **stdin,
+never argv**. It answers JSON on stdout, and **its exit status is the answer**:
+
+    <door> sign-in                              < {"email", "password"}
+        0  {"person", "tenant", "email", "name", "language", "garages": "all" | [ids],
+            "permissions": [...], "version"}
+        1  {"refused": true}      no such person, a wrong password, or nobody the dashboard is for
+    <door> who --tenant T --person P
+        0  the same as sign-in    1  {"gone": true}
+    <door> passkey --credential C
+        0  {"person", "tenant", "public_key", "counter", "transports"}    1  {"unknown": true}
+    <door> passkey-used --credential C --counter N
+        0  {"counter": N}         1  {"refused": true}   (the counter did not go up)
+    2  could not decide: words on stderr, nothing to read on stdout
+
+`version` changes whenever the person's garages, permissions or password change.
+Anything but these shapes, a door that cannot be run or does not answer within
+15 seconds, and exit 2 are all **could not decide**: the sign-in is refused, `503
+sign_in_undecided` ("Sign-in could not be checked just now. Try again in a
+moment."), and **nobody is let in**.
+
+**Sign-in asks the admin first.** An email that is not the admin's, with the door
+named, goes to the door; the door's refusal is the same `401 sign_in_refused`,
+byte for byte, held to the same floor. **The per-address lock covers door
+sign-ins**: ten refusals for one email from one address lock that address out of
+that email for 30 minutes, kept by a hash of the email (`linked_sign_in_locks`),
+and a locked address does not reach the door. A permission the door names that
+is not in the list below, a garage that is not an id, or a tenant this platform
+does not have, is could-not-decide, never a smaller session.
+
+**The session keeps** who, the tenant, the garages, the permissions and the
+version (`linked_sessions`; only the token's SHA-256), under sign-in's own idle
+and absolute ends and the same cookie. **It asks `who` again** when the last
+answer is older than `ACCOUNTS_RECHECK_SECONDS` (default 60, 10 to 900): a new
+version takes the new garages and permissions; `gone`, or another tenant, ends
+the session (`401 session_ended`); could-not-decide refuses the request, `503
+accounts_undecided`, and runs nothing, until the door answers again. A linked
+person's passkey is the module's: the passkey sign-in above asks `passkey` for an
+id this platform does not keep, checks the signature here, and records the use
+through `passkey-used` before it asks `who` and signs in.
+
+A linked person's change-log lines name them by the email the module gave
+(`actor_kind` `linked`). Their language comes from the module; `PUT
+/api/v1/auth/language` changes it for that session only.
+
+### Permissions: one on every operator route
+
+**Every operator route names exactly one permission**, and a request whose
+session does not hold it is refused `403 permission_refused` before the route
+runs. The list is this platform's own, each a `read` or a `change` (`change`
+includes `read`):
+
+    garages   the garages, their setup, alerts, the board, banned cars
+    rates     rate plans, taxes, the board's prices
+    lanes     lanes, their computers, closing and reopening
+    payments  the garage's own Stripe account, its location and card readers
+    money     takings and the reconciliation
+    refunds   giving money back
+    payouts   the payouts view
+    account   the account itself, its keys
+    inventory walks through a garage and what they saw
+    stays     open and past stays, ending a stuck one
+    log       the change log and refused attempts
+
+**The admin and every operator key hold all of them**, at every garage, so
+nothing an admin or a key does today changes. A linked person holds what the
+module says. **A route about a garage** — its id in the path, or a lane or a
+computer of it — **also checks that garage is in the session's list**, and one
+that is not answers what an id naming nothing answers (`404`), so a list never
+says what lies outside it. `GET /api/v1/garages` lists only the session's
+garages; making a garage needs `garages:change` and every garage. A test walks
+every route the operator router has and fails if one names no permission, or
+one that is not in the list.
+
+`GET /api/v1/auth/me` says who: `{kind: "admin" | "linked", email, name,
+tenant_id, session_ends_at, language, permissions, garages: "all" | [ids]}`.
+
+### Done by
+
+**An operator key may say who, in plain words, is acting through it**: an
+`X-Done-By` header, the person's name percent-encoded as UTF-8, 1 to 80
+characters after it is decoded, with no control characters (`400 done_by_refused`
+otherwise). It is kept on the change-log line of what the request changes, and
+read back with it (`done_by`). **It is never trusted for anything else**: the
+key's permissions are the key's, whatever name is given, and on a session the
+header is not read: the line names the person signed in.
+
+`test/linked-accounts.test.js`, `test/passkeys.test.js` and
+`test/permissions.test.js` hold each of these, against a stand-in for the door
+(`test/fixtures/accounts-door`); `npm run linked-accounts-fail-control` breaks
+each one in turn.
+
 ### The owner's reads
 
 What the owner's screens read, behind the session or a key, tenant-scoped in
