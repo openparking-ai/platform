@@ -689,8 +689,9 @@ test('THE READ: changes newest first, the garage and the account, paged; refused
   const times = first.json.changes.map((c) => Date.parse(c.at));
   assert.deepEqual(times, [...times].sort((x, y) => y - x), 'newest first');
   assert.deepEqual(first.json.changes[0].after, { name: 'Paged 54' });
-  assert.deepEqual(Object.keys(first.json.changes[0]).sort(), ['action', 'after', 'at', 'attempts', 'before', 'garage_id', 'id', 'last_at', 'outcome', 'refusal', 'subject', 'who']);
+  assert.deepEqual(Object.keys(first.json.changes[0]).sort(), ['action', 'after', 'at', 'attempts', 'before', 'done_by', 'garage_id', 'id', 'last_at', 'outcome', 'refusal', 'subject', 'who']);
   assert.deepEqual(first.json.changes[0].who, { kind: 'owner', name: a.email });
+  assert.equal(first.json.changes[0].done_by, null, 'a cookie session names nobody beside itself');
   const second = await call(base, 'GET', `/garages/${g.id}/changes/${first.json.next}`, { as: a });
   assert.equal(second.status, 200);
   const seen = new Set(first.json.changes.map((c) => c.id));

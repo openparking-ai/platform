@@ -587,8 +587,8 @@ their session (WebAuthn, through `@simplewebauthn/server`; migration 0035):
     POST   /api/v1/auth/passkeys/options     ->  200 the creation options (a challenge)
     POST   /api/v1/auth/passkeys             {name, response}  ->  201 {passkey: {id, name, created_at, last_used_at}}
     GET    /api/v1/auth/passkeys             ->  200 {passkeys: [...]}
-    PATCH  /api/v1/auth/passkeys/<id>        {name}            ->  200 {passkey}
-    DELETE /api/v1/auth/passkeys/<id>        ->  204
+    POST   /api/v1/auth/passkeys/rename      {id, name}        ->  200 {passkey}
+    POST   /api/v1/auth/passkeys/remove      {id}              ->  204
     POST   /api/v1/auth/passkey/options      ->  200 the request options (no session needed)
     POST   /api/v1/auth/passkey/sign-in      {response}        ->  200 as sign-in answers, and the cookie
 

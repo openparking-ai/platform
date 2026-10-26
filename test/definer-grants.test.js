@@ -84,6 +84,8 @@ test('every caller still works: the application role runs each definer the way t
   await pool.query('SELECT touch_operator_token($1)', [randomUUID()]);
   assert.deepEqual((await pool.query('SELECT * FROM resolve_operator_session($1, $2)', ['0'.repeat(64), 1800])).rows, []);
   assert.deepEqual((await pool.query('SELECT * FROM resolve_operator_user($1)', ['nobody-definer@example.com'])).rows, []);
+  assert.deepEqual((await pool.query('SELECT * FROM resolve_operator_passkey($1)', ['A'.repeat(22)])).rows, []);
+  assert.deepEqual((await pool.query('SELECT * FROM resolve_linked_session($1, $2)', ['0'.repeat(64), 1800])).rows, []);
   assert.deepEqual((await pool.query('SELECT * FROM resolve_lane_device($1)', ['0'.repeat(64)])).rows, []);
   await pool.query('SELECT touch_lane_device($1)', [randomUUID()]);
   assert.ok(Array.isArray((await pool.query('SELECT tenant_id FROM list_tenant_ids_for_maintenance()')).rows));

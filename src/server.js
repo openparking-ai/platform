@@ -6,6 +6,7 @@ import { readAuthSettings } from './signIn.js';
 import { assertCanSend, readEmailSettings } from './email.js';
 import { assertStartSettings } from './startSettings.js';
 import { assertValidationsDoor } from './validations.js';
+import { assertAccountsDoor, doorConfigured as accountsDoorConfigured } from './accountsDoor.js';
 
 // Before the port opens, not after. A service that starts and then discovers it
 // is behind has already served requests, and the requests it served are the
@@ -20,6 +21,7 @@ let port;
 try {
   ({ PORT: port } = assertStartSettings());
   assertValidationsDoor();
+  assertAccountsDoor();
   await assertSchemaCurrent();
 } catch (err) {
   console.error(`[platform] REFUSING TO SERVE: ${err.message}`);
@@ -47,6 +49,8 @@ if (!auth.cookieSecure) {
 if (auth.adminOrigin === null) {
   console.log('[platform] owner sign-in is off: ADMIN_ORIGIN is not set');
 }
+if (auth.passkeys === null) console.log('[platform] passkeys are off: PASSKEY_RP_ID is not set');
+if (!accountsDoorConfigured()) console.log('[platform] only the admin signs in: ACCOUNTS_DOOR is not set');
 
 // Email (0032) the same way: a setting that is not one of its forms refuses to
 // start, and so does a key file that is named and cannot be read -- found now,

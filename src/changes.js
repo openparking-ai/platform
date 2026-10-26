@@ -43,7 +43,7 @@ import { LINE_WORDS } from './alerts.js';
 
 /** The subjects a line can be about, as the table allows them. */
 export const SUBJECTS = Object.freeze([
-  'garage', 'lane', 'computer', 'reader', 'payment_account', 'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'unknown',
+  'garage', 'lane', 'computer', 'reader', 'payment_account', 'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'passkey', 'unknown',
 ]);
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -120,12 +120,17 @@ export function assertNoCredential(line, secrets = []) {
 }
 
 /**
- * Who is asking, as the operator middleware found them. An owner is named by
- * the email they signed in with; a key by the name it was issued under, read
- * when the first line is written.
+ * Who is asking, as the operator middleware found them. An owner, and a
+ * person from a linked accounts module, is named by the email they signed in
+ * with; a key by the name it was issued under, read when the first line is
+ * written. A key may also say who acted through it (`doneBy`, src/doneBy.js),
+ * kept beside the line and nothing more.
  */
 export function context(req, secrets = []) {
-  return { tenantId: req.tenantId, actor: req.actor, count: 0, unchanged: false, secrets: secrets.filter(Boolean), private: [] };
+  return {
+    tenantId: req.tenantId, actor: req.actor, doneBy: req.actor?.kind === 'key' ? req.doneBy ?? null : null,
+    count: 0, unchanged: false, secrets: secrets.filter(Boolean), private: [],
+  };
 }
 
 /** A value as one string, its keys in order: two values that say the same are the same string. */
@@ -155,8 +160,8 @@ export const internals = {
   async insert(client, row) {
     await client.query(
       `INSERT INTO garage_changes (tenant_id, garage_id, outcome, actor_kind, actor_id, actor_name,
-                                   action, subject_kind, subject_id, subject_name, before, after)
-       VALUES ($1, $2, 'done', $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+                                   action, subject_kind, subject_id, subject_name, before, after, done_by)
+       VALUES ($1, $2, 'done', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       row,
     );
   },
@@ -195,6 +200,7 @@ export async function record(client, ctx, { garageId = null, action, subject, be
     subject.name === null || subject.name === undefined ? null : String(subject.name).slice(0, 300),
     before === null ? null : JSON.stringify(before),
     after === null ? null : JSON.stringify(after),
+    actor.kind === 'key' ? ctx.doneBy ?? null : null,
   ]);
   ctx.count += 1;
 }
@@ -269,7 +275,7 @@ export async function refused(req, err, { action, request: said, credential, cre
       credential,
       actor ? actor.kind : 'nobody',
       actor ? actor.id : null,
-      actor && actor.kind === 'owner' ? actor.name : null,
+      actor && (actor.kind === 'owner' || actor.kind === 'linked') ? actor.name : null,
       target.kind,
       target.id,
       action,
@@ -307,7 +313,7 @@ export async function linesForGarage(client, tenantId, garageId, { outcome = 'do
   }
   // A person to tell is named as they are now; one removed has no name.
   const { rows } = await client.query(
-    `SELECT gc.id, gc.garage_id, gc.at, gc.outcome, gc.actor_kind, gc.actor_name, gc.action, gc.subject_kind, gc.subject_id,
+    `SELECT gc.id, gc.garage_id, gc.at, gc.outcome, gc.actor_kind, gc.actor_name, gc.done_by, gc.action, gc.subject_kind, gc.subject_id,
             CASE WHEN gc.subject_kind = 'alert_contact' THEN ac.name ELSE gc.subject_name END AS subject_name,
             (gc.subject_kind = 'alert_contact' AND ac.id IS NULL) AS subject_removed,
             gc.before, gc.after, gc.refusal, gc.attempts, gc.last_at

@@ -624,13 +624,18 @@ test('A GET never changes anything: every operator GET, cookie-authenticated fro
 
 test('NO CREDENTIAL IN A URL: no auth route has a path parameter, and the auth code reads no query', async () => {
   const auth = routeTable(main.app).filter((r) => r.base === '/api/v1/auth');
-  // Sign-in's four, and the four doors behind an emailed link (0032, test/account-links.test.js).
+  // Sign-in's four, the four doors behind an emailed link (0032, test/account-links.test.js),
+  // and the passkeys' seven (0035, test/passkeys.test.js).
   assert.deepEqual(auth.map((r) => `${r.method} ${r.path}`).sort(), [
-    'GET /me', 'POST /forgot', 'POST /invite/accept', 'POST /invite/status', 'POST /reset', 'POST /sign-in', 'POST /sign-out', 'PUT /language',
+    'GET /me', 'GET /passkeys', 'POST /forgot', 'POST /invite/accept', 'POST /invite/status',
+    'POST /passkey/options', 'POST /passkey/sign-in', 'POST /passkeys', 'POST /passkeys/options', 'POST /passkeys/remove', 'POST /passkeys/rename',
+    'POST /reset', 'POST /sign-in', 'POST /sign-out', 'PUT /language',
   ]);
   for (const r of auth) assert.equal(r.path.includes(':'), false, `${r.method} ${r.path}`);
-  const source = readFileSync(new URL('../src/signIn.js', import.meta.url), 'utf8');
-  assert.equal(/req\.(query|params)\b/.test(source), false, 'src/signIn.js reads req.query or req.params');
+  for (const file of ['../src/signIn.js', '../src/passkeys.js', '../src/linkedAccounts.js']) {
+    const source = readFileSync(new URL(file, import.meta.url), 'utf8');
+    assert.equal(/req\.(query|params)\b/.test(source), false, `${file} reads req.query or req.params`);
+  }
   // And behaviourally: credentials in the query sign nobody in.
   const who = await owner('si-url');
   const q = `?email=${encodeURIComponent(who.email)}&password=${encodeURIComponent(PASSWORD)}&token=x`;

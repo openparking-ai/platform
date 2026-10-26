@@ -1,7 +1,7 @@
 {
   "name": "@openparking-ai/platform",
   "version": "0.1.0",
-  "description": "Open Parking AI platform \u2014 multi-tenant parking server with Postgres row-level security",
+  "description": "Open Parking AI platform — multi-tenant parking server with Postgres row-level security",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "engines": {
@@ -54,6 +54,7 @@
     "alerts-fail-control": "node scripts/alerts-fail-control.js",
     "board-fail-control": "node scripts/board-fail-control.js",
     "account-links-fail-control": "node scripts/account-links-fail-control.js",
+    "linked-accounts-fail-control": "node scripts/linked-accounts-fail-control.js",
     "garage-checks-fail-control": "node scripts/garage-checks-fail-control.js",
     "db-restart-fail-control": "node scripts/db-restart-fail-control.js",
     "bans-fail-control": "node scripts/bans-fail-control.js",
@@ -64,6 +65,7 @@
     "check-no-sibling-names": "node .github/scripts/check-no-sibling-names.js"
   },
   "dependencies": {
+    "@simplewebauthn/server": "14.0.3",
     "express": "^4.21.2",
     "pg": "^8.13.1",
     "sharp": "0.35.5"
