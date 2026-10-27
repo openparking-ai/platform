@@ -2936,10 +2936,10 @@ export function createApp() {
       // or, for the driver's word, no stay at all.
       const exitId = exits.uuidField(req.body?.exit_id, 'exit_id');
       const { plate, ticketRef } = exitId ? { plate: null, ticketRef: null } : laneIdentity(req.body);
+      if (!closeEventId) throw bad('event_id is required');
       // WHO OPENED for a car with a case (0042): the authority a person at
       // the lane opened the barrier on, as the lane's vend names it.
       const letOutBy = exits.letOutByField(req.body?.let_out_by, exitId);
-      if (!closeEventId) throw bad('event_id is required');
       laneEventId(closeEventId);
       const exitConfirmation = confirmation(
         req.body?.exit_confirmation,
