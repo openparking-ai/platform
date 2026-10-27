@@ -34,6 +34,7 @@ import * as exitPicker from './exitPicker.js';
 import * as exitPayments from './exitPayments.js';
 import * as textReceipt from './textReceipt.js';
 import * as stuck from './stuckStays.js';
+import * as walks from './walks.js';
 import { connectConfig, StripeError, StripeUnreachable } from './stripe.js';
 import { garageCurrency, garageName, garageSpaces, garageTimezone } from './garageFields.js';
 import { verifyUtf8 } from './utf8Body.js';
@@ -98,6 +99,8 @@ export const ID_PARAMS = Object.freeze({
     pictureId: () => new HttpError(404, 'picture not found'),
     exitId: () => new HttpError(404, 'exit case not found', 'exit_not_found'),
     stayId: () => new HttpError(404, 'stay not found', 'stay_not_found'),
+    walkId: () => new HttpError(404, 'walk not found', 'walk_not_found'),
+    sightingId: () => new HttpError(404, 'sighting not found', 'sighting_not_found'),
   }),
   lane: Object.freeze({
     sessionId: () => conflict('stay_not_open', STAY_NOT_OPEN),
@@ -798,7 +801,10 @@ export function createApp() {
   const pictureJson = express.json({ limit: '5mb', verify: verifyUtf8 });
   const readPicture = (req, res, next) => pictureJson(
     req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined));
-  app.use((req, res, next) => (req.path === '/api/v1/lane/pictures' ? next() : json(
+  // A walk's sighting (0040) carries a phone's picture: the same larger body,
+  // read by its route after the operator token.
+  const WALK_SIGHTING = /^\/api\/v1\/garages\/[^/]+\/walks\/[^/]+\/sightings\/?$/i;
+  app.use((req, res, next) => (req.path === '/api/v1/lane/pictures' || WALK_SIGHTING.test(req.path) ? next() : json(
     req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined))));
 
   // Says whether the database answers NOW: 503 while it cannot be reached, 200
@@ -3407,17 +3413,23 @@ export function createApp() {
 
   /**
    * THE STAYS THAT LOOK STUCK (0039): this garage's open stays that came in
-   * at least `older_than_hours` ago (72 by default), oldest first, for a
-   * person to end. A read.
+   * at least `older_than_hours` ago (72 by default), and those the latest
+   * finished walk did not see (0040), oldest first, for a person to end. A
+   * read.
    */
   operator.get('/garages/:garageId/stays/stuck', async (req, res, next) => {
     try {
       const hours = stuck.olderThanHours(req.query.older_than_hours);
-      const stays = await withTenant(req.tenantId, async (client) => {
+      const { stays, facts } = await withTenant(req.tenantId, async (client) => {
         await ownGarage(client, req);
-        return stuck.stuckStays(client, req.tenantId, req.params.garageId, { hours });
+        const old = await stuck.stuckStays(client, req.tenantId, req.params.garageId, { hours });
+        const facts = await walks.walkFacts(client, req.tenantId, req.params.garageId);
+        const unseen = await stuck.openStaysAmong(client, req.tenantId, req.params.garageId, [...facts.notSeenLast],
+          new Set(old.map((r) => r.id)));
+        const all = [...old, ...unseen].sort((a, b) => a.entry_at - b.entry_at || (a.id < b.id ? -1 : 1));
+        return { stays: all, facts };
       });
-      res.json({ older_than_hours: hours, stays: stays.map(stuck.presentStuck) });
+      res.json({ older_than_hours: hours, stays: stays.map((r) => stuck.presentStuck(r, facts)) });
     } catch (err) {
       next(err);
     }
@@ -3468,6 +3480,193 @@ export function createApp() {
         return row;
       });
       res.json({ stay: stuck.presentEnded(ended) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * THE INVENTORY WALK (0040): a person walks the garage with a phone,
+   * photographs the cars parked there or types their plates, and the walk
+   * finishes into four lists, frozen. A picture is read by vehicle-id and
+   * not kept. Several walks may be open at a garage at once.
+   */
+  const walkActor = async (client, req) => {
+    const actor = await changes.who(client, req.change);
+    return `${actor.kind}:${actor.name ?? actor.id ?? ''}`.slice(0, 300);
+  };
+  const ownWalk = async (client, req, { lock = false } = {}) => {
+    const walk = await walks.getWalk(client, req.tenantId, req.params.garageId, req.params.walkId, { lock });
+    if (!walk) throw new HttpError(404, 'walk not found', 'walk_not_found');
+    return walk;
+  };
+  const walkFinished = () => conflict('walk_finished', 'this walk is finished: start another');
+
+  operator.post('/garages/:garageId/walks', async (req, res, next) => {
+    try {
+      const walk = await changeTx(req, async (client) => {
+        const garage = await ownGarage(client, req);
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`walks|${garage.id}`]);
+        if (await walks.openWalks(client, req.tenantId, garage.id) >= walks.WALK_OPEN_MAX) {
+          throw conflict('too_many_open_walks', `at most ${walks.WALK_OPEN_MAX} walks are open at a garage at once: finish one first`);
+        }
+        const row = await walks.startWalk(client, req.tenantId, garage.id, await walkActor(client, req));
+        await changes.record(client, req.change, {
+          garageId: garage.id,
+          action: 'walk.start',
+          subject: { kind: 'walk', id: row.id, name: null },
+          before: null,
+          after: { open: true },
+        });
+        return row;
+      });
+      res.status(201).json({ walk: { id: walk.id, started_at: walk.started_at } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  operator.post('/garages/:garageId/walks/:walkId/sightings', readPicture, async (req, res, next) => {
+    try {
+      const ask = walks.sightingRequest(req.body);
+      const takenAt = ask.takenAt === null ? new Date() : refuseFuture(parseTime(ask.takenAt, 'taken_at'), 'taken_at');
+      let image = null;
+      if (ask.picture !== null) {
+        const bytes = Buffer.from(ask.picture, 'base64');
+        const type = bytes.length > 0 && bytes.length <= bans.PICTURE_MAX_BYTES ? bans.pictureType(bytes) : null;
+        image = type ? await bans.freshPicture(bytes, type) : null;
+        if (!image || image.length > bans.PICTURE_MAX_BYTES) {
+          throw new HttpError(400, `picture must be a JPEG or a PNG of at most ${bans.PICTURE_MAX_BYTES} bytes that opens`, 'picture_invalid');
+        }
+      }
+      // Asked before the picture is read, so a sighting sent again is not read twice.
+      const kept = await withTenant(req.tenantId, async (client) => {
+        await ownGarage(client, req);
+        const walk = await ownWalk(client, req);
+        const replay = ask.clientRef ? await walks.sightingByRef(client, req.tenantId, walk.id, ask.clientRef) : null;
+        if (!replay && walk.finished_at) throw walkFinished();
+        return replay;
+      });
+      let read;
+      if (kept) {
+        read = null;
+      } else if (ask.plate !== null) {
+        read = walks.fromTyped(ask.plate);
+      } else {
+        const settings = walks.readerSettings();
+        if (!settings.on) {
+          read = walks.READER_OFF;
+        } else {
+          const answer = await walks.readPicture(settings, image, takenAt);
+          if (answer.refused) throw new HttpError(400, 'the plate reader could not open this picture', 'picture_invalid');
+          if (!answer.ok) {
+            throw new HttpError(503, 'the plate reader did not answer: nothing was kept, send the sighting again', 'reader_unanswered');
+          }
+          read = walks.fromRead(answer);
+        }
+      }
+      const { sighting, stays, created } = await changeTx(req, async (client) => {
+        const garage = await ownGarage(client, req);
+        const walk = await ownWalk(client, req, { lock: true });
+        const replay = ask.clientRef ? await walks.sightingByRef(client, req.tenantId, walk.id, ask.clientRef) : null;
+        const stays = await walks.staysDuring(client, req.tenantId, garage.id, walk.started_at);
+        if (replay) {
+          await changes.record(client, req.change, {
+            garageId: garage.id, action: 'walk.sighting', subject: { kind: 'walk', id: walk.id, name: null },
+            before: { sighting: replay.id }, after: { sighting: replay.id },
+          });
+          return { sighting: replay, stays, created: false };
+        }
+        if (walk.finished_at) throw walkFinished();
+        if (await walks.sightingCount(client, req.tenantId, walk.id) >= walks.SIGHTINGS_MAX) {
+          throw conflict('too_many_sightings', `a walk holds at most ${walks.SIGHTINGS_MAX} sightings: finish it and start another`);
+        }
+        if (ask.confirms) {
+          const earlier = await walks.getSighting(client, req.tenantId, walk.id, ask.confirms);
+          if (!earlier) throw new HttpError(400, 'confirms must be a sighting of this walk', 'confirms_invalid');
+          if (await walks.answered(client, req.tenantId, earlier.id)) {
+            throw conflict('sighting_already_confirmed', 'a later sighting already answers that one');
+          }
+        }
+        const found = walks.fit({ plate_state: read.characters?.state, plate_rule: read.characters?.rule,
+          plate_pattern: read.characters?.pattern }, stays.filter((s) => s.exit_at === null));
+        const row = await walks.addSighting(client, req.tenantId, walk.id, {
+          ...read, clientRef: ask.clientRef, confirms: ask.confirms, takenAt, candidates: found.candidates ?? [],
+          by: await walkActor(client, req),
+        });
+        await changes.record(client, req.change, {
+          garageId: garage.id, action: 'walk.sighting', subject: { kind: 'walk', id: walk.id, name: null },
+          before: null, after: { sighting: row.id, read: row.read, confirms: row.confirms },
+        });
+        return { sighting: row, stays, created: true };
+      });
+      res.status(created ? 201 : 200).json({ sighting: walks.presentSighting(sighting, stays) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  operator.post('/garages/:garageId/walks/:walkId/sightings/:sightingId/pick', async (req, res, next) => {
+    try {
+      const stayId = req.body?.stay;
+      const { sighting, stays } = await changeTx(req, async (client) => {
+        const garage = await ownGarage(client, req);
+        const walk = await ownWalk(client, req, { lock: true });
+        const found = await walks.getSighting(client, req.tenantId, walk.id, req.params.sightingId);
+        if (!found) throw new HttpError(404, 'sighting not found', 'sighting_not_found');
+        if (walk.finished_at) throw walkFinished();
+        if (typeof stayId !== 'string' || !found.candidates.includes(stayId)) {
+          throw new HttpError(400, "stay must be one of the sighting's candidates", 'stay_not_a_candidate');
+        }
+        const row = await walks.pickStay(client, req.tenantId, found.id, stayId);
+        await changes.record(client, req.change, {
+          garageId: garage.id, action: 'walk.pick', subject: { kind: 'walk', id: walk.id, name: null },
+          before: { sighting: found.id, picked_stay: found.picked_stay }, after: { sighting: row.id, picked_stay: row.picked_stay },
+        });
+        return { sighting: row, stays: await walks.staysDuring(client, req.tenantId, garage.id, walk.started_at) };
+      });
+      res.json({ sighting: walks.presentSighting(sighting, stays) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  operator.post('/garages/:garageId/walks/:walkId/finish', async (req, res, next) => {
+    try {
+      const walk = await changeTx(req, async (client) => {
+        const garage = await ownGarage(client, req);
+        const open = await ownWalk(client, req, { lock: true });
+        const subject = { kind: 'walk', id: open.id, name: null };
+        if (open.finished_at) {
+          await changes.record(client, req.change, {
+            garageId: garage.id, action: 'walk.finish', subject, before: { open: false }, after: { open: false },
+          });
+          return open;
+        }
+        const found = walks.lists(open, await walks.sightingsOf(client, req.tenantId, open.id),
+          await walks.staysDuring(client, req.tenantId, garage.id, open.started_at));
+        const row = await walks.finishWalk(client, req.tenantId, open.id, await walkActor(client, req), found);
+        await changes.record(client, req.change, {
+          garageId: garage.id, action: 'walk.finish', subject, before: { open: true },
+          after: { open: false, ...Object.fromEntries(walks.LISTS.map((l) => [l, found[l].length])) },
+        });
+        return row;
+      });
+      res.json({ walk: { id: walk.id, started_at: walk.started_at, finished_at: walk.finished_at, lists: walk.lists } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  operator.get('/garages/:garageId/walks/:walkId', async (req, res, next) => {
+    try {
+      const out = await withTenant(req.tenantId, async (client) => {
+        const garage = await ownGarage(client, req);
+        const walk = await ownWalk(client, req);
+        const sightings = await walks.sightingsOf(client, req.tenantId, walk.id);
+        return walks.presentWalk(walk, sightings, await walks.staysDuring(client, req.tenantId, garage.id, walk.started_at));
+      });
+      res.json({ walk: out });
     } catch (err) {
       next(err);
     }
@@ -4127,6 +4326,10 @@ export const WRITE_ROUTES = Object.freeze([
   ['POST', '/garages/:garageId/exits/:exitId/let-out', 'exit.let_out'],
   ['POST', '/garages/:garageId/exits/:exitId/pay', 'exit.payment_start'],
   ['POST', '/garages/:garageId/stays/:stayId/end', 'stay.end'],
+  ['POST', '/garages/:garageId/walks', 'walk.start'],
+  ['POST', '/garages/:garageId/walks/:walkId/sightings', 'walk.sighting'],
+  ['POST', '/garages/:garageId/walks/:walkId/sightings/:sightingId/pick', 'walk.pick'],
+  ['POST', '/garages/:garageId/walks/:walkId/finish', 'walk.finish'],
 ]);
 
 const WRITE_PATTERNS = WRITE_ROUTES.map(([method, path, action]) => [

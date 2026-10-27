@@ -12,9 +12,11 @@
  * own words on it, an event beside it and a line in the change log. Works
  * by the stay's id, so an unread stay ends like any other.
  *
- * "Not seen on recent walks" is read from the inventory walks once they
- * exist; until then every stay listed is listed for its age (`why: "old"`)
- * and `last_seen_on_walk` is null.
+ * "Not seen on recent walks" is read from the inventory walks (0040): a
+ * stay the garage's latest finished walk did not see is listed whatever its
+ * age (`why: "not_seen_on_walk"`), and `last_seen_on_walk` is when a
+ * finished walk last saw it. Any other stay is listed for its age
+ * (`why: "old"`).
  */
 import { HttpError } from './errors.js';
 
@@ -82,8 +84,30 @@ export async function stuckStays(client, tenantId, garageId, { hours, now = new 
   return rows;
 }
 
-/** A listed stay, in the shape the attendant's app reads. */
-export function presentStuck(r) {
+/**
+ * The garage's open stays among `ids` that the age list did not already
+ * hold, oldest first: the ones the latest walk did not see.
+ */
+export async function openStaysAmong(client, tenantId, garageId, ids, except) {
+  const wanted = ids.filter((id) => !except.has(id));
+  if (wanted.length === 0) return [];
+  const { rows } = await client.query(
+    `SELECT s.id, s.entry_at, s.entry_plate_pattern, v.plate, v.ticket_ref, v.unread_ref, l.name AS entry_lane,
+            EXISTS (SELECT 1 FROM exits x
+                     WHERE x.tenant_id = s.tenant_id AND x.session_id = s.id AND x.closed_at IS NULL) AS at_exit
+       FROM sessions s
+       JOIN vehicles v ON v.tenant_id = s.tenant_id AND v.id = s.vehicle_id
+       LEFT JOIN lanes l ON l.tenant_id = s.tenant_id AND l.id = s.entry_lane_id
+      WHERE s.tenant_id = $1 AND s.id = ANY($3::uuid[]) AND s.garage_id = $2 AND s.exit_at IS NULL
+      ORDER BY s.entry_at, s.id
+      LIMIT $4`,
+    [tenantId, garageId, wanted, STUCK_LIMIT],
+  );
+  return rows;
+}
+
+/** A listed stay, in the shape the attendant's app reads, with what the walks say of it. */
+export function presentStuck(r, walks = { lastSeen: new Map(), notSeenLast: new Set() }) {
   return {
     id: r.id,
     plate: r.plate ?? r.entry_plate_pattern ?? null,
@@ -93,8 +117,8 @@ export function presentStuck(r) {
     entered_at: r.entry_at,
     entry_lane: r.entry_lane ?? null,
     at_exit: r.at_exit,
-    last_seen_on_walk: null,
-    why: 'old',
+    last_seen_on_walk: walks.lastSeen.get(r.id) ?? null,
+    why: walks.notSeenLast.has(r.id) ? 'not_seen_on_walk' : 'old',
   };
 }
 

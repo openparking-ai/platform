@@ -1821,8 +1821,11 @@ plate could not be read. It is how a garage finds the stays no exit closed
 (see "Ending a stay no exit closed"): the stuck list reads the walks.
 
 Every route takes an operator token, acts at the garage in its path and
-refuses another tenant's garage or walk (`404`). Who did each step is the
-change's own "done by", kept on the walk and on each sighting.
+refuses another tenant's garage or walk, or a walk reached through another
+of its garages (`404 walk_not_found`). Who did each step is the change's own
+"done by", kept on the walk and on each sighting. Each change is one
+change-log line about the walk -- `walk.start`, `walk.sighting`,
+`walk.pick`, `walk.finish` -- that names no plate.
 
 - **Start** -- `POST /api/v1/garages/:garageId/walks {}` →
   `201 {walk: {id, started_at}}`. Several walks may be open at once (one per
@@ -1850,9 +1853,12 @@ change's own "done by", kept on the walk and on each sighting.
     earlier one leaves the lists; this one stands for it.
   - `taken_at`: when the picture was taken (not in the future); the time it
     arrived otherwise.
-  - Refused: `409 walk_finished` on a finished walk; `400 picture_invalid` for
-    a picture that does not open; `503 reader_unanswered` when vehicle-id did
-    not answer (nothing is kept: send it again).
+  - Refused: `409 walk_finished` on a finished walk; `409 too_many_sightings`
+    past 5000 on one walk; `400 confirms_invalid` for `confirms` that is not
+    a sighting of this walk and `409 sighting_already_confirmed` for one a
+    later sighting already answers; `400 picture_invalid` for a picture that
+    does not open; `503 reader_unanswered` when vehicle-id did not answer
+    (nothing is kept: send it again).
 
   `SIGHTING` is `{id, plate, read, why, readers, needs_confirmation,
   plate_characters, candidates, confirms, taken_at, added_by}` (`why`, on
@@ -1904,8 +1910,9 @@ walk last saw the stay, and a stay the garage's latest finished walk did not
 see is listed whatever its age, with `why: "not_seen_on_walk"`.
 
 The walks hold plates and are personal data: a walk is deleted with its
-sightings once it finished longer ago than the tenant's retention window
-(`retention_days`), in the same purge as the vehicles.
+sightings once it finished -- or, never finished, started -- longer ago
+than the tenant's retention window (`retention_days`), in the same purge as
+the vehicles.
 
 ## Deploying
 

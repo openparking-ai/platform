@@ -250,6 +250,18 @@ jobs:
         # 0039's guards, and requires test/stay-endings.test.js to go red.
         run: npm run stay-endings-fail-control
 
+      - name: Inventory walks fail-control
+        # Breaks the inventory walk (0040) one property at a time -- the cap
+        # on open walks, a walk reached only through its garage, a typed plate
+        # confirmed and folded, a picture written fresh, opened, taken whole
+        # and read by a named reader, the reader off or down, a sighting sent
+        # again kept and read once, the candidates and the pick, an answered
+        # sighting leaving the lists, the four lists and the finish frozen,
+        # the stuck list reading the latest walk, retention, a line naming no
+        # plate -- and six of 0040's guards, and requires test/walks.test.js
+        # to go red.
+        run: npm run walks-fail-control
+
       - name: Descriptor fail-control
         # A session carries the appearance descriptor its entry read produced
         # (migration 0009) and the one its exit read produced (0010). Each break

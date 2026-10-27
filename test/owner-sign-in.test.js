@@ -973,13 +973,18 @@ test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, not JSON, oversized or
   const changing = routeTable(main.app).filter((r) => r.base === '/api/v1' && r.method !== 'GET');
   // U4's 22, U4b's four people-to-tell writes and U4c's four board writes,
   // U7f's one, U7g's try: a POST that changes nothing but reads a body, and
-  // 0037's exit let out by a person.
-  assert.equal(changing.length, 35, `the walk found ${changing.length} non-GET operator routes`);
+  // 0037's exit let out by a person; 0040's four inventory walk writes.
+  const CHANGING_ROUTES = 39;
+  assert.equal(changing.length, CHANGING_ROUTES, `the walk found ${changing.length} non-GET operator routes`);
+  // A walk's sighting carries a phone's picture: its body may be 5 MB, so
+  // "oversized" is more than that there.
+  const pictureRoute = (r) => r.path === '/garages/:garageId/walks/:walkId/sightings';
+  const oversized = (r) => JSON.stringify({ name: `Echo-Me-Back${'x'.repeat((pictureRoute(r) ? 5 : 1) * 1024 * 1024)}` });
   const cases = [
     { name: 'malformed', raw: '{"name": "Echo-Me-Back", oops', headers: {}, status: 400, body: BODY_UNREADABLE },
     // The parser's own text for this one quotes what was sent.
     { name: 'not JSON', raw: 'Echo-Me-Back, not JSON at all', headers: {}, status: 400, body: BODY_UNREADABLE },
-    { name: 'oversized', raw: JSON.stringify({ name: `Echo-Me-Back${'x'.repeat(1024 * 1024)}` }), headers: {}, status: 413, body: BODY_TOO_LARGE },
+    { name: 'oversized', raw: null, headers: {}, status: 413, body: BODY_TOO_LARGE },
     { name: 'not gzip', raw: '{"name":"Echo-Me-Back"}', headers: { 'content-encoding': 'gzip' }, status: 400, body: BODY_UNREADABLE },
     { name: 'bad charset', raw: '{"name":"Echo-Me-Back"}', headers: { 'content-type': 'application/json; charset=koi8-r' }, status: 400, body: BODY_UNREADABLE },
     // Read lossily, a name with U+FFFD in it that nobody sent.
@@ -1002,7 +1007,7 @@ test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, not JSON, oversized or
       for (const c of cases) {
         for (const auth of [{ headers: { authorization: `Bearer ${key}` } }, { cookie: token, origin: ADMIN_ORIGIN, headers: {} }]) {
           const res = await call(main.base, r.method, path, {
-            ...auth, raw: c.raw, headers: { 'content-type': 'application/json', ...auth.headers, ...c.headers },
+            ...auth, raw: c.raw ?? oversized(r), headers: { 'content-type': 'application/json', ...auth.headers, ...c.headers },
           });
           answers += 1;
           const ok = res.status === c.status && res.text === JSON.stringify(c.body) && !res.text.includes('Echo-Me-Back')
@@ -1012,7 +1017,7 @@ test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, not JSON, oversized or
       }
     }
   }
-  assert.equal(answers, 35 * spellings.length * cases.length * 2);
+  assert.equal(answers, CHANGING_ROUTES * spellings.length * cases.length * 2);
   assert.deepEqual(wrong, []);
 });
 

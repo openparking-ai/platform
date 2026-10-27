@@ -101,6 +101,8 @@ function bodyFor(r, id) {
     'POST /garages/:garageId/tax-sets': { tax_set: { effective_from: '2026-01-01T00:00:00Z', rules: [] } },
     'POST /garages/:garageId/exits/:exitId/let-out': { reason: 'ids' },
     'POST /garages/:garageId/stays/:stayId/end': { outcome: 'abandoned', reason: 'ids' },
+    'POST /garages/:garageId/walks/:walkId/sightings': { plate: 'IDS123', confirmed: true },
+    'POST /garages/:garageId/walks/:walkId/sightings/:sightingId/pick': { stay: id },
     'POST /exits/:exitId/word': { entry_at: '2026-09-10T12:00:00Z' },
     'POST /exits/:exitId/receipt': { phone: '(202) 555-0143' },
     'POST /sessions/:sessionId/validation': {

@@ -389,6 +389,49 @@ export const TENANT_TABLES = [
       ),
   },
   {
+    table: 'walks',
+    insert: (c, t, w) =>
+      c.query(`INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, 'key:row') RETURNING id`, [t, w.garage]),
+  },
+  {
+    table: 'walk_sightings',
+    // A walk of its own and a typed plate on it.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH k AS (
+           INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, 'key:row') RETURNING id
+         )
+         INSERT INTO walk_sightings (tenant_id, walk_id, read, plate, taken_at, added_by)
+         SELECT $1, k.id, 'typed', 'ROW1', now(), 'key:row' FROM k
+         RETURNING id`,
+        [t, w.garage],
+      ),
+  },
+  {
+    table: 'walk_stays',
+    // A finished walk of its own listing a stay of its own: a stay a walk listed once.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH k AS (
+           INSERT INTO walks (tenant_id, garage_id, started_by, finished_at, finished_by, lists)
+           VALUES ($1, $2, 'key:row', now(), 'key:row', '{}'::jsonb) RETURNING id
+         ), v AS (
+           INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'WK-' || gen_random_uuid()) RETURNING id
+         ), s AS (
+           INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                                 open_event_id, entry_confirmation)
+           SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD', gen_random_uuid()::text, 'confirmed' FROM v
+           RETURNING id
+         )
+         INSERT INTO walk_stays (tenant_id, walk_id, session_id, list)
+         SELECT $1, k.id, s.id, 'seen' FROM k, s
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+    // Written once at the finish and deleted with its walk: no UPDATE grant.
+    writeOnce: true,
+  },
+  {
     table: 'lane_devices',
     insert: (c, t, w) =>
       c.query(
