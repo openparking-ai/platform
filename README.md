@@ -1912,8 +1912,9 @@ like that usually saw too little of the garage to feed the stuck list (see
   stay_not_a_candidate` for any other stay; `409 walk_finished` or
   `409 walk_abandoned` once the walk is closed.
 - **Finish** -- `POST /api/v1/garages/:garageId/walks/:walkId/finish {}` →
-  `200 {walk: {id, started_at, finished_at, lists: WALK_LISTS, feeds_stuck}}`,
-  again the same on a finished walk. `WALK_LISTS` is
+  `200 {walk: {id, started_at, finished_at, lists: WALK_LISTS, feeds_stuck,
+  seen_percent, complete_percent, incomplete}}`, again the same on a finished
+  walk. `WALK_LISTS` is
   - `seen_with_stay`: `[{stay, plate, entered_at, sightings}]` -- a stay a
     sighting's plate matched alone, or the one the person picked; listed
     once however many times it was seen.
@@ -1926,15 +1927,23 @@ like that usually saw too little of the garage to feed the stuck list (see
     came in after the walk started is never "not seen".
   - `not_readable`: `[{sighting, plate: null, why}]` -- a picture with nothing
     sure on it, not answered by a later sighting.
+  - `incomplete`: `"walk incomplete (N%)"` when the walk saw too little to
+    feed the stuck list, otherwise null.
 
   `feeds_stuck` says whether this walk's "not seen" list feeds the stuck
-  list (below): only when the walk had sightings and saw at least
-  `FEEDS_STUCK_PERCENT` (80) of the stays it was checking -- those open when
-  it started and still open at its end. A walk finished with no sightings,
-  or one that covered part of the garage, keeps its lists as they are but
-  lists no stay as stuck.
+  list (below): only when the walk saw at least the garage's
+  `walk_complete_percent` of the stays it was checking -- those open when it
+  started and still open at its end. The setting is 80 unless the garage
+  sets another, 1 to 100 (`PATCH /garages/:id {walk_complete_percent}`,
+  0040); the walk keeps the one in force when it finished
+  (`complete_percent`). `seen_percent` is the share it saw, rounded down,
+  null when there was no stay to check; the comparison is made whole, so
+  exactly the setting feeds. A walk under it -- no sightings, or part of the
+  garage -- keeps its lists as they are, lists no stay as stuck, and says
+  `incomplete: "walk incomplete (N%)"` in its answer and its lists.
 - **Read** -- `GET /api/v1/garages/:garageId/walks/:walkId` → the walk
-  (`abandoned_at` set once abandoned, `feeds_stuck` once finished), its
+  (`abandoned_at` set once abandoned, `feeds_stuck`, `seen_percent`,
+  `complete_percent` and `incomplete` once finished), its
   sightings and, once finished, its lists.
 - **A sighting's picture** --
   `GET /api/v1/garages/:garageId/walks/:walkId/sightings/:sightingId/picture`

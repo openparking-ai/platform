@@ -26,9 +26,10 @@ import { PICTURE_DAYS } from './bans.js';
  * the change carries the person's own name (`req.change.doneBy`).
  *
  * A finished walk's "not seen" list feeds the stuck list only when the walk
- * saw at least FEEDS_STUCK_PERCENT of the stays it was checking: a walk
- * with no sightings, or one that covered part of the garage, never lists a
- * stay as stuck on its own.
+ * saw at least the garage's `walk_complete_percent` (80 unless the garage
+ * sets another) of the stays it was checking: a walk with no sightings, or
+ * one that covered part of the garage, is "walk incomplete (N%)" and never
+ * lists a stay as stuck on its own.
  *
  * Settings, read at each picture, so a deployment can set them without a
  * restart:
@@ -47,8 +48,12 @@ export const WALK_ABANDON_HOURS = 12;
 export const SIGHTINGS_MAX = 5000;
 /** The most sightings one key may send a minute: each picture waits in the one decoder lane pictures use. */
 export const SIGHTINGS_PER_MINUTE = 120;
-/** The share of the stays a walk was checking it must have seen for its "not seen" list to feed the stuck list. */
-export const FEEDS_STUCK_PERCENT = 80;
+/**
+ * The share of the stays a walk was checking it must have seen for its "not
+ * seen" list to feed the stuck list, where the garage sets none (the
+ * column's default, 0040). A garage sets 1 to 100.
+ */
+export const WALK_COMPLETE_DEFAULT_PERCENT = 80;
 export const CLIENT_REF_MAX = 100;
 /** A plate as a person gives it: letters and digits, once spaces and dashes are out. */
 export const PLATE_MAX = 10;
@@ -315,19 +320,30 @@ export function lists(walk, sightings, stays) {
 }
 
 /**
- * Whether a finished walk's "not seen" list feeds the stuck list: it had
- * sightings, and saw at least FEEDS_STUCK_PERCENT of the stays it was
- * checking (open when it started and still open at its end). Pure.
+ * How much of the garage a finished walk saw, against the garage's
+ * `completePercent`. Pure. The stays it was checking are those open when
+ * it started and still open at its end; `seen_percent` is the share of them
+ * it saw, rounded down, null when there were none. Its "not seen" list
+ * feeds the stuck list only at or over `completePercent`, compared whole,
+ * not rounded; under it, the walk is `incomplete`: "walk incomplete (N%)".
  */
-export function feedsStuck(walk, sightings, found, stays) {
-  if (sightings.length === 0) return false;
+export function coverage(walk, found, stays, completePercent) {
   const startedAt = new Date(walk.started_at);
   const checked = stays.filter((s) => s.exit_at === null && new Date(s.entry_at) <= startedAt);
-  if (checked.length === 0) return false;
+  if (checked.length === 0) return { seen_percent: null, complete_percent: completePercent, feeds_stuck: false, incomplete: null };
   const seen = new Set(found.seen_with_stay.map((r) => r.stay));
   const saw = checked.filter((s) => seen.has(s.id)).length;
-  return saw * 100 >= checked.length * FEEDS_STUCK_PERCENT;
+  const seenPercent = Math.floor((saw * 100) / checked.length);
+  const feeds = saw * 100 >= checked.length * completePercent;
+  return {
+    seen_percent: seenPercent,
+    complete_percent: completePercent,
+    feeds_stuck: feeds,
+    incomplete: feeds ? null : incompleteWords(seenPercent),
+  };
 }
+
+export const incompleteWords = (seenPercent) => `walk incomplete (${seenPercent}%)`;
 
 /** The garage's stays open at some point since `since`: still open, or closed after it. */
 export async function staysDuring(client, tenantId, garageId, since) {
@@ -506,7 +522,7 @@ export async function pickStay(client, tenantId, sightingId, stayId) {
  * on the walk -- in that order, since the database takes no listed stay for
  * a walk once it is finished.
  */
-export async function finishWalk(client, tenantId, walkId, by, found, feeds) {
+export async function finishWalk(client, tenantId, walkId, by, found, cover) {
   const seen = found.seen_with_stay.map((r) => r.stay);
   const notSeen = found.stay_not_seen.map((r) => r.stay);
   if (seen.length + notSeen.length > 0) {
@@ -517,9 +533,11 @@ export async function finishWalk(client, tenantId, walkId, by, found, feeds) {
     );
   }
   const { rows } = await client.query(
-    `UPDATE walks SET finished_at = greatest(now(), started_at), finished_by = $3, lists = $4, feeds_stuck = $5
+    `UPDATE walks SET finished_at = greatest(now(), started_at), finished_by = $3, lists = $4,
+                      feeds_stuck = $5, seen_percent = $6, complete_percent = $7
       WHERE tenant_id = $1 AND id = $2 AND finished_at IS NULL RETURNING *`,
-    [tenantId, walkId, by, JSON.stringify(found), feeds],
+    [tenantId, walkId, by, JSON.stringify({ ...found, incomplete: cover.incomplete }), cover.feeds_stuck,
+      cover.seen_percent, cover.complete_percent],
   );
   return rows[0];
 }
@@ -547,6 +565,16 @@ export function presentSighting(s, stays = []) {
   };
 }
 
+/** A finished walk's coverage as it was stored at its finish; nulls before. */
+export function walkCoverage(w) {
+  return {
+    feeds_stuck: w.feeds_stuck,
+    seen_percent: w.seen_percent,
+    complete_percent: w.complete_percent,
+    incomplete: w.feeds_stuck === false && w.seen_percent !== null ? incompleteWords(w.seen_percent) : null,
+  };
+}
+
 export function presentWalk(w, sightings = null, stays = []) {
   return {
     id: w.id,
@@ -556,7 +584,7 @@ export function presentWalk(w, sightings = null, stays = []) {
     finished_by: w.finished_by,
     abandoned_at: abandonedAt(w),
     lists: w.lists,
-    feeds_stuck: w.feeds_stuck,
+    ...walkCoverage(w),
     ...(sightings ? { sightings: sightings.map((s) => presentSighting(s, stays)) } : {}),
   };
 }

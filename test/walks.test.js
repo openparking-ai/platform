@@ -15,7 +15,7 @@ import { randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import { createApp } from '../src/app.js';
 import { redactExpiredVehicles } from '../src/retention.js';
-import { WALK_ABANDON_HOURS, SIGHTINGS_PER_MINUTE, FEEDS_STUCK_PERCENT } from '../src/walks.js';
+import { WALK_ABANDON_HOURS, SIGHTINGS_PER_MINUTE, WALK_COMPLETE_DEFAULT_PERCENT } from '../src/walks.js';
 import { fold } from '../src/exitMatch.js';
 import {
   pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage, superuserClient,
@@ -557,7 +557,8 @@ test('THE FOUR LISTS: a car seen twice lists once; a stay that came in or left d
   assert.deepEqual(done.lists.seen_with_stay.map((r) => [r.stay, r.plate, r.sightings]), [[twice.id, 'TWI2222', [a.id, b.id]]]);
   assert.deepEqual(done.lists.stay_not_seen.map((r) => [r.stay, r.plate]), [[missed.id, 'MIS3333']]);
   assert.ok(!done.lists.stay_not_seen.some((r) => r.stay === late.id || r.stay === leaves.id));
-  assert.deepEqual(Object.keys(done.lists).sort(), ['not_readable', 'seen_with_stay', 'seen_without_stay', 'stay_not_seen']);
+  assert.deepEqual(Object.keys(done.lists).sort(), ['incomplete', 'not_readable', 'seen_with_stay', 'seen_without_stay', 'stay_not_seen']);
+  assert.deepEqual([done.seen_percent, done.incomplete, done.lists.incomplete], [50, 'walk incomplete (50%)', 'walk incomplete (50%)']);
 });
 
 test('FROZEN: a finished walk answers the same lists again, refuses sightings, and never works them out again', async () => {
@@ -623,18 +624,21 @@ test('A WALK THAT SAW NOTHING: its lists say every stay was not seen, but it mar
   const stays = await parked(g, ['EMW1111', 'EMW2222']);
   const done = await finish(g, await startWalk(g));
   assert.equal(done.feeds_stuck, false);
+  assert.deepEqual([done.seen_percent, done.incomplete, done.lists.incomplete], [0, 'walk incomplete (0%)', 'walk incomplete (0%)']);
   assert.deepEqual(done.lists.stay_not_seen.map((r) => r.stay).sort(), stays.map((s) => s.id).sort());
   assert.deepEqual(await notSeenStuck(g), []);
 });
 
-test(`A WALK THAT SAW PART OF THE GARAGE: under ${FEEDS_STUCK_PERCENT}% of its stays seen marks none stuck; nothing a walk lists ends or charges a stay`, async () => {
+test(`A WALK THAT SAW PART OF THE GARAGE: under ${WALK_COMPLETE_DEFAULT_PERCENT}% of its stays seen, by default, is incomplete and marks none stuck; nothing a walk lists ends or charges a stay`, async () => {
   const g = await garage('wk-part-walk');
   const all = await parked(g, ['PRT1111', 'PRT2222', 'PRT3333', 'PRT4444', 'PRT5555']);
   const part = await walkSaw(g, ['PRT1111', 'PRT2222', 'PRT3333', 'XXX0001', 'XXX0002']);
   assert.equal(part.feeds_stuck, false, 'sightings of cars with no stay count as seeing the garage');
+  assert.deepEqual([part.seen_percent, part.complete_percent, part.incomplete], [60, 80, 'walk incomplete (60%)']);
   assert.deepEqual(await notSeenStuck(g), []);
   const enough = await walkSaw(g, ['PRT1111', 'PRT2222', 'PRT3333', 'PRT4444']);
-  assert.equal(enough.feeds_stuck, true);
+  assert.equal(enough.feeds_stuck, true, 'exactly the threshold feeds');
+  assert.deepEqual([enough.seen_percent, enough.incomplete, enough.lists.incomplete], [80, null, null]);
   assert.deepEqual(await notSeenStuck(g), [all[4].id]);
   const partLater = await walkSaw(g, ['PRT5555']);
   assert.equal(partLater.feeds_stuck, false);
@@ -658,6 +662,42 @@ test("THE STUCK LIST IS THE GARAGE'S OWN: a later walk at the tenant's other gar
   assert.deepEqual(await notSeenStuck(h), []);
 });
 
+test("A GARAGE SETS ITS OWN THRESHOLD: at 75%, 3 of 4 seen feeds the stuck list; at 76%, the same walk is incomplete; the tenant's other garage keeps 80%", async () => {
+  const g = await garage('wk-threshold');
+  const h = await sameTenantGarage(g);
+  const set = (body) => call(g.op, 'PATCH', `/garages/${g.id}`, body);
+  for (const wrong of [0, 101, 75.5, '75', null, true]) {
+    assert.equal((await set({ walk_complete_percent: wrong })).status, 400, `walk_complete_percent ${JSON.stringify(wrong)}`);
+  }
+  const res = await set({ walk_complete_percent: 75 });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).garage.walk_complete_percent, 75);
+  const line = await withTenant(g.tenant, (c) => c.query(
+    "SELECT before, after FROM garage_changes WHERE garage_id = $1 AND action = 'garage.update' AND outcome = 'done'", [g.id]));
+  assert.deepEqual(line.rows, [{ before: { walk_complete_percent: 80 }, after: { walk_complete_percent: 75 } }]);
+
+  const stays = await parked(g, ['THR1111', 'THR2222', 'THR3333', 'THR4444']);
+  const at75 = await walkSaw(g, ['THR1111', 'THR2222', 'THR3333']);
+  assert.deepEqual([at75.feeds_stuck, at75.seen_percent, at75.complete_percent, at75.incomplete], [true, 75, 75, null],
+    'exactly the garage threshold feeds');
+  assert.deepEqual(await notSeenStuck(g), [stays[3].id]);
+
+  assert.equal((await set({ walk_complete_percent: 76 })).status, 200);
+  const at76 = await walkSaw(g, ['THR1111', 'THR2222', 'THR3333']);
+  assert.deepEqual([at76.feeds_stuck, at76.seen_percent, at76.complete_percent, at76.incomplete, at76.lists.incomplete],
+    [false, 75, 76, 'walk incomplete (75%)', 'walk incomplete (75%)'], 'one point under the garage threshold does not');
+  assert.deepEqual(await notSeenStuck(g), [stays[3].id], 'an incomplete walk feeds nothing: the last complete walk still lists');
+  const kept = (await (await call(g.op, 'GET', `/garages/${g.id}/walks/${at75.id}`)).json()).walk;
+  assert.deepEqual([kept.feeds_stuck, kept.complete_percent, kept.incomplete], [true, 75, null], 'a finished walk keeps the threshold it finished under');
+  const shown = (await (await call(g.op, 'GET', `/garages/${g.id}/walks/${at76.id}`)).json()).walk;
+  assert.deepEqual([shown.seen_percent, shown.incomplete, shown.lists.incomplete], [75, 'walk incomplete (75%)', 'walk incomplete (75%)']);
+
+  await parked(h, ['HTH1111', 'HTH2222', 'HTH3333', 'HTH4444']);
+  const other = await walkSaw(h, ['HTH1111', 'HTH2222', 'HTH3333']);
+  assert.deepEqual([other.feeds_stuck, other.complete_percent, other.incomplete], [false, 80, 'walk incomplete (75%)']);
+  assert.deepEqual(await notSeenStuck(h), []);
+});
+
 // --- the database ---------------------------------------------------------------------
 
 test("THE DATABASE KEEPS A WALK TO ITS OWN: no walk at another account's garage, no sighting or listed stay from elsewhere, no name on its line", async () => {
@@ -672,6 +712,14 @@ test("THE DATABASE KEEPS A WALK TO ITS OWN: no walk at another account's garage,
   await refused('INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, $3)', [a.tenant, a.id, by], /walks_one_open_per_person/);
   await refused('UPDATE walks SET abandoned_at = now(), finished_at = now() WHERE id = $1', [walk.id], /walks_abandoned_unfinished/);
   await refused("INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, 'key:x')", [a.tenant, b.id], /walks_garage/);
+  await refused('UPDATE garages SET walk_complete_percent = 0 WHERE id = $1', [a.id], /garages_walk_complete_percent_check/);
+  await refused('UPDATE garages SET walk_complete_percent = 101 WHERE id = $1', [a.id], /garages_walk_complete_percent_check/);
+  await refused(
+    `UPDATE walks SET finished_at = now(), finished_by = 'key:x', lists = '{}', feeds_stuck = true, seen_percent = 79, complete_percent = 80
+      WHERE id = $1`, [walk.id], /walks_finished_whole/);
+  await refused(
+    "UPDATE walks SET finished_at = now(), finished_by = 'key:x', lists = '{}', feeds_stuck = false, seen_percent = 50 WHERE id = $1",
+    [walk.id], /walks_finished_whole/);
   await refused(
     `INSERT INTO walk_sightings (tenant_id, walk_id, read, plate, candidates, taken_at, added_by)
      VALUES ($1, $2, 'typed', 'THR1111', $3, now(), 'key:x')`, [a.tenant, walk.id, [theirs.id]], /walk_sightings_candidates/);
@@ -697,6 +745,7 @@ test('THE DATABASE KEEPS A CLOSED WALK AS IT ENDED: the app role reopens nothing
   await refused('UPDATE walks SET finished_at = NULL, finished_by = NULL, lists = NULL, feeds_stuck = NULL WHERE id = $1', [walk.id], /walks_frozen/);
   await refused("UPDATE walks SET lists = '{}'::jsonb WHERE id = $1", [walk.id], /walks_frozen/);
   await refused('UPDATE walks SET feeds_stuck = NOT feeds_stuck WHERE id = $1', [walk.id], /walks_frozen/);
+  await refused('UPDATE walks SET complete_percent = 1 WHERE id = $1', [walk.id], /walks_frozen/);
   await refused("UPDATE walk_sightings SET plate = 'DBF2222' WHERE id = $1", [s.id], /walk_sightings_frozen/);
   await refused('UPDATE walk_sightings SET picked_stay = $2 WHERE id = $1', [s.id, later.id], /walk_sightings_frozen/);
   await refused(

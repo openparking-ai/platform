@@ -259,7 +259,9 @@ jobs:
         # kept and read once, the rate limit, a typed answer that does not say
         # so, the candidates and the pick, an answered sighting leaving the
         # lists, the four lists and the finish frozen, the stuck list reading
-        # the latest walk of its own garage that saw enough of it, retention,
+        # the latest walk of its own garage that saw at least the garage's
+        # threshold of it (exactly the threshold included), "walk incomplete
+        # (N%)" said otherwise, the reason `not_seen_on_walk`, retention,
         # a line naming no plate -- and eleven of 0040's guards, among them a
         # closed walk frozen for the app role, and requires test/walks.test.js
         # to go red.

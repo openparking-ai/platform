@@ -23,6 +23,9 @@
 --                    does that for a picture sent twice.
 --   walk_stays       the stays a finished walk listed, and in which list
 --                    (`seen` or `not_seen`): what the stuck list reads.
+--   garages          `walk_complete_percent`: the share of the stays it was
+--                    checking a walk must see to feed the stuck list, 80
+--                    unless the garage sets another.
 --   garage_changes   a walk as what a change was done to (`walk`). A line about
 --                    a walk names no vehicle.
 --
@@ -35,6 +38,11 @@
 
 BEGIN;
 
+-- A constant default: no rewrite of the table.
+ALTER TABLE garages
+  ADD COLUMN walk_complete_percent integer NOT NULL DEFAULT 80
+    CONSTRAINT garages_walk_complete_percent_check CHECK (walk_complete_percent BETWEEN 1 AND 100);
+
 CREATE TABLE walks (
   id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id    uuid        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -44,14 +52,20 @@ CREATE TABLE walks (
   finished_at  timestamptz,
   finished_by  text        CHECK (finished_by IS NULL OR length(finished_by) BETWEEN 1 AND 300),
   lists        jsonb,
-  -- Whether its "not seen" list feeds the stuck list: it saw enough of the
-  -- stays it was checking (src/walks.js FEEDS_STUCK_SHARE).
-  feeds_stuck  boolean,
+  -- Whether its "not seen" list feeds the stuck list: it saw at least
+  -- complete_percent of the stays it was checking (seen_percent, rounded
+  -- down; null when there was none to check). complete_percent is the
+  -- garage's setting when the walk finished.
+  feeds_stuck      boolean,
+  seen_percent     integer CHECK (seen_percent BETWEEN 0 AND 100),
+  complete_percent integer CHECK (complete_percent BETWEEN 1 AND 100),
   abandoned_at timestamptz,
   CONSTRAINT walks_finished_whole CHECK (
-    (finished_at IS NULL AND finished_by IS NULL AND lists IS NULL AND feeds_stuck IS NULL)
+    (finished_at IS NULL AND finished_by IS NULL AND lists IS NULL AND feeds_stuck IS NULL
+     AND seen_percent IS NULL AND complete_percent IS NULL)
     OR (finished_at IS NOT NULL AND finished_by IS NOT NULL AND jsonb_typeof(lists) = 'object'
-        AND feeds_stuck IS NOT NULL AND finished_at >= started_at)
+        AND feeds_stuck IS NOT NULL AND complete_percent IS NOT NULL AND finished_at >= started_at
+        AND (NOT feeds_stuck OR seen_percent >= complete_percent))
   ),
   -- Abandoned is never finished, and has no lists.
   CONSTRAINT walks_abandoned_unfinished CHECK (

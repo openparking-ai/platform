@@ -46,6 +46,14 @@
  *   walks_kept_forever          a walk past the retention window is kept
  *   open_walk_kept_forever      a walk never finished is kept past the window
  *   walk_line_names_plate       the change-log line about a sighting names its plate
+ *   threshold_not_the_garage    a walk is measured against 80% whatever the garage set
+ *   threshold_exclusive         a walk at exactly the threshold does not feed the stuck list
+ *   threshold_rounded_up        a walk one share under the threshold feeds it
+ *   incomplete_unsaid           an incomplete walk's lists do not say "walk incomplete (N%)"
+ *   incomplete_unshown          an incomplete walk's answer does not say so
+ *   threshold_setting_unchecked the garage's walk threshold takes anything
+ *   threshold_setting_dropped   the garage's walk threshold is never saved
+ *   stuck_reason_not_seen       the stuck list sends `not_seen`, not `not_seen_on_walk`
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with one
  * statement of 0040 edited, so the property genuinely never existed there.
@@ -58,6 +66,8 @@
  *   walk_line_may_name          a line about a walk may carry a name
  *   two_open_walks_a_person     a person may have two walks open at a garage
  *   abandoned_and_finished      a walk may be both abandoned and finished
+ *   threshold_unbounded         a garage's walk threshold may be 0 or over 100
+ *   walk_feeds_under_threshold  a finished walk may feed the stuck list under its threshold
  */
 import { spawnSync } from 'node:child_process';
 import {
@@ -383,15 +393,71 @@ const SOURCE_BREAKS = [
     name: 'walk_always_feeds_stuck',
     why: "every finished walk, even one that saw nothing, feeds the stuck list",
     file: 'src/walks.js',
-    from: "export function feedsStuck(walk, sightings, found, stays) {\n",
-    to: "export function feedsStuck(walk, sightings, found, stays) {\n  return true;\n",
+    from: "  const feeds = saw * 100 >= checked.length * completePercent;",
+    to: "  const feeds = true;",
   },
   {
     name: 'partial_walk_feeds_stuck',
     why: `a walk that saw under the share of the garage feeds the stuck list`,
     file: 'src/walks.js',
-    from: "  return saw * 100 >= checked.length * FEEDS_STUCK_PERCENT;",
-    to: "  return saw >= 0;",
+    from: "  const feeds = saw * 100 >= checked.length * completePercent;",
+    to: "  const feeds = saw >= 0;",
+  },
+  {
+    name: 'threshold_not_the_garage',
+    why: "a walk is measured against 80% whatever the garage set",
+    file: 'src/app.js',
+    from: "walks.coverage(open, found, stays, garage.walk_complete_percent)",
+    to: "walks.coverage(open, found, stays, walks.WALK_COMPLETE_DEFAULT_PERCENT)",
+  },
+  {
+    name: 'threshold_exclusive',
+    why: "a walk that saw exactly the threshold does not feed the stuck list",
+    file: 'src/walks.js',
+    from: "  const feeds = saw * 100 >= checked.length * completePercent;",
+    to: "  const feeds = saw * 100 > checked.length * completePercent;",
+  },
+  {
+    name: 'threshold_rounded_up',
+    why: "a walk one share under the threshold feeds it once rounded",
+    file: 'src/walks.js',
+    from: "  const feeds = saw * 100 >= checked.length * completePercent;",
+    to: "  const feeds = saw * 100 + checked.length >= checked.length * completePercent;",
+  },
+  {
+    name: 'incomplete_unsaid',
+    why: "a walk under the threshold does not say \"walk incomplete (N%)\" in its lists",
+    file: 'src/walks.js',
+    from: "    incomplete: feeds ? null : incompleteWords(seenPercent),",
+    to: "    incomplete: null,",
+  },
+  {
+    name: 'incomplete_unshown',
+    why: "a walk's answer does not say it was incomplete",
+    file: 'src/walks.js',
+    from: "    incomplete: w.feeds_stuck === false && w.seen_percent !== null ? incompleteWords(w.seen_percent) : null,",
+    to: "    incomplete: null,",
+  },
+  {
+    name: 'threshold_setting_unchecked',
+    why: "the garage's walk threshold takes anything",
+    file: 'src/app.js',
+    from: "      if (walkComplete !== undefined && !(Number.isInteger(walkComplete) && walkComplete >= 1 && walkComplete <= 100)) {",
+    to: "      if (false) {",
+  },
+  {
+    name: 'threshold_setting_dropped',
+    why: "the garage's walk threshold is never saved",
+    file: 'src/app.js',
+    from: "        walk_complete_percent: walkComplete,\n      };",
+    to: "      };",
+  },
+  {
+    name: 'stuck_reason_not_seen',
+    why: "the stuck list sends `not_seen`, not `not_seen_on_walk`",
+    file: 'src/stuckStays.js',
+    from: "    why: walks.notSeenLast.has(r.id) ? 'not_seen_on_walk' : 'old',",
+    to: "    why: walks.notSeenLast.has(r.id) ? 'not_seen' : 'old',",
   },
   {
     name: 'last_seen_missing',
@@ -426,6 +492,20 @@ const SOURCE_BREAKS = [
 const ADDED_0040 = '0040_inventory_walks.sql';
 
 const SCHEMA_BREAKS = [
+  {
+    name: 'threshold_unbounded',
+    why: "a garage's walk threshold may be 0 or over 100",
+    edits: [{ file: ADDED_0040, from: "    CONSTRAINT garages_walk_complete_percent_check CHECK (walk_complete_percent BETWEEN 1 AND 100);", to: ";" }],
+  },
+  {
+    name: 'walk_feeds_under_threshold',
+    why: "a finished walk may feed the stuck list under its threshold, or keep none",
+    edits: [{
+      file: ADDED_0040,
+      from: "        AND feeds_stuck IS NOT NULL AND complete_percent IS NOT NULL AND finished_at >= started_at\n        AND (NOT feeds_stuck OR seen_percent >= complete_percent))",
+      to: "        AND feeds_stuck IS NOT NULL AND finished_at >= started_at)",
+    }],
+  },
   {
     name: 'walk_garage_unchecked',
     why: "a walk may be at another account's garage",

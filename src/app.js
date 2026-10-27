@@ -1032,10 +1032,18 @@ export function createApp() {
       // The garage's number of spaces (0034): the garage map writes its count of
       // switched-on spots here, or the owner types it on the Garages page.
       const spaces = req.body?.spaces === undefined ? undefined : garageSpaces(req.body.spaces);
-      const given = { default_action: action, transient_available: transient, ban_tailgaters: banTailgaters, ban_reach: banReach, spaces };
+      // The share of the stays a walk must see to feed the stuck list (0040).
+      const walkComplete = req.body?.walk_complete_percent;
+      if (walkComplete !== undefined && !(Number.isInteger(walkComplete) && walkComplete >= 1 && walkComplete <= 100)) {
+        throw bad('walk_complete_percent must be a whole number from 1 to 100 when given');
+      }
+      const given = {
+        default_action: action, transient_available: transient, ban_tailgaters: banTailgaters, ban_reach: banReach, spaces,
+        walk_complete_percent: walkComplete,
+      };
       const fields = Object.keys(given).filter((f) => given[f] !== undefined);
       if (fields.length === 0) {
-        throw bad('default_action, transient_available, ban_tailgaters, ban_reach or spaces is required');
+        throw bad('default_action, transient_available, ban_tailgaters, ban_reach, spaces or walk_complete_percent is required');
       }
       const garage = await changeTx(req, async (client) => {
         // Read first, locked: the line says what each field was.
@@ -3680,16 +3688,22 @@ export function createApp() {
         const sightings = await walks.sightingsOf(client, req.tenantId, open.id);
         const stays = await walks.staysDuring(client, req.tenantId, garage.id, open.started_at);
         const found = walks.lists(open, sightings, stays);
-        const feeds = walks.feedsStuck(open, sightings, found, stays);
-        const row = await walks.finishWalk(client, req.tenantId, open.id, await walkActor(client, req), found, feeds);
+        const cover = walks.coverage(open, found, stays, garage.walk_complete_percent);
+        const row = await walks.finishWalk(client, req.tenantId, open.id, await walkActor(client, req), found, cover);
         await changes.record(client, req.change, {
           garageId: garage.id, action: 'walk.finish', subject, before: { open: true },
-          after: { open: false, ...Object.fromEntries(walks.LISTS.map((l) => [l, found[l].length])), feeds_stuck: feeds },
+          after: {
+            open: false,
+            ...Object.fromEntries(walks.LISTS.map((l) => [l, found[l].length])),
+            feeds_stuck: cover.feeds_stuck,
+            seen_percent: cover.seen_percent,
+            complete_percent: cover.complete_percent,
+          },
         });
         return row;
       });
       res.json({
-        walk: { id: walk.id, started_at: walk.started_at, finished_at: walk.finished_at, lists: walk.lists, feeds_stuck: walk.feeds_stuck },
+        walk: { id: walk.id, started_at: walk.started_at, finished_at: walk.finished_at, lists: walk.lists, ...walks.walkCoverage(walk) },
       });
     } catch (err) {
       next(err);
