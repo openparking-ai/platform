@@ -202,6 +202,16 @@ jobs:
         # only at a route is a rule one direct INSERT goes around.
         run: npm run ticket-identity-fail-control
 
+      - name: Unread-identity fail-control
+        # A car whose plate nobody could read is a stay too (0036). Each break
+        # removes one property that makes that safe -- the open reading it,
+        # one vehicle per unread car, alone and only `true`, the purge, the
+        # candidate set's name for it, the count of cars inside and the lane's
+        # feed counting it, and the two halves of 0036's constraint -- and
+        # requires test/unread-identity.test.js to go red with at least one of
+        # its tests still green.
+        run: npm run unread-identity-fail-control
+
       - name: Descriptor fail-control
         # A session carries the appearance descriptor its entry read produced
         # (migration 0009) and the one its exit read produced (0010). Each break

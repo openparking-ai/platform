@@ -56,9 +56,10 @@
  * run meaningless.
  *
  *   drop_exactly_one     `vehicles_exactly_one_identity` never created, in
- *                        either migration that touches it.
- *   weak_exactly_one     0008 never applied, so the constraint is 0007's XOR
- *                        alone and an empty string counts as an identity.
+ *                        any migration that touches it (0007, 0008, 0036).
+ *   weak_exactly_one     0008 never applied, and 0036 without its emptiness
+ *                        checks, so the constraint is an exactly-one alone and
+ *                        an empty string counts as an identity.
  *   drop_ticket_unique   `vehicles_tenant_ticket_ref_key` never created.
  */
 import { spawnSync } from 'node:child_process';
@@ -162,6 +163,7 @@ const SOURCE_BREAKS = [
 
 const ADDED_0007 = '0007_vehicle_ticket_identity.sql';
 const ADDED_0008 = '0008_identity_not_empty.sql';
+const ADDED_0036 = '0036_vehicle_unread_identity.sql';
 
 /**
  * The 0008 statements, as one edit. The constraint lives in 0008 now — 0007 is
@@ -183,6 +185,28 @@ const ADD_0007 = `ALTER TABLE vehicles
   ADD CONSTRAINT vehicles_exactly_one_identity
     CHECK ((plate IS NULL) <> (ticket_ref IS NULL));`;
 
+/**
+ * And 0036, which drops the constraint by name again and adds it back over a
+ * third column (an unread car). So a break that wants NO constraint reaches it
+ * too, and a break that wants an empty string counted as an identity takes its
+ * emptiness checks out -- otherwise 0036 quietly puts back what the break
+ * removed, and the control passes for the wrong reason.
+ */
+const DROP_AND_ADD_0036 = `ALTER TABLE vehicles DROP CONSTRAINT vehicles_exactly_one_identity;
+
+ALTER TABLE vehicles
+  ADD CONSTRAINT vehicles_exactly_one_identity
+    CHECK (
+      num_nonnulls(plate, ticket_ref, unread_ref) = 1
+      AND (plate IS NULL OR length(plate) > 0)
+      AND (ticket_ref IS NULL OR length(ticket_ref) > 0)
+      AND (unread_ref IS NULL OR length(unread_ref) > 0)
+    );`;
+const EMPTINESS_0036 = `
+      AND (plate IS NULL OR length(plate) > 0)
+      AND (ticket_ref IS NULL OR length(ticket_ref) > 0)
+      AND (unread_ref IS NULL OR length(unread_ref) > 0)`;
+
 const SCHEMA_BREAKS = [
   {
     name: 'drop_exactly_one',
@@ -194,6 +218,7 @@ const SCHEMA_BREAKS = [
         to: '-- 0008, removed by the fail-control',
       },
       { file: ADDED_0007, from: ADD_0007, to: '-- the exactly-one constraint, removed by the fail-control' },
+      { file: ADDED_0036, from: DROP_AND_ADD_0036, to: '-- 0036\'s constraint, removed by the fail-control' },
     ],
   },
   {
@@ -205,6 +230,7 @@ const SCHEMA_BREAKS = [
         from: DROP_AND_ADD_0008,
         to: '-- 0008, removed by the fail-control',
       },
+      { file: ADDED_0036, from: EMPTINESS_0036, to: '' },
     ],
   },
   {

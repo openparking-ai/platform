@@ -19,7 +19,8 @@
  * its outcome beside an ORACLE: on a plate- or ticket-matched exit the close
  * picked the stay independently of the descriptor, and a figure published
  * over those exits names that oracle. So each candidate carries its
- * identifying components -- exactly one of `plate` or `ticket_ref`, the
+ * identifying components -- at most one of `plate` or `ticket_ref` (an
+ * unread car's stay carries neither, 0036), the
  * region, and the vehicle attributes the entry read produced -- so a consumer
  * can say which stay the plate picked without a second query. `forSearch`
  * below is the projection down to what the search is sent: no plate leaves
@@ -27,8 +28,8 @@
  * involves no plate.
  *
  * THE DENOMINATOR TRAVELS WITH THE SET. `vehicles_exactly_one_identity` means
- * only plate- or ticket-identified cars ever get a session, so this set covers
- * those cars only; and the descriptor is opt-in at the identity service, so a
+ * every car with a session is plate-, ticket- or unread-identified (0036), so
+ * this set covers them all; and the descriptor is opt-in at the identity service, so a
  * stay may be open with none. Both counts are on the result, because a figure
  * produced over this set has to be written beside them.
  *
@@ -59,7 +60,8 @@ export async function candidateStays(client, tenantId, garageId) {
     entry_confirmation: r.entry_confirmation,
     // Named rather than inferred from which column is null, so a consumer
     // reads one field and the exactly-one rule is stated on the row it holds.
-    identity_kind: r.ticket_ref ? 'ticket' : 'plate',
+    // A stay whose plate nobody could read (0036) carries neither: `unread`.
+    identity_kind: r.ticket_ref ? 'ticket' : r.plate ? 'plate' : 'unread',
     plate: r.plate,
     ticket_ref: r.ticket_ref,
     plate_region: r.plate_region,

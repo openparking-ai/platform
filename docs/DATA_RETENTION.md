@@ -37,6 +37,7 @@ everything identifying is replaced:
 ```
 plate         -> 'redacted:<row id>'   (keeps the unique index satisfied, carries nothing)
 ticket_ref    -> 'redacted:<row id>'   (the same, for a stay identified by a ticket)
+unread_ref    -> 'redacted:<row id>'   (the same, for a car whose plate nobody could read)
 plate_region  -> NULL
 make          -> NULL
 model         -> NULL
@@ -57,6 +58,15 @@ constraint and fail the whole purge, and filling neither would leave the ticket
 as the one identity retention could not remove. `test/retention.test.js` asserts
 the redaction and carries the control that a ticket inside the window is left
 alone.
+
+**Added with migration 0036:** a car the lane's loops saw go in and whose plate
+nobody could read is a stay too, and its vehicle carries neither a plate nor a
+ticket but `unread_ref` -- the lane's event id of that stay's open, one row per
+unread car. It is not a plate and names no person, but it is the key of a car's
+stay, so it is redacted the same way, on the same window, in the same statement,
+and the row keeps exactly one identity. What was measured of the car -- make,
+model, colour -- goes as it does for a plate. `test/unread-identity.test.js`
+asserts it.
 
 **Added with migration 0008:** the same constraint also refuses an identity that
 is an EMPTY STRING in either column. `'' IS NULL` is false, so 0007's XOR alone

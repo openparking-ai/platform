@@ -23,6 +23,12 @@ const VEHICLE_COLUMNS = 'id, plate, plate_region, ticket_ref, make, model, color
  * one of the two non-null, `src/app.js` refuses a request that sends both or
  * neither, and this function is handed whichever one survived that.
  *
+ * A THIRD KEY, `unreadRef` (0036): a car the lane saw and could not read, keyed
+ * on the open's event id -- one row per unread car, never one shared row, which
+ * would fold every unread car in the garage into the first one's open stay. A
+ * camera looked at it, so what it measured -- make, model, colour -- is kept
+ * with it as with a plate.
+ *
  * The vision attributes are on the plate branch only, and that is not an
  * omission. A plate arrives with a make, a model and a colour because a camera
  * looked at a vehicle; a ticket arrives because a person read a code out. There
@@ -35,6 +41,7 @@ export async function upsertVehicle(
   {
     plate = null,
     ticketRef = null,
+    unreadRef = null,
     plateRegion = null,
     seenAt,
     make = null,
@@ -51,6 +58,18 @@ export async function upsertVehicle(
          SET last_seen_at = GREATEST(vehicles.last_seen_at, EXCLUDED.last_seen_at)
        RETURNING ${VEHICLE_COLUMNS}`,
       [tenantId, ticketRef, seenAt],
+    );
+    return rows[0];
+  }
+  if (unreadRef) {
+    const { rows } = await client.query(
+      `INSERT INTO vehicles (tenant_id, unread_ref, make, model, color, attributes,
+                             first_seen_at, last_seen_at)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6::jsonb, '{}'::jsonb), $7, $7)
+       ON CONFLICT (tenant_id, unread_ref) DO UPDATE
+         SET last_seen_at = GREATEST(vehicles.last_seen_at, EXCLUDED.last_seen_at)
+       RETURNING ${VEHICLE_COLUMNS}`,
+      [tenantId, unreadRef, make, model, color, attributes ? JSON.stringify(attributes) : null, seenAt],
     );
     return rows[0];
   }

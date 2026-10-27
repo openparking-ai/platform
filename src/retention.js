@@ -20,6 +20,8 @@
  * would violate the constraint and fail the whole purge; writing it into
  * neither would leave a ticket — which a person read out loud and which
  * identifies a stay — as the one piece of identity retention could not remove.
+ * A car whose plate nobody could read (0036) carries `unread_ref`, the key of
+ * its one stay, and it is redacted the same way, so the row keeps its shape.
  *
  * A SHADOW SEARCH (migration 0011) ages out with the stay it shadowed: the
  * row's session references -- `session_id`, `candidate_ids`, `matched_ids` --
@@ -84,6 +86,8 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
           SET plate        = CASE WHEN v.plate      IS NULL THEN NULL
                                   ELSE 'redacted:' || v.id END,
               ticket_ref   = CASE WHEN v.ticket_ref IS NULL THEN NULL
+                                  ELSE 'redacted:' || v.id END,
+              unread_ref   = CASE WHEN v.unread_ref IS NULL THEN NULL
                                   ELSE 'redacted:' || v.id END,
               plate_region = NULL,
               make         = NULL,

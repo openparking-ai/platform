@@ -91,7 +91,7 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 | `GET /api/v1/lane/rules` | what the lane caches so it can decide offline: the garage's plans whole, its space class, each linked module's register, the open stays with a cursor — the slow cadence |
 | `GET /api/v1/lane/stays?since=<cursor>` | every stay changed since the cursor, closed rows included — the fast cadence; without `since`, the full open set; every answer also carries the lane's own `lane` state and `board` |
 | `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` |
-| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater` (U7f) |
+| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater` (U7f); identified by a plate, a ticket, or `plate_unreadable: true` (0036) |
 | `POST /api/v1/lane/pictures` | a picture kept with an entry (U7f): `{picture_ref, event_id, taken_at, image}`, the image base64, a JPEG or a PNG, at most 3 MiB; idempotent on `picture_ref` |
 | `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation`; carries and echoes an optional `descriptor` |
 
@@ -128,6 +128,26 @@ unique per tenant and that it looks like one.
 It is personal data on the same terms a plate is, and the retention purge
 redacts it on the same window — see
 [docs/DATA_RETENTION.md](docs/DATA_RETENTION.md).
+
+**And a car whose plate nobody could read (0036).** The owner's rule: every car
+that crosses a lane's activation loop and then its closing loop is a stay,
+whatever opened the barrier, and "unreadable" is part of the car's identity,
+not a failure to have one. Such a car had no identity to open a stay on, so it
+got into the garage and into no record. An entry's open now takes, instead of a
+plate or a ticket, `plate_unreadable: true` — alone, and only `true`: beside a
+plate it would say the plate was both read and not, and beside a ticket it
+would be two cars, so either is a `400`. The stay's vehicle carries neither a
+plate nor a ticket but `unread_ref`, the open's own event id: **one row per
+unread car**, because nothing here can say two unread cars are the same car and
+a vehicle with an open stay takes no second one — a shared "unreadable" row
+would fold every unread car in the garage into the first one's stay. A replayed
+open is the same row and the same stay. The database holds the rule too
+(`vehicles_exactly_one_identity` over three columns, `vehicles_tenant_unread_ref_key`).
+Nothing finds or closes a stay by it: the close and the exit's lookup take a
+plate or a ticket, as before, and matching an exit to an unread car's stay is
+not built here. The stay counts among the cars inside (0034) and is on the
+lane's feed with no plate and no ticket. `npm run unread-identity-fail-control`
+breaks each property in turn.
 
 ### Every session records what saw the car
 
@@ -754,7 +774,10 @@ garage or all their garages; a ban lasts until someone takes the car off; no car
   tailgater nobody identified, a banned car refused. `npm run purge` removes them one week after the stay that
   holds them closed, or one week after they were taken when no stay holds them. A car still inside keeps its
   pictures, and so does a car on the list. The arming loop's pictures are not stored, here or anywhere.
-- **A tailgater stay** is opened with `tailgater: true` and prices at the exit as any other.
+- **A tailgater stay** is opened with `tailgater: true` and prices at the exit as any other. Since
+  0036 the lane opens one for every car through the gate that no open command let in, read or
+  not: a car nobody could read is a stay with `plate_unreadable` (*A stay is identified...*),
+  and its pictures are kept with its stay's open.
 - **Two settings** on `PATCH /garages/:id`, off by default: `ban_tailgaters` (true or false) and `ban_reach`
   (`garage` or `all`).
 - **The list** (`banned_vehicles`): with `ban_tailgaters` on, a tailgater stay opened with a `descriptor` is
@@ -1089,7 +1112,8 @@ that. The engine counts nothing; this platform counts, and hands it the figure.
   a map the owner types it. Anything else is `400 garage_spaces_refused`.
 - **`sessions.occupancy_at_entry_bp`**: `floor(10000 x cars inside / spaces)`,
   at most 10000, set when the stay opens: every open stay of the garage, any
-  kind of space, before this one. Counted inside the open's transaction behind
+  kind of space, a car nobody could read included (0036), before this one.
+  Counted inside the open's transaction behind
   a per-garage lock, so two lanes opening at once count each other (n and n+1,
   never n twice). Null when the garage has no `spaces`. **No lane sets it**:
   one sent on the open or in an event is ignored.
