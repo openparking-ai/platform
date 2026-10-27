@@ -238,6 +238,19 @@ jobs:
         # go red.
         run: npm run exit-payments-fail-control
 
+      - name: Exit-let-out fail-control
+        # Canceling an exit's payment, and a car a person let out (0042).
+        # Each break removes one property -- the cancel canceling the intent
+        # at Stripe with its idempotency key, never a paid one, never under a
+        # card being authorised, the reader cleared only while it shows the
+        # case's intent, a canceled payment never taken again; the close
+        # canceling first and writing the stay let out unpaid, never at the
+        # quoted fee, with the lane computer named and the line in the change
+        # log once; the past stays saying so; a driver's time with its
+        # offset; each route only its own garage and lane -- and three of
+        # 0042's guards, and requires test/exit-let-out.test.js to go red.
+        run: npm run exit-let-out-fail-control
+
       - name: Stay-endings fail-control
         # A stay no exit closed (0039). Each break removes one property the
         # ending rests on -- the same car again later superseding its old stay

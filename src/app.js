@@ -711,6 +711,30 @@ function parseTime(value, label) {
   return at;
 }
 
+// What the lane accepts from a driver (Python's `fromisoformat` with an
+// offset): a `T` or a space, seconds optional, and Z, +hh:mm, +hhmm or +hh.
+const DRIVER_TIME = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2}(?:\.\d{1,6})?)?(Z|[+-]\d{2}(?::?\d{2})?)$/i;
+
+/**
+ * A TIME A DRIVER SAID, WITH ITS OFFSET, or a 400 saying so. Without one,
+ * `new Date` reads it on this server's clock, which is not the garage's,
+ * and the stay is priced for hours the car was not there.
+ */
+function driverTime(value, label) {
+  if (!value) throw bad(`${label} is required`);
+  const m = typeof value === 'string' ? DRIVER_TIME.exec(value.trim()) : null;
+  if (!m) {
+    throw new HttpError(400,
+      `${label} must be a date and time with its time zone offset, such as 2026-10-27T09:00:00-04:00: a time without one cannot be placed`,
+      'entry_time_without_offset');
+  }
+  const [, date, minutes, seconds = ':00', zone] = m;
+  const offset = zone.toUpperCase() === 'Z' ? 'Z' : `${zone.slice(0, 3)}:${zone.slice(3).replace(':', '') || '00'}`;
+  const at = new Date(`${date}T${minutes}${seconds}${offset}`);
+  if (Number.isNaN(at.getTime())) throw bad(`${label} is not a valid timestamp`);
+  return at;
+}
+
 /**
  * How far ahead of this server's clock a lane-supplied time may be, in seconds.
  *
@@ -2446,7 +2470,8 @@ export function createApp() {
 
   /**
    * THE DRIVER'S WORD. No stay was found for the car; the driver says when
-   * it came in, `{entry_at}`, and the engine prices that stay by the
+   * it came in, `{entry_at}` with its offset (one without is refused, 400
+   * `entry_time_without_offset`), and the engine prices that stay by the
    * garage's own rules. Kept on the case with the pictures; the attendants
    * on duty are told (`exit_driver_word`). No later than the exit, no more
    * than WORD_MAX_DAYS before it; said once.
@@ -2455,7 +2480,7 @@ export function createApp() {
     try {
       const { tenantId, garageId, laneId, direction } = req.device;
       if (direction !== 'exit') throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
-      const claimed = parseTime(req.body?.entry_at, 'entry_at');
+      const claimed = driverTime(req.body?.entry_at, 'entry_at');
       const out = await withTenant(tenantId, async (client) => {
         const row = await exits.caseById(client, tenantId, garageId, req.params.exitId, { lock: true });
         if (!row) throw new HttpError(404, 'exit case not found', 'exit_not_found');
@@ -2553,6 +2578,9 @@ export function createApp() {
         if (!reader) throw conflict('no_reader_bound', 'this lane has no card reader bound');
       }
       const existing = await exitPayments.paymentOf(client, tenantId, row.id);
+      if (existing?.status === 'canceled') {
+        throw conflict('payment_canceled', "this case's payment was canceled and is not taken again; a person decides");
+      }
       const accountId = existing?.account_id ?? reader?.account_id ?? (await exitPayments.garageAccount(client, tenantId, garageId));
       if (!accountId) throw conflict('no_payment_account', 'this garage has no Stripe account to take a card on');
       if (reader && reader.account_id !== accountId) {
@@ -2576,6 +2604,10 @@ export function createApp() {
       }
       if (typeof intent?.id !== 'string') throw new StripeUnreachable('Stripe answered an intent with no id');
       const written = await withTenant(tenantId, async (client) => {
+        // Under the case's lock, as the close takes it: a case closed since
+        // it was read gets no payment, and its new intent is canceled below.
+        const fresh = await exits.caseById(client, tenantId, garageId, exitId, { lock: true });
+        if (fresh.closed_at) return { closedMeanwhile: true };
         const w = await exitPayments.insertPayment(client, tenantId, {
           garageId, exitId, sessionId: staged.row.session_id, channel, readerId: staged.reader?.reader_id ?? null,
           accountId: staged.accountId, intentId: intent.id, amountMinor: q.fee_minor,
@@ -2599,11 +2631,15 @@ export function createApp() {
         }
         return w;
       });
+      if (written.closedMeanwhile) {
+        await exitPayments.cancelIntent(config, staged.accountId, intent.id, exitPayments.cancelKey(intent)).catch(() => {});
+        throw conflict('exit_closed', 'the car has already left: this case is closed');
+      }
       payment = written.row;
       if (payment.payment_intent_id !== intent.id) {
         // Another request for this case wrote its intent first (past the
         // idempotency key's 24 hours): this one is never used.
-        await exitPayments.cancelIntent(config, staged.accountId, intent.id).catch(() => {});
+        await exitPayments.cancelIntent(config, staged.accountId, intent.id, exitPayments.cancelKey(intent)).catch(() => {});
         intent = null;
       }
     }
@@ -2640,38 +2676,135 @@ export function createApp() {
   }
 
   /**
-   * A person let the car out while its payment was open: the intent is
-   * canceled so no card is taken for an exit already settled. If Stripe says
-   * it had already succeeded, that is recorded instead -- paid and let out.
-   * After the person's decision is written, never in its way.
+   * CANCEL A CASE'S OPEN PAYMENT AT STRIPE: the lane let the case go, or a
+   * person let the car out. Answers `{row, outcome}`:
+   *   canceled  Stripe says the intent is canceled: no card can be taken;
+   *   paid      Stripe says it succeeded: recorded paid, nothing refunded;
+   *   none      the case has no payment.
+   * A card being authorised (`payment_in_progress`) or Stripe not answering
+   * (`StripeUnreachable`) is thrown with nothing recorded but what Stripe
+   * said, so asking again is safe. The reader is cleared only while it shows
+   * this intent: a later car's payment on the same reader is never touched.
    */
-  async function cancelForPerson(tenantId, garageId, row) {
+  async function cancelPayment(tenantId, garageId, row, { why }) {
     const p = row.payment;
-    if (!p || p.status !== 'open') return row;
+    if (!p) return { row, outcome: 'none' };
+    if (p.status === 'succeeded') return { row, outcome: 'paid' };
+    if (p.status === 'canceled') return { row, outcome: 'canceled' };
     const config = connectConfig();
-    if (!config.key) return row;
-    try {
-      let intent;
+    if (!config.key) throw new StripeUnreachable('Stripe is not configured: the open payment cannot be canceled');
+    if (p.reader_id) {
+      let onReader = null;
       try {
-        intent = await exitPayments.cancelIntent(config, p.account_id, p.payment_intent_id);
+        onReader = await exitPayments.readerIntent(config, p.account_id, p.reader_id);
+      } catch (err) {
+        if (!(err instanceof StripeError)) throw err;
+      }
+      if (onReader === p.payment_intent_id) {
+        try {
+          await exitPayments.clearReader(config, p.account_id, p.reader_id);
+        } catch (err) {
+          if (err instanceof stripeAccount.ConnectRefusal && err.code === 'reader_busy') {
+            throw conflict('payment_in_progress', 'a card is being authorised for this exit: ask again in a few seconds');
+          }
+          if (!(err instanceof stripeAccount.ConnectRefusal || err instanceof StripeError)) throw err;
+        }
+      }
+    }
+    let intent = await exitPayments.readIntent(config, p.account_id, p.payment_intent_id);
+    if (exitPayments.CANCELABLE.has(intent.status)) {
+      try {
+        intent = await exitPayments.cancelIntent(config, p.account_id, p.payment_intent_id, exitPayments.cancelKey(intent));
       } catch (err) {
         if (!(err instanceof StripeError)) throw err;
         intent = await exitPayments.readIntent(config, p.account_id, p.payment_intent_id);
       }
-      const updated = await recordIntent(tenantId, garageId, row.id, intent);
-      if (updated.payment?.status === 'canceled') {
-        await withTenant(tenantId, (client) => repo.appendEvents(client, tenantId, [{
-          garageId,
-          laneId: row.lane_id,
-          eventId: `${exitPayments.PAYMENT_CANCELED_EVENT_KIND}:${p.id}`,
-          kind: exitPayments.PAYMENT_CANCELED_EVENT_KIND,
-          occurredAt: new Date(),
-          detail: { actor: 'platform:exit', exit_id: row.id, payment_intent_id: p.payment_intent_id, why: 'let_out_by_person' },
-        }]));
-      }
-      return updated;
+    }
+    const updated = await recordIntent(tenantId, garageId, row.id, intent);
+    const status = updated.payment?.status;
+    if (status === 'succeeded') return { row: updated, outcome: 'paid' };
+    if (intent.status === 'succeeded') {
+      throw conflict('payment_amount_mismatch', "Stripe took an amount other than this case's fee: a person decides");
+    }
+    if (status !== 'canceled') {
+      throw conflict('payment_in_progress', 'a card is being authorised for this exit: ask again in a few seconds');
+    }
+    await withTenant(tenantId, (client) => repo.appendEvents(client, tenantId, [{
+      garageId,
+      laneId: row.lane_id,
+      eventId: `${exitPayments.PAYMENT_CANCELED_EVENT_KIND}:${p.id}`,
+      kind: exitPayments.PAYMENT_CANCELED_EVENT_KIND,
+      occurredAt: new Date(),
+      detail: { actor: 'platform:exit', exit_id: row.id, payment_intent_id: p.payment_intent_id, why },
+    }]));
+    return { row: updated, outcome: 'canceled' };
+  }
+
+  /** A 503 the lane retries: its outbox sends a 5xx close again, and dead-letters a 4xx. */
+  const paymentUnsettled = () => new HttpError(503,
+    "the exit case's payment could not be settled with Stripe now; send the close again", 'payment_unsettled');
+
+  /**
+   * BEFORE A CASE'S CLOSE: an open payment is canceled at Stripe, or found
+   * paid, so the stay is written as one or the other -- never let out unpaid
+   * with a card that can still be taken. Stripe not answering, or a card
+   * being authorised: 503, nothing written, and the lane sends it again.
+   */
+  async function settleBeforeClose(tenantId, garageId, exitId) {
+    const row = await withTenant(tenantId, (client) => exits.caseById(client, tenantId, garageId, exitId));
+    if (!row || row.closed_at || row.payment?.status !== 'open') return;
+    try {
+      await cancelPayment(tenantId, garageId, row, { why: 'let_out_at_lane' });
     } catch (err) {
-      if (err instanceof StripeUnreachable || err instanceof StripeError) return row;
+      if (err instanceof StripeUnreachable || err instanceof StripeError || err instanceof stripeAccount.ConnectRefusal
+        || err.code === 'payment_in_progress' || err.code === 'payment_amount_mismatch') {
+        throw paymentUnsettled();
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * WHO LET THE CAR OUT AT THE LANE: a line in the change log, by the lane
+   * computer the person used, naming the case and the stay -- when the lane
+   * says a person opened (`let_out_by`), or the case closes owing and no
+   * attendant had already decided it (theirs is the line they wrote).
+   */
+  async function recordLetOutAtLane(client, { tenantId, garageId, deviceId, exitCase, letOut, letOutBy }) {
+    if (exitCase.person || (!letOutBy && !letOut)) return;
+    const { rows } = await client.query('SELECT name FROM lane_devices WHERE tenant_id = $1 AND id = $2', [tenantId, deviceId]);
+    const ctx = { tenantId, actor: { kind: 'computer', id: deviceId, name: rows[0]?.name ?? null }, count: 0, secrets: [], private: [] };
+    await changes.record(client, ctx, {
+      garageId,
+      action: 'exit.let_out',
+      subject: { kind: 'exit', id: exitCase.id, name: null },
+      before: { let_out: false },
+      after: {
+        let_out: true,
+        at_lane: true,
+        authority: letOutBy,
+        stay_id: exitCase.session_id,
+        paid: exitCase.payment?.status === 'succeeded',
+        owed_minor: letOut?.owed_minor ?? null,
+        currency: letOut?.currency ?? exitCase.quote?.currency ?? null,
+        payment: exitCase.payment?.status ?? null,
+      },
+    });
+  }
+
+  /**
+   * A person let the car out while its payment was open: the intent is
+   * canceled so no card is taken for an exit already settled. If Stripe says
+   * it had already succeeded, that is recorded instead -- paid and let out.
+   * After the person's decision is written, never in its way: a payment left
+   * open here is settled by the case's close, which cancels before it writes.
+   */
+  async function cancelForPerson(tenantId, garageId, row) {
+    try {
+      return (await cancelPayment(tenantId, garageId, row, { why: 'let_out_by_person' })).row;
+    } catch (err) {
+      if (err instanceof StripeUnreachable || err instanceof StripeError || err instanceof stripeAccount.ConnectRefusal
+        || err.code === 'payment_in_progress' || err.code === 'payment_amount_mismatch') return row;
       throw err;
     }
   }
@@ -2695,20 +2828,27 @@ export function createApp() {
   }));
 
   /**
-   * Clear the lane's reader: the driver gave up, or the lane wants the
-   * screen back. The intent stays, to be tried again; a card already being
-   * authorised cannot be stopped (409 reader_busy).
+   * CANCEL THE CASE'S PAYMENT: the car left, the next car came, or a person
+   * opened at the lane. The intent is canceled at Stripe and the reader
+   * cleared while it shows it. Asked again, the same answer: canceled, with
+   * no second call to Stripe. A card that had already paid is never refunded
+   * or voided here: 409 `exit_paid`, and the case is settled as paid. A card
+   * being authorised: 409 `payment_in_progress`, ask again. Stripe not
+   * answering: 503, nothing recorded, ask again.
    */
   lane.post('/exits/:exitId/pay/cancel', connectRoute(async (req, res) => {
     const { tenantId, garageId, laneId, direction } = req.device;
     if (direction !== 'exit') throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
-    const config = stripeAccount.requireConnect();
+    stripeAccount.requireConnect();
     const row = await withTenant(tenantId, (client) => exits.caseById(client, tenantId, garageId, req.params.exitId));
     if (!row) throw new HttpError(404, 'exit case not found', 'exit_not_found');
     if (row.lane_id !== laneId) throw conflict('exit_on_another_lane', 'this exit case is at another lane');
-    if (row.payment?.status !== 'open' || !row.payment.reader_id) throw conflict('no_payment_on_reader', 'no payment of this case is on a reader');
-    await exitPayments.clearReader(config, row.payment.account_id, row.payment.reader_id);
-    res.json({ exit: exits.present(await refreshPayment(tenantId, garageId, { ...row, payment: { ...row.payment, read_at: null } })) });
+    if (!row.payment) throw conflict('no_payment', 'this exit case has no payment to cancel');
+    const out = await cancelPayment(tenantId, garageId, row, { why: 'lane_cancel' });
+    if (out.outcome === 'paid') {
+      throw conflict('exit_paid', 'the card had already paid: nothing was canceled, and the exit is settled as paid');
+    }
+    res.json({ exit: exits.present(out.row), canceled: true });
   }));
 
   /**
@@ -2770,7 +2910,7 @@ export function createApp() {
    */
   lane.post('/sessions/close', async (req, res, next) => {
     try {
-      const { tenantId, garageId, laneId, direction } = req.device;
+      const { tenantId, garageId, laneId, direction, deviceId } = req.device;
       if (direction !== 'exit') {
         throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
       }
@@ -2796,6 +2936,9 @@ export function createApp() {
       // or, for the driver's word, no stay at all.
       const exitId = exits.uuidField(req.body?.exit_id, 'exit_id');
       const { plate, ticketRef } = exitId ? { plate: null, ticketRef: null } : laneIdentity(req.body);
+      // WHO OPENED for a car with a case (0042): the authority a person at
+      // the lane opened the barrier on, as the lane's vend names it.
+      const letOutBy = exits.letOutByField(req.body?.let_out_by, exitId);
       if (!closeEventId) throw bad('event_id is required');
       laneEventId(closeEventId);
       const exitConfirmation = confirmation(
@@ -2813,6 +2956,7 @@ export function createApp() {
       await activeGarageOrRefuse({
         tenantId, garageId, laneId, laneEventId: String(closeEventId), action: 'close', at: exitAt,
       });
+      if (exitId) await settleBeforeClose(tenantId, garageId, exitId);
 
       const out = await withTenant(tenantId, async (client) => {
         // Keyed on the event first, so a replay returns the very session this
@@ -2822,12 +2966,18 @@ export function createApp() {
         if (already) return { session: already, closed: false, replay: true };
 
         let exitCase = null;
+        let letOut = null;
         if (exitId) {
           const keptClose = await exits.caseByCloseEvent(client, tenantId, String(closeEventId));
           if (keptClose) return { session: null, exitCase: keptClose, closed: false, replay: true };
           exitCase = await exits.caseById(client, tenantId, garageId, exitId, { lock: true });
           if (!exitCase) throw new HttpError(404, 'exit case not found', 'exit_not_found');
           if (exitCase.closed_at) throw conflict('exit_closed', 'this exit case was closed by another exit event');
+          // A payment started since `settleBeforeClose`: asked again, it is
+          // canceled or found paid before the stay is written.
+          if (exitCase.payment?.status === 'open') throw paymentUnsettled();
+          letOut = exits.letOutOf(exitCase, { by: `lane_device:${deviceId}`, authority: letOutBy, at: exitAt });
+          await recordLetOutAtLane(client, { tenantId, garageId, deviceId, exitCase, letOut, letOutBy });
           if (!exitCase.session_id) {
             // The driver's word, or no stay found and a person let the car
             // out: the case is the whole record of this exit.
@@ -2945,6 +3095,10 @@ export function createApp() {
           // the barrier: the fee it was shown and paid.
           ({ asked, pricing } = quotePricing(exitCase.quote));
           if (pricing.outcome === entitlement.EXIT_OUTCOMES.COVERED) plans = [];
+          // LET OUT WITH NOTHING PAID (0042): no fee, because none was paid;
+          // what it owed is on the record beside it. No validation is
+          // recorded on it and no tax taken.
+          if (letOut && !pricing.refusal) pricing = { outcome: pricing.outcome };
         } else if (consumable.consume) {
           decidedBy = 'lane';
           const coveredBy = localDecision.status === 'covered' ? localDecision.covered_by : [];
@@ -3069,6 +3223,7 @@ export function createApp() {
           decidedBy,
           decisionInputs,
           validation: validated.record,
+          letOut,
         });
         if (wasEnded || clocksApart) {
           await repo.appendEvents(client, tenantId, [

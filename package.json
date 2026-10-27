@@ -20,6 +20,7 @@
     "unread-identity-fail-control": "node scripts/unread-identity-fail-control.js",
     "exits-fail-control": "node scripts/exits-fail-control.js",
     "exit-payments-fail-control": "node scripts/exit-payments-fail-control.js",
+    "exit-let-out-fail-control": "node scripts/exit-let-out-fail-control.js",
     "stay-endings-fail-control": "node scripts/stay-endings-fail-control.js",
     "descriptor-fail-control": "node scripts/descriptor-fail-control.js",
     "shadow-fail-control": "node scripts/shadow-fail-control.js",

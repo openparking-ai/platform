@@ -87,6 +87,8 @@ jobs:
         run: npm run exits-fail-control
       - name: Exit-payments fail-control
         run: npm run exit-payments-fail-control
+      - name: Exit-let-out fail-control
+        run: npm run exit-let-out-fail-control
       - name: Stay-endings fail-control
         run: npm run stay-endings-fail-control
       - name: Descriptor fail-control

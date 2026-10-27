@@ -69,6 +69,40 @@ export function idFields(body) {
   return { plate, colour_code: colour, size };
 }
 
+/** The authorities a person at the lane opens the barrier on, as the lane's vend names them. */
+export const LET_OUT_AUTHORITIES = Object.freeze(['display_code_confirmed', 'human_open_now']);
+
+/** The close's `let_out_by`: one of LET_OUT_AUTHORITIES, on a close that names its case; or null. */
+export function letOutByField(value, exitId) {
+  if (value === undefined || value === null) return null;
+  if (!LET_OUT_AUTHORITIES.includes(value)) throw bad(`let_out_by must be one of ${LET_OUT_AUTHORITIES.join(', ')}`);
+  if (!exitId) throw bad('let_out_by is sent with the exit_id of the case the person opened for');
+  return value;
+}
+
+/**
+ * A CAR LET OUT OWING, WITH NOTHING PAID (0042): the record its stay closes
+ * with, or null when nothing was owed or the card paid. `by` is the
+ * attendant who decided the case, or else the lane computer a person
+ * opened from (`by`), with the authority the lane named.
+ */
+export function letOutOf(row, { by, authority, at }) {
+  if (row.payment?.status === 'succeeded') return null;
+  const q = row.quote;
+  if (q?.outcome === 'covered') return null;
+  if (q && !q.refusal && q.fee_minor === 0) return null;
+  return {
+    paid: false,
+    by: row.person?.by ?? by,
+    reason: row.person?.reason ?? authority ?? null,
+    exit_id: row.id,
+    owed_minor: q && !q.refusal ? q.fee_minor : null,
+    currency: q?.currency ?? null,
+    payment: row.payment?.status ?? null,
+    at: at.toISOString(),
+  };
+}
+
 export function uuidField(value, label) {
   if (value === undefined || value === null) return null;
   if (typeof value !== 'string' || !UUID.test(value)) throw bad(`${label} must be an id`);

@@ -18,6 +18,11 @@
  * THE AMOUNT IS THE PLATFORM'S: the case's fee as shown. Stripe's answer is
  * taken as paid only when its amount and currency are the ones recorded.
  *
+ * CANCELED ONLY ON STRIPE'S WORD. A cancel reads the intent first: one that
+ * succeeded is paid, and is never refunded or voided here; one a card is
+ * being authorised on is left to finish and asked about again. The record
+ * says canceled only when Stripe answered with a canceled intent.
+ *
  * PULL, NOT PUSH, as the account's state is (0020): nothing listens for
  * Stripe's webhooks. The lane polls the case while the driver pays; each
  * poll reads the intent from Stripe, at most once every READ_EVERY_MS.
@@ -41,6 +46,21 @@ export const READ_EVERY_MS = 2000;
 /** One intent per case, whatever retries or races ask for it. */
 export const intentKey = (exitId) =>
   `openparking-exit-pay-${createHash('sha256').update(String(exitId)).digest('hex').slice(0, 32)}`;
+
+/** The states Stripe lets an intent be canceled from without a refund: nothing was taken. */
+export const CANCELABLE = new Set(['requires_payment_method', 'requires_confirmation', 'requires_action']);
+
+/**
+ * One cancel per intent per card attempt. Stripe keeps the first answer to a
+ * key for a day, a refusal included: keyed on the intent alone, a cancel
+ * refused while a card was being authorised would be refused again after that
+ * card was declined, and the intent would stay open. The latest charge names
+ * the attempt, so a retry of the same cancel replays its answer and a cancel
+ * after another card is asked afresh.
+ */
+export const cancelKey = (intent) =>
+  `openparking-exit-cancel-${createHash('sha256')
+    .update(`${intent.id}:${intent.latest_charge ?? 'none'}:${intent.status}`).digest('hex').slice(0, 32)}`;
 
 /**
  * The PaymentIntent for a case's fee. In person: `card_present`, and
@@ -170,8 +190,14 @@ export function readIntent(config, accountId, intentId) {
   return stripeCall({ method: 'GET', path: `/v1/payment_intents/${encodeURIComponent(intentId)}`, account: accountId }, config);
 }
 
-export function cancelIntent(config, accountId, intentId) {
-  return stripeCall({ method: 'POST', path: `/v1/payment_intents/${encodeURIComponent(intentId)}/cancel`, account: accountId, form: {} }, config);
+export function cancelIntent(config, accountId, intentId, idempotencyKey = undefined) {
+  return stripeCall({ method: 'POST', path: `/v1/payment_intents/${encodeURIComponent(intentId)}/cancel`, account: accountId, form: {}, idempotencyKey }, config);
+}
+
+/** The intent the reader is working on now, or null: another car's is never cleared. */
+export async function readerIntent(config, accountId, readerId) {
+  const reader = await stripeCall({ method: 'GET', path: `/v1/terminal/readers/${encodeURIComponent(readerId)}`, account: accountId }, config);
+  return reader?.action?.process_payment_intent?.payment_intent ?? null;
 }
 
 /**
@@ -206,7 +232,7 @@ export async function sendToReader(config, accountId, readerId, intentId) {
   }
 }
 
-/** Clear what the reader is doing; the intent stays, to be tried again. */
+/** Clear what the reader is doing. */
 export async function clearReader(config, accountId, readerId) {
   try {
     await stripeCall({ method: 'POST', path: `/v1/terminal/readers/${encodeURIComponent(readerId)}/cancel_action`, account: accountId, form: {} }, config);
