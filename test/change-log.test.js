@@ -434,6 +434,23 @@ const WRITES = [
     state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM banned_vehicles WHERE id = $1', [s.ban.id]),
   },
   {
+    action: 'exit.let_out',
+    // A car at an exit that found no stay (0037), written as the lane's ask
+    // writes it, and let out by a person.
+    setup: async () => {
+      const g = await newGarage(base, a);
+      const lane = await newLane(base, a, g.id, 'Out', 'exit');
+      const exit = await withTenant(a.tenant, async (c) => (await c.query(
+        `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+         VALUES ($1, $2, $3, 'cl' || replace(gen_random_uuid()::text, '-', ''), now(), 'none') RETURNING id`,
+        [a.tenant, g.id, lane.id])).rows[0]);
+      return { g, exit };
+    },
+    run: (s) => call(base, 'POST', `/garages/${s.g.id}/exits/${s.exit.id}/let-out`, { as: a, body: { reason: 'paper ticket shown' } }),
+    line: (l, s) => assert.deepEqual([l.subject_kind, l.subject_id, l.before, l.after], ['exit', s.exit.id, { let_out: false }, { let_out: true, reason: 'paper ticket shown' }]),
+    state: (s) => one(a.tenant, "SELECT person->>'reason' AS reason FROM exits WHERE id = $1", [s.exit.id]),
+  },
+  {
     action: 'lane.board_prices',
     setup: async () => {
       const g = await newGarage(base, a);
@@ -471,7 +488,7 @@ function routeTable(expressApp) {
   return out;
 }
 
-test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 31 -- and every one has a recipe here, or is always refused', () => {
+test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 32 -- and every one has a recipe here, or is always refused', () => {
   const reads = READ_POSTS.map(([m, p]) => `${m} ${p}`);
   const writes = routeTable(expressApp).filter((r) => r.mount === '/api/v1' && r.method !== 'GET').map((r) => `${r.method} ${r.path}`);
   assert.deepEqual(writes.filter((w) => !reads.includes(w)).sort(), WRITE_ROUTES.map(([m, p]) => `${m} ${p}`).sort());
@@ -481,13 +498,14 @@ test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 
   // 22 from U4, U4b's four: a person added, changed, removed, and what they
   // get; and U4c's four: a board message added, changed, removed, and a
   // lane's price switch.
-  // And U7f's one: a banned car taken off the list.
-  assert.equal(WRITE_ROUTES.length, 31);
+  // And U7f's one: a banned car taken off the list; and 0037's: a car at an
+  // exit let out by a person.
+  assert.equal(WRITE_ROUTES.length, 32);
   const covered = new Set([...WRITES.map((w) => w.action), ...ALWAYS_REFUSED]);
   assert.deepEqual(WRITE_ROUTES.map(([, , action]) => action).filter((x) => !covered.has(x)), [], 'a write route with no recipe here');
   // The owner's one write outside the operator router: the language.
   assert.deepEqual(routeTable(expressApp).filter((r) => r.mount === '/api/v1/auth' && r.method === 'PUT').map((r) => r.path), ['/language']);
-  assert.equal(WRITES.length, 31, '30 operator writes that can succeed, and the language: 32 writes with the retired rates route');
+  assert.equal(WRITES.length, 32, '31 operator writes that can succeed, and the language: 33 writes with the retired rates route');
 });
 
 test('EVERY WRITE: one change, exactly one line -- who, what, before and after -- by the session, and by the key the same way', async () => {

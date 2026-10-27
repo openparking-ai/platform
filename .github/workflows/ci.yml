@@ -214,6 +214,18 @@ jobs:
         # red with at least one of its tests still green.
         run: npm run unread-identity-fail-control
 
+      - name: Exit-case fail-control
+        # The car at an exit, found by its ID (0037). Each break removes one
+        # property the exit rests on -- the matcher's exclusions (a differing
+        # sure character, colour or size, unreadable against read), folding,
+        # a clear winner, the picker sent pictures only, within a limit, once,
+        # never with a car hidden, its answer one number; the driver's word
+        # bounded and once; the gate settled only at zero, covered or by a
+        # named person; the close writing the case's fee; the entry's ID kept
+        # and purged -- and two halves of 0037's constraints, and requires
+        # test/exit-match.test.js and test/exits.test.js to go red.
+        run: npm run exits-fail-control
+
       - name: Descriptor fail-control
         # A session carries the appearance descriptor its entry read produced
         # (migration 0009) and the one its exit read produced (0010). Each break

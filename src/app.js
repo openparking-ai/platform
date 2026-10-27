@@ -28,6 +28,9 @@ import { MESSAGE_MAX } from './lanes.js';
 import * as setup from './setup.js';
 import * as alerts from './alerts.js';
 import * as bans from './bans.js';
+import * as exits from './exits.js';
+import * as exitMatch from './exitMatch.js';
+import * as exitPicker from './exitPicker.js';
 import { garageCurrency, garageName, garageSpaces, garageTimezone } from './garageFields.js';
 import { verifyUtf8 } from './utf8Body.js';
 
@@ -89,9 +92,11 @@ export const ID_PARAMS = Object.freeze({
     messageId: () => new HttpError(404, 'board message not found', 'board_message_not_found'),
     banId: () => new HttpError(404, 'banned car not found', 'banned_car_not_found'),
     pictureId: () => new HttpError(404, 'picture not found'),
+    exitId: () => new HttpError(404, 'exit case not found', 'exit_not_found'),
   }),
   lane: Object.freeze({
     sessionId: () => conflict('stay_not_open', STAY_NOT_OPEN),
+    exitId: () => new HttpError(404, 'exit case not found', 'exit_not_found'),
   }),
 });
 function checkIds(router, params) {
@@ -2055,6 +2060,10 @@ export function createApp() {
       // What was read of an unread car's plate below the lane's confidence
       // (0036): kept, never an identity.
       const unsure = unsurePlateFields(req.body, { plateUnreadable });
+      // The ID the exit finds this stay by (0037): the positioned plate
+      // characters, the colour code, the size. Each optional; an older lane
+      // sends none and its stays are found by their plate.
+      const entryId = exits.idFields(req.body);
       // Required, not optional. Without it there is no key to be idempotent on
       // and the only thing left to check is state -- which is exactly how a
       // replay arriving after the car has left opens a second, phantom session.
@@ -2093,6 +2102,7 @@ export function createApp() {
           noOpenCommand,
           entryUnsurePlate: unsure.plate,
           entryUnsurePlateConfidence: unsure.confidence,
+          entryId,
         });
         if (opened.created) await bans.listIfBanned(client, tenantId, { garage, session: opened.session, vehicle });
         return opened;
@@ -2292,6 +2302,180 @@ export function createApp() {
   });
 
   /**
+   * THE EXIT CASE (0037). The car is on the exit's arming loop and the lane
+   * could not let it out on its own copy (a pass it holds, or nothing to
+   * pay): which stay is it, and what does it owe? Body:
+   *
+   *   {event_id, exit_at, plate_characters?, color_code?, size?, session_id?}
+   *
+   * `session_id`: the lane matched the stay itself. Otherwise the platform
+   * finds it by the ID (src/exitMatch.js): one clear stay; or a few, and the
+   * picker chooses by pictures -- the lane's pictures under this `event_id`
+   * and each candidate's entry pictures -- within its time limit; or none.
+   * A matched stay is priced here, the modules asked first; the fee is what
+   * the lane shows and what is paid. 201 with the case; a resend of the
+   * same `event_id` is the same case (200), and the picker is never asked
+   * twice for one car.
+   */
+  lane.post('/exits', async (req, res, next) => {
+    try {
+      const { tenantId, garageId, laneId, direction } = req.device;
+      if (direction !== 'exit') throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
+      const body = req.body ?? {};
+      if (!body.event_id) throw bad('event_id is required');
+      const eventId = String(laneEventId(body.event_id));
+      const exitAt = refuseFuture(parseTime(body.exit_at, 'exit_at'), 'exit_at');
+      const id = exits.idFields(body);
+      const namedStay = exits.uuidField(body.session_id, 'session_id');
+      const garage = await activeGarageOrRefuse({ tenantId, garageId, laneId, laneEventId: eventId, action: 'close', at: exitAt });
+
+      const staged = await withTenant(tenantId, async (client) => {
+        const already = await exits.caseByEvent(client, tenantId, eventId);
+        if (already) return { already };
+        if (namedStay) {
+          const open = await repo.findOpenSessionById(client, tenantId, garageId, namedStay);
+          if (!open) throw conflict('stay_not_open', 'the named stay is not open in this garage');
+          return { method: 'lane', sessionId: open.id, candidates: [] };
+        }
+        const stays = await exits.openStaysForMatch(client, tenantId, garageId, exitAt);
+        const found = exitMatch.match(id, stays);
+        if (found.kind === 'single') return { method: 'single', sessionId: found.stay, candidates: [found.stay] };
+        if (found.kind === 'none') return { method: 'none', candidates: [] };
+        const byId = new Map(stays.map((s) => [s.id, s]));
+        const exitPictures = await exits.picturesOf(client, tenantId, eventId, exitPicker.PICTURES_PER_CAR);
+        const candidates = [];
+        for (const sid of found.candidates) {
+          candidates.push({ session_id: sid, pictures: await exits.picturesOf(client, tenantId, byId.get(sid).open_event_id, exitPicker.PICTURES_PER_CAR) });
+        }
+        return { few: { exitPictures, candidates } };
+      });
+      if (staged.already) return res.status(200).json({ exit: exits.present(staged.already) });
+
+      // THE PICKER, outside any transaction: nothing is held while a car waits
+      // on an answer from the network.
+      let method = staged.method;
+      let sessionId = staged.sessionId ?? null;
+      let candidates = staged.candidates;
+      let picker = null;
+      if (staged.few) {
+        const { exitPictures, candidates: shown } = staged.few;
+        candidates = shown.map((c) => c.session_id);
+        const settings = exitPicker.readPickerSettings();
+        const pictures = { exit: exitPictures.map((p) => p.id), candidates: shown.map((c) => c.pictures.map((p) => p.id)) };
+        if (!settings.on) {
+          picker = { outcome: 'off' };
+        } else if (exitPictures.length === 0 || shown.some((c) => c.pictures.length === 0)) {
+          // A candidate it cannot see is one it can never choose: asking would
+          // let it choose the wrong one with the right one hidden.
+          picker = { outcome: 'not_asked', reason: 'a car without pictures', pictures };
+        } else {
+          const asked = await exitPicker.pick(settings, { exitPictures, candidates: shown });
+          picker = { outcome: asked.outcome, answer: asked.answer, model: asked.model, elapsed_ms: asked.elapsed_ms, pictures };
+          if (asked.outcome === 'picked') sessionId = asked.chosen;
+        }
+        method = sessionId ? 'picker' : 'none';
+      }
+
+      const out = await withTenant(tenantId, async (client) => {
+        const already = await exits.caseByEvent(client, tenantId, eventId);
+        if (already) return { row: already, created: false };
+        let quote = null;
+        if (sessionId) {
+          const open = await repo.findOpenSessionById(client, tenantId, garageId, sessionId);
+          if (open) {
+            const vehicle = await exits.vehicleOf(client, tenantId, open.vehicle_id);
+            quote = await quoteStay(client, { tenantId, garage, laneId, session: open, vehicle, exitAt });
+          } else {
+            method = 'none';
+            sessionId = null;
+          }
+        }
+        const written = await exits.insertCase(client, tenantId, {
+          garageId, laneId, eventId, exitAt, id, method, sessionId, candidates, picker, quote,
+        });
+        if (written.created && method === 'none') {
+          await repo.appendEvents(client, tenantId, [{
+            garageId,
+            laneId,
+            eventId: `${exits.UNMATCHED_EVENT_KIND}:${written.row.id}`,
+            kind: exits.UNMATCHED_EVENT_KIND,
+            occurredAt: exitAt,
+            detail: { actor: 'platform:exit', exit_id: written.row.id, candidates: candidates.length, picker: picker?.outcome ?? null },
+          }]);
+        }
+        return written;
+      });
+      res.status(out.created ? 201 : 200).json({ exit: exits.present(out.row) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** The case as it stands: what the lane polls while the driver pays or a person decides. */
+  lane.get('/exits/:exitId', async (req, res, next) => {
+    try {
+      const { tenantId, garageId, direction } = req.device;
+      if (direction !== 'exit') throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
+      const row = await withTenant(tenantId, (client) => exits.caseById(client, tenantId, garageId, req.params.exitId));
+      if (!row) throw new HttpError(404, 'exit case not found', 'exit_not_found');
+      res.json({ exit: exits.present(row) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * THE DRIVER'S WORD. No stay was found for the car; the driver says when
+   * it came in, `{entry_at}`, and the engine prices that stay by the
+   * garage's own rules. Kept on the case with the pictures; the attendants
+   * on duty are told (`exit_driver_word`). No later than the exit, no more
+   * than WORD_MAX_DAYS before it; said once.
+   */
+  lane.post('/exits/:exitId/word', async (req, res, next) => {
+    try {
+      const { tenantId, garageId, laneId, direction } = req.device;
+      if (direction !== 'exit') throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
+      const claimed = parseTime(req.body?.entry_at, 'entry_at');
+      const out = await withTenant(tenantId, async (client) => {
+        const row = await exits.caseById(client, tenantId, garageId, req.params.exitId, { lock: true });
+        if (!row) throw new HttpError(404, 'exit case not found', 'exit_not_found');
+        if (row.method !== 'none' || row.closed_at) {
+          throw conflict('word_not_wanted', 'the driver is asked for an entry time only when no stay was found, once');
+        }
+        const exitAt = row.exit_at;
+        if (claimed > exitAt) throw conflict('word_after_exit', 'the entry time said is after the car reached the exit');
+        if (exitAt - claimed > exits.WORD_MAX_DAYS * 86_400_000) {
+          throw conflict('word_too_old', `the entry time said is more than ${exits.WORD_MAX_DAYS} days before the exit`);
+        }
+        const garage = await repo.getGarage(client, tenantId, garageId);
+        const session = { entry_at: claimed, currency: garage.currency, occupancy_at_entry_bp: null };
+        const quote = await quoteStay(client, { tenantId, garage, laneId, session, vehicle: null, exitAt });
+        const updated = await exits.recordWord(client, tenantId, row.id, { claimedEntryAt: claimed, quote });
+        await repo.appendEvents(client, tenantId, [{
+          garageId,
+          laneId,
+          eventId: `${exits.DRIVER_WORD_EVENT_KIND}:${row.id}`,
+          kind: exits.DRIVER_WORD_EVENT_KIND,
+          occurredAt: new Date(),
+          detail: {
+            actor: 'platform:exit',
+            exit_id: row.id,
+            claimed_entry_at: claimed.toISOString(),
+            exit_at: exitAt.toISOString(),
+            fee_minor: quote.fee_minor,
+            currency: quote.currency,
+            refused: Boolean(quote.refusal),
+          },
+        }]);
+        return updated;
+      });
+      res.json({ exit: exits.present(out) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
    * Exit. Computes the fee and freezes it, along with the rate that produced it.
    * Idempotent: closing an already-closed session returns it unchanged.
    */
@@ -2318,7 +2502,11 @@ export function createApp() {
       // a ticket could never be closed: the close would upsert a vehicle from a
       // plate it does not have, find no open session, and 404 — a car that got
       // in and a stay that stays open and unbilled for ever.
-      const { plate, ticketRef } = laneIdentity(req.body);
+      // OR THE EXIT CASE (0037), which already names the stay it found by
+      // the car's ID -- a stay no plate could find, an unread one included --
+      // or, for the driver's word, no stay at all.
+      const exitId = exits.uuidField(req.body?.exit_id, 'exit_id');
+      const { plate, ticketRef } = exitId ? { plate: null, ticketRef: null } : laneIdentity(req.body);
       if (!closeEventId) throw bad('event_id is required');
       laneEventId(closeEventId);
       const exitConfirmation = confirmation(
@@ -2343,27 +2531,46 @@ export function createApp() {
         const already = await repo.findSessionByCloseEvent(client, tenantId, String(closeEventId));
         if (already) return { session: already, closed: false, replay: true };
 
-        const vehicle = await repo.upsertVehicle(client, tenantId, {
-          plate, ticketRef, seenAt: exitAt,
-        });
+        let exitCase = null;
+        if (exitId) {
+          const keptClose = await exits.caseByCloseEvent(client, tenantId, String(closeEventId));
+          if (keptClose) return { session: null, exitCase: keptClose, closed: false, replay: true };
+          exitCase = await exits.caseById(client, tenantId, garageId, exitId, { lock: true });
+          if (!exitCase) throw new HttpError(404, 'exit case not found', 'exit_not_found');
+          if (exitCase.closed_at) throw conflict('exit_closed', 'this exit case was closed by another exit event');
+          if (!exitCase.session_id) {
+            // The driver's word, or no stay found and a person let the car
+            // out: the case is the whole record of this exit.
+            const closedCase = await exits.markClosed(client, tenantId, exitCase.id, { closeEventId: String(closeEventId), closedAt: exitAt });
+            return { session: null, exitCase: closedCase, closed: true, replay: false };
+          }
+        }
+
+        const named = exitCase?.session_id ?? sessionId;
+        const openByCase = exitCase ? await repo.findOpenSessionById(client, tenantId, garageId, exitCase.session_id) : null;
+        const vehicle = exitCase
+          ? (openByCase ? await exits.vehicleOf(client, tenantId, openByCase.vehicle_id) : null)
+          : await repo.upsertVehicle(client, tenantId, { plate, ticketRef, seenAt: exitAt });
 
         // When the lane names the session, that is the session -- no guessing
         // from a plate, so a stale exit from an earlier visit can never land on
         // a later one. When it does not (it was offline at the exit), fall back
         // to the plate with the ordering guard below.
-        const open = sessionId
-          ? await repo.findOpenSessionById(client, tenantId, garageId, sessionId)
-          : await repo.findOpenSession(client, tenantId, garageId, vehicle.id);
+        const open = exitCase
+          ? openByCase
+          : named
+            ? await repo.findOpenSessionById(client, tenantId, garageId, named)
+            : await repo.findOpenSession(client, tenantId, garageId, vehicle.id);
 
         if (!open) {
           throw new HttpError(
             404,
-            sessionId
+            named
               ? 'the named session is not open in this garage'
               : 'no open session for this vehicle',
           );
         }
-        if (sessionId && open.vehicle_id !== vehicle.id) {
+        if (!exitCase && sessionId && open.vehicle_id !== vehicle.id) {
           throw conflict('session_vehicle_mismatch', 'the named session belongs to a different vehicle');
         }
 
@@ -2420,7 +2627,12 @@ export function createApp() {
         let pricing;
         let decidedBy = 'platform';
         let decisionInputs = null;
-        if (consumable.consume) {
+        if (exitCase) {
+          // The case's figures (0037), asked and priced when the car reached
+          // the barrier: the fee it was shown and paid.
+          ({ asked, pricing } = quotePricing(exitCase.quote));
+          if (pricing.outcome === entitlement.EXIT_OUTCOMES.COVERED) plans = [];
+        } else if (consumable.consume) {
           decidedBy = 'lane';
           const coveredBy = localDecision.status === 'covered' ? localDecision.covered_by : [];
           asked = {
@@ -2620,7 +2832,10 @@ export function createApp() {
             },
           ]);
         }
-        return { session: closed, closed: true, replay: false, releaseAfter: validated.releaseAfter };
+        const closedCase = exitCase
+          ? await exits.markClosed(client, tenantId, exitCase.id, { closeEventId: String(closeEventId), closedAt: exitAt })
+          : null;
+        return { session: closed, exitCase: closedCase, closed: true, replay: false, releaseAfter: validated.releaseAfter };
       });
 
       // The release the close decided on, asked AFTER the close committed
@@ -2638,7 +2853,12 @@ export function createApp() {
       // The row as written, `exit_descriptor` with it -- echoed for the reason
       // `entry_descriptor` is on the open, and a replay echoes what the close
       // that actually closed the stay stored.
-      res.status(200).json({ session: presentSession(out.session), closed: out.closed, replay: out.replay });
+      res.status(200).json({
+        session: out.session ? presentSession(out.session) : null,
+        ...(out.exitCase ? { exit: exits.present(out.exitCase) } : {}),
+        closed: out.closed,
+        replay: out.replay,
+      });
     } catch (err) {
       next(err);
     }
@@ -2790,6 +3010,67 @@ export function createApp() {
     if (!garage) throw new HttpError(404, 'garage not found');
     return garage;
   };
+
+  /**
+   * THE EXIT CASES STILL AT A LANE (0037): every car at an exit of this
+   * garage whose case is not closed, newest first, with what is missing --
+   * the driver's word, a person, a payment -- and, for a case the picker
+   * was asked about, what it was shown and answered.
+   */
+  operator.get('/garages/:garageId/exits', async (req, res, next) => {
+    try {
+      const open = await withTenant(req.tenantId, async (client) => {
+        await ownGarage(client, req);
+        return exits.openCases(client, req.tenantId, req.params.garageId);
+      });
+      res.json({ exits: open.map(exits.presentForPerson) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * A PERSON LETS THE CAR OUT, `{reason}`: the case is settled whatever it
+   * owed, with who and why on the case, an event beside it, and a line in
+   * the change log. Once per case, and only while the car is at the lane.
+   */
+  operator.post('/garages/:garageId/exits/:exitId/let-out', async (req, res, next) => {
+    try {
+      const reason = req.body?.reason;
+      if (typeof reason !== 'string' || reason.trim().length === 0 || reason.length > 500) {
+        throw bad('reason is required: why the car is let out, at most 500 characters');
+      }
+      const row = await changeTx(req, async (client) => {
+        const garage = await ownGarage(client, req);
+        const found = await exits.caseById(client, req.tenantId, garage.id, req.params.exitId, { lock: true });
+        if (!found) throw new HttpError(404, 'exit case not found', 'exit_not_found');
+        if (found.closed_at) throw conflict('exit_closed', 'the car has already left: this case is closed');
+        if (found.person) throw conflict('exit_already_let_out', 'a person has already let this car out');
+        const actor = await changes.who(client, req.change);
+        const person = { by: `${actor.kind}:${actor.name ?? actor.id ?? ''}`.slice(0, 300), reason: reason.trim(), at: new Date().toISOString() };
+        const updated = await exits.recordPerson(client, req.tenantId, found.id, person);
+        await repo.appendEvents(client, req.tenantId, [{
+          garageId: garage.id,
+          laneId: found.lane_id,
+          eventId: `${exits.PERSON_EVENT_KIND}:${found.id}`,
+          kind: exits.PERSON_EVENT_KIND,
+          occurredAt: new Date(),
+          detail: { actor: person.by, exit_id: found.id, reason: person.reason, owed: exits.settledOf(found) },
+        }]);
+        await changes.record(client, req.change, {
+          garageId: garage.id,
+          action: 'exit.let_out',
+          subject: { kind: 'exit', id: found.id, name: null },
+          before: { let_out: false },
+          after: { let_out: true, reason: person.reason },
+        });
+        return updated;
+      });
+      res.json({ exit: exits.presentForPerson(row) });
+    } catch (err) {
+      next(err);
+    }
+  });
 
   /**
    * THE BANNED CARS (0033, U7f). The garage's two settings, and every car
@@ -3249,6 +3530,79 @@ async function priceStay({ garage, plans, session, exitAt }) {
 }
 
 /**
+ * THE FEE OF AN EXIT CASE (0037), worked out as the close works out its own
+ * when it prices -- the modules asked, then the engine, then the tax -- and
+ * kept on the case whole: what the lane shows, what is paid, and what the
+ * close writes (`quotePricing`). A stay with no plate read cannot be asked
+ * about by the modules (they hold plates), so it prices as a transient and
+ * says why. `vehicle` null: the driver's word, which no module is asked about.
+ */
+async function quoteStay(client, { tenantId, garage, laneId, session, vehicle, exitAt }) {
+  const identity = vehicle?.plate ?? vehicle?.ticket_ref ?? null;
+  const asked = identity
+    ? await entitlement.consult({ garage, identity, laneId, entryAt: session.entry_at, exitAt })
+    : {
+        outcome: entitlement.EXIT_OUTCOMES.TRANSIENT,
+        covered_by: [],
+        record: {
+          identity: null,
+          asked_at: exitAt.toISOString(),
+          covered_by: [],
+          reason: vehicle ? 'no plate was read at the entry: no module can be asked about this car' : "the driver's word: no stay to ask about",
+        },
+      };
+  const base = {
+    entry_at: new Date(session.entry_at).toISOString(),
+    exit_at: exitAt.toISOString(),
+    currency: session.currency,
+    covered_by: asked.covered_by,
+    entitlement: asked.record,
+  };
+  if (asked.outcome === entitlement.EXIT_OUTCOMES.COVERED) {
+    return { ...base, outcome: entitlement.EXIT_OUTCOMES.COVERED, fee_minor: 0, subtotal_minor: 0, breakdown: [], refusal: null, pre_tax: null };
+  }
+  const plans = ratePlans.documents(await ratePlans.ratePlansForGarage(client, tenantId, garage.id));
+  const priced = await priceStay({ garage, plans, session, exitAt });
+  if (priced.refusal) {
+    return { ...base, outcome: entitlement.EXIT_OUTCOMES.TRANSIENT, fee_minor: null, subtotal_minor: null, breakdown: null, refusal: priced.refusal, pre_tax: null };
+  }
+  const taxed = await taxedPricing({ outcome: entitlement.EXIT_OUTCOMES.TRANSIENT, ...priced }, {
+    client, tenantId, garage, currency: session.currency, at: exitAt,
+  });
+  return {
+    ...base,
+    outcome: entitlement.EXIT_OUTCOMES.TRANSIENT,
+    fee_minor: taxed.feeMinor,
+    subtotal_minor: taxed.subtotalMinor,
+    breakdown: taxed.breakdown,
+    plan_version: priced.planVersion,
+    space_class: priced.spaceClass,
+    refusal: null,
+    pre_tax: { feeMinor: priced.feeMinor, planVersion: priced.planVersion, breakdown: priced.breakdown, spaceClass: priced.spaceClass },
+  };
+}
+
+/**
+ * The close's `asked` and pre-tax `pricing` for a stay a case found: the
+ * case's own figures, written as shown -- the taxed fee and its lines ride
+ * as `asDecided`, so the close writes the number the driver saw and paid
+ * and does not price a second time.
+ */
+function quotePricing(quote) {
+  const asked = { outcome: quote.outcome, covered_by: quote.covered_by, record: quote.entitlement };
+  if (quote.outcome === entitlement.EXIT_OUTCOMES.COVERED) return { asked, pricing: { outcome: quote.outcome } };
+  if (quote.refusal) return { asked, pricing: { outcome: quote.outcome, refusal: quote.refusal } };
+  return {
+    asked,
+    pricing: {
+      outcome: quote.outcome,
+      ...quote.pre_tax,
+      asDecided: { feeMinor: quote.fee_minor, breakdown: quote.breakdown },
+    },
+  };
+}
+
+/**
  * THE TAX LINES, LAST (0023). `pricing` arrives PRE-TAX -- base lines, then a
  * recorded validation line if there is one -- and leaves with the tax lines
  * after them, `subtotalMinor` beside the fee, and the fee the running total:
@@ -3351,6 +3705,7 @@ export const WRITE_ROUTES = Object.freeze([
   ['DELETE', '/garages/:garageId/board-messages/:messageId', 'board_message.remove'],
   ['PUT', '/lanes/:laneId/board-prices', 'lane.board_prices'],
   ['POST', '/garages/:garageId/banned/:banId/remove', 'garage.banned_car_remove'],
+  ['POST', '/garages/:garageId/exits/:exitId/let-out', 'exit.let_out'],
 ]);
 
 const WRITE_PATTERNS = WRITE_ROUTES.map(([method, path, action]) => [

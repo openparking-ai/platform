@@ -99,6 +99,8 @@ function bodyFor(r, id) {
     'POST /garages/:garageId/rate-plans': { plan: flatHourlyPlan() },
     'POST /lanes/:laneId/devices': { name: 'ids-device' },
     'POST /garages/:garageId/tax-sets': { tax_set: { effective_from: '2026-01-01T00:00:00Z', rules: [] } },
+    'POST /garages/:garageId/exits/:exitId/let-out': { reason: 'ids' },
+    'POST /exits/:exitId/word': { entry_at: '2026-09-10T12:00:00Z' },
     'POST /sessions/:sessionId/validation': {
       phone: '(202) 555-0143',
       local_decision: {
@@ -153,7 +155,8 @@ test('the walk finds every route with an id on both routers, and every parameter
   };
   t.diagnostic(`operator: ${count('operator')}; lane: ${count('lane')}`);
   assert.ok(routes.filter((r) => r.router === 'operator').length >= 20);
-  assert.equal(routes.filter((r) => r.router === 'lane').length, 1);
+  // The validation claim, and the exit case read and the driver's word (0037).
+  assert.equal(routes.filter((r) => r.router === 'lane').length, 3);
 });
 
 test('A MALFORMED ID answers what an id naming nothing answers, before the body and before the database', async () => {

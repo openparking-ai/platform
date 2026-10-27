@@ -123,7 +123,7 @@ export async function openSession(
   tenantId,
   {
     garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation, entryDescriptor = null, tailgater = false,
-    noOpenCommand = false, entryUnsurePlate = null, entryUnsurePlateConfidence = null,
+    noOpenCommand = false, entryUnsurePlate = null, entryUnsurePlateConfidence = null, entryId = null,
   },
 ) {
   // Keyed on the event, so a replay is recognised whether the session it
@@ -164,12 +164,15 @@ export async function openSession(
       `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
                              open_event_id, entry_confirmation, entry_descriptor, tailgater,
                              occupancy_at_entry_bp, no_open_command, entry_unsure_plate,
-                             entry_unsure_plate_confidence)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                             entry_unsure_plate_confidence, entry_plate_state, entry_plate_rule,
+                             entry_plate_pattern, entry_colour_code, entry_size)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
        RETURNING *`,
       [tenantId, garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation,
        entryDescriptor, tailgater, occupancyAtEntryBp,
-       noOpenCommand, entryUnsurePlate, entryUnsurePlateConfidence],
+       noOpenCommand, entryUnsurePlate, entryUnsurePlateConfidence,
+       entryId?.plate?.state ?? null, entryId?.plate?.rule ?? null, entryId?.plate?.pattern ?? null,
+       entryId?.colour_code ?? null, entryId?.size ?? null],
     );
     await client.query('RELEASE SAVEPOINT open_session');
     return { session: rows[0], created: true };

@@ -18,6 +18,7 @@
     "devices-and-codes-fail-control": "node scripts/devices-and-codes-fail-control.js",
     "ticket-identity-fail-control": "node scripts/ticket-identity-fail-control.js",
     "unread-identity-fail-control": "node scripts/unread-identity-fail-control.js",
+    "exits-fail-control": "node scripts/exits-fail-control.js",
     "descriptor-fail-control": "node scripts/descriptor-fail-control.js",
     "shadow-fail-control": "node scripts/shadow-fail-control.js",
     "rate-plans-fail-control": "node scripts/rate-plans-fail-control.js",

@@ -13,6 +13,19 @@
 
 export const TENANT_TABLES = [
   {
+    table: 'exits',
+    // A car at an exit that found no stay (0037): each its own event id.
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+         VALUES ($1, $2, $3, 'tt' || replace(gen_random_uuid()::text, '-', ''), now(), 'none')
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    // The record of why a car was let out: updated as it settles, never deleted.
+    noDelete: true,
+  },
+  {
     table: 'entry_pictures',
     // A picture kept with an entry (0033): each its own picture_ref, so rows
     // collide with nothing but a policy.

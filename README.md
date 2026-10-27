@@ -143,10 +143,10 @@ a vehicle with an open stay takes no second one — a shared "unreadable" row
 would fold every unread car in the garage into the first one's stay. A replayed
 open is the same row and the same stay. The database holds the rule too
 (`vehicles_exactly_one_identity` over three columns, `vehicles_tenant_unread_ref_key`).
-Nothing finds or closes a stay by it: the close and the exit's lookup take a
-plate or a ticket, as before, and matching an exit to an unread car's stay is
-not built here -- **until it is, an unread stay has no way to end**: a car
-counts as inside from its entry to its exit, with no age-out. The stay counts
+The close by plate and the exit's lookup take a plate or a ticket, as before;
+an unread car's stay is found and closed through its **exit case** (0037,
+below), by the car's ID. A car counts as inside from its entry to its exit,
+with no age-out. The stay counts
 among the cars inside (0034) and is on the lane's feed with no plate and no
 ticket.
 
@@ -1581,6 +1581,82 @@ properties: `stripe_dashboard.type: none`, `fees.payer: account`,
 the three missing, each route above answers `409 connect_not_configured`,
 *"This deployment has no Stripe Connect configured."*, asks Stripe nothing,
 and every other route behaves exactly as without it.
+
+### The exit, by the car's ID (0037)
+
+The entry and exit cameras are a matched pair under the same light, so a car
+is identified by both ends giving the **same ID**, not by an exact plate: the
+plate as positioned characters, the sure ones folded (`O`/`0`, `I`/`1`,
+`B`/`8`, `S`/`5`) and the rest `?`, under a named rule (`opvid-plate-chars/1`);
+or the fact that it was `unreadable`, or `not_seen`; the colour code
+(`opvid-colour/1`); the size when one is measured. An entry's open may carry
+`plate_characters` (`{state, rule, pattern}`), `color_code` and `size`, and the
+stay keeps them (`entry_plate_state`, `entry_plate_rule`,
+`entry_plate_pattern`, `entry_colour_code`, `entry_size`); the purge nulls them
+with the plate.
+
+**Every car at an exit lane the lane could not let out on its own copy is a
+case** — `POST /api/v1/lane/exits` with `{event_id, exit_at, plate_characters?,
+color_code?, size?, session_id?}`:
+
+| `method` | how the stay was decided |
+|---|---|
+| `lane` | the lane matched it from its own copy and named it (`session_id`) |
+| `single` | one open stay agreed with the car's ID, clearly (`src/exitMatch.js`) |
+| `picker` | a few agreed; the picker chose one by pictures (`src/exitPicker.js`) |
+| `none` | no stay found; the driver has not said yet |
+| `driver_word` | no stay found; the driver's stated entry time was priced |
+
+**The matcher** excludes a stay on any component that disagrees: a sure
+character that differs in its position, a colour code further than 0.20
+(vehicle-id's stated assumption, not a measurement), a different size, a read
+plate against an unreadable one. An unreadable plate matches unreadable
+plates only; `not_seen` (no picture of the plate at all) says nothing either
+way, as does anything that cannot be compared. A stay wins alone with 3 sure
+characters in agreement (or 2 with the colour or size beside them) and 2 more
+than the next stay; an unreadable plate wins alone when it is the only stay
+left and its colour or size agrees. Otherwise up to 10 candidates go to the
+picker; more than that, or nothing left, is `none`. A stay opened by an older
+lane with a whole plate counts as every position sure.
+
+**The picker** (off unless `EXIT_PICKER_KEY_FILE` names the file holding an
+Anthropic API key, re-read on every ask) is shown the exit's pictures (the
+lane's `POST /pictures` under the case's `event_id`) and each candidate's
+entry pictures, numbered, and asked only which number is the same car, or 0.
+Pictures only: no plate, colour, time or id is sent, and only the number is
+kept, with the model, the time it took and the pictures shown. It is asked
+outside any transaction, within `EXIT_PICKER_TIMEOUT_MS` (8000 by default,
+1000 to 30000), once per car: a resend of the same `event_id` is the same case.
+No answer in time, an answer that is not one number in range, or a candidate
+with no pictures (it could never be chosen) is `none`. The model is
+`EXIT_PICKER_MODEL`, `claude-sonnet-5-5` by default.
+
+**None found:** an `exit_unmatched` event for the attendants, then the
+driver's word — `POST /api/v1/lane/exits/:exitId/word {entry_at}`, once, no
+later than the exit and no more than 90 days before it — priced by the engine
+on the garage's own rules (no module is asked: there is no plate), kept on
+the case, and an `exit_driver_word` event. The stay that car really was stays
+open; a person ends it.
+
+**Settled** is the one thing the lane opens on: covered by a module, a fee of
+zero, or a person who let the car out. A fee above zero says `needs:
+"payment"`; an unpriced one `needs: "person"`; no stay `needs:
+"driver_word"`. `GET /api/v1/lane/exits/:exitId` is what the lane polls.
+
+**A person**: `GET /api/v1/garages/:garageId/exits` lists the cases still at a
+lane, with the candidates and what the picker said;
+`POST /api/v1/garages/:garageId/exits/:exitId/let-out {reason}` settles one,
+once, with who and why on the case, an `exit_let_out_by_person` event, and an
+`exit.let_out` change-log line.
+
+**The close** takes `exit_id` instead of a plate. A case with a stay closes it
+— an unread one included — writing the case's own figures (the fee shown, as
+`asDecided`), never a second price. A case with no stay (the driver's word, or
+a person) is closed on the case itself; the response's `session` is `null`.
+
+A case is never deleted (no DELETE grant), is forced under row-level security,
+and names only its own account's lane and stay (a trigger, as 0033's). A lane
+with a case on record is not removed.
 
 ### A garage's card reader, bound to a lane
 

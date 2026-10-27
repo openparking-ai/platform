@@ -117,6 +117,21 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
           WHERE tenant_id = $1 AND entry_unsure_plate IS NOT NULL AND vehicle_id = ANY($2::uuid[])`,
         [tenantId, rows.map((r) => r.id)],
       );
+      // The ID the exit matched by (0037): plate characters, colour, size --
+      // on the stay, and on every exit case that found it.
+      await client.query(
+        `UPDATE sessions SET entry_plate_state = NULL, entry_plate_rule = NULL, entry_plate_pattern = NULL,
+                             entry_colour_code = NULL, entry_size = NULL
+          WHERE tenant_id = $1 AND vehicle_id = ANY($2::uuid[])
+            AND (entry_plate_state IS NOT NULL OR entry_colour_code IS NOT NULL OR entry_size IS NOT NULL)`,
+        [tenantId, rows.map((r) => r.id)],
+      );
+      await client.query(
+        `UPDATE exits SET plate_state = NULL, plate_rule = NULL, plate_pattern = NULL, colour_code = NULL, size = NULL
+          WHERE tenant_id = $1
+            AND session_id IN (SELECT s.id FROM sessions s WHERE s.tenant_id = $1 AND s.vehicle_id = ANY($2::uuid[]))`,
+        [tenantId, rows.map((r) => r.id)],
+      );
       // The entitlement record (0015) names the identity the modules were
       // asked about, inside the argv and their answers. Nulled with the
       // descriptors; `exit_outcome` stays -- the outcome survives, who it was
@@ -136,6 +151,16 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
         [tenantId, rows.map((r) => r.id), now],
       );
     }
+    // An exit case that found no stay (the driver's word, or a person) has no
+    // vehicle to age out with: its ID goes when the window has passed since
+    // the car left.
+    await client.query(
+      `UPDATE exits SET plate_state = NULL, plate_rule = NULL, plate_pattern = NULL, colour_code = NULL, size = NULL
+        WHERE tenant_id = $1 AND session_id IS NULL
+          AND (plate_state IS NOT NULL OR colour_code IS NOT NULL OR size IS NOT NULL)
+          AND COALESCE(closed_at, exit_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,
+      [tenantId, now, days],
+    );
     return { tenantId, retentionDays: days, redacted: rows.length, wouldRedact: rows.length };
   });
 }
