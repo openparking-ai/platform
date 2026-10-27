@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import { createApp } from '../src/app.js';
 import { redactExpiredVehicles } from '../src/retention.js';
+import { removeExpiredPictures } from '../src/pictureRetention.js';
 import { WALK_ABANDON_HOURS, SIGHTINGS_PER_MINUTE, WALK_COMPLETE_DEFAULT_PERCENT } from '../src/walks.js';
 import { fold } from '../src/exitMatch.js';
 import {
@@ -799,8 +800,7 @@ test('A PICTURE HAS 30 DAYS: then it is forgotten and the sighting keeps what wa
   const old = await seen(g, walk, picture());
   const fresh = await seen(g, walk, picture());
   await withTenant(g.tenant, (c) => c.query("UPDATE walk_sightings SET taken_at = now() - interval '31 days' WHERE id = $1", [old.id]));
-  const result = await redactExpiredVehicles(g.tenant);
-  assert.equal(result.walkPictures, 1);
+  assert.deepEqual(await removeExpiredPictures(g.tenant), { lane: 0, walk: 1 });
   const path = (s) => `/garages/${g.id}/walks/${walk.id}/sightings/${s.id}/picture`;
   assert.equal((await call(g.op, 'GET', path(old))).status, 404);
   assert.equal((await call(g.op, 'GET', path(fresh))).status, 200);

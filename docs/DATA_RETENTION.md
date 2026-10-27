@@ -146,13 +146,22 @@ documents and nothing about a person or a car. The purge does not touch it, and
 which the purge redacted a vehicle. The `rate_plan_stored` event beside it names
 an operator token, not a person, and is append-only like every event.
 
-## Pictures kept with an entry (U7f, 0033)
+## Pictures: the lane's (U7f, 0033) and the walk's (0040)
 
 A lane sends the pictures it took of the car at its arming read (since 0036), between the vend and the closing loop,
-and at the closing loop. They are personal data on the same terms as the plate. They are **deleted**, not redacted:
-**30 days** after the stay that holds them closed, or 30 days after they were taken when no stay holds them (a
-crossing no car made, a banned car refused at the entry). The owner set 30 days on 2026-10-26; it was one week. A
-car still inside keeps its pictures. `npm run purge` runs both rules.
+and at the closing loop; a person on an inventory walk photographs the parked cars. Both are personal data on the
+same terms as the plate. A lane picture is **deleted**; a walk picture is forgotten and its sighting keeps what was
+read. Both go **30 days** after they were taken, a day being 24 hours. The owner set 30 days on 2026-10-26; it was one
+week.
+
+**A stay keeps the pictures it holds** -- the lane's of its entry, and the walk's a finished walk listed as seeing
+it -- while the car is inside, then for 30 days after it left (by the exit or a person's ending), and while its
+customer has paid picture storage (`sessions.pictures_paid_until`, 0041; nothing writes it yet). A walk past the
+retention window is kept while one of its pictures is.
+
+The job is `npm run purge-pictures` (`npm run purge` runs it first), one tenant at a time under that tenant's row
+security; it prints counts only. `test/picture-retention.test.js` holds each rule, and
+`scripts/picture-retention-fail-control.js` breaks each one.
 
 **A car on a banned list is held:** while it is listed, its vehicle is not redacted by the window above and its
 pictures are not deleted. Taken off the list, both rules apply again as to any other car.

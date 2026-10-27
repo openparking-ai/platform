@@ -46,12 +46,12 @@
  *
  * An INVENTORY WALK (0040) holds plates a person photographed or typed: it
  * is deleted, with its sightings and the stays it listed, once it finished,
- * was abandoned, or (neither) started longer ago than the window. A
- * sighting's picture goes sooner, once its PICTURE_DAYS (30) are over.
+ * was abandoned, or (neither) started longer ago than the window, and none
+ * of its pictures is still kept. Its pictures, and the lane's, go by their
+ * own rule, in the picture job (src/pictureRetention.js).
  */
 import { withTenant } from './db.js';
 import * as repo from './repository.js';
-import * as walksModule from './walks.js';
 
 export async function redactExpiredVehicles(tenantId, { now = null, dryRun = false } = {}) {
   return withTenant(tenantId, async (client) => {
@@ -167,14 +167,18 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
           AND COALESCE(closed_at, exit_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,
       [tenantId, now, days],
     );
+    // A walk one of whose pictures is still kept (src/pictureRetention.js)
+    // waits for it: deleting the walk would take the picture with it.
     const { rowCount: walks } = await client.query(
-      `DELETE FROM walks
-        WHERE tenant_id = $1
-          AND COALESCE(finished_at, abandoned_at, started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,
+      `DELETE FROM walks w
+        WHERE w.tenant_id = $1
+          AND COALESCE(w.finished_at, w.abandoned_at, w.started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)
+          AND NOT EXISTS (
+                SELECT 1 FROM walk_sightings ws
+                 WHERE ws.tenant_id = w.tenant_id AND ws.walk_id = w.id AND ws.picture IS NOT NULL)`,
       [tenantId, now, days],
     );
-    const walkPictures = await walksModule.removeExpiredPictures(client, tenantId, { now });
-    return { tenantId, retentionDays: days, redacted: rows.length, wouldRedact: rows.length, walksDeleted: walks, walkPictures };
+    return { tenantId, retentionDays: days, redacted: rows.length, wouldRedact: rows.length, walksDeleted: walks };
   });
 }
 

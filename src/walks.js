@@ -11,7 +11,9 @@ import { PICTURE_DAYS } from './bans.js';
  *
  * A picture is read by the deployment's vehicle-id (`POST /v1/reads`), whose
  * one plate reader is fast-alpr, and is kept as it was written fresh for
- * PICTURE_DAYS (30), as a lane's picture is.
+ * PICTURE_DAYS (30), as a lane's picture is; a picture a finished walk
+ * listed as seeing a stay is that stay's, kept as the stay keeps its lane
+ * pictures (removeExpiredPictures).
  * The plate's positioned characters (`opvid-plate-chars/1`) are what a
  * sighting is matched on, by the exit's own matching (src/exitMatch.js),
  * against the garage's stays open at some point during the walk. A phone's
@@ -401,12 +403,33 @@ export async function sightingPicture(client, tenantId, walkId, sightingId) {
   return rows[0] ?? null;
 }
 
-/** Forget the walk pictures whose PICTURE_DAYS are over; the sighting keeps what was read. */
+/**
+ * Forget the walk pictures whose PICTURE_DAYS are over at `now` (the
+ * database's now when not given); the sighting keeps what was read. A
+ * picture a finished walk listed as seeing a stay -- in `seen_with_stay`,
+ * itself or through the sighting that answered it -- is kept as that stay
+ * keeps its lane pictures: while the car is inside, 30 days after it left
+ * (by the exit or a person's ending), and while its customer has paid
+ * picture storage past `now` (0041). A day is 24 hours, as for a lane's.
+ */
 export async function removeExpiredPictures(client, tenantId, { now = null } = {}) {
   const { rowCount } = await client.query(
-    `UPDATE walk_sightings SET picture = NULL, picture_type = NULL, picture_digest = NULL
-      WHERE tenant_id = $1 AND picture IS NOT NULL
-        AND taken_at < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,
+    `UPDATE walk_sightings ws SET picture = NULL, picture_type = NULL, picture_digest = NULL
+      WHERE ws.tenant_id = $1 AND ws.picture IS NOT NULL
+        AND ws.taken_at <= COALESCE($2::timestamptz, now()) - make_interval(hours => 24 * $3)
+        AND NOT EXISTS (
+              SELECT 1
+                FROM walks w
+                CROSS JOIN LATERAL jsonb_array_elements(w.lists->'seen_with_stay') AS e(row)
+                JOIN sessions s ON s.tenant_id = w.tenant_id AND s.id = (e.row->>'stay')::uuid
+               WHERE w.tenant_id = ws.tenant_id AND w.id = ws.walk_id
+                 AND (e.row->'sightings' ? ws.id::text
+                      OR EXISTS (SELECT 1 FROM walk_sightings a
+                                  WHERE a.tenant_id = ws.tenant_id AND a.walk_id = ws.walk_id AND a.confirms = ws.id
+                                    AND e.row->'sightings' ? a.id::text))
+                 AND (s.exit_at IS NULL
+                      OR s.exit_at > COALESCE($2::timestamptz, now()) - make_interval(hours => 24 * $3)
+                      OR s.pictures_paid_until > COALESCE($2::timestamptz, now())))`,
     [tenantId, now, PICTURE_DAYS],
   );
   return rowCount;
