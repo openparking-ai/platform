@@ -41,7 +41,8 @@
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out of 0015, so the property genuinely never existed.
  *
- *   covered_may_carry_a_fee    the four-shape constraint never created.
+ *   covered_may_carry_a_fee    the four-shape constraint never created, in
+ *                              0015 or where 0039 replaces it.
  *   link_shape_unchecked       the link CHECKs never created.
  *
  * Needs the same environment as the suite: the engine, the two modules'
@@ -170,6 +171,15 @@ const SCHEMA_BREAKS = [
         from: `ALTER TABLE sessions
   ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused CHECK (`,
         to: `ALTER TABLE sessions
+  ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled CHECK (true OR`,
+      },
+      {
+        file: '0039_stay_endings.sql',
+        from: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_covered_priced_or_refused;
+ALTER TABLE sessions
+  ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused CHECK (`,
+        to: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled;
+ALTER TABLE sessions
   ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled CHECK (true OR`,
       },
     ],

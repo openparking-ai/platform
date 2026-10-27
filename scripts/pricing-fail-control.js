@@ -36,16 +36,18 @@
  *                            the garage's class; every exit then refuses.
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
- * statement edited out of 0013, so the property genuinely never existed.
+ * statement edited out, so the property genuinely never existed. 0039
+ * replaces both constraints again, so each break edits it out there too.
  *
  *   no_priced_or_refused     the closed-stay shape constraint (0015's
  *                            `sessions_closed_is_covered_priced_or_refused`,
- *                            which replaced 0013's) never created: a closed
- *                            stay may carry half a pricing, or a fee and a
- *                            refusal at once.
+ *                            which replaced 0013's, and 0039's six shapes)
+ *                            never created: a closed stay may carry half a
+ *                            pricing, or a fee and a refusal at once.
  *   closed_still_needs_fee   0002's `sessions_closed_is_complete` is never
- *                            replaced, so a closed stay must still carry a
- *                            fee, and the unpriced close cannot be written.
+ *                            replaced, by 0013 or by 0039, so a closed stay
+ *                            must still carry a fee, and the unpriced close
+ *                            cannot be written.
  *
  * Needs the same environment as the suite, plus the engine
  * (RATE_ENGINE_PYTHON). The suite starts and stops the engine itself.
@@ -142,6 +144,15 @@ const SCHEMA_BREAKS = [
         to: `ALTER TABLE sessions
   ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled CHECK (true OR`,
       },
+      {
+        file: '0039_stay_endings.sql',
+        from: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_covered_priced_or_refused;
+ALTER TABLE sessions
+  ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused CHECK (`,
+        to: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled;
+ALTER TABLE sessions
+  ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled CHECK (true OR`,
+      },
     ],
   },
   {
@@ -161,6 +172,14 @@ ALTER TABLE sessions
     (exit_at IS NOT NULL AND exit_lane_id IS NOT NULL AND close_event_id IS NOT NULL)
   );`,
         to: 'ALTER TABLE sessions DROP CONSTRAINT sessions_plan_pricing_is_complete;',
+      },
+      {
+        file: '0039_stay_endings.sql',
+        from: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_complete;
+ALTER TABLE sessions
+  ADD CONSTRAINT sessions_closed_is_complete CHECK (`,
+        to: `ALTER TABLE sessions
+  ADD CONSTRAINT sessions_closed_is_complete_0039_disabled CHECK (true OR`,
       },
     ],
   },
