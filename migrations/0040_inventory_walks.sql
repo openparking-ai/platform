@@ -238,10 +238,11 @@ CREATE TRIGGER walk_stays_on_own_walk_and_stay
 
 -- FROZEN AT THE FINISH, held here and not only by the code. A walk finished
 -- or abandoned never changes again: not its lists, not who finished it, and
--- never back to open. Its sightings take nothing new, and change only by
--- losing their picture once its days are over, or a picked stay or an
--- answered sighting going when that row goes. Its listed stays are written
--- before the finish and never after (src/walks.js finishWalk).
+-- never back to open. Its sightings take nothing new, never move to another
+-- walk, and change only by losing their picture once its days are over, or a
+-- picked stay or an answered sighting going when that row goes. Its listed
+-- stays are written before the finish and never after (src/walks.js
+-- finishWalk); the app role cannot change or move one at all (no UPDATE).
 CREATE FUNCTION walks_frozen() RETURNS trigger
   LANGUAGE plpgsql
   SET search_path = pg_catalog, public
@@ -271,6 +272,12 @@ CREATE FUNCTION walk_sightings_frozen() RETURNS trigger
   SET search_path = pg_catalog, public
   AS $$
   BEGIN
+    -- A sighting stays on the walk it was added to: it never leaves a closed
+    -- walk, and the walk checked below is the one it was on as well.
+    IF TG_OP = 'UPDATE' AND NEW.walk_id IS DISTINCT FROM OLD.walk_id THEN
+      RAISE EXCEPTION 'walk_sightings_frozen: a sighting stays on the walk it was added to'
+        USING ERRCODE = 'check_violation', CONSTRAINT = 'walk_sightings_frozen';
+    END IF;
     IF NOT walk_closed(NEW.walk_id) THEN
       RETURN NEW;
     END IF;

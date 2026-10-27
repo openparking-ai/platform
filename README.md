@@ -1872,8 +1872,9 @@ like that usually saw too little of the garage to feed the stuck list (see
     with neither `confirms` nor `client_ref` (a phone that answers a
     sighting by typing its plate) answers an earlier one only where that can
     be told: the one unanswered `unsure` sighting whose sure characters all
-    agree with the plate, or, with none of those, the one sighting still
-    waiting when it is a `none`. Otherwise it is a new car. The change-log
+    agree with the plate. A `none` has no character to agree with, so only
+    `confirms` answers it: without one it stays in `not_readable`. Anything
+    else is a new car. The change-log
     line says `confirms_inferred: true` when the platform worked it out.
   - `taken_at`: when the picture was taken (not in the future); the time it
     arrived otherwise.
@@ -1971,7 +1972,10 @@ really gone.
 or abandoned, its row never changes (no new lists, never open again), its
 sightings take nothing new and change only by losing their picture after
 its days, and its listed stays are never added to; the application role
-cannot delete a sighting or a listed stay at all (they go with their walk).
+cannot delete a sighting or a listed stay at all (they go with their walk),
+nor change a listed stay. A sighting never moves to another walk, open or
+closed, so it never leaves a finished walk's record for an open walk's
+share.
 
 The walks hold plates and are personal data: a walk is deleted with its
 sightings once it finished or was abandoned -- or, neither, started --
