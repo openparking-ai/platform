@@ -254,11 +254,14 @@ jobs:
         # Breaks the inventory walk (0040) one property at a time -- the cap
         # on open walks, a walk reached only through its garage, a typed plate
         # confirmed and folded, a picture written fresh, opened, taken whole
-        # and read by a named reader, the reader off or down, a sighting sent
-        # again kept and read once, the candidates and the pick, an answered
-        # sighting leaving the lists, the four lists and the finish frozen,
-        # the stuck list reading the latest walk, retention, a line naming no
-        # plate -- and six of 0040's guards, and requires test/walks.test.js
+        # and read by a named reader, an empty plate from it, the reader off
+        # or down, a sighting sent again (by client_ref or by its picture)
+        # kept and read once, the rate limit, a typed answer that does not say
+        # so, the candidates and the pick, an answered sighting leaving the
+        # lists, the four lists and the finish frozen, the stuck list reading
+        # the latest walk of its own garage that saw enough of it, retention,
+        # a line naming no plate -- and eleven of 0040's guards, among them a
+        # closed walk frozen for the app role, and requires test/walks.test.js
         # to go red.
         run: npm run walks-fail-control
 

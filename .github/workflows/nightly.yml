@@ -89,6 +89,8 @@ jobs:
         run: npm run exit-payments-fail-control
       - name: Stay-endings fail-control
         run: npm run stay-endings-fail-control
+      - name: Inventory walks fail-control
+        run: npm run walks-fail-control
       - name: Descriptor fail-control
         run: npm run descriptor-fail-control
       - name: Shadow-run fail-control

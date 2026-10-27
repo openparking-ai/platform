@@ -15,17 +15,22 @@ import { randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import { createApp } from '../src/app.js';
 import { redactExpiredVehicles } from '../src/retention.js';
-import { WALK_ABANDON_HOURS } from '../src/walks.js';
+import { WALK_ABANDON_HOURS, SIGHTINGS_PER_MINUTE, FEEDS_STUCK_PERCENT } from '../src/walks.js';
 import { fold } from '../src/exitMatch.js';
-import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
+import {
+  pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage, superuserClient,
+} from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
 
 const RULE = 'opvid-plate-chars/1';
 const RED = 'opvid-colour/1:m:f000000000000000';
 const MARK = 'WALK-PICTURE-SECRET-TEXT';
-const JPEG = await sharp({ create: { width: 64, height: 48, channels: 3, background: { r: 20, g: 90, b: 200 } } })
+const jpeg = (blue) => sharp({ create: { width: 64, height: 48, channels: 3, background: { r: 20, g: 90, b: blue } } })
   .withMetadata({ exif: { IFD0: { Copyright: MARK } } }).jpeg().toBuffer();
+// Each car photographed is a picture of its own: the same bytes twice are one sighting.
+const SHOTS = await Promise.all(Array.from({ length: 24 }, (_, i) => jpeg(i * 10)));
+let shots = 0;
 
 let engine;
 let server;
@@ -61,6 +66,36 @@ async function garage(name) {
   const op = generateDeviceToken();
   await withTenant(tenant, (c) => c.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'desk',$2)`, [tenant, hashToken(op)]));
   return { tenant, id: world.garage, world, op, entry: await token(tenant, world.entryLane, 'entry') };
+}
+
+/** Another garage of the same tenant, with its own entry lane, and the same operator key. */
+async function sameTenantGarage(g) {
+  const { id, lane } = await withTenant(g.tenant, async (c) => {
+    const garageId = (await c.query(
+      "INSERT INTO garages (tenant_id, name, timezone, currency) VALUES ($1, 'Second', 'UTC', 'USD') RETURNING id", [g.tenant])).rows[0].id;
+    await storePlan(c, g.tenant, garageId, flatHourlyPlan({ hourlyMinor: 250, currency: 'USD' }));
+    await activateGarage(c, g.tenant, garageId);
+    const laneId = (await c.query(
+      "INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1, $2, 'Entry 2', 'entry') RETURNING id", [g.tenant, garageId])).rows[0].id;
+    return { id: garageId, lane: laneId };
+  });
+  return { ...g, id, entry: await token(g.tenant, lane, 'entry 2') };
+}
+
+/** Finished walks moved back in time, as no role of a deployment can: a closed walk never changes. */
+async function ageWalks(ids, days) {
+  const su = superuserClient();
+  await su.connect();
+  try {
+    await su.query('BEGIN');
+    await su.query('SET LOCAL session_replication_role = replica');
+    await su.query(
+      `UPDATE walks SET started_at = started_at - make_interval(days => $2),
+                        finished_at = finished_at - make_interval(days => $2) WHERE id = ANY($1::uuid[])`, [ids, days]);
+    await su.query('COMMIT');
+  } finally {
+    await su.end();
+  }
 }
 
 /** A second operator key at the garage: another person on the floor. */
@@ -109,7 +144,8 @@ async function finish(g, walk) {
   return (await res.json()).walk;
 }
 const typed = (plate) => ({ plate, confirmed: true });
-const picture = (extra = {}) => ({ picture: JPEG.toString('base64'), ...extra });
+const picture = (extra = {}) => ({ picture: SHOTS[shots++ % SHOTS.length].toString('base64'), ...extra });
+const stuckList = async (g) => (await (await call(g.op, 'GET', `/garages/${g.id}/stays/stuck`)).json()).stays;
 
 function readerOn() {
   process.env.VEHICLE_ID_URL = reader.url;
@@ -305,6 +341,107 @@ test('SENT AGAIN: the same client_ref on the same walk answers the sighting alre
   assert.equal(n, 1);
 });
 
+test('SENT AGAIN WITHOUT A CLIENT_REF: the same picture on the same walk answers the sighting already kept, read once', async () => {
+  readerOn();
+  reader.state.identity = { plate: 'DIG1234', plate_characters: read('DIG1234') };
+  const g = await garage('wk-digest');
+  const stay = await enter(g, { plate: 'DIG1234' });
+  const walk = await startWalk(g);
+  const body = picture();
+  const first = await seen(g, walk, body);
+  const again = await sight(g, walk, body);
+  assert.equal(again.status, 200);
+  assert.equal((await again.json()).sighting.id, first.id);
+  assert.equal(reader.state.requests.length, 1, 'a picture sent again was read again');
+  const done = await finish(g, walk);
+  assert.deepEqual(done.lists.seen_with_stay.map((r) => [r.stay, r.sightings]), [[stay.id, [first.id]]]);
+  const after = await sight(g, walk, body);
+  assert.equal(after.status, 200, 'a picture sent again after the finish is answered, so the phone stops sending it');
+  const n = await withTenant(g.tenant, async (c) => (await c.query('SELECT count(*)::int AS n FROM walk_sightings WHERE walk_id = $1', [walk.id])).rows[0].n);
+  assert.equal(n, 1);
+});
+
+test('AN ANSWER THAT DOES NOT SAY SO: a typed plate answers the one waiting read it agrees with; anything else is a car of its own', async () => {
+  readerOn();
+  const g = await garage('wk-infer');
+  const one = await enter(g, { plate: 'INF1123' });
+  const two = await enter(g, { plate: 'INF2123' });
+  reader.state.identity = { plate: 'INF?123', plate_characters: read('INF?123') };
+  const walk = await startWalk(g);
+  const unsure = await seen(g, walk, picture());
+  const unrelated = await seen(g, walk, typed('ZZZ9999'));
+  assert.equal(unrelated.confirms, null);
+  const named = await seen(g, walk, { ...typed('INF2123'), client_ref: 'phone-typed-1' });
+  assert.equal(named.confirms, null, 'a typed plate the phone gave its own id is a car of its own');
+  const answer = await seen(g, walk, typed('INF1123'));
+  assert.equal(answer.confirms, unsure.id);
+  const done = await finish(g, walk);
+  assert.deepEqual(new Map(done.lists.seen_with_stay.map((r) => [r.stay, r.sightings])), new Map([[one.id, [answer.id]], [two.id, [named.id]]]));
+  assert.deepEqual(done.lists.seen_without_stay.map((r) => r.sighting), [unrelated.id]);
+});
+
+test('TWO READS WAITING: a typed plate that fits neither alone answers neither', async () => {
+  readerOn();
+  const g = await garage('wk-infer-two');
+  reader.state.identity = { plate: null, plate_characters: { state: 'unreadable', rule: RULE, pattern: null } };
+  const walk = await startWalk(g);
+  await seen(g, walk, picture());
+  await seen(g, walk, picture());
+  assert.equal((await seen(g, walk, typed('TWW1234'))).confirms, null);
+});
+
+test('ONE CAR SENT TWICE WITH NO STAY: a whole plate is listed once, with both sightings', async () => {
+  const g = await garage('wk-twice-none');
+  const walk = await startWalk(g);
+  const a = await seen(g, walk, typed('DUP1234'));
+  const b = await seen(g, walk, typed('dup-1234'));
+  const done = await finish(g, walk);
+  assert.deepEqual(done.lists.seen_without_stay.map((r) => [r.sighting, r.plate, r.sightings]), [[a.id, 'DUP1234', [a.id, b.id]]]);
+});
+
+test('AN EMPTY PLATE FROM THE READER: its sure characters stand for it, kept and answered, never a 500', async () => {
+  readerOn();
+  const g = await garage('wk-empty-plate');
+  const stay = await enter(g, { plate: 'EMP1234' });
+  reader.state.identity = { plate: '', plate_characters: read('EMP1234') };
+  const walk = await startWalk(g);
+  const s = await seen(g, walk, picture());
+  assert.deepEqual([s.read, s.plate, s.needs_confirmation], ['agreed', read('EMP1234').pattern, false]);
+  const done = await finish(g, walk);
+  assert.deepEqual(done.lists.seen_with_stay.map((r) => r.stay), [stay.id]);
+});
+
+test(`TOO MANY SIGHTINGS: a key sends at most ${SIGHTINGS_PER_MINUTE} a minute, refused before a picture is opened or read`, async () => {
+  readerOn();
+  reader.state.identity = { plate: 'LIM1234', plate_characters: read('LIM1234') };
+  const g = await garage('wk-limit');
+  const walk = await startWalk(g);
+  for (let i = 0; i < SIGHTINGS_PER_MINUTE; i += 1) assert.equal((await sight(g, walk, {})).status, 400);
+  const res = await sight(g, walk, picture());
+  assert.equal(res.status, 429);
+  assert.equal((await res.json()).code, 'too_many_sightings');
+  assert.equal(reader.state.requests.length, 0);
+  const other = await person(g, 'second desk');
+  assert.equal((await sight(other, await startWalk(other), picture())).status, 201, "another key's minute is its own");
+});
+
+test('A PICK ON A FINISHED WALK: refused, and the finished lists keep the read unpicked', async () => {
+  readerOn();
+  const g = await garage('wk-pick-late');
+  const one = await enter(g, { plate: 'PKL1123' });
+  await enter(g, { plate: 'PKL2123' });
+  reader.state.identity = { plate: 'PKL?123', plate_characters: read('PKL?123') };
+  const walk = await startWalk(g);
+  const s = await seen(g, walk, picture());
+  const done = await finish(g, walk);
+  const res = await call(g.op, 'POST', `/garages/${g.id}/walks/${walk.id}/sightings/${s.id}/pick`, { stay: one.id });
+  assert.equal(res.status, 409);
+  assert.equal((await res.json()).code, 'walk_finished');
+  const shown = (await (await call(g.op, 'GET', `/garages/${g.id}/walks/${walk.id}`)).json()).walk;
+  assert.deepEqual(shown.lists, done.lists);
+  assert.equal(shown.sightings.find((x) => x.id === s.id).picked_stay, null);
+});
+
 test('AN UNSURE READ: the stays it fits are its candidates; the person picks one, and only one of them', async () => {
   readerOn();
   const g = await garage('wk-unsure');
@@ -443,13 +580,21 @@ test('FROZEN: a finished walk answers the same lists again, refuses sightings, a
 
 // --- the stuck list -------------------------------------------------------------------
 
+const parked = (g, plates) => Promise.all(plates.map((plate) => enter(g, { plate, minutes: 60 })));
+async function walkSaw(g, plates) {
+  const walk = await startWalk(g);
+  for (const plate of plates) await seen(g, walk, typed(plate));
+  return finish(g, walk);
+}
+const notSeenStuck = async (g) => (await stuckList(g)).filter((s) => s.why === 'not_seen_on_walk').map((s) => s.id);
+
 test('THE STUCK LIST READS THE WALKS: a young stay the latest walk missed is listed; a seen one carries when it was seen', async () => {
   const g = await garage('wk-stuck');
   const young = await enter(g, { plate: 'YNG1111', minutes: 60 });
   const old = await enter(g, { plate: 'OLD2222', minutes: 100 * 60 });
-  const walk = await startWalk(g);
-  await seen(g, walk, typed('OLD2222'));
-  const done = await finish(g, walk);
+  await parked(g, ['STK1111', 'STK2222', 'STK3333']);
+  const done = await walkSaw(g, ['OLD2222', 'STK1111', 'STK2222', 'STK3333']);
+  assert.equal(done.feeds_stuck, true);
   const res = await call(g.op, 'GET', `/garages/${g.id}/stays/stuck`);
   assert.equal(res.status, 200);
   const { stays } = await res.json();
@@ -465,12 +610,52 @@ test('THE STUCK LIST READS THE WALKS: a young stay the latest walk missed is lis
 test('ONLY THE LATEST WALK: a stay an earlier walk missed and the latest saw is not listed for the walks', async () => {
   const g = await garage('wk-latest');
   const stay = await enter(g, { plate: 'LTS1111', minutes: 60 });
-  await finish(g, await startWalk(g));
-  const second = await startWalk(g);
-  await seen(g, second, typed('LTS1111'));
-  await finish(g, second);
-  const { stays } = await (await call(g.op, 'GET', `/garages/${g.id}/stays/stuck`)).json();
-  assert.ok(!stays.some((s) => s.id === stay.id));
+  await parked(g, ['LTS2222', 'LTS3333', 'LTS4444', 'LTS5555']);
+  await walkSaw(g, ['LTS2222', 'LTS3333', 'LTS4444', 'LTS5555']);
+  assert.deepEqual(await notSeenStuck(g), [stay.id]);
+  const newer = await enter(g, { plate: 'LTS6666', minutes: 0 });
+  await walkSaw(g, ['LTS1111', 'LTS2222', 'LTS3333', 'LTS4444', 'LTS5555']);
+  assert.deepEqual(await notSeenStuck(g), [newer.id]);
+});
+
+test('A WALK THAT SAW NOTHING: its lists say every stay was not seen, but it marks none stuck', async () => {
+  const g = await garage('wk-empty-walk');
+  const stays = await parked(g, ['EMW1111', 'EMW2222']);
+  const done = await finish(g, await startWalk(g));
+  assert.equal(done.feeds_stuck, false);
+  assert.deepEqual(done.lists.stay_not_seen.map((r) => r.stay).sort(), stays.map((s) => s.id).sort());
+  assert.deepEqual(await notSeenStuck(g), []);
+});
+
+test(`A WALK THAT SAW PART OF THE GARAGE: under ${FEEDS_STUCK_PERCENT}% of its stays seen marks none stuck; nothing a walk lists ends or charges a stay`, async () => {
+  const g = await garage('wk-part-walk');
+  const all = await parked(g, ['PRT1111', 'PRT2222', 'PRT3333', 'PRT4444', 'PRT5555']);
+  const part = await walkSaw(g, ['PRT1111', 'PRT2222', 'PRT3333', 'XXX0001', 'XXX0002']);
+  assert.equal(part.feeds_stuck, false, 'sightings of cars with no stay count as seeing the garage');
+  assert.deepEqual(await notSeenStuck(g), []);
+  const enough = await walkSaw(g, ['PRT1111', 'PRT2222', 'PRT3333', 'PRT4444']);
+  assert.equal(enough.feeds_stuck, true);
+  assert.deepEqual(await notSeenStuck(g), [all[4].id]);
+  const partLater = await walkSaw(g, ['PRT5555']);
+  assert.equal(partLater.feeds_stuck, false);
+  assert.deepEqual(await notSeenStuck(g), [], 'a stay a later walk saw is not stuck, even when that walk covered too little to list');
+  const left = await withTenant(g.tenant, async (c) => ({
+    open: (await c.query('SELECT count(*)::int AS n FROM sessions WHERE garage_id = $1 AND exit_at IS NULL', [g.id])).rows[0].n,
+    paid: (await c.query('SELECT count(*)::int AS n FROM exit_payments WHERE tenant_id = $1', [g.tenant])).rows[0].n,
+  }));
+  assert.deepEqual(left, { open: 5, paid: 0 });
+});
+
+test("THE STUCK LIST IS THE GARAGE'S OWN: a later walk at the tenant's other garage hides nothing this garage's walk missed", async () => {
+  const g = await garage('wk-stuck-two');
+  const h = await sameTenantGarage(g);
+  const missed = await enter(g, { plate: 'MSD1111', minutes: 60 });
+  await parked(g, ['GSN1111', 'GSN2222', 'GSN3333', 'GSN4444']);
+  assert.equal((await walkSaw(g, ['GSN1111', 'GSN2222', 'GSN3333', 'GSN4444'])).feeds_stuck, true);
+  await parked(h, ['HSN1111']);
+  assert.equal((await walkSaw(h, ['HSN1111'])).feeds_stuck, true);
+  assert.deepEqual(await notSeenStuck(g), [missed.id]);
+  assert.deepEqual(await notSeenStuck(h), []);
 });
 
 // --- the database ---------------------------------------------------------------------
@@ -499,6 +684,42 @@ test("THE DATABASE KEEPS A WALK TO ITS OWN: no walk at another account's garage,
      VALUES ($1, $2, 'done', 'key', gen_random_uuid(), 'walk.start', 'walk', $3, 'ABC123')`, [a.tenant, a.id, walk.id], /garage_changes_walk_names_no_vehicle/);
 });
 
+test('THE DATABASE KEEPS A CLOSED WALK AS IT ENDED: the app role reopens nothing, changes no sighting or list, and deletes no listed stay', async () => {
+  const g = await garage('wk-db-frozen');
+  await enter(g, { plate: 'DBF1111' });
+  await enter(g, { plate: 'DBF2222' });
+  const walk = await startWalk(g);
+  const s = await seen(g, walk, typed('DBF1111'));
+  const p = await seen(g, walk, picture());
+  await finish(g, walk);
+  const later = await enter(g, { plate: 'DBF3333', minutes: 0 });
+  const refused = (sql, params, why) => assert.rejects(withTenant(g.tenant, (c) => c.query(sql, params)), why);
+  await refused('UPDATE walks SET finished_at = NULL, finished_by = NULL, lists = NULL, feeds_stuck = NULL WHERE id = $1', [walk.id], /walks_frozen/);
+  await refused("UPDATE walks SET lists = '{}'::jsonb WHERE id = $1", [walk.id], /walks_frozen/);
+  await refused('UPDATE walks SET feeds_stuck = NOT feeds_stuck WHERE id = $1', [walk.id], /walks_frozen/);
+  await refused("UPDATE walk_sightings SET plate = 'DBF2222' WHERE id = $1", [s.id], /walk_sightings_frozen/);
+  await refused('UPDATE walk_sightings SET picked_stay = $2 WHERE id = $1', [s.id, later.id], /walk_sightings_frozen/);
+  await refused(
+    `INSERT INTO walk_sightings (tenant_id, walk_id, read, plate, taken_at, added_by)
+     VALUES ($1, $2, 'typed', 'DBF2222', now(), 'key:x')`, [g.tenant, walk.id], /walk_sightings_frozen/);
+  await refused("INSERT INTO walk_stays (tenant_id, walk_id, session_id, list) VALUES ($1, $2, $3, 'seen')", [g.tenant, walk.id, later.id], /walk_stays_frozen/);
+  await refused("UPDATE walk_stays SET list = 'seen' WHERE walk_id = $1", [walk.id], /permission denied/);
+  await refused('DELETE FROM walk_stays WHERE walk_id = $1', [walk.id], /permission denied/);
+  await refused('DELETE FROM walk_sightings WHERE walk_id = $1', [walk.id], /permission denied/);
+  const forgotten = await withTenant(g.tenant, (c) => c.query(
+    'UPDATE walk_sightings SET picture = NULL, picture_type = NULL, picture_digest = NULL WHERE id = $1 AND picture IS NOT NULL', [p.id]));
+  assert.equal(forgotten.rowCount, 1, 'the picture of a closed walk can still be forgotten');
+  const night = await person(g, 'night desk');
+  const stale = await startWalk(night);
+  await withTenant(g.tenant, (c) => c.query(
+    'UPDATE walks SET started_at = started_at - make_interval(hours => $2) WHERE id = $1', [stale.id, WALK_ABANDON_HOURS + 1]));
+  await startWalk(night);
+  await refused('UPDATE walks SET abandoned_at = NULL WHERE id = $1', [stale.id], /walks_frozen/);
+  const kept = await withTenant(g.tenant, async (c) => (await c.query(
+    'SELECT list, count(*)::int AS n FROM walk_stays WHERE walk_id = $1 GROUP BY list ORDER BY list', [walk.id])).rows);
+  assert.deepEqual(kept, [{ list: 'not_seen', n: 1 }, { list: 'seen', n: 1 }]);
+});
+
 // --- retention ------------------------------------------------------------------------
 
 test('RETENTION: a walk is deleted with its sightings once it finished, or was abandoned, longer ago than the window', async () => {
@@ -509,9 +730,7 @@ test('RETENTION: a walk is deleted with its sightings once it finished, or was a
   await finish(g, oldWalk);
   const stale = await startWalk(g);
   await seen(g, stale, typed('RET1111'));
-  await withTenant(g.tenant, (c) => c.query(
-    "UPDATE walks SET started_at = started_at - interval '40 days', finished_at = finished_at - interval '40 days' WHERE id = ANY($1::uuid[])",
-    [[oldWalk.id, stale.id]]));
+  await ageWalks([oldWalk.id, stale.id], 40);
   const recent = await startWalk(g);
   await seen(g, recent, typed('RET1111'));
   await finish(g, recent);

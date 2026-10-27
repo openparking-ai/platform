@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { HttpError } from './errors.js';
 import * as exitMatch from './exitMatch.js';
 import { PICTURE_DAYS } from './bans.js';
@@ -20,7 +20,15 @@ import { PICTURE_DAYS } from './bans.js';
  *
  * A person has one unfinished walk at a garage at a time; starting again
  * answers it. One left unfinished WALK_ABANDON_HOURS after it started is
- * abandoned: it takes nothing more and never has lists.
+ * abandoned: it takes nothing more and never has lists. "A person" is who
+ * the request is made as: through a relay that holds one operator key for
+ * a whole company, everyone on that key shares one walk at a garage, until
+ * the change carries the person's own name (`req.change.doneBy`).
+ *
+ * A finished walk's "not seen" list feeds the stuck list only when the walk
+ * saw at least FEEDS_STUCK_PERCENT of the stays it was checking: a walk
+ * with no sightings, or one that covered part of the garage, never lists a
+ * stay as stuck on its own.
  *
  * Settings, read at each picture, so a deployment can set them without a
  * restart:
@@ -37,6 +45,10 @@ export const LISTS = Object.freeze(['seen_with_stay', 'seen_without_stay', 'stay
 export const WALK_ABANDON_HOURS = 12;
 /** The most sightings one walk takes. */
 export const SIGHTINGS_MAX = 5000;
+/** The most sightings one key may send a minute: each picture waits in the one decoder lane pictures use. */
+export const SIGHTINGS_PER_MINUTE = 120;
+/** The share of the stays a walk was checking it must have seen for its "not seen" list to feed the stuck list. */
+export const FEEDS_STUCK_PERCENT = 80;
 export const CLIENT_REF_MAX = 100;
 /** A plate as a person gives it: letters and digits, once spaces and dashes are out. */
 export const PLATE_MAX = 10;
@@ -171,7 +183,8 @@ export function fromRead({ identity, confidence }) {
   if (shaped && chars.state === 'read' && typeof chars.pattern === 'string' && PATTERN.test(chars.pattern)
       && /[0-9A-Z]/.test(chars.pattern)) {
     const whole = !chars.pattern.includes('?');
-    const plate = whole && typeof identity.plate === 'string' && identity.plate.length <= 32 ? identity.plate : chars.pattern;
+    const named = typeof identity.plate === 'string' && identity.plate.length >= 1 && identity.plate.length <= 32;
+    const plate = whole && named ? identity.plate : chars.pattern;
     return {
       read: whole ? 'agreed' : 'unsure',
       why: null,
@@ -199,6 +212,28 @@ export function fromTyped(plate) {
     characters: { state: 'read', rule: exitMatch.PLATE_RULE, pattern: exitMatch.fold(plate) },
     readers: [],
   };
+}
+
+/** The picture's bytes as the phone sent them, named: the same picture sent again is the same sighting. */
+export function pictureDigest(bytes) {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/**
+ * The earlier sighting a typed plate answers when the phone did not say
+ * (no `confirms`, no `client_ref`), or null. `waiting` are the walk's
+ * sightings still waiting for a person (`unsure` or `none`, not answered).
+ * Only where it can be told: the one `unsure` whose sure characters all
+ * agree with the plate in their positions, or, with no such one, the one
+ * sighting waiting when it is a `none`. Anything else is a new car.
+ */
+export function answersWaiting(typed, waiting) {
+  const agrees = (w) => w.read === 'unsure' && w.plate_rule === typed.rule && w.plate_pattern?.length === typed.pattern.length
+    && [...w.plate_pattern].every((c, i) => c === '?' || c === typed.pattern[i]);
+  const fits = waiting.filter(agrees);
+  if (fits.length === 1) return fits[0].id;
+  if (fits.length === 0 && waiting.length === 1 && waiting[0].read === 'none') return waiting[0].id;
+  return null;
 }
 
 /** The sighting's plate ID as the exit's matching takes it, or null: only a plate with sure characters is matched. */
@@ -239,6 +274,7 @@ export function lists(walk, sightings, stays) {
   const byId = new Map(stays.map((s) => [s.id, s]));
   const seen = new Map();
   const without = [];
+  const withoutByPlate = new Map();
   const notReadable = [];
   for (const s of standing) {
     if (s.read === 'none') {
@@ -252,9 +288,18 @@ export function lists(walk, sightings, stays) {
       const row = seen.get(stay) ?? { stay, plate: stayPlate(byId.get(stay)), entered_at: byId.get(stay).entry_at, sightings: [] };
       row.sightings.push(s.id);
       seen.set(stay, row);
-    } else {
-      without.push({ sighting: s.id, plate: s.plate, candidates: found.candidates ?? [] });
+      continue;
     }
+    // One whole plate is one car, however often it was sent.
+    const whole = s.read === 'agreed' || s.read === 'typed' ? s.plate : null;
+    const same = whole ? withoutByPlate.get(whole) : undefined;
+    if (same) {
+      same.sightings.push(s.id);
+      continue;
+    }
+    const row = { sighting: s.id, plate: s.plate, candidates: found.candidates ?? [], sightings: [s.id] };
+    if (whole) withoutByPlate.set(whole, row);
+    without.push(row);
   }
   const startedAt = new Date(walk.started_at);
   const notSeen = stays
@@ -267,6 +312,21 @@ export function lists(walk, sightings, stays) {
     stay_not_seen: notSeen,
     not_readable: notReadable,
   };
+}
+
+/**
+ * Whether a finished walk's "not seen" list feeds the stuck list: it had
+ * sightings, and saw at least FEEDS_STUCK_PERCENT of the stays it was
+ * checking (open when it started and still open at its end). Pure.
+ */
+export function feedsStuck(walk, sightings, found, stays) {
+  if (sightings.length === 0) return false;
+  const startedAt = new Date(walk.started_at);
+  const checked = stays.filter((s) => s.exit_at === null && new Date(s.entry_at) <= startedAt);
+  if (checked.length === 0) return false;
+  const seen = new Set(found.seen_with_stay.map((r) => r.stay));
+  const saw = checked.filter((s) => seen.has(s.id)).length;
+  return saw * 100 >= checked.length * FEEDS_STUCK_PERCENT;
 }
 
 /** The garage's stays open at some point since `since`: still open, or closed after it. */
@@ -328,7 +388,7 @@ export async function sightingPicture(client, tenantId, walkId, sightingId) {
 /** Forget the walk pictures whose PICTURE_DAYS are over; the sighting keeps what was read. */
 export async function removeExpiredPictures(client, tenantId, { now = null } = {}) {
   const { rowCount } = await client.query(
-    `UPDATE walk_sightings SET picture = NULL, picture_type = NULL
+    `UPDATE walk_sightings SET picture = NULL, picture_type = NULL, picture_digest = NULL
       WHERE tenant_id = $1 AND picture IS NOT NULL
         AND taken_at < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,
     [tenantId, now, PICTURE_DAYS],
@@ -377,6 +437,26 @@ export async function sightingByRef(client, tenantId, walkId, clientRef) {
   return rows[0] ?? null;
 }
 
+export async function sightingByPicture(client, tenantId, walkId, digest) {
+  const { rows } = await client.query(
+    `SELECT ${SIGHTING_COLUMNS} FROM walk_sightings WHERE tenant_id = $1 AND walk_id = $2 AND picture_digest = $3`,
+    [tenantId, walkId, digest],
+  );
+  return rows[0] ?? null;
+}
+
+/** The walk's sightings still waiting for a person: unsure or unreadable, and no later one answers them. */
+export async function waitingSightings(client, tenantId, walkId) {
+  const { rows } = await client.query(
+    `SELECT s.id, s.read, s.plate_rule, s.plate_pattern FROM walk_sightings s
+      WHERE s.tenant_id = $1 AND s.walk_id = $2 AND s.read IN ('unsure', 'none')
+        AND NOT EXISTS (SELECT 1 FROM walk_sightings a WHERE a.tenant_id = s.tenant_id AND a.confirms = s.id)
+      ORDER BY s.added_at, s.id`,
+    [tenantId, walkId],
+  );
+  return rows;
+}
+
 export async function getSighting(client, tenantId, walkId, sightingId) {
   if (!UUID.test(sightingId)) return null;
   const { rows } = await client.query(
@@ -403,12 +483,12 @@ export const READER_OFF = Object.freeze({
 export async function addSighting(client, tenantId, walkId, s) {
   const { rows } = await client.query(
     `INSERT INTO walk_sightings (tenant_id, walk_id, client_ref, read, why, plate, plate_state, plate_rule, plate_pattern,
-                                 readers, candidates, confirms, taken_at, added_by, picture_type, picture)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                                 readers, candidates, confirms, taken_at, added_by, picture_type, picture, picture_digest)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
      RETURNING ${SIGHTING_COLUMNS}`,
     [tenantId, walkId, s.clientRef, s.read, s.why, s.plate, s.characters?.state ?? null, s.characters?.rule ?? null,
       s.characters?.pattern ?? null, JSON.stringify(s.readers), s.candidates ?? [], s.confirms, s.takenAt, s.by,
-      s.picture?.type ?? null, s.picture?.image ?? null],
+      s.picture?.type ?? null, s.picture?.image ?? null, s.picture ? s.picture.digest : null],
   );
   return rows[0];
 }
@@ -421,13 +501,12 @@ export async function pickStay(client, tenantId, sightingId, stayId) {
   return rows[0];
 }
 
-/** Store the finish: the lists on the walk, and the stays it listed for the stuck list. */
-export async function finishWalk(client, tenantId, walkId, by, found) {
-  const { rows } = await client.query(
-    `UPDATE walks SET finished_at = greatest(now(), started_at), finished_by = $3, lists = $4
-      WHERE tenant_id = $1 AND id = $2 AND finished_at IS NULL RETURNING *`,
-    [tenantId, walkId, by, JSON.stringify(found)],
-  );
+/**
+ * Store the finish: the stays it listed, for the stuck list, then the lists
+ * on the walk -- in that order, since the database takes no listed stay for
+ * a walk once it is finished.
+ */
+export async function finishWalk(client, tenantId, walkId, by, found, feeds) {
   const seen = found.seen_with_stay.map((r) => r.stay);
   const notSeen = found.stay_not_seen.map((r) => r.stay);
   if (seen.length + notSeen.length > 0) {
@@ -437,6 +516,11 @@ export async function finishWalk(client, tenantId, walkId, by, found) {
       [tenantId, walkId, [...seen, ...notSeen], [...seen.map(() => 'seen'), ...notSeen.map(() => 'not_seen')]],
     );
   }
+  const { rows } = await client.query(
+    `UPDATE walks SET finished_at = greatest(now(), started_at), finished_by = $3, lists = $4, feeds_stuck = $5
+      WHERE tenant_id = $1 AND id = $2 AND finished_at IS NULL RETURNING *`,
+    [tenantId, walkId, by, JSON.stringify(found), feeds],
+  );
   return rows[0];
 }
 
@@ -472,11 +556,16 @@ export function presentWalk(w, sightings = null, stays = []) {
     finished_by: w.finished_by,
     abandoned_at: abandonedAt(w),
     lists: w.lists,
+    feeds_stuck: w.feeds_stuck,
     ...(sightings ? { sightings: sightings.map((s) => presentSighting(s, stays)) } : {}),
   };
 }
 
-/** For the stuck list: when finished walks last saw each stay, and the stays the latest walk did not see. */
+/**
+ * For the stuck list: when finished walks last saw each stay, and the stays
+ * the latest walk that feeds the stuck list did not see and no walk finished
+ * after it saw.
+ */
 export async function walkFacts(client, tenantId, garageId) {
   const { rows: seen } = await client.query(
     `SELECT ws.session_id, max(w.finished_at) AS at
@@ -487,10 +576,14 @@ export async function walkFacts(client, tenantId, garageId) {
   );
   const { rows: notSeen } = await client.query(
     `SELECT ws.session_id
-       FROM walk_stays ws
+       FROM walk_stays ws JOIN walks w ON w.id = ws.walk_id AND w.tenant_id = ws.tenant_id
       WHERE ws.tenant_id = $1 AND ws.list = 'not_seen' AND ws.walk_id = (
-        SELECT w.id FROM walks w WHERE w.tenant_id = $1 AND w.garage_id = $2 AND w.finished_at IS NOT NULL
-         ORDER BY w.finished_at DESC, w.id LIMIT 1)`,
+        SELECT w.id FROM walks w WHERE w.tenant_id = $1 AND w.garage_id = $2 AND w.finished_at IS NOT NULL AND w.feeds_stuck
+         ORDER BY w.finished_at DESC, w.id LIMIT 1)
+        AND NOT EXISTS (
+          SELECT 1 FROM walk_stays later JOIN walks lw ON lw.id = later.walk_id AND lw.tenant_id = later.tenant_id
+           WHERE later.tenant_id = $1 AND later.session_id = ws.session_id AND later.list = 'seen'
+             AND lw.finished_at > w.finished_at)`,
     [tenantId, garageId],
   );
   return {

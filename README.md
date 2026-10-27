@@ -1822,10 +1822,22 @@ plate could not be read. It is how a garage finds the stays no exit closed
 
 Every route takes an operator token, acts at the garage in its path and
 refuses another tenant's garage or walk, or a walk reached through another
-of its garages (`404 walk_not_found`). Who did each step is the change's own
-"done by", kept on the walk and on each sighting. Each change is one
+of its garages (`404 walk_not_found`). Who did each step is the operator
+key it was done with, kept on the walk and on each sighting, with the
+change's own "done by" beside it once changes carry one. Each change is one
 change-log line about the walk -- `walk.start`, `walk.sighting`,
 `walk.pick`, `walk.finish` -- that names no plate.
+
+⚠ **Known limit: "a person" is the operator key, for now.** Nothing on this
+branch reads a person's name from the request yet (that arrives with the
+"done by" of the people and permissions change). So a relay that holds one
+operator key for a whole company makes every attendant on that key the
+same person: they share one walk at a garage, starting again answers it,
+and when one of them finishes it the others' sightings still on their
+phones are refused (`409 walk_finished`). Until then, give each person a
+key of their own, or have one person walk at a time. A walk finished early
+like that usually saw too little of the garage to feed the stuck list (see
+"The stuck list reads the walks").
 
 - **Start** -- `POST /api/v1/garages/:garageId/walks {}` →
   `201 {walk: {id, started_at}}`. A person has one unfinished walk at a
@@ -1851,17 +1863,26 @@ change-log line about the walk -- `walk.start`, `walk.sighting`,
   - `client_ref`: the phone's own id for the sighting, at most 100 characters.
     The phone sends again when it heard no answer; the same `client_ref` on
     the same walk answers the sighting already kept (`200`), so it is counted
-    once. Without one, a sighting sent twice is two sightings (a car seen
-    twice still lists once).
+    once. Without one, the same picture sent again (the same bytes) answers
+    the sighting already kept, read once; a plate typed again is a second
+    sighting, but a car seen twice lists once, with or without a stay.
   - `confirms`: the id of an earlier sighting of this walk that this one
     answers -- the person's reading of a plate the reader was unsure of. The
-    earlier one leaves the lists; this one stands for it.
+    earlier one leaves the lists; this one stands for it. A typed plate sent
+    with neither `confirms` nor `client_ref` (a phone that answers a
+    sighting by typing its plate) answers an earlier one only where that can
+    be told: the one unanswered `unsure` sighting whose sure characters all
+    agree with the plate, or, with none of those, the one sighting still
+    waiting when it is a `none`. Otherwise it is a new car. The change-log
+    line says `confirms_inferred: true` when the platform worked it out.
   - `taken_at`: when the picture was taken (not in the future); the time it
     arrived otherwise.
   - Refused: `409 walk_finished` on a finished walk, `409 walk_abandoned` on
-    an abandoned one; `409 too_many_sightings`
-    past 5000 on one walk; `400 confirms_invalid` for `confirms` that is not
-    a sighting of this walk and `409 sighting_already_confirmed` for one a
+    an abandoned one; `409 too_many_sightings` past 5000 on one walk;
+    `429 too_many_sightings` past `SIGHTINGS_PER_MINUTE` (120) a minute from
+    one key, before the picture is opened, since every picture is opened by
+    the same one-at-a-time decoder as the lanes' pictures;
+    `400 confirms_invalid` for `confirms` that is not a sighting of this walk and `409 sighting_already_confirmed` for one a
     later sighting already answers; `400 picture_invalid` for a picture that
     does not open; `503 reader_unanswered` when vehicle-id did not answer
     (nothing is kept: send it again).
@@ -1880,31 +1901,41 @@ change-log line about the walk -- `walk.start`, `walk.sighting`,
 
   `readers` is `[{reader: "fast-alpr", plate, confidence}]` for a picture
   (empty for a typed plate). `plate_characters` is vehicle-id's
-  `{state, rule, pattern}`, what the matching uses. With no vehicle-id set up
-  (`VEHICLE_ID_URL` unset), a picture is kept as `read: "none"`,
-  `why: "reader_off"`, for the person to type. `candidates` is the open
+  `{state, rule, pattern}`, what the matching uses. A read with every
+  character sure but an empty `plate` takes the pattern as its plate. With
+  no vehicle-id set up (`VEHICLE_ID_URL` unset), a picture is kept as
+  `read: "none"`, `why: "reader_off"`, for the person to type. `candidates` is the open
   stays the plate fits when there is more than one, `[{stay, plate,
   entered_at}]`, for the person to pick.
 - **Pick** -- `POST /api/v1/garages/:garageId/walks/:walkId/sightings/:sightingId/pick {stay}`
   → `200 {sighting}`: which of its candidates the car is. `400
-  stay_not_a_candidate` for any other stay.
+  stay_not_a_candidate` for any other stay; `409 walk_finished` or
+  `409 walk_abandoned` once the walk is closed.
 - **Finish** -- `POST /api/v1/garages/:garageId/walks/:walkId/finish {}` →
-  `200 {walk: {id, started_at, finished_at, lists: WALK_LISTS}}`, again the
-  same on a finished walk. `WALK_LISTS` is
+  `200 {walk: {id, started_at, finished_at, lists: WALK_LISTS, feeds_stuck}}`,
+  again the same on a finished walk. `WALK_LISTS` is
   - `seen_with_stay`: `[{stay, plate, entered_at, sightings}]` -- a stay a
     sighting's plate matched alone, or the one the person picked; listed
     once however many times it was seen.
-  - `seen_without_stay`: `[{sighting, plate, candidates}]` -- a plate no open
-    stay fits, or one that fits several and was not picked (its candidates
-    stay in the next list).
+  - `seen_without_stay`: `[{sighting, plate, candidates, sightings}]` -- a
+    plate no open stay fits, or one that fits several and was not picked (its
+    candidates stay in the next list); one whole plate is listed once, with
+    every sighting of it.
   - `stay_not_seen`: `[{stay, plate, entered_at}]` -- the stays open when the
     walk started, still open at its end, that no sighting matched. A stay that
     came in after the walk started is never "not seen".
   - `not_readable`: `[{sighting, plate: null, why}]` -- a picture with nothing
     sure on it, not answered by a later sighting.
+
+  `feeds_stuck` says whether this walk's "not seen" list feeds the stuck
+  list (below): only when the walk had sightings and saw at least
+  `FEEDS_STUCK_PERCENT` (80) of the stays it was checking -- those open when
+  it started and still open at its end. A walk finished with no sightings,
+  or one that covered part of the garage, keeps its lists as they are but
+  lists no stay as stuck.
 - **Read** -- `GET /api/v1/garages/:garageId/walks/:walkId` → the walk
-  (`abandoned_at` set once abandoned), its sightings and, once finished, its
-  lists.
+  (`abandoned_at` set once abandoned, `feeds_stuck` once finished), its
+  sightings and, once finished, its lists.
 - **A sighting's picture** --
   `GET /api/v1/garages/:garageId/walks/:walkId/sightings/:sightingId/picture`
   → the image bytes, `image/jpeg` or `image/png`, `Cache-Control: private,
@@ -1919,14 +1950,28 @@ stay, and a phone's "unreadable" is never matched against a lane's: the plate
 characters decide.
 
 **The stuck list reads the walks**: `last_seen_on_walk` is when a finished
-walk last saw the stay, and a stay the garage's latest finished walk did not
-see is listed whatever its age, with `why: "not_seen_on_walk"`.
+walk last saw the stay, and a stay the garage's latest walk that feeds the
+stuck list did not see, and no walk finished after it saw, is listed
+whatever its age, with `why: "not_seen_on_walk"`. A listing only shows the
+stay to a person: nothing ends a stay but a person, with a reason ("Ending
+a stay no exit closed"). Ending one means the exit no longer finds it, so
+that car would leave on the driver's word: end a stay only once it is
+really gone.
+
+**Frozen in the database**, not only in the code: once a walk is finished
+or abandoned, its row never changes (no new lists, never open again), its
+sightings take nothing new and change only by losing their picture after
+its days, and its listed stays are never added to; the application role
+cannot delete a sighting or a listed stay at all (they go with their walk).
 
 The walks hold plates and are personal data: a walk is deleted with its
 sightings once it finished or was abandoned -- or, neither, started --
 longer ago than the tenant's retention window (`retention_days`), in the
 same purge as the vehicles. That purge also forgets each walk picture past
-its 30 days.
+its 30 days. **Not built yet:** keeping a walk picture with a stay a person
+ended, or with an exit decision, beyond those 30 days, and keeping pictures
+longer where the garage pays for storage. Today every walk picture goes at
+30 days.
 
 ## Deploying
 

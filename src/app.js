@@ -3543,12 +3543,21 @@ export function createApp() {
     }
   });
 
+  // A sighting sent again: by the phone's client_ref, or, with none, by the picture's own bytes.
+  const sightingSentBefore = async (client, req, walk, ask, digest) =>
+    (ask.clientRef ? await walks.sightingByRef(client, req.tenantId, walk.id, ask.clientRef) : null)
+      ?? (digest ? await walks.sightingByPicture(client, req.tenantId, walk.id, digest) : null);
+
   operator.post('/garages/:garageId/walks/:walkId/sightings', readPicture, async (req, res, next) => {
     try {
+      if (!sightingLimiter.take(`${req.actor.kind}:${req.actor.id}`)) {
+        throw new HttpError(429, `at most ${walks.SIGHTINGS_PER_MINUTE} sightings a minute; send the rest in a minute`, 'too_many_sightings');
+      }
       const ask = walks.sightingRequest(req.body);
       const takenAt = ask.takenAt === null ? new Date() : refuseFuture(parseTime(ask.takenAt, 'taken_at'), 'taken_at');
       let image = null;
       let imageType = null;
+      let digest = null;
       if (ask.picture !== null) {
         const bytes = Buffer.from(ask.picture, 'base64');
         imageType = bytes.length > 0 && bytes.length <= bans.PICTURE_MAX_BYTES ? bans.pictureType(bytes) : null;
@@ -3556,12 +3565,13 @@ export function createApp() {
         if (!image || image.length > bans.PICTURE_MAX_BYTES) {
           throw new HttpError(400, `picture must be a JPEG or a PNG of at most ${bans.PICTURE_MAX_BYTES} bytes that opens`, 'picture_invalid');
         }
+        digest = walks.pictureDigest(bytes);
       }
       // Asked before the picture is read, so a sighting sent again is not read twice.
       const kept = await withTenant(req.tenantId, async (client) => {
         await ownGarage(client, req);
         const walk = await ownWalk(client, req);
-        const replay = ask.clientRef ? await walks.sightingByRef(client, req.tenantId, walk.id, ask.clientRef) : null;
+        const replay = await sightingSentBefore(client, req, walk, ask, digest);
         if (!replay && walkClosed(walk)) throw walkClosed(walk);
         return replay;
       });
@@ -3586,7 +3596,7 @@ export function createApp() {
       const { sighting, stays, created } = await changeTx(req, async (client) => {
         const garage = await ownGarage(client, req);
         const walk = await ownWalk(client, req, { lock: true });
-        const replay = ask.clientRef ? await walks.sightingByRef(client, req.tenantId, walk.id, ask.clientRef) : null;
+        const replay = await sightingSentBefore(client, req, walk, ask, digest);
         const stays = await walks.staysDuring(client, req.tenantId, garage.id, walk.started_at);
         if (replay) {
           await changes.record(client, req.change, {
@@ -3606,15 +3616,20 @@ export function createApp() {
             throw conflict('sighting_already_confirmed', 'a later sighting already answers that one');
           }
         }
+        // A phone that answers a sighting by typing its plate, and says neither which one nor its own id.
+        const inferred = !ask.confirms && !ask.clientRef && ask.picture === null && read.read === 'typed'
+          ? walks.answersWaiting(read.characters, await walks.waitingSightings(client, req.tenantId, walk.id))
+          : null;
+        const confirms = ask.confirms ?? inferred;
         const found = walks.fit({ plate_state: read.characters?.state, plate_rule: read.characters?.rule,
           plate_pattern: read.characters?.pattern }, stays.filter((s) => s.exit_at === null));
         const row = await walks.addSighting(client, req.tenantId, walk.id, {
-          ...read, clientRef: ask.clientRef, confirms: ask.confirms, takenAt, candidates: found.candidates ?? [],
-          by: await walkActor(client, req), picture: image ? { type: imageType, image } : null,
+          ...read, clientRef: ask.clientRef, confirms, takenAt, candidates: found.candidates ?? [],
+          by: await walkActor(client, req), picture: image ? { type: imageType, image, digest } : null,
         });
         await changes.record(client, req.change, {
           garageId: garage.id, action: 'walk.sighting', subject: { kind: 'walk', id: walk.id, name: null },
-          before: null, after: { sighting: row.id, read: row.read, confirms: row.confirms },
+          before: null, after: { sighting: row.id, read: row.read, confirms: row.confirms, ...(inferred ? { confirms_inferred: true } : {}) },
         });
         return { sighting: row, stays, created: true };
       });
@@ -3662,16 +3677,20 @@ export function createApp() {
           });
           return open;
         }
-        const found = walks.lists(open, await walks.sightingsOf(client, req.tenantId, open.id),
-          await walks.staysDuring(client, req.tenantId, garage.id, open.started_at));
-        const row = await walks.finishWalk(client, req.tenantId, open.id, await walkActor(client, req), found);
+        const sightings = await walks.sightingsOf(client, req.tenantId, open.id);
+        const stays = await walks.staysDuring(client, req.tenantId, garage.id, open.started_at);
+        const found = walks.lists(open, sightings, stays);
+        const feeds = walks.feedsStuck(open, sightings, found, stays);
+        const row = await walks.finishWalk(client, req.tenantId, open.id, await walkActor(client, req), found, feeds);
         await changes.record(client, req.change, {
           garageId: garage.id, action: 'walk.finish', subject, before: { open: true },
-          after: { open: false, ...Object.fromEntries(walks.LISTS.map((l) => [l, found[l].length])) },
+          after: { open: false, ...Object.fromEntries(walks.LISTS.map((l) => [l, found[l].length])), feeds_stuck: feeds },
         });
         return row;
       });
-      res.json({ walk: { id: walk.id, started_at: walk.started_at, finished_at: walk.finished_at, lists: walk.lists } });
+      res.json({
+        walk: { id: walk.id, started_at: walk.started_at, finished_at: walk.finished_at, lists: walk.lists, feeds_stuck: walk.feeds_stuck },
+      });
     } catch (err) {
       next(err);
     }
@@ -4065,6 +4084,7 @@ function presentRatePlan(r) {
 export const TRY_MAX_STAYS = 100;
 export const TRY_PER_MINUTE = 20;
 const tryLimiter = signIn.addressLimiter({ max: TRY_PER_MINUTE, windowSeconds: 60 });
+const sightingLimiter = signIn.addressLimiter({ max: walks.SIGHTINGS_PER_MINUTE, windowSeconds: 60 });
 
 /** One `{ entry, exit }` of a try, read in the garage's time and refused by name. */
 function tryStay(raw, i, timezone) {

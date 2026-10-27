@@ -560,7 +560,7 @@ const WRITES = [
     },
     run: (s) => call(base, 'POST', `/garages/${s.g.id}/walks/${s.walk.id}/finish`, { as: a, body: {} }),
     line: (l, s) => assert.deepEqual([l.subject_kind, l.subject_id, l.before, l.after], ['walk', s.walk.id, { open: true },
-      { open: false, seen_with_stay: 0, seen_without_stay: 0, stay_not_seen: 0, not_readable: 0 }]),
+      { open: false, seen_with_stay: 0, seen_without_stay: 0, stay_not_seen: 0, not_readable: 0, feeds_stuck: false }]),
     state: (s) => one(a.tenant, 'SELECT finished_at FROM walks WHERE id = $1', [s.walk.id]),
   },
   {
