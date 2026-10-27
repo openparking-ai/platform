@@ -31,7 +31,12 @@
  *   unsure_plate_dropped   what was read below the confidence is not stored
  *   unsure_beside_plate    an unsure plate is taken beside a read plate
  *   unsure_not_purged      the purge leaves what was read of the plate behind
- *   event_id_any_shape     the open takes any event_id: an object, `redacted:...`
+ *   event_id_any_shape     the lane routes take any event_id: an object, `redacted:...`
+ *   event_id_uuid_only     a UUID only: another lane's own ids (`tp-0001`) refused
+ *   close_event_id_unchecked
+ *                          the close takes any event_id
+ *   unread_tailgater_stored
+ *                          an unread open that says tailgater is stored as one
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with one
  * statement of 0036 edited, so the property genuinely never existed there, and
@@ -157,10 +162,31 @@ const SOURCE_BREAKS = [
   },
   {
     name: 'event_id_any_shape',
-    why: 'the open takes any event_id',
+    why: 'the lane routes take any event_id',
     file: 'src/app.js',
-    from: "      if (typeof openEventId !== 'string' || !LANE_EVENT_ID_SHAPE.test(openEventId)) {",
-    to: '      if (false) {',
+    from: "  if (typeof value !== 'string' || !LANE_EVENT_ID_SHAPE.test(value)) {",
+    to: '  if (false) {',
+  },
+  {
+    name: 'event_id_uuid_only',
+    why: "the routes take a UUID only, and another lane's ids are refused",
+    file: 'src/app.js',
+    from: 'const LANE_EVENT_ID_SHAPE = /^[A-Za-z0-9_-]{1,64}$/;',
+    to: 'const LANE_EVENT_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;',
+  },
+  {
+    name: 'close_event_id_unchecked',
+    why: "the close takes any event_id",
+    file: 'src/app.js',
+    from: '      laneEventId(closeEventId);\n',
+    to: '',
+  },
+  {
+    name: 'unread_tailgater_stored',
+    why: 'an unread open that says tailgater is stored as one',
+    file: 'src/app.js',
+    from: '      const tailgater = tailgaterSaid && !plateUnreadable;',
+    to: '      const tailgater = tailgaterSaid;',
   },
 ];
 

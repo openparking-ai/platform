@@ -37,6 +37,7 @@ import { randomUUID } from 'node:crypto';
 import { createApp } from '../src/app.js';
 import { candidateStays } from '../src/candidates.js';
 import { redactExpiredVehicles } from '../src/retention.js';
+import * as bans from '../src/bans.js';
 import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
@@ -78,7 +79,7 @@ const unread = (extra = {}) => ({
   plate_unreadable: true,
   entry_at: minutesAgo(30),
   entry_confirmation: 'confirmed',
-  tailgater: true,
+  no_open_command: true,
   ...extra,
 });
 
@@ -118,7 +119,8 @@ test('a car nobody could read opens a stay, and its vehicle carries no plate and
   assert.equal(res.status, 201);
   const { session } = await res.json();
   assert.equal(session.entry_confirmation, 'confirmed', 'the loops saw it: echoed as sent');
-  assert.equal(session.tailgater, true, 'no open command let it in');
+  assert.equal(session.no_open_command, true, 'no open command let it in');
+  assert.equal(session.tailgater, false, 'and an unread car is never a tailgater');
   assert.equal(session.exit_at, null, 'it is inside');
   const vehicle = await vehicleOf(session.id);
   assert.equal(vehicle.plate, null, 'no plate is invented for it');
@@ -329,6 +331,24 @@ test('a car nobody could read is never ban-listed, even marked a tailgater with 
     descriptor: 'opvid-opa-id/2:read',
   });
   assert.equal(await listed(read.id), 1);
+
+  // AND THE LISTING RULE ITSELF, apart from the route's normalising: a stay
+  // marked a tailgater whose vehicle has no read plate -- a row written by
+  // anything but this route -- is not listed either.
+  const decided = await withTenant(banning, async (c) => {
+    const vehicle = (await c.query(
+      'INSERT INTO vehicles (tenant_id, unread_ref) VALUES ($1, $2) RETURNING id, plate', [banning, randomUUID()],
+    )).rows[0];
+    const session = (await c.query(
+      `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                             open_event_id, entry_confirmation, entry_descriptor, tailgater)
+       VALUES ($1, $2, $3, $4, now(), 'USD', $5, 'confirmed', 'opvid-opa-id/2:direct', true)
+       RETURNING *`,
+      [banning, g.garage, vehicle.id, g.entryLane, randomUUID()],
+    )).rows[0];
+    return bans.listIfBanned(c, banning, { garage: { ban_tailgaters: true }, session, vehicle });
+  });
+  assert.equal(decided, false, 'a tailgater stay with no read plate was listed');
 });
 
 // --- what was seen, kept and not an identity -------------------------------
@@ -366,19 +386,59 @@ test('what was read below the confidence is kept on the stay, and is not an iden
 
 // --- the open's event id -------------------------------------------------------
 
-test('the open\'s event_id is a UUID: an object, a redacted value, or anything else is refused', async () => {
-  const send = (eventId, body = unread()) =>
-    fetch(`${base}/api/v1/lane/sessions/open`, {
+test('one event-id rule on the open, the close and the events: bounded, safe, and another lane\'s ids still work', async () => {
+  const send = (route, token, body) =>
+    fetch(`${base}/api/v1/lane/${route}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${entryToken}` },
-      body: JSON.stringify({ ...body, event_id: eventId }),
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
     });
-  for (const value of [{ id: randomUUID() }, ['x'], 42, `redacted:${randomUUID()}`, 'evt-1', `${randomUUID()}x`, 'x'.repeat(300)]) {
-    const res = await send(value);
-    assert.equal(res.status, 400, JSON.stringify(value).slice(0, 60));
-    assert.match((await res.json()).error, /event_id must be the lane's own id/);
+  const refusedIds = [{ id: randomUUID() }, ['x'], 42, `redacted:${randomUUID()}`, 'has space', 'x'.repeat(65), 'evt.1'];
+  // A lane that is not ours mints its own ids, and they keep working.
+  const theirs = `tp-${randomUUID().slice(0, 8)}`;
+  const car = plate();
+  const opened = await send('sessions/open', entryToken, {
+    event_id: theirs, plate: car, entry_at: minutesAgo(40), entry_confirmation: 'confirmed',
+  });
+  assert.equal(opened.status, 201, await opened.clone().text());
+  const closed = await send('sessions/close', exitToken, {
+    event_id: `${theirs}_out`, plate: car, exit_at: minutesAgo(1), exit_confirmation: 'confirmed',
+  });
+  assert.equal(closed.status, 200, await closed.clone().text());
+  const logged = await send('events', entryToken, {
+    events: [{ event_id: 'tp-0001', kind: 'armed', occurred_at: minutesAgo(1), detail: {} }],
+  });
+  assert.equal(logged.status, 202, await logged.clone().text());
+  assert.equal((await send('sessions/open', entryToken, { ...unread(), event_id: randomUUID() })).status, 201,
+    'and our lane\'s UUIDs');
+
+  for (const value of refusedIds) {
+    const label = JSON.stringify(value).slice(0, 40);
+    const open = await send('sessions/open', entryToken, { ...unread(), event_id: value });
+    assert.equal(open.status, 400, `open ${label}`);
+    assert.match((await open.json()).error, /event_id must be 1 to 64 characters/);
+    const close = await send('sessions/close', exitToken, {
+      event_id: value, plate: plate(), exit_at: minutesAgo(1), exit_confirmation: 'confirmed',
+    });
+    assert.equal(close.status, 400, `close ${label}`);
+    assert.match((await close.json()).error, /event_id must be 1 to 64 characters/);
+    const events = await send('events', entryToken, {
+      events: [{ event_id: value, kind: 'armed', occurred_at: minutesAgo(1), detail: {} }],
+    });
+    assert.equal(events.status, 400, `events ${label}`);
+    assert.match((await events.json()).error, /event_id must be 1 to 64 characters/);
   }
-  // THE CONTROLS: a lane's UUID opens, for an unread car and a read one.
-  assert.equal((await send(randomUUID())).status, 201);
-  assert.equal((await send(randomUUID(), { plate: plate(), entry_at: minutesAgo(2), entry_confirmation: 'confirmed' })).status, 201);
+});
+
+test('an unread open that says it is a tailgater is stored as not one, and still opens', async () => {
+  const res = await openStay(unread({ tailgater: true, no_open_command: true }));
+  assert.equal(res.status, 201, 'the stay is never refused over it');
+  const { session } = await res.json();
+  assert.equal(session.tailgater, false, 'an unread car is never a tailgater, in the data');
+  assert.equal(session.no_open_command, true);
+  // THE CONTROL: a read car that says so is one.
+  const read = await (await openStay({
+    plate: plate(), entry_at: minutesAgo(3), entry_confirmation: 'confirmed', tailgater: true,
+  })).json();
+  assert.equal(read.session.tailgater, true);
 });

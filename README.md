@@ -90,10 +90,10 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 |---|---|
 | `GET /api/v1/lane/rules` | what the lane caches so it can decide offline: the garage's plans whole, its space class, each linked module's register, the open stays with a cursor — the slow cadence |
 | `GET /api/v1/lane/stays?since=<cursor>` | every stay changed since the cursor, closed rows included — the fast cadence; without `since`, the full open set; every answer also carries the lane's own `lane` state and `board` |
-| `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` |
-| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater` (U7f); identified by a plate, a ticket, or `plate_unreadable: true` (0036), with an optional `no_open_command` and, for an unread car, `unsure_plate` and its confidence; `event_id` a UUID |
+| `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` (1-64 of `A-Za-z0-9_-`) |
+| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater` (U7f); identified by a plate, a ticket, or `plate_unreadable: true` (0036), with an optional `no_open_command` and, for an unread car, `unsure_plate` and its confidence; `event_id` 1-64 of `A-Za-z0-9_-` |
 | `POST /api/v1/lane/pictures` | a picture kept with an entry (U7f): `{picture_ref, event_id, taken_at, image}`, the image base64, a JPEG or a PNG, at most 3 MiB; idempotent on `picture_ref` |
-| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation`; carries and echoes an optional `descriptor` |
+| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id` (1-64 of `A-Za-z0-9_-`); requires `exit_confirmation`; carries and echoes an optional `descriptor` |
 
 ### A stay is identified by a plate or by a ticket — exactly one
 
@@ -158,10 +158,13 @@ finds a stay by it, nothing compares it to a plate, and no ban lists it; the
 purge nulls it with the stay's descriptors. Beside a plate or a ticket it is a
 `400`. **`no_open_command: true`** says the lane's loops saw the car go in and
 no open command let it in; it is its own field, and `tailgater` keeps its own
-meaning (*Pictures, tailgaters and banned cars*). **The open's `event_id` is a
-UUID**, as a lane mints it, or a `400`: it is now the key an unread car's
-vehicle is held under, so an object coerced to text or a value shaped like the
-purge's `redacted:` is refused. `npm run unread-identity-fail-control` breaks
+meaning (*Pictures, tailgaters and banned cars*): an unread open that says
+`tailgater: true` is stored as not one, and opens all the same. **A lane's
+`event_id`** -- on the open, the close and every log event -- is 1 to 64
+characters of letters, digits, hyphen and underscore, or a `400`: the open's
+is now the key an unread car's vehicle is held under, so an object coerced to
+text, a value shaped like the purge's `redacted:` or an unbounded string is
+refused. Our lane's UUIDs and another lane's own ids (`tp-0001`) fit. `npm run unread-identity-fail-control` breaks
 each property in turn.
 
 ### Every session records what saw the car

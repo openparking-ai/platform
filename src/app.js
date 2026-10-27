@@ -308,14 +308,24 @@ function confirmation(value, label, allowed = CONFIRMATIONS) {
 const TICKET_REF_SHAPE = /^[A-Z0-9-]{6,64}$/;
 
 /**
- * The lane's id for an open (0036): a UUID, which is what a lane mints for every
- * event it records. The open's id is now also the key an unread car's vehicle
- * is held under, so it is checked for its shape like any identity -- a JSON
- * object would otherwise reach the database as `[object Object]`, and a value
- * shaped like the purge's `redacted:<id>` would be a live key that reads as a
- * redacted one.
+ * A lane's id for anything it records (0036), on every route that takes one --
+ * an open, a close, a log event: 1 to 64 characters of letters, digits, hyphen
+ * and underscore. Our lane mints a UUID; another lane's own scheme (`tp-0001`)
+ * fits too. The open's id is now also the key an unread car's vehicle is held
+ * under, so it is checked for its shape like any identity -- a JSON object
+ * would otherwise reach the database as `[object Object]`, a value shaped like
+ * the purge's `redacted:<id>` would be a live key that reads as a redacted one,
+ * and an unbounded one is a row an attacker chooses the size of.
  */
-const LANE_EVENT_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const LANE_EVENT_ID_SHAPE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** `value` as a lane's event id, or a 400 naming the rule. */
+function laneEventId(value, label = 'event_id') {
+  if (typeof value !== 'string' || !LANE_EVENT_ID_SHAPE.test(value)) {
+    throw bad(`${label} must be 1 to 64 characters of A-Z, a-z, 0-9, hyphen and underscore`);
+  }
+  return value;
+}
 
 /**
  * What the camera read of an UNREAD car's plate below the lane's confidence,
@@ -1956,7 +1966,7 @@ export function createApp() {
         return {
           garageId,
           laneId,
-          eventId: String(e.event_id),
+          eventId: laneEventId(e.event_id, 'every event_id'),
           kind: eventKind(e.kind),
           // The same bound as an entry_at and an exit_at, on the third
           // lane-supplied time. A future-dated event satisfies every window a
@@ -2031,8 +2041,13 @@ export function createApp() {
       // closing loop (U7f; and, since the owner's rule of 2026-10-26, read or
       // not): a stay like any other, which pays at the exit -- and, where the
       // garage bans tailgaters, a car on its list.
-      const tailgater = req.body?.tailgater ?? false;
-      if (typeof tailgater !== 'boolean') throw bad('tailgater must be true or false when given');
+      const tailgaterSaid = req.body?.tailgater ?? false;
+      if (typeof tailgaterSaid !== 'boolean') throw bad('tailgater must be true or false when given');
+      // NEVER A CAR NOBODY COULD READ (0036): `tailgater` is a car no vend let
+      // in whose plate was read. An unread open that says otherwise is stored
+      // as not one -- the stay is never refused over it -- so no unread car is
+      // a tailgater in the data, whatever a lane sent.
+      const tailgater = tailgaterSaid && !plateUnreadable;
       // A car the lane's loops saw go in that no open command let in (0036),
       // read or not. Its own field: `tailgater` above keeps its own meaning.
       const noOpenCommand = req.body?.no_open_command ?? false;
@@ -2045,11 +2060,9 @@ export function createApp() {
       // replay arriving after the car has left opens a second, phantom session.
       if (!openEventId) throw bad('event_id is required');
       // AND OF ONE SHAPE (0036): it is the key an unread car's vehicle is held
-      // under, so it is the lane's UUID and nothing else -- never an object
-      // coerced to text, never `redacted:...`, never a device token's worth.
-      if (typeof openEventId !== 'string' || !LANE_EVENT_ID_SHAPE.test(openEventId)) {
-        throw bad('event_id must be the lane\'s own id for the open: a UUID, 36 characters of hex and hyphens');
-      }
+      // under -- never an object coerced to text, never `redacted:...`, never
+      // a device token's worth (`LANE_EVENT_ID_SHAPE`).
+      laneEventId(openEventId);
       const entryAt = refuseFuture(parseTime(req.body?.entry_at, 'entry_at'), 'entry_at');
 
       // THE GATE (0014): an inactive garage opens no stay. Recorded, then
@@ -2307,6 +2320,7 @@ export function createApp() {
       // in and a stay that stays open and unbilled for ever.
       const { plate, ticketRef } = laneIdentity(req.body);
       if (!closeEventId) throw bad('event_id is required');
+      laneEventId(closeEventId);
       const exitConfirmation = confirmation(
         req.body?.exit_confirmation,
         'exit_confirmation',
