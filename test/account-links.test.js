@@ -38,6 +38,22 @@ const PASSWORD = 'correct horse battery staple';
 const NEW_PASSWORD = 'a brand new horse battery staple';
 const FLOOR_MS = 500;
 
+/**
+ * Every connection this file makes -- its own, the app's and the command's --
+ * runs in a time zone whose clocks go back three days from now, built from
+ * today: seven days on its calendar are then 169 hours whatever the day and
+ * whatever the database's own zone, so an invite counted in hours fails here
+ * on a UTC database too. Back, not forward: 168 hours then stays inside the
+ * seven days the table allows, and it is the test that refuses it.
+ */
+function clockChangeZone(now = new Date()) {
+  const at = new Date(now.getTime() + 3 * 86_400_000);
+  const day = Math.round((Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate()) - Date.UTC(at.getUTCFullYear(), 0, 1)) / 86_400_000);
+  return `XST5XDT,${(day + 180) % 365}/2,${day}/2`;
+}
+const ZONE = clockChangeZone();
+process.env.PGOPTIONS = `-c TimeZone=${ZONE}`;
+
 const secrets = new Set([PASSWORD, NEW_PASSWORD]);
 const bodies = [];
 const printed = [];
@@ -224,6 +240,14 @@ test('CONTROL: the stand-in keeps what the real sender sends it, the key in the 
   await sendEmail({ configured: true, keyFile: KEY_FILE, from: FROM, apiUrl: serviceUrl }, { to, subject: 'control', text: 'a control message' });
   const [m] = await mailTo(to);
   assert.deepEqual({ ...m }, { authorization: `Bearer ${KEY}`, path: '/emails', from: FROM, to: [to], subject: 'control', text: 'a control message' });
+});
+
+test("CONTROL: this file's connections are in a zone whose clocks change this week, so seven days on its calendar are not 168 hours", async () => {
+  const week = "SELECT current_setting('TimeZone') AS zone, extract(epoch FROM (now() + interval '7 days') - now()) / 3600 AS hours";
+  for (const c of [su, pool]) {
+    const { rows: [r] } = await c.query(week);
+    assert.deepEqual([r.zone, Number(r.hours)], [ZONE, 169]);
+  }
 });
 
 // --- check 1: the invite, end to end ---------------------------------------------------------
