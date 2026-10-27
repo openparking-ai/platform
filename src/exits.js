@@ -1,4 +1,5 @@
 import { HttpError } from './errors.js';
+import { presentPayment } from './exitPayments.js';
 
 /**
  * THE EXIT CASE (0037): one car at an exit lane, from the moment the lane
@@ -13,8 +14,8 @@ import { HttpError } from './errors.js';
  *   driver_word  no stay was found, and the driver's stated entry time was
  *                priced.
  *
- * SETTLED is the one thing the lane opens on: covered, a fee of zero, or a
- * person's decision -- and, once payments exist, paid. Anything else keeps
+ * SETTLED is the one thing the lane opens on: covered, a fee of zero, paid
+ * (0038, src/exitPayments.js), or a person's decision. Anything else keeps
  * the barrier down and says what is missing.
  */
 
@@ -108,14 +109,26 @@ export async function vehicleOf(client, tenantId, vehicleId) {
   return rows[0] ?? null;
 }
 
+/** A case with its payment (0038) beside it, as `payment`, or null. */
+const WITH_PAYMENT = `SELECT e.*, to_jsonb(p) AS payment
+                        FROM exits e
+                        LEFT JOIN exit_payments p ON p.tenant_id = e.tenant_id AND p.exit_id = e.id`;
+
+/** A row written with RETURNING, given its payment as a read would. */
+export async function withPayment(client, tenantId, row) {
+  if (!row) return row;
+  const { rows } = await client.query('SELECT to_jsonb(p) AS payment FROM exit_payments p WHERE tenant_id = $1 AND exit_id = $2', [tenantId, row.id]);
+  return { ...row, payment: rows[0]?.payment ?? null };
+}
+
 export async function caseByEvent(client, tenantId, eventId) {
-  const { rows } = await client.query('SELECT * FROM exits WHERE tenant_id = $1 AND event_id = $2', [tenantId, eventId]);
+  const { rows } = await client.query(`${WITH_PAYMENT} WHERE e.tenant_id = $1 AND e.event_id = $2`, [tenantId, eventId]);
   return rows[0] ?? null;
 }
 
 export async function caseById(client, tenantId, garageId, exitId, { lock = false } = {}) {
   const { rows } = await client.query(
-    `SELECT * FROM exits WHERE tenant_id = $1 AND garage_id = $2 AND id = $3${lock ? ' FOR UPDATE' : ''}`,
+    `${WITH_PAYMENT} WHERE e.tenant_id = $1 AND e.garage_id = $2 AND e.id = $3${lock ? ' FOR UPDATE OF e' : ''}`,
     [tenantId, garageId, exitId],
   );
   return rows[0] ?? null;
@@ -145,7 +158,7 @@ export async function recordWord(client, tenantId, exitId, { claimedEntryAt, quo
       RETURNING *`,
     [tenantId, exitId, claimedEntryAt, JSON.stringify(quote)],
   );
-  return rows[0] ?? null;
+  return withPayment(client, tenantId, rows[0] ?? null);
 }
 
 export async function recordPerson(client, tenantId, exitId, person) {
@@ -153,7 +166,7 @@ export async function recordPerson(client, tenantId, exitId, person) {
     `UPDATE exits SET person = $3 WHERE tenant_id = $1 AND id = $2 AND closed_at IS NULL AND person IS NULL RETURNING *`,
     [tenantId, exitId, JSON.stringify(person)],
   );
-  return rows[0] ?? null;
+  return withPayment(client, tenantId, rows[0] ?? null);
 }
 
 export async function markClosed(client, tenantId, exitId, { closeEventId, closedAt }) {
@@ -162,19 +175,19 @@ export async function markClosed(client, tenantId, exitId, { closeEventId, close
       WHERE tenant_id = $1 AND id = $2 AND closed_at IS NULL RETURNING *`,
     [tenantId, exitId, closeEventId, closedAt],
   );
-  return rows[0] ?? null;
+  return withPayment(client, tenantId, rows[0] ?? null);
 }
 
 export async function caseByCloseEvent(client, tenantId, closeEventId) {
-  const { rows } = await client.query('SELECT * FROM exits WHERE tenant_id = $1 AND close_event_id = $2', [tenantId, closeEventId]);
+  const { rows } = await client.query(`${WITH_PAYMENT} WHERE e.tenant_id = $1 AND e.close_event_id = $2`, [tenantId, closeEventId]);
   return rows[0] ?? null;
 }
 
 /** The cases still at a lane of this garage, newest first: what an attendant works from. */
 export async function openCases(client, tenantId, garageId, limit = 100) {
   const { rows } = await client.query(
-    `SELECT * FROM exits WHERE tenant_id = $1 AND garage_id = $2 AND closed_at IS NULL
-      ORDER BY created_at DESC, id LIMIT $3`,
+    `${WITH_PAYMENT} WHERE e.tenant_id = $1 AND e.garage_id = $2 AND e.closed_at IS NULL
+      ORDER BY e.created_at DESC, e.id LIMIT $3`,
     [tenantId, garageId, limit],
   );
   return rows;
@@ -183,10 +196,11 @@ export async function openCases(client, tenantId, garageId, limit = 100) {
 /**
  * Whether the barrier may open for this case, and if not, what is missing:
  * `driver_word` (no stay found, the driver has not said), `person` (the fee
- * could not be priced), `payment` (a fee above zero).
+ * could not be priced), `payment` (a fee above zero, not yet paid).
  */
 export function settledOf(row) {
   if (row.person) return { settled: true, why: 'person' };
+  if (row.payment?.status === 'succeeded') return { settled: true, why: 'paid' };
   const q = row.quote;
   if (q?.outcome === 'covered') return { settled: true, why: 'covered' };
   if (q && !q.refusal && q.fee_minor === 0) return { settled: true, why: 'zero_fee' };
@@ -220,6 +234,7 @@ export function present(row) {
     entry_at: row.quote?.entry_at ?? row.claimed_entry_at ?? null,
     claimed_entry_at: row.claimed_entry_at,
     fee: presentFee(row.quote),
+    payment: presentPayment(row.payment ?? null),
     ...settledOf(row),
     closed: row.closed_at !== null,
   };

@@ -226,6 +226,18 @@ jobs:
         # test/exit-match.test.js and test/exits.test.js to go red.
         run: npm run exits-fail-control
 
+      - name: Exit-payments fail-control
+        # Paying at the exit (0038). Each break removes one property the
+        # payment rests on -- the intent the case's fee, in person, captured
+        # at once, on the garage's account, one per case by its idempotency
+        # key; paid only at the recorded amount; the reader's refusals named
+        # and a timeout never a failure; only this lane's reader; a person's
+        # letting out canceling the intent; the poll reading Stripe; a text
+        # receipt once, paid, US and Canada only, the number not kept -- and
+        # three of 0038's guards, and requires test/exit-payments.test.js to
+        # go red.
+        run: npm run exit-payments-fail-control
+
       - name: Descriptor fail-control
         # A session carries the appearance descriptor its entry read produced
         # (migration 0009) and the one its exit read produced (0010). Each break

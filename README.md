@@ -1639,9 +1639,10 @@ the case, and an `exit_driver_word` event. The stay that car really was stays
 open; a person ends it.
 
 **Settled** is the one thing the lane opens on: covered by a module, a fee of
-zero, or a person who let the car out. A fee above zero says `needs:
-"payment"`; an unpriced one `needs: "person"`; no stay `needs:
-"driver_word"`. `GET /api/v1/lane/exits/:exitId` is what the lane polls.
+zero, paid by card (0038, below), or a person who let the car out. A fee
+above zero says `needs: "payment"`; an unpriced one `needs: "person"`; no
+stay `needs: "driver_word"`. `GET /api/v1/lane/exits/:exitId` is what the
+lane polls.
 
 **A person**: `GET /api/v1/garages/:garageId/exits` lists the cases still at a
 lane, with the candidates and what the picker said;
@@ -1686,6 +1687,73 @@ Each create is **refused while the account cannot take a card**. Stripe is
 asked for `card_payments` at the moment of the request, and the read is kept
 like any other. A lane holds one reader at a time, and a reader serves one
 lane at a time, at the route and at the table.
+
+### Paying at the exit (0038)
+
+An exit case that says `needs: "payment"` is paid with a card, in person, on
+the garage's own Stripe account (direct charges, `Stripe-Account` header):
+one PaymentIntent for the case's fee as shown, `card_present` (and
+`interac_present` in Canadian dollars), captured at once. Nothing here
+touches a card number.
+
+- **At the lane's reader** — `POST /api/v1/lane/exits/:exitId/pay` (the exit
+  lane's device, its own case only) creates the intent and hands it to the
+  reader bound to that lane (`process_payment_intent`). The answer's `sent`
+  is `true`, `false` (the intent was not waiting for a card: paid or being
+  paid), or `"unknown"` (the reader did not acknowledge in time; it may have
+  it — the poll says). `POST .../pay/cancel` clears the reader; the intent
+  stays to be tried again, and a card already being authorised cannot be
+  stopped (`409 reader_busy`).
+- **At an attendant's phone** — `POST /api/v1/garages/:garageId/exits/:exitId/pay`
+  (an operator token) creates the same intent and answers its
+  `client_secret` for Stripe's Terminal SDK on the phone, with an
+  `exit.payment_start` change-log line.
+
+**One payment per stay.** The intent is created with an idempotency key
+derived from the case, so a resend, a retry or a second attendant gets the
+same intent; a declined card is tried again on that intent, never a new one.
+A second case for the same stay cannot start a payment while the first is
+live or paid (`exit_payments_one_per_stay`, `409 stay_payment_elsewhere`).
+
+**Paid is Stripe's word at the recorded amount.** While a payment is open,
+each `GET /api/v1/lane/exits/:exitId` reads the intent from Stripe, at most
+once every 2 seconds; nothing listens for webhooks. The case is settled
+(`why: "paid"`) only when the intent has succeeded at the amount and currency
+recorded. A decline is kept as `last_failure` and the case still needs
+payment. Stripe out of reach is not a failed poll: the case answers as last
+recorded.
+
+Refused before any card: a closed or settled case (`exit_closed`,
+`exit_settled`), one that needs the driver's word or a person first
+(`nothing_to_pay_yet`), another lane's case, a lane with no reader
+(`no_reader_bound`), a garage with no Stripe account, a reader on another
+account, a fee below the card minimum (`fee_below_card_minimum`: a person
+decides). The reader's own refusals are named: `503 reader_offline`,
+`409 reader_busy`.
+
+**A person who lets the car out** while a payment is open cancels the
+intent, so no card is taken for a settled exit; if Stripe says it had
+already succeeded, that is recorded instead — paid and let out.
+
+**Offline.** The lane's reader is driven from here, so it takes no card
+while it or Stripe is offline: the case still needs payment and a person
+decides. A phone reader may store a card offline and forward it later; that
+payment is not seen here until Stripe has it.
+
+**A text receipt** — `POST /api/v1/lane/exits/:exitId/receipt {phone}`, once
+per paid case, to a **United States or Canadian number only**: the Caribbean
+and US-territory area codes, toll-free, premium and service codes are
+refused (`400 phone_not_us_or_canada`) before anything is sent. The number is
+used for the one send and kept nowhere; the payment keeps its last two
+digits, the time and the provider's reference. The provider is the
+deployment's, read at each send: `TEXT_PROVIDER` (`twilio`), `TEXT_ACCOUNT`,
+`TEXT_KEY_FILE` (an absolute path, re-read every send) and `TEXT_FROM`. With
+any unset, receipts are off (`409 text_receipts_off`).
+
+A payment is never deleted, is forced under row-level security, names only
+its own account's case and stay (a trigger). What it pays for, its amount
+and its intent never change; once succeeded or canceled it stays so; its
+receipt is written once.
 
 ## Deploying
 

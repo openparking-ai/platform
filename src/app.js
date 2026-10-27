@@ -31,6 +31,9 @@ import * as bans from './bans.js';
 import * as exits from './exits.js';
 import * as exitMatch from './exitMatch.js';
 import * as exitPicker from './exitPicker.js';
+import * as exitPayments from './exitPayments.js';
+import * as textReceipt from './textReceipt.js';
+import { connectConfig, StripeError, StripeUnreachable } from './stripe.js';
 import { garageCurrency, garageName, garageSpaces, garageTimezone } from './garageFields.js';
 import { verifyUtf8 } from './utf8Body.js';
 
@@ -2418,7 +2421,7 @@ export function createApp() {
       if (direction !== 'exit') throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
       const row = await withTenant(tenantId, (client) => exits.caseById(client, tenantId, garageId, req.params.exitId));
       if (!row) throw new HttpError(404, 'exit case not found', 'exit_not_found');
-      res.json({ exit: exits.present(row) });
+      res.json({ exit: exits.present(await refreshPayment(tenantId, garageId, row)) });
     } catch (err) {
       next(err);
     }
@@ -2470,6 +2473,275 @@ export function createApp() {
         return updated;
       });
       res.json({ exit: exits.present(out) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // PAYING AT THE EXIT (0038, src/exitPayments.js). One PaymentIntent per
+  // case for the case's own fee, on the garage's account; the lane's reader
+  // or an attendant's phone takes the card; the case is settled when Stripe
+  // says the intent succeeded for that amount.
+  // -------------------------------------------------------------------------
+
+  const paidEvent = (client, tenantId, row, payment) => repo.appendEvents(client, tenantId, [{
+    garageId: row.garage_id,
+    laneId: row.lane_id,
+    eventId: `${exitPayments.PAID_EVENT_KIND}:${payment.id}`,
+    kind: exitPayments.PAID_EVENT_KIND,
+    occurredAt: new Date(),
+    detail: {
+      actor: 'platform:exit',
+      exit_id: row.id,
+      amount_minor: payment.amount_minor,
+      currency: payment.currency,
+      payment_intent_id: payment.payment_intent_id,
+      channel: payment.channel,
+    },
+  }]);
+
+  /** What Stripe says of the case's intent, written down; the case as it now stands. */
+  const recordIntent = (tenantId, garageId, exitId, intent, readerId = null) => withTenant(tenantId, async (client) => {
+    const row = await exits.caseById(client, tenantId, garageId, exitId, { lock: true });
+    let payment = await exitPayments.paymentOf(client, tenantId, exitId);
+    if (readerId) payment = await exitPayments.recordReader(client, tenantId, payment, readerId);
+    const written = await exitPayments.recordIntent(client, tenantId, payment, intent);
+    if (written.paidNow) await paidEvent(client, tenantId, row, written.row);
+    return exits.caseById(client, tenantId, garageId, exitId);
+  });
+
+  /**
+   * Start the payment of a case's fee, or carry on with the one it has.
+   * `lane_reader`: the intent is handed to the lane's bound reader whenever
+   * it is waiting for a card -- the first time, and again after a decline.
+   * `phone_reader`: the intent's client secret is answered for the phone to
+   * collect. Never a second intent for a case.
+   */
+  async function payCase({ tenantId, garageId, exitId, channel, laneId = null, actor, record = null }) {
+    const config = stripeAccount.requireConnect();
+    const staged = await withTenant(tenantId, async (client) => {
+      const row = await exits.caseById(client, tenantId, garageId, exitId, { lock: true });
+      if (!row) throw new HttpError(404, 'exit case not found', 'exit_not_found');
+      if (row.closed_at) throw conflict('exit_closed', 'the car has already left: this case is closed');
+      const owed = exits.settledOf(row);
+      if (owed.settled) throw conflict('exit_settled', `there is nothing to pay: this exit is settled (${owed.why})`);
+      if (owed.needs !== 'payment') {
+        throw conflict('nothing_to_pay_yet', `this exit needs ${owed.needs === 'driver_word' ? "the driver's word" : 'a person'} before a payment`);
+      }
+      let reader = null;
+      if (channel === 'lane_reader') {
+        if (row.lane_id !== laneId) throw conflict('exit_on_another_lane', 'this exit case is at another lane');
+        reader = await exitPayments.boundReader(client, tenantId, laneId);
+        if (!reader) throw conflict('no_reader_bound', 'this lane has no card reader bound');
+      }
+      const existing = await exitPayments.paymentOf(client, tenantId, row.id);
+      const accountId = existing?.account_id ?? reader?.account_id ?? (await exitPayments.garageAccount(client, tenantId, garageId));
+      if (!accountId) throw conflict('no_payment_account', 'this garage has no Stripe account to take a card on');
+      if (reader && reader.account_id !== accountId) {
+        throw conflict('reader_on_another_account', "the lane's reader is on another Stripe account than this payment");
+      }
+      return { row, reader, accountId, existing };
+    });
+
+    let intent = null;
+    let payment = staged.existing;
+    if (!payment) {
+      const q = staged.row.quote;
+      try {
+        intent = await exitPayments.createIntent(config, staged.accountId,
+          exitPayments.intentBody({ amountMinor: q.fee_minor, currency: q.currency, exitId, garageId }), exitId);
+      } catch (err) {
+        if (err instanceof StripeError && err.code === 'amount_too_small') {
+          throw conflict('fee_below_card_minimum', 'the fee is below the least a card can be charged; a person decides');
+        }
+        throw err;
+      }
+      if (typeof intent?.id !== 'string') throw new StripeUnreachable('Stripe answered an intent with no id');
+      const written = await withTenant(tenantId, async (client) => {
+        const w = await exitPayments.insertPayment(client, tenantId, {
+          garageId, exitId, sessionId: staged.row.session_id, channel, readerId: staged.reader?.reader_id ?? null,
+          accountId: staged.accountId, intentId: intent.id, amountMinor: q.fee_minor,
+          currency: String(q.currency).toLowerCase(), stripeStatus: String(intent.status).slice(0, 40), startedBy: actor,
+        });
+        if (w.created) {
+          await repo.appendEvents(client, tenantId, [{
+            garageId,
+            laneId: staged.row.lane_id,
+            eventId: `${exitPayments.PAYMENT_STARTED_EVENT_KIND}:${w.row.id}`,
+            kind: exitPayments.PAYMENT_STARTED_EVENT_KIND,
+            occurredAt: new Date(),
+            detail: { actor, exit_id: exitId, amount_minor: w.row.amount_minor, currency: w.row.currency, channel },
+          }]);
+          await record?.(client, {
+            garageId, action: 'exit.payment_start',
+            subject: { kind: 'exit', id: exitId, name: null },
+            before: { payment: null },
+            after: { payment: 'started', amount_minor: w.row.amount_minor, currency: w.row.currency, channel },
+          });
+        }
+        return w;
+      });
+      payment = written.row;
+      if (payment.payment_intent_id !== intent.id) {
+        // Another request for this case wrote its intent first (past the
+        // idempotency key's 24 hours): this one is never used.
+        await exitPayments.cancelIntent(config, staged.accountId, intent.id).catch(() => {});
+        intent = null;
+      }
+    }
+    if (!intent) intent = await exitPayments.readIntent(config, payment.account_id, payment.payment_intent_id);
+
+    let sent = channel === 'lane_reader' ? false : null;
+    if (channel === 'lane_reader' && intent.status === 'requires_payment_method') {
+      sent = (await exitPayments.sendToReader(config, payment.account_id, staged.reader.reader_id, payment.payment_intent_id)).sent;
+      if (sent === false) intent = await exitPayments.readIntent(config, payment.account_id, payment.payment_intent_id);
+    }
+    const row = await recordIntent(tenantId, garageId, exitId, intent, channel === 'lane_reader' ? staged.reader.reader_id : null);
+    return { row, sent, clientSecret: channel === 'phone_reader' ? intent.client_secret : undefined };
+  }
+
+  /**
+   * While the lane polls a case whose payment is open, Stripe is asked how
+   * the intent stands, at most once every READ_EVERY_MS. Stripe out of reach
+   * is not a failed poll: the case is answered as last recorded.
+   */
+  async function refreshPayment(tenantId, garageId, row) {
+    const p = row.payment;
+    if (!p || p.status !== 'open') return row;
+    if (p.read_at && Date.now() - new Date(p.read_at).getTime() < exitPayments.READ_EVERY_MS) return row;
+    const config = connectConfig();
+    if (!config.key) return row;
+    let intent;
+    try {
+      intent = await exitPayments.readIntent(config, p.account_id, p.payment_intent_id);
+    } catch (err) {
+      if (err instanceof StripeUnreachable || err instanceof StripeError) return row;
+      throw err;
+    }
+    return recordIntent(tenantId, garageId, row.id, intent);
+  }
+
+  /**
+   * A person let the car out while its payment was open: the intent is
+   * canceled so no card is taken for an exit already settled. If Stripe says
+   * it had already succeeded, that is recorded instead -- paid and let out.
+   * After the person's decision is written, never in its way.
+   */
+  async function cancelForPerson(tenantId, garageId, row) {
+    const p = row.payment;
+    if (!p || p.status !== 'open') return row;
+    const config = connectConfig();
+    if (!config.key) return row;
+    try {
+      let intent;
+      try {
+        intent = await exitPayments.cancelIntent(config, p.account_id, p.payment_intent_id);
+      } catch (err) {
+        if (!(err instanceof StripeError)) throw err;
+        intent = await exitPayments.readIntent(config, p.account_id, p.payment_intent_id);
+      }
+      const updated = await recordIntent(tenantId, garageId, row.id, intent);
+      if (updated.payment?.status === 'canceled') {
+        await withTenant(tenantId, (client) => repo.appendEvents(client, tenantId, [{
+          garageId,
+          laneId: row.lane_id,
+          eventId: `${exitPayments.PAYMENT_CANCELED_EVENT_KIND}:${p.id}`,
+          kind: exitPayments.PAYMENT_CANCELED_EVENT_KIND,
+          occurredAt: new Date(),
+          detail: { actor: 'platform:exit', exit_id: row.id, payment_intent_id: p.payment_intent_id, why: 'let_out_by_person' },
+        }]));
+      }
+      return updated;
+    } catch (err) {
+      if (err instanceof StripeUnreachable || err instanceof StripeError) return row;
+      throw err;
+    }
+  }
+
+  /**
+   * PAY AT THE LANE'S READER. The case's fee goes to the reader bound to
+   * this lane; the driver presents a card there. Sent again on a resend
+   * while the intent waits for a card (a decline, the driver's cancel), never
+   * a second intent. The lane then polls the case; it opens on `settled`.
+   * `sent` is true, false (the intent was not waiting for a card: paid or
+   * paying), or "unknown" (the reader did not acknowledge in time; it may
+   * have it -- the poll says).
+   */
+  lane.post('/exits/:exitId/pay', connectRoute(async (req, res) => {
+    const { tenantId, garageId, laneId, direction } = req.device;
+    if (direction !== 'exit') throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
+    const { row, sent } = await payCase({
+      tenantId, garageId, exitId: req.params.exitId, channel: 'lane_reader', laneId, actor: `lane_device:${req.device.deviceId}`,
+    });
+    res.json({ exit: exits.present(row), sent });
+  }));
+
+  /**
+   * Clear the lane's reader: the driver gave up, or the lane wants the
+   * screen back. The intent stays, to be tried again; a card already being
+   * authorised cannot be stopped (409 reader_busy).
+   */
+  lane.post('/exits/:exitId/pay/cancel', connectRoute(async (req, res) => {
+    const { tenantId, garageId, laneId, direction } = req.device;
+    if (direction !== 'exit') throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
+    const config = stripeAccount.requireConnect();
+    const row = await withTenant(tenantId, (client) => exits.caseById(client, tenantId, garageId, req.params.exitId));
+    if (!row) throw new HttpError(404, 'exit case not found', 'exit_not_found');
+    if (row.lane_id !== laneId) throw conflict('exit_on_another_lane', 'this exit case is at another lane');
+    if (row.payment?.status !== 'open' || !row.payment.reader_id) throw conflict('no_payment_on_reader', 'no payment of this case is on a reader');
+    await exitPayments.clearReader(config, row.payment.account_id, row.payment.reader_id);
+    res.json({ exit: exits.present(await refreshPayment(tenantId, garageId, { ...row, payment: { ...row.payment, read_at: null } })) });
+  }));
+
+  /**
+   * A TEXT RECEIPT for a paid exit, `{phone}`: to a US or Canadian number
+   * only; any other is refused and nothing is sent. Once per payment. The
+   * number is kept nowhere: the payment keeps its last two digits.
+   */
+  lane.post('/exits/:exitId/receipt', async (req, res, next) => {
+    try {
+      const { tenantId, garageId, direction } = req.device;
+      if (direction !== 'exit') throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
+      let settings;
+      try {
+        settings = textReceipt.readTextSettings();
+      } catch {
+        throw conflict('text_receipts_misconfigured', 'text receipts are set up wrongly on this deployment');
+      }
+      if (!settings.on) throw conflict('text_receipts_off', 'this deployment sends no text receipts');
+      const to = textReceipt.usOrCanada(req.body?.phone);
+      if (!to) throw new HttpError(400, 'text receipts go to United States and Canadian numbers only', 'phone_not_us_or_canada');
+      const staged = await withTenant(tenantId, async (client) => {
+        const row = await exits.caseById(client, tenantId, garageId, req.params.exitId);
+        if (!row) throw new HttpError(404, 'exit case not found', 'exit_not_found');
+        if (row.payment?.status !== 'succeeded') throw conflict('not_paid', 'a receipt is sent for a paid exit');
+        if (row.payment.receipt) throw conflict('receipt_sent', 'the receipt for this payment was already sent');
+        return { row, garage: await repo.getGarage(client, tenantId, garageId) };
+      });
+      const p = staged.row.payment;
+      let ref;
+      try {
+        ref = await textReceipt.sendText(settings, {
+          to,
+          body: textReceipt.receiptText({
+            garageName: staged.garage.name,
+            amountMinor: p.amount_minor,
+            currency: p.currency,
+            paidAt: p.succeeded_at,
+            timezone: staged.garage.timezone,
+            reference: p.payment_intent_id,
+          }),
+        });
+      } catch (err) {
+        if (err instanceof textReceipt.TextNotSent) throw new HttpError(502, err.message, 'text_not_sent');
+        throw err;
+      }
+      const row = await withTenant(tenantId, async (client) => {
+        await exitPayments.recordReceipt(client, tenantId, p, { sent_at: new Date().toISOString(), to_last2: to.slice(-2), provider_ref: ref });
+        return exits.caseById(client, tenantId, garageId, req.params.exitId);
+      });
+      res.json({ exit: exits.present(row) });
     } catch (err) {
       next(err);
     }
@@ -3066,11 +3338,29 @@ export function createApp() {
         });
         return updated;
       });
-      res.json({ exit: exits.presentForPerson(row) });
+      res.json({ exit: exits.presentForPerson(await cancelForPerson(req.tenantId, row.garage_id, row)) });
     } catch (err) {
       next(err);
     }
   });
+
+  /**
+   * PAY AT A PHONE READER: an attendant's phone, with Stripe's Terminal SDK,
+   * collects the case's fee. The same intent the lane's reader would take
+   * (one per case); answered with its client secret for the phone, which
+   * then presents the card to it. The case is settled when Stripe says the
+   * intent succeeded -- the lane's poll, or this route asked again, reads it.
+   */
+  operator.post('/garages/:garageId/exits/:exitId/pay', connectRoute(async (req, res) => {
+    const garage = await withTenant(req.tenantId, (client) => ownGarage(client, req));
+    const { row, clientSecret } = await payCase({
+      tenantId: req.tenantId, garageId: garage.id, exitId: req.params.exitId, channel: 'phone_reader',
+      actor: `operator_token:${req.operatorTokenId}`, record: recorder(req),
+    });
+    const out = { exit: exits.presentForPerson(row) };
+    if (row.payment?.status === 'open') out.client_secret = clientSecret;
+    res.json(out);
+  }));
 
   /**
    * THE BANNED CARS (0033, U7f). The garage's two settings, and every car
@@ -3706,6 +3996,7 @@ export const WRITE_ROUTES = Object.freeze([
   ['PUT', '/lanes/:laneId/board-prices', 'lane.board_prices'],
   ['POST', '/garages/:garageId/banned/:banId/remove', 'garage.banned_car_remove'],
   ['POST', '/garages/:garageId/exits/:exitId/let-out', 'exit.let_out'],
+  ['POST', '/garages/:garageId/exits/:exitId/pay', 'exit.payment_start'],
 ]);
 
 const WRITE_PATTERNS = WRITE_ROUTES.map(([method, path, action]) => [

@@ -30,6 +30,9 @@ export async function startStripeStub() {
   const byIdempotencyKey = new Map(); // key -> account id
   const terminal = []; // locations and readers, as created
   const terminalByKey = new Map();
+  const intents = new Map(); // id -> payment intent
+  const intentByKey = new Map();
+  const readerActions = []; // every process_payment_intent the stub accepted
   let seq = 0;
   const behaviour = { failNext: null };
 
@@ -106,6 +109,58 @@ export async function startStripeStub() {
         terminal.push(object);
         return send(200, object);
       }
+      // PaymentIntents and reader actions (0038), on a connected account.
+      if (url.pathname.startsWith('/v1/payment_intents') || /^\/v1\/terminal\/readers\/[^/]+\/(process_payment_intent|cancel_action)$/.test(url.pathname)) {
+        const on = req.headers['stripe-account'];
+        if (!on || !accounts.has(on)) {
+          return send(400, { error: { type: 'invalid_request_error', code: 'account_invalid', message: 'no such connected account' } });
+        }
+        const form = Object.fromEntries(new URLSearchParams(raw));
+        if (req.method === 'POST' && url.pathname === '/v1/payment_intents') {
+          const key = req.headers['idempotency-key'];
+          if (key && intentByKey.has(key)) return send(200, intents.get(intentByKey.get(key)));
+          const id = `pi_stub${randomBytes(6).toString('hex')}`;
+          const types = Object.keys(form).filter((k) => k.startsWith('payment_method_types[')).map((k) => form[k]);
+          const intent = {
+            id, object: 'payment_intent', amount: Number(form.amount), currency: form.currency, status: 'requires_payment_method',
+            payment_method_types: types, capture_method: form.capture_method, client_secret: `${id}_secret_stub`,
+            last_payment_error: null, metadata: metadataOf(form), on,
+          };
+          intents.set(id, intent);
+          if (key) intentByKey.set(key, id);
+          return send(200, intent);
+        }
+        const pi = url.pathname.match(/^\/v1\/payment_intents\/([^/]+)(\/cancel)?$/);
+        if (pi) {
+          const intent = intents.get(decodeURIComponent(pi[1]));
+          if (!intent || intent.on !== on) return send(404, { error: { code: 'resource_missing', message: 'no such payment_intent' } });
+          if (req.method === 'GET' && !pi[2]) return send(200, intent);
+          if (req.method === 'POST' && pi[2]) {
+            if (intent.status === 'succeeded' || intent.status === 'canceled') {
+              return send(400, { error: { type: 'invalid_request_error', code: 'payment_intent_unexpected_state', message: `cannot cancel a ${intent.status} intent` } });
+            }
+            intent.status = 'canceled';
+            return send(200, intent);
+          }
+        }
+        const action = url.pathname.match(/^\/v1\/terminal\/readers\/([^/]+)\/(process_payment_intent|cancel_action)$/);
+        if (action && req.method === 'POST') {
+          const reader = terminal.find((t) => t.id === decodeURIComponent(action[1]) && t.object === 'terminal.reader');
+          if (!reader || reader.on !== on) return send(404, { error: { code: 'resource_missing', message: 'no such reader' } });
+          if (action[2] === 'cancel_action') {
+            reader.action = null;
+            return send(200, { id: reader.id, object: 'terminal.reader', action: null });
+          }
+          const intent = intents.get(form.payment_intent);
+          if (!intent || intent.on !== on) return send(404, { error: { code: 'resource_missing', message: 'no such payment_intent' } });
+          if (intent.status !== 'requires_payment_method') {
+            return send(400, { error: { type: 'invalid_request_error', code: 'intent_invalid_state', message: 'Payment intent must be in the requires_payment_method state to be processed by a reader.' } });
+          }
+          reader.action = { type: 'process_payment_intent', status: 'in_progress', process_payment_intent: { payment_intent: intent.id } };
+          readerActions.push({ reader: reader.id, intent: intent.id });
+          return send(200, { id: reader.id, object: 'terminal.reader', action: reader.action });
+        }
+      }
       const read = url.pathname.match(/^\/v1\/accounts\/([^/]+)$/);
       if (req.method === 'GET' && read) {
         const a = accounts.get(decodeURIComponent(read[1]));
@@ -160,6 +215,22 @@ export async function startStripeStub() {
     /** Stripe's side moves: onboarding done, capability granted. */
     setState(id, v1) {
       Object.assign(accounts.get(id).v1, v1);
+    },
+    intents,
+    readerActions,
+    /**
+     * A card at the reader or the phone: paid, or declined -- the intent back
+     * to waiting for a card, as Stripe leaves it, with the decline on it.
+     */
+    presentCard(intentId, { decline = null } = {}) {
+      const intent = intents.get(intentId);
+      if (decline) {
+        intent.status = 'requires_payment_method';
+        intent.last_payment_error = { code: 'card_declined', decline_code: decline };
+      } else {
+        intent.status = 'succeeded';
+        intent.last_payment_error = null;
+      }
     },
     close: () => new Promise((resolve) => server.close(resolve)),
   };
