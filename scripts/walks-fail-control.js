@@ -11,7 +11,12 @@
  * tracked file is edited. `node_modules` is symlinked rather than reinstalled.
  * Each anchor must occur exactly once in its file.
  *
- *   too_many_walks              more than WALK_OPEN_MAX walks are open at once
+ *   second_open_walk            a person starting again gets a second open walk, not theirs
+ *   stale_walk_resumed          a walk left WALK_ABANDON_HOURS is resumed, not abandoned
+ *   sighting_on_abandoned       an abandoned walk takes sightings
+ *   picture_not_kept            a walk's picture is not kept
+ *   picture_any_walk            a sighting's picture is served through another walk
+ *   picture_kept_forever        a walk's picture is kept past PICTURE_DAYS
  *   walk_any_garage             a walk is reached through another garage of its tenant
  *   typed_unconfirmed           a typed plate is kept without the person confirming it
  *   typed_unfolded              a typed plate is matched as typed, not folded as the rule folds
@@ -51,6 +56,8 @@
  *   walk_stays_unchecked        a walk may list a stay elsewhere
  *   walk_subject_refused        the change log does not take a walk as its subject
  *   walk_line_may_name          a line about a walk may carry a name
+ *   two_open_walks_a_person     a person may have two walks open at a garage
+ *   abandoned_and_finished      a walk may be both abandoned and finished
  */
 import { spawnSync } from 'node:child_process';
 import {
@@ -72,11 +79,46 @@ const SCRATCH = process.env.WALKS_SCRATCH_DB || 'openparking_walks_control';
 
 const SOURCE_BREAKS = [
   {
-    name: 'too_many_walks',
-    why: "more than WALK_OPEN_MAX walks are open at once",
+    name: 'second_open_walk',
+    why: "a person starting again gets a second open walk, not theirs",
     file: 'src/app.js',
-    from: "        if (await walks.openWalks(client, req.tenantId, garage.id) >= walks.WALK_OPEN_MAX) {",
-    to: "        if (false) {",
+    from: "        const open = await walks.openWalkOf(client, req.tenantId, garage.id, by);",
+    to: "        const open = null;",
+  },
+  {
+    name: 'stale_walk_resumed',
+    why: "a walk left WALK_ABANDON_HOURS is resumed, not abandoned",
+    file: 'src/app.js',
+    from: "        await walks.abandonStale(client, req.tenantId, garage.id);",
+    to: "",
+  },
+  {
+    name: 'sighting_on_abandoned',
+    why: "an abandoned walk takes sightings",
+    file: 'src/app.js',
+    from: "    if (walks.abandonedAt(walk)) {",
+    to: "    if (false) {",
+  },
+  {
+    name: 'picture_not_kept',
+    why: "a walk's picture is not kept",
+    file: 'src/walks.js',
+    from: "      s.picture?.type ?? null, s.picture?.image ?? null],",
+    to: "      null, null],",
+  },
+  {
+    name: 'picture_any_walk',
+    why: "a sighting's picture is served through another walk",
+    file: 'src/walks.js',
+    from: "      WHERE tenant_id = $1 AND walk_id = $2 AND id = $3 AND picture IS NOT NULL`,",
+    to: "      WHERE tenant_id = $1 AND $2::uuid IS NOT NULL AND id = $3 AND picture IS NOT NULL`,",
+  },
+  {
+    name: 'picture_kept_forever',
+    why: "a walk's picture is kept past PICTURE_DAYS",
+    file: 'src/walks.js',
+    from: "      WHERE tenant_id = $1 AND picture IS NOT NULL\n        AND taken_at <",
+    to: "      WHERE false AND tenant_id = $1 AND picture IS NOT NULL\n        AND taken_at <",
   },
   {
     name: 'walk_any_garage',
@@ -103,8 +145,8 @@ const SOURCE_BREAKS = [
     name: 'picture_not_fresh',
     why: "a picture goes to the reader with what was written into it",
     file: 'src/app.js',
-    from: "        image = type ? await bans.freshPicture(bytes, type) : null;",
-    to: "        image = type ? bytes : null;",
+    from: "        image = imageType ? await bans.freshPicture(bytes, imageType) : null;",
+    to: "        image = imageType ? bytes : null;",
   },
   {
     name: 'picture_unchecked',
@@ -145,8 +187,8 @@ const SOURCE_BREAKS = [
     name: 'read_again_on_resend',
     why: "a sighting sent again is read again",
     file: 'src/app.js',
-    from: "        if (!replay && walk.finished_at) throw walkFinished();\n        return replay;",
-    to: "        if (!replay && walk.finished_at) throw walkFinished();\n        return null;",
+    from: "        if (!replay && walkClosed(walk)) throw walkClosed(walk);\n        return replay;",
+    to: "        if (!replay && walkClosed(walk)) throw walkClosed(walk);\n        return null;",
   },
   {
     name: 'client_ref_forgotten',
@@ -236,9 +278,8 @@ const SOURCE_BREAKS = [
     name: 'sighting_on_finished',
     why: "a finished walk takes sightings",
     file: 'src/app.js',
-    from: "        if (!replay && walk.finished_at) throw walkFinished();",
-    to: "        if (false) throw walkFinished();",
-    also: [{ file: "src/app.js", from: "        if (walk.finished_at) throw walkFinished();\n        if (await walks.sightingCount", to: "        if (false) throw walkFinished();\n        if (await walks.sightingCount" }],
+    from: "    if (walk.finished_at) return walkFinished();\n    if (walks.abandonedAt(walk)) {",
+    to: "    if (false) return walkFinished();\n    if (walks.abandonedAt(walk)) {",
   },
   {
     name: 'stuck_ignores_walks',
@@ -272,7 +313,7 @@ const SOURCE_BREAKS = [
     name: 'open_walk_kept_forever',
     why: "a walk never finished is kept past the window",
     file: 'src/retention.js',
-    from: "          AND COALESCE(finished_at, started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,",
+    from: "          AND COALESCE(finished_at, abandoned_at, started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,",
     to: "          AND finished_at < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,",
   },
   {
@@ -316,6 +357,16 @@ const SCHEMA_BREAKS = [
     name: 'walk_line_may_name',
     why: "a line about a walk may carry a name",
     edits: [{ file: ADDED_0040, from: "  CHECK (subject_kind <> 'walk' OR subject_name IS NULL);", to: "  CHECK (true);" }],
+  },
+  {
+    name: 'two_open_walks_a_person',
+    why: "a person may have two walks open at a garage",
+    edits: [{ file: ADDED_0040, from: "CREATE UNIQUE INDEX walks_one_open_per_person", to: "CREATE INDEX walks_one_open_per_person" }],
+  },
+  {
+    name: 'abandoned_and_finished',
+    why: "a walk may be both abandoned and finished",
+    edits: [{ file: ADDED_0040, from: "    abandoned_at IS NULL OR (finished_at IS NULL AND abandoned_at >= started_at)", to: "    true" }],
   },
 ];
 

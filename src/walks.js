@@ -3,18 +3,24 @@ import { isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { HttpError } from './errors.js';
 import * as exitMatch from './exitMatch.js';
+import { PICTURE_DAYS } from './bans.js';
 
 /**
  * THE INVENTORY WALK (0040): a person photographs the cars parked in a garage,
  * or types their plates, and the walk finishes into four lists, frozen.
  *
  * A picture is read by the deployment's vehicle-id (`POST /v1/reads`), whose
- * one plate reader is fast-alpr, and is not kept: the walk keeps what was read.
+ * one plate reader is fast-alpr, and is kept as it was written fresh for
+ * PICTURE_DAYS (30), as a lane's picture is.
  * The plate's positioned characters (`opvid-plate-chars/1`) are what a
  * sighting is matched on, by the exit's own matching (src/exitMatch.js),
  * against the garage's stays open at some point during the walk. A phone's
  * picture is not the lane's camera, so its colour and size never exclude a
  * stay and its "unreadable" is never matched against a lane's.
+ *
+ * A person has one unfinished walk at a garage at a time; starting again
+ * answers it. One left unfinished WALK_ABANDON_HOURS after it started is
+ * abandoned: it takes nothing more and never has lists.
  *
  * Settings, read at each picture, so a deployment can set them without a
  * restart:
@@ -27,8 +33,8 @@ import * as exitMatch from './exitMatch.js';
 
 export const READS = Object.freeze(['agreed', 'unsure', 'none', 'typed']);
 export const LISTS = Object.freeze(['seen_with_stay', 'seen_without_stay', 'stay_not_seen', 'not_readable']);
-/** Open walks a garage may have at once. */
-export const WALK_OPEN_MAX = 10;
+/** An unfinished walk is abandoned this long after it started. */
+export const WALK_ABANDON_HOURS = 12;
 /** The most sightings one walk takes. */
 export const SIGHTINGS_MAX = 5000;
 export const CLIENT_REF_MAX = 100;
@@ -278,7 +284,57 @@ export async function staysDuring(client, tenantId, garageId, since) {
 }
 
 const SIGHTING_COLUMNS = `id, walk_id, client_ref, read, why, plate, plate_state, plate_rule, plate_pattern, readers,
-  candidates, picked_stay, confirms, taken_at, added_at, added_by`;
+  candidates, picked_stay, confirms, taken_at, added_at, added_by, picture IS NOT NULL AS has_picture`;
+
+/** When a walk was abandoned, or null: recorded, or due WALK_ABANDON_HOURS after it started and still unfinished. */
+export function abandonedAt(walk, now = new Date()) {
+  if (walk.abandoned_at) return walk.abandoned_at;
+  if (walk.finished_at) return null;
+  const due = new Date(new Date(walk.started_at).getTime() + WALK_ABANDON_HOURS * 3600_000);
+  return due <= now ? due : null;
+}
+
+/** Record every walk at the garage left unfinished past WALK_ABANDON_HOURS as abandoned then. */
+export async function abandonStale(client, tenantId, garageId) {
+  await client.query(
+    `UPDATE walks SET abandoned_at = started_at + make_interval(hours => $3)
+      WHERE tenant_id = $1 AND garage_id = $2 AND finished_at IS NULL AND abandoned_at IS NULL
+        AND started_at + make_interval(hours => $3) <= now()`,
+    [tenantId, garageId, WALK_ABANDON_HOURS],
+  );
+}
+
+/** The person's unfinished walk at the garage, or null. */
+export async function openWalkOf(client, tenantId, garageId, by) {
+  const { rows } = await client.query(
+    `SELECT * FROM walks
+      WHERE tenant_id = $1 AND garage_id = $2 AND started_by = $3 AND finished_at IS NULL AND abandoned_at IS NULL`,
+    [tenantId, garageId, by],
+  );
+  return rows[0] ?? null;
+}
+
+/** A sighting's picture, `{content_type, image}`, or null: none taken, its days over, or not this walk's. */
+export async function sightingPicture(client, tenantId, walkId, sightingId) {
+  if (!UUID.test(sightingId)) return null;
+  const { rows } = await client.query(
+    `SELECT picture_type AS content_type, picture AS image FROM walk_sightings
+      WHERE tenant_id = $1 AND walk_id = $2 AND id = $3 AND picture IS NOT NULL`,
+    [tenantId, walkId, sightingId],
+  );
+  return rows[0] ?? null;
+}
+
+/** Forget the walk pictures whose PICTURE_DAYS are over; the sighting keeps what was read. */
+export async function removeExpiredPictures(client, tenantId, { now = null } = {}) {
+  const { rowCount } = await client.query(
+    `UPDATE walk_sightings SET picture = NULL, picture_type = NULL
+      WHERE tenant_id = $1 AND picture IS NOT NULL
+        AND taken_at < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,
+    [tenantId, now, PICTURE_DAYS],
+  );
+  return rowCount;
+}
 
 export async function getWalk(client, tenantId, garageId, walkId, { lock = false } = {}) {
   if (!UUID.test(walkId)) return null;
@@ -287,14 +343,6 @@ export async function getWalk(client, tenantId, garageId, walkId, { lock = false
     [tenantId, garageId, walkId],
   );
   return rows[0] ?? null;
-}
-
-export async function openWalks(client, tenantId, garageId) {
-  const { rows } = await client.query(
-    'SELECT count(*)::int AS n FROM walks WHERE tenant_id = $1 AND garage_id = $2 AND finished_at IS NULL',
-    [tenantId, garageId],
-  );
-  return rows[0].n;
 }
 
 export async function startWalk(client, tenantId, garageId, by) {
@@ -355,11 +403,12 @@ export const READER_OFF = Object.freeze({
 export async function addSighting(client, tenantId, walkId, s) {
   const { rows } = await client.query(
     `INSERT INTO walk_sightings (tenant_id, walk_id, client_ref, read, why, plate, plate_state, plate_rule, plate_pattern,
-                                 readers, candidates, confirms, taken_at, added_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                                 readers, candidates, confirms, taken_at, added_by, picture_type, picture)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
      RETURNING ${SIGHTING_COLUMNS}`,
     [tenantId, walkId, s.clientRef, s.read, s.why, s.plate, s.characters?.state ?? null, s.characters?.rule ?? null,
-      s.characters?.pattern ?? null, JSON.stringify(s.readers), s.candidates ?? [], s.confirms, s.takenAt, s.by],
+      s.characters?.pattern ?? null, JSON.stringify(s.readers), s.candidates ?? [], s.confirms, s.takenAt, s.by,
+      s.picture?.type ?? null, s.picture?.image ?? null],
   );
   return rows[0];
 }
@@ -408,6 +457,7 @@ export function presentSighting(s, stays = []) {
     }),
     picked_stay: s.picked_stay,
     confirms: s.confirms,
+    has_picture: s.has_picture,
     taken_at: s.taken_at,
     added_by: s.added_by,
   };
@@ -420,6 +470,7 @@ export function presentWalk(w, sightings = null, stays = []) {
     started_by: w.started_by,
     finished_at: w.finished_at,
     finished_by: w.finished_by,
+    abandoned_at: abandonedAt(w),
     lists: w.lists,
     ...(sightings ? { sightings: sightings.map((s) => presentSighting(s, stays)) } : {}),
   };

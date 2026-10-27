@@ -1828,17 +1828,22 @@ change-log line about the walk -- `walk.start`, `walk.sighting`,
 `walk.pick`, `walk.finish` -- that names no plate.
 
 - **Start** -- `POST /api/v1/garages/:garageId/walks {}` →
-  `201 {walk: {id, started_at}}`. Several walks may be open at once (one per
-  floor, say), at most `WALK_OPEN_MAX` (10) per garage
-  (`409 too_many_open_walks`).
+  `201 {walk: {id, started_at}}`. A person has one unfinished walk at a
+  garage: starting again answers that walk (`200`), so a phone that lost it
+  carries on. Other people start their own. A walk left unfinished
+  `WALK_ABANDON_HOURS` (12) after it started is **abandoned**: it takes no
+  more sightings, picks or finish (`409 walk_abandoned`), has no lists, and
+  its person's next start begins a new walk.
 - **A sighting** --
   `POST /api/v1/garages/:garageId/walks/:walkId/sightings
   {picture?, plate?, confirmed, client_ref?, confirms?, taken_at?}` →
   `201 {sighting: SIGHTING}`.
   - `picture`: a JPEG or a PNG, base64, at most 3 MiB, as a lane's picture.
     It is opened and written fresh (no metadata, no location), sent to the
-    deployment's vehicle-id to read, and **not kept**: the walk keeps what was
-    read. The reader is fast-alpr, the one plate reader.
+    deployment's vehicle-id to read. That fresh picture is kept
+    `PICTURE_DAYS` (30) from when it was taken, as a lane's picture is, so a
+    person can look at it again; then it is forgotten and the sighting keeps
+    what was read. The reader is fast-alpr, the one plate reader.
   - `plate`: a plate the person typed or confirmed, with `confirmed: true`
     (`400 plate_not_confirmed` without it): letters and digits, 1 to 10 once
     spaces and dashes are taken out. A sighting with a plate is matched on
@@ -1853,7 +1858,8 @@ change-log line about the walk -- `walk.start`, `walk.sighting`,
     earlier one leaves the lists; this one stands for it.
   - `taken_at`: when the picture was taken (not in the future); the time it
     arrived otherwise.
-  - Refused: `409 walk_finished` on a finished walk; `409 too_many_sightings`
+  - Refused: `409 walk_finished` on a finished walk, `409 walk_abandoned` on
+    an abandoned one; `409 too_many_sightings`
     past 5000 on one walk; `400 confirms_invalid` for `confirms` that is not
     a sighting of this walk and `409 sighting_already_confirmed` for one a
     later sighting already answers; `400 picture_invalid` for a picture that
@@ -1861,7 +1867,8 @@ change-log line about the walk -- `walk.start`, `walk.sighting`,
     (nothing is kept: send it again).
 
   `SIGHTING` is `{id, plate, read, why, readers, needs_confirmation,
-  plate_characters, candidates, confirms, taken_at, added_by}` (`why`, on
+  plate_characters, candidates, picked_stay, confirms, has_picture, taken_at,
+  added_by}` (`why`, on
   `read: "none"` only: `unreadable`, `not_seen` or `reader_off`):
 
   | the reader's answer | `read` | `plate` | `needs_confirmation` |
@@ -1895,8 +1902,14 @@ change-log line about the walk -- `walk.start`, `walk.sighting`,
     came in after the walk started is never "not seen".
   - `not_readable`: `[{sighting, plate: null, why}]` -- a picture with nothing
     sure on it, not answered by a later sighting.
-- **Read** -- `GET /api/v1/garages/:garageId/walks/:walkId` → the walk, its
-  sightings and, once finished, its lists.
+- **Read** -- `GET /api/v1/garages/:garageId/walks/:walkId` → the walk
+  (`abandoned_at` set once abandoned), its sightings and, once finished, its
+  lists.
+- **A sighting's picture** --
+  `GET /api/v1/garages/:garageId/walks/:walkId/sightings/:sightingId/picture`
+  → the image bytes, `image/jpeg` or `image/png`, `Cache-Control: private,
+  no-store`; `404` when the sighting has none, its days are over, or it is
+  not this walk's.
 
 **Matching** is the exit's (0037, `src/exitMatch.js`): the sure characters in
 their positions, folded, against the garage's stays open at some point during
@@ -1910,9 +1923,10 @@ walk last saw the stay, and a stay the garage's latest finished walk did not
 see is listed whatever its age, with `why: "not_seen_on_walk"`.
 
 The walks hold plates and are personal data: a walk is deleted with its
-sightings once it finished -- or, never finished, started -- longer ago
-than the tenant's retention window (`retention_days`), in the same purge as
-the vehicles.
+sightings once it finished or was abandoned -- or, neither, started --
+longer ago than the tenant's retention window (`retention_days`), in the
+same purge as the vehicles. That purge also forgets each walk picture past
+its 30 days.
 
 ## Deploying
 

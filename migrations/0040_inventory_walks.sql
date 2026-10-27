@@ -4,23 +4,27 @@
 --   walks            one walk at one garage: who started it and when, and, once
 --                    finished, who finished it, when, and its four lists
 --                    (`lists`), stored as they were worked out at the finish and
---                    never worked out again.
+--                    never worked out again. A person has one unfinished walk at
+--                    a garage at a time; one left unfinished is closed as
+--                    abandoned (`abandoned_at`), with no lists.
 --   walk_sightings   one car seen on a walk: what the reader made of its picture
 --                    or the plate the person gave (`read`), the plate's
 --                    positioned characters the matching uses
 --                    (`plate_state/rule/pattern`), the candidates it fitted when
 --                    it fitted several, the one the person picked, and an
---                    earlier sighting it answers (`confirms`). The picture is
---                    not kept. `client_ref` is the phone's own id for it, so a
---                    sighting sent twice is kept once.
+--                    earlier sighting it answers (`confirms`), and the picture as
+--                    it was written fresh, until its 30 days are over.
+--                    `client_ref` is the phone's own id for it, so a sighting
+--                    sent twice is kept once.
 --   walk_stays       the stays a finished walk listed, and in which list
 --                    (`seen` or `not_seen`): what the stuck list reads.
 --   garage_changes   a walk as what a change was done to (`walk`). A line about
 --                    a walk names no vehicle.
 --
 -- A walk holds plates: it is deleted with its sightings and its stays once it
--- finished (or, never finished, started) longer ago than the tenant's
--- retention window (src/retention.js).
+-- finished, was abandoned, or (neither) started longer ago than the tenant's
+-- retention window; a sighting's picture goes once its 30 days are over
+-- (src/retention.js).
 --
 -- Run as the database OWNER.
 
@@ -35,12 +39,20 @@ CREATE TABLE walks (
   finished_at  timestamptz,
   finished_by  text        CHECK (finished_by IS NULL OR length(finished_by) BETWEEN 1 AND 300),
   lists        jsonb,
+  abandoned_at timestamptz,
   CONSTRAINT walks_finished_whole CHECK (
     (finished_at IS NULL AND finished_by IS NULL AND lists IS NULL)
     OR (finished_at IS NOT NULL AND finished_by IS NOT NULL AND jsonb_typeof(lists) = 'object'
         AND finished_at >= started_at)
+  ),
+  -- Abandoned is never finished, and has no lists.
+  CONSTRAINT walks_abandoned_unfinished CHECK (
+    abandoned_at IS NULL OR (finished_at IS NULL AND abandoned_at >= started_at)
   )
 );
+
+CREATE UNIQUE INDEX walks_one_open_per_person ON walks (garage_id, started_by)
+  WHERE finished_at IS NULL AND abandoned_at IS NULL;
 
 CREATE INDEX walks_tenant_id_idx ON walks (tenant_id);
 CREATE INDEX walks_garage_idx ON walks (tenant_id, garage_id, started_at);
@@ -63,6 +75,9 @@ CREATE TABLE walk_sightings (
   taken_at        timestamptz NOT NULL,
   added_at        timestamptz NOT NULL DEFAULT now(),
   added_by        text        NOT NULL CHECK (length(added_by) BETWEEN 1 AND 300),
+  picture_type    text        CHECK (picture_type IS NULL OR picture_type IN ('image/jpeg', 'image/png')),
+  picture         bytea       CHECK (picture IS NULL OR octet_length(picture) BETWEEN 1 AND 3145728),
+  CONSTRAINT walk_sightings_picture_whole CHECK ((picture IS NULL) = (picture_type IS NULL)),
   -- `none` says why and has no plate; every other read has a plate and no why.
   CONSTRAINT walk_sightings_read_shape CHECK (
     (read = 'none' AND why IS NOT NULL AND plate IS NULL)

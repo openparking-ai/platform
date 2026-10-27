@@ -390,8 +390,9 @@ export const TENANT_TABLES = [
   },
   {
     table: 'walks',
+    // A person has one open walk at a garage, so each row is another person's.
     insert: (c, t, w) =>
-      c.query(`INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, 'key:row') RETURNING id`, [t, w.garage]),
+      c.query(`INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, 'key:' || gen_random_uuid()) RETURNING id`, [t, w.garage]),
   },
   {
     table: 'walk_sightings',
@@ -399,7 +400,7 @@ export const TENANT_TABLES = [
     insert: (c, t, w) =>
       c.query(
         `WITH k AS (
-           INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, 'key:row') RETURNING id
+           INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, 'key:' || gen_random_uuid()) RETURNING id
          )
          INSERT INTO walk_sightings (tenant_id, walk_id, read, plate, taken_at, added_by)
          SELECT $1, k.id, 'typed', 'ROW1', now(), 'key:row' FROM k

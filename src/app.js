@@ -3489,11 +3489,14 @@ export function createApp() {
    * THE INVENTORY WALK (0040): a person walks the garage with a phone,
    * photographs the cars parked there or types their plates, and the walk
    * finishes into four lists, frozen. A picture is read by vehicle-id and
-   * not kept. Several walks may be open at a garage at once.
+   * kept 30 days. A person has one unfinished walk at a garage at a time.
    */
+  // The person: the actor, and the name a key says acted through it where
+  // the request carries one (`req.change.doneBy`).
   const walkActor = async (client, req) => {
     const actor = await changes.who(client, req.change);
-    return `${actor.kind}:${actor.name ?? actor.id ?? ''}`.slice(0, 300);
+    const by = `${actor.kind}:${actor.name ?? actor.id ?? ''}`;
+    return (req.change.doneBy ? `${by} (${req.change.doneBy})` : by).slice(0, 300);
   };
   const ownWalk = async (client, req, { lock = false } = {}) => {
     const walk = await walks.getWalk(client, req.tenantId, req.params.garageId, req.params.walkId, { lock });
@@ -3501,16 +3504,30 @@ export function createApp() {
     return walk;
   };
   const walkFinished = () => conflict('walk_finished', 'this walk is finished: start another');
+  const walkClosed = (walk) => {
+    if (walk.finished_at) return walkFinished();
+    if (walks.abandonedAt(walk)) {
+      return conflict('walk_abandoned', `this walk was left unfinished for ${walks.WALK_ABANDON_HOURS} hours: start another`);
+    }
+    return null;
+  };
 
   operator.post('/garages/:garageId/walks', async (req, res, next) => {
     try {
-      const walk = await changeTx(req, async (client) => {
+      const { walk, created } = await changeTx(req, async (client) => {
         const garage = await ownGarage(client, req);
-        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`walks|${garage.id}`]);
-        if (await walks.openWalks(client, req.tenantId, garage.id) >= walks.WALK_OPEN_MAX) {
-          throw conflict('too_many_open_walks', `at most ${walks.WALK_OPEN_MAX} walks are open at a garage at once: finish one first`);
+        const by = await walkActor(client, req);
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`walks|${garage.id}|${by}`]);
+        await walks.abandonStale(client, req.tenantId, garage.id);
+        const open = await walks.openWalkOf(client, req.tenantId, garage.id, by);
+        if (open) {
+          await changes.record(client, req.change, {
+            garageId: garage.id, action: 'walk.start', subject: { kind: 'walk', id: open.id, name: null },
+            before: { open: true }, after: { open: true },
+          });
+          return { walk: open, created: false };
         }
-        const row = await walks.startWalk(client, req.tenantId, garage.id, await walkActor(client, req));
+        const row = await walks.startWalk(client, req.tenantId, garage.id, by);
         await changes.record(client, req.change, {
           garageId: garage.id,
           action: 'walk.start',
@@ -3518,9 +3535,9 @@ export function createApp() {
           before: null,
           after: { open: true },
         });
-        return row;
+        return { walk: row, created: true };
       });
-      res.status(201).json({ walk: { id: walk.id, started_at: walk.started_at } });
+      res.status(created ? 201 : 200).json({ walk: { id: walk.id, started_at: walk.started_at } });
     } catch (err) {
       next(err);
     }
@@ -3531,10 +3548,11 @@ export function createApp() {
       const ask = walks.sightingRequest(req.body);
       const takenAt = ask.takenAt === null ? new Date() : refuseFuture(parseTime(ask.takenAt, 'taken_at'), 'taken_at');
       let image = null;
+      let imageType = null;
       if (ask.picture !== null) {
         const bytes = Buffer.from(ask.picture, 'base64');
-        const type = bytes.length > 0 && bytes.length <= bans.PICTURE_MAX_BYTES ? bans.pictureType(bytes) : null;
-        image = type ? await bans.freshPicture(bytes, type) : null;
+        imageType = bytes.length > 0 && bytes.length <= bans.PICTURE_MAX_BYTES ? bans.pictureType(bytes) : null;
+        image = imageType ? await bans.freshPicture(bytes, imageType) : null;
         if (!image || image.length > bans.PICTURE_MAX_BYTES) {
           throw new HttpError(400, `picture must be a JPEG or a PNG of at most ${bans.PICTURE_MAX_BYTES} bytes that opens`, 'picture_invalid');
         }
@@ -3544,7 +3562,7 @@ export function createApp() {
         await ownGarage(client, req);
         const walk = await ownWalk(client, req);
         const replay = ask.clientRef ? await walks.sightingByRef(client, req.tenantId, walk.id, ask.clientRef) : null;
-        if (!replay && walk.finished_at) throw walkFinished();
+        if (!replay && walkClosed(walk)) throw walkClosed(walk);
         return replay;
       });
       let read;
@@ -3577,7 +3595,7 @@ export function createApp() {
           });
           return { sighting: replay, stays, created: false };
         }
-        if (walk.finished_at) throw walkFinished();
+        if (walkClosed(walk)) throw walkClosed(walk);
         if (await walks.sightingCount(client, req.tenantId, walk.id) >= walks.SIGHTINGS_MAX) {
           throw conflict('too_many_sightings', `a walk holds at most ${walks.SIGHTINGS_MAX} sightings: finish it and start another`);
         }
@@ -3592,7 +3610,7 @@ export function createApp() {
           plate_pattern: read.characters?.pattern }, stays.filter((s) => s.exit_at === null));
         const row = await walks.addSighting(client, req.tenantId, walk.id, {
           ...read, clientRef: ask.clientRef, confirms: ask.confirms, takenAt, candidates: found.candidates ?? [],
-          by: await walkActor(client, req),
+          by: await walkActor(client, req), picture: image ? { type: imageType, image } : null,
         });
         await changes.record(client, req.change, {
           garageId: garage.id, action: 'walk.sighting', subject: { kind: 'walk', id: walk.id, name: null },
@@ -3614,7 +3632,7 @@ export function createApp() {
         const walk = await ownWalk(client, req, { lock: true });
         const found = await walks.getSighting(client, req.tenantId, walk.id, req.params.sightingId);
         if (!found) throw new HttpError(404, 'sighting not found', 'sighting_not_found');
-        if (walk.finished_at) throw walkFinished();
+        if (walkClosed(walk)) throw walkClosed(walk);
         if (typeof stayId !== 'string' || !found.candidates.includes(stayId)) {
           throw new HttpError(400, "stay must be one of the sighting's candidates", 'stay_not_a_candidate');
         }
@@ -3637,6 +3655,7 @@ export function createApp() {
         const garage = await ownGarage(client, req);
         const open = await ownWalk(client, req, { lock: true });
         const subject = { kind: 'walk', id: open.id, name: null };
+        if (!open.finished_at && walks.abandonedAt(open)) throw walkClosed(open);
         if (open.finished_at) {
           await changes.record(client, req.change, {
             garageId: garage.id, action: 'walk.finish', subject, before: { open: false }, after: { open: false },
@@ -3653,6 +3672,21 @@ export function createApp() {
         return row;
       });
       res.json({ walk: { id: walk.id, started_at: walk.started_at, finished_at: walk.finished_at, lists: walk.lists } });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  operator.get('/garages/:garageId/walks/:walkId/sightings/:sightingId/picture', async (req, res, next) => {
+    try {
+      const picture = await withTenant(req.tenantId, async (client) => {
+        await ownGarage(client, req);
+        const walk = await ownWalk(client, req);
+        return walks.sightingPicture(client, req.tenantId, walk.id, req.params.sightingId);
+      });
+      if (!picture) throw new HttpError(404, 'picture not found');
+      res.set({ 'Content-Type': picture.content_type, 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' });
+      res.send(picture.image);
     } catch (err) {
       next(err);
     }

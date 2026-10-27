@@ -15,7 +15,7 @@ import { randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import { createApp } from '../src/app.js';
 import { redactExpiredVehicles } from '../src/retention.js';
-import { WALK_OPEN_MAX } from '../src/walks.js';
+import { WALK_ABANDON_HOURS } from '../src/walks.js';
 import { fold } from '../src/exitMatch.js';
 import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
@@ -61,6 +61,13 @@ async function garage(name) {
   const op = generateDeviceToken();
   await withTenant(tenant, (c) => c.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'desk',$2)`, [tenant, hashToken(op)]));
   return { tenant, id: world.garage, world, op, entry: await token(tenant, world.entryLane, 'entry') };
+}
+
+/** A second operator key at the garage: another person on the floor. */
+async function person(g, name) {
+  const op = generateDeviceToken();
+  await withTenant(g.tenant, (c) => c.query('INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,$2,$3)', [g.tenant, name, hashToken(op)]));
+  return { ...g, op };
 }
 
 const call = (tok, method, path, body) =>
@@ -137,16 +144,39 @@ after(async () => {
 
 // --- start ----------------------------------------------------------------------------
 
-test('START: a walk starts at the garage in its path; several may be open, at most WALK_OPEN_MAX', async () => {
+test('ONE WALK A PERSON: starting again resumes the open walk; another person starts their own; a finish frees a new one', async () => {
   const g = await garage('wk-start');
   const first = await startWalk(g);
   assert.ok(first.id && first.started_at);
-  for (let i = 1; i < WALK_OPEN_MAX; i += 1) await startWalk(g);
-  const over = await call(g.op, 'POST', `/garages/${g.id}/walks`, {});
-  assert.equal(over.status, 409);
-  assert.equal((await over.json()).code, 'too_many_open_walks');
+  const again = await call(g.op, 'POST', `/garages/${g.id}/walks`, {});
+  assert.equal(again.status, 200);
+  assert.equal((await again.json()).walk.id, first.id);
+  const theirs = await startWalk(await person(g, 'night desk'));
+  assert.notEqual(theirs.id, first.id);
   await finish(g, first);
-  await startWalk(g);
+  const next = await startWalk(g);
+  assert.ok(![first.id, theirs.id].includes(next.id));
+});
+
+test(`LEFT UNFINISHED ${WALK_ABANDON_HOURS} HOURS: abandoned -- no sightings, no finish, no lists, and its person starts afresh`, async () => {
+  const g = await garage('wk-abandon');
+  const walk = await startWalk(g);
+  await seen(g, walk, typed('ABN1234'));
+  await withTenant(g.tenant, (c) => c.query(
+    'UPDATE walks SET started_at = started_at - make_interval(hours => $2) WHERE id = $1', [walk.id, WALK_ABANDON_HOURS + 1]));
+  const late = await sight(g, walk, typed('ABN1234'));
+  assert.equal(late.status, 409);
+  assert.equal((await late.json()).code, 'walk_abandoned');
+  const done = await call(g.op, 'POST', `/garages/${g.id}/walks/${walk.id}/finish`, {});
+  assert.equal(done.status, 409);
+  assert.equal((await done.json()).code, 'walk_abandoned');
+  const shown = (await (await call(g.op, 'GET', `/garages/${g.id}/walks/${walk.id}`)).json()).walk;
+  assert.ok(shown.abandoned_at);
+  assert.equal(shown.lists, null);
+  const next = await startWalk(g);
+  assert.notEqual(next.id, walk.id);
+  const recorded = await withTenant(g.tenant, async (c) => (await c.query('SELECT abandoned_at FROM walks WHERE id = $1', [walk.id])).rows[0].abandoned_at);
+  assert.ok(recorded, 'the stale walk was not recorded as abandoned');
 });
 
 test("ANOTHER TENANT'S WALK: a key never starts, reads, adds to or finishes another tenant's walk", async () => {
@@ -189,7 +219,7 @@ test('A TYPED PLATE: kept as typed only when the person confirmed it, and matche
   assert.deepEqual(done.lists.stay_not_seen, []);
 });
 
-test('A PICTURE: written fresh, read by vehicle-id with fast-alpr named, and not kept', async () => {
+test('A PICTURE: written fresh, read by vehicle-id with fast-alpr named, kept fresh and served on its own walk only', async () => {
   readerOn();
   const g = await garage('wk-picture');
   const stay = await enter(g, { plate: 'PIC4567' });
@@ -204,9 +234,17 @@ test('A PICTURE: written fresh, read by vehicle-id with fast-alpr named, and not
   assert.equal(asked.path, '/v1/reads');
   const sent = Buffer.from(asked.body.captures[0].image_b64, 'base64');
   assert.ok(sent.length > 0 && !sent.includes(Buffer.from(MARK)), 'the picture went with what was written into it');
-  const kept = await withTenant(g.tenant, async (c) => (await c.query(
-    "SELECT row_to_json(w)::text AS row FROM walk_sightings w WHERE id = $1", [s.id])).rows[0].row);
-  assert.ok(!kept.includes(asked.body.captures[0].image_b64.slice(0, 64)), 'the picture was kept');
+  assert.equal(s.has_picture, true);
+  const shown = await call(g.op, 'GET', `/garages/${g.id}/walks/${walk.id}/sightings/${s.id}/picture`);
+  assert.equal(shown.status, 200);
+  assert.equal(shown.headers.get('content-type'), 'image/jpeg');
+  assert.equal(shown.headers.get('cache-control'), 'private, no-store');
+  assert.ok(Buffer.from(await shown.arrayBuffer()).equals(sent), 'the picture kept is not the fresh one read');
+  const other = await startWalk(await person(g, 'second desk'));
+  assert.equal((await call(g.op, 'GET', `/garages/${g.id}/walks/${other.id}/sightings/${s.id}/picture`)).status, 404);
+  const typedOne = await seen(g, walk, typed('PIC4567'));
+  assert.equal(typedOne.has_picture, false);
+  assert.equal((await call(g.op, 'GET', `/garages/${g.id}/walks/${walk.id}/sightings/${typedOne.id}/picture`)).status, 404);
   const pics = await withTenant(g.tenant, async (c) => (await c.query('SELECT count(*)::int AS n FROM entry_pictures WHERE garage_id = $1', [g.id])).rows[0].n);
   assert.equal(pics, 0);
   const done = await finish(g, walk);
@@ -440,11 +478,14 @@ test('ONLY THE LATEST WALK: a stay an earlier walk missed and the latest saw is 
 test("THE DATABASE KEEPS A WALK TO ITS OWN: no walk at another account's garage, no sighting or listed stay from elsewhere, no name on its line", async () => {
   const a = await garage('wk-db-a');
   const b = await garage('wk-db-b');
+  const refused = (sql, params, why) => assert.rejects(withTenant(a.tenant, (c) => c.query(sql, params)), why);
   const theirs = await enter(b, { plate: 'THR1111' });
   const walk = await startWalk(a);
-  const other = await startWalk(a);
+  const other = await startWalk(await person(a, 'second desk'));
   const first = await seen(a, other, typed('ABC123'));
-  const refused = (sql, params, why) => assert.rejects(withTenant(a.tenant, (c) => c.query(sql, params)), why);
+  const { started_by: by } = (await (await call(a.op, 'GET', `/garages/${a.id}/walks/${walk.id}`)).json()).walk;
+  await refused('INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, $3)', [a.tenant, a.id, by], /walks_one_open_per_person/);
+  await refused('UPDATE walks SET abandoned_at = now(), finished_at = now() WHERE id = $1', [walk.id], /walks_abandoned_unfinished/);
   await refused("INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, 'key:x')", [a.tenant, b.id], /walks_garage/);
   await refused(
     `INSERT INTO walk_sightings (tenant_id, walk_id, read, plate, candidates, taken_at, added_by)
@@ -460,7 +501,7 @@ test("THE DATABASE KEEPS A WALK TO ITS OWN: no walk at another account's garage,
 
 // --- retention ------------------------------------------------------------------------
 
-test('RETENTION: a walk is deleted with its sightings once it finished, or started, longer ago than the window', async () => {
+test('RETENTION: a walk is deleted with its sightings once it finished, or was abandoned, longer ago than the window', async () => {
   const g = await garage('wk-retention');
   await enter(g, { plate: 'RET1111' });
   const oldWalk = await startWalk(g);
@@ -482,4 +523,21 @@ test('RETENTION: a walk is deleted with its sightings once it finished, or start
     stays: (await c.query('SELECT 1 FROM walk_stays WHERE walk_id = $1', [oldWalk.id])).rows.length,
   }));
   assert.deepEqual(left, { walks: [recent.id], sightings: 0, stays: 0 });
+});
+
+test('A PICTURE HAS 30 DAYS: then it is forgotten and the sighting keeps what was read', async () => {
+  const g = await garage('wk-picture-days');
+  const walk = await startWalk(g);
+  const old = await seen(g, walk, picture());
+  const fresh = await seen(g, walk, picture());
+  await withTenant(g.tenant, (c) => c.query("UPDATE walk_sightings SET taken_at = now() - interval '31 days' WHERE id = $1", [old.id]));
+  const result = await redactExpiredVehicles(g.tenant);
+  assert.equal(result.walkPictures, 1);
+  const path = (s) => `/garages/${g.id}/walks/${walk.id}/sightings/${s.id}/picture`;
+  assert.equal((await call(g.op, 'GET', path(old))).status, 404);
+  assert.equal((await call(g.op, 'GET', path(fresh))).status, 200);
+  const shown = (await (await call(g.op, 'GET', `/garages/${g.id}/walks/${walk.id}`)).json()).walk;
+  const byId = new Map(shown.sightings.map((s) => [s.id, s]));
+  assert.deepEqual([byId.get(old.id).has_picture, byId.get(old.id).read, byId.get(old.id).why], [false, 'none', 'reader_off']);
+  assert.equal(byId.get(fresh.id).has_picture, true);
 });
