@@ -30,6 +30,25 @@
 -- (`redacted:<row id>`, src/retention.js), so a redacted row keeps its shape
 -- and this constraint still holds.
 --
+-- TWO MORE THINGS ABOUT THE STAY, on `sessions`:
+--
+--   no_open_command   the lane's loops saw this car go in and no open command
+--                     of the lane let it in -- a car following another through
+--                     one opening, a refused car that drove in anyway, a car
+--                     through a barrier that is up. NOT `tailgater`, which
+--                     keeps its own meaning (U7f, 0033: a car no vend let in
+--                     whose plate was READ, the one a garage that bans
+--                     tailgaters may list). A car nobody could read is never
+--                     listed: a dirty plate on a monthly would lock the
+--                     monthly out on a match nobody can check.
+--   entry_unsure_plate, entry_unsure_plate_confidence
+--                     what the camera read of an unread car's plate below the
+--                     lane's confidence, and that confidence -- what was seen,
+--                     kept for the exit's matching. NOT an identity: no route
+--                     finds a stay by it, nothing compares it to a plate, no
+--                     ban lists it. Both or neither. Personal data like a
+--                     plate: the purge nulls it with the stay's descriptors.
+--
 -- 0007 AND 0008 ARE NOT EDITED. This drops the constraint by name and adds it
 -- back over three columns, in one transaction, so no row is ever
 -- unconstrained. Every existing row has a plate or a ticket and no unread_ref,
@@ -53,6 +72,24 @@ ALTER TABLE vehicles
       AND (plate IS NULL OR length(plate) > 0)
       AND (ticket_ref IS NULL OR length(ticket_ref) > 0)
       AND (unread_ref IS NULL OR length(unread_ref) > 0)
+    );
+
+ALTER TABLE sessions
+  ADD COLUMN no_open_command boolean NOT NULL DEFAULT false;
+
+ALTER TABLE sessions
+  ADD COLUMN entry_unsure_plate text,
+  ADD COLUMN entry_unsure_plate_confidence double precision;
+
+ALTER TABLE sessions
+  ADD CONSTRAINT sessions_entry_unsure_plate_shape
+    CHECK (
+      (entry_unsure_plate IS NULL AND entry_unsure_plate_confidence IS NULL)
+      OR (
+        length(entry_unsure_plate) BETWEEN 1 AND 32
+        AND entry_unsure_plate_confidence >= 0
+        AND entry_unsure_plate_confidence <= 1
+      )
     );
 
 COMMIT;

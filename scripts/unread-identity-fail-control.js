@@ -24,6 +24,14 @@
  *                          the next car is priced on an emptier garage
  *   unread_left_off_feed   the open stays the lane is sent leave unread cars
  *                          out, so the lane's count of cars inside is short
+ *   unread_ban_listed      an unread car marked a tailgater is put on the
+ *                          banned list: a monthly with a dirty plate locked out
+ *   no_open_command_dropped
+ *                          the open's no_open_command is not stored
+ *   unsure_plate_dropped   what was read below the confidence is not stored
+ *   unsure_beside_plate    an unsure plate is taken beside a read plate
+ *   unsure_not_purged      the purge leaves what was read of the plate behind
+ *   event_id_any_shape     the open takes any event_id: an object, `redacted:...`
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with one
  * statement of 0036 edited, so the property genuinely never existed there, and
@@ -111,6 +119,48 @@ const SOURCE_BREAKS = [
     file: 'src/repository.js',
     from: '      WHERE s.tenant_id = $1 AND s.garage_id = $2 AND s.exit_at IS NULL\n      ORDER BY s.change_seq`,',
     to: '      WHERE s.tenant_id = $1 AND s.garage_id = $2 AND s.exit_at IS NULL AND v.unread_ref IS NULL\n      ORDER BY s.change_seq`,',
+  },
+  {
+    name: 'unread_ban_listed',
+    why: 'an unread car marked a tailgater is ban-listed',
+    file: 'src/bans.js',
+    from: '  if (!vehicle?.plate) return false;\n',
+    to: '',
+  },
+  {
+    name: 'no_open_command_dropped',
+    why: "the open's no_open_command is not stored",
+    file: 'src/app.js',
+    from: '          noOpenCommand,\n',
+    to: '          noOpenCommand: false,\n',
+  },
+  {
+    name: 'unsure_plate_dropped',
+    why: 'what was read below the confidence is not stored',
+    file: 'src/app.js',
+    from: '          entryUnsurePlate: unsure.plate,\n          entryUnsurePlateConfidence: unsure.confidence,\n',
+    to: '',
+  },
+  {
+    name: 'unsure_beside_plate',
+    why: 'an unsure plate is taken beside a read plate',
+    file: 'src/app.js',
+    from: '  if (!plateUnreadable) {\n    throw bad(',
+    to: '  if (false) {\n    throw bad(',
+  },
+  {
+    name: 'unsure_not_purged',
+    why: 'the purge leaves what was read of the plate behind',
+    file: 'src/retention.js',
+    from: "WHERE tenant_id = $1 AND entry_unsure_plate IS NOT NULL AND vehicle_id = ANY($2::uuid[])",
+    to: "WHERE false AND tenant_id = $1 AND vehicle_id = ANY($2::uuid[])",
+  },
+  {
+    name: 'event_id_any_shape',
+    why: 'the open takes any event_id',
+    file: 'src/app.js',
+    from: "      if (typeof openEventId !== 'string' || !LANE_EVENT_ID_SHAPE.test(openEventId)) {",
+    to: '      if (false) {',
   },
 ];
 

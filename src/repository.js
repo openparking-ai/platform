@@ -121,7 +121,10 @@ export async function findOpenSession(client, tenantId, garageId, vehicleId) {
 export async function openSession(
   client,
   tenantId,
-  { garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation, entryDescriptor = null, tailgater = false },
+  {
+    garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation, entryDescriptor = null, tailgater = false,
+    noOpenCommand = false, entryUnsurePlate = null, entryUnsurePlateConfidence = null,
+  },
 ) {
   // Keyed on the event, so a replay is recognised whether the session it
   // created is still open, already closed, or closed and long forgotten.
@@ -160,11 +163,13 @@ export async function openSession(
     const { rows } = await client.query(
       `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
                              open_event_id, entry_confirmation, entry_descriptor, tailgater,
-                             occupancy_at_entry_bp)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                             occupancy_at_entry_bp, no_open_command, entry_unsure_plate,
+                             entry_unsure_plate_confidence)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING *`,
       [tenantId, garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation,
-       entryDescriptor, tailgater, occupancyAtEntryBp],
+       entryDescriptor, tailgater, occupancyAtEntryBp,
+       noOpenCommand, entryUnsurePlate, entryUnsurePlateConfidence],
     );
     await client.query('RELEASE SAVEPOINT open_session');
     return { session: rows[0], created: true };

@@ -148,15 +148,18 @@ an operator token, not a person, and is append-only like every event.
 
 ## Pictures kept with an entry (U7f, 0033)
 
-A lane sends the pictures it took between the vend and the closing loop, and at the closing loop. They are personal
-data on the same terms as the plate. They are **deleted**, not redacted: one week after the stay that holds them
-closed, or one week after they were taken when no stay holds them (a tailgater nobody identified, a banned car
-refused at the entry). A car still inside keeps its pictures. `npm run purge` runs both rules.
+A lane sends the pictures it took of the car at its arming read (since 0036), between the vend and the closing loop,
+and at the closing loop. They are personal data on the same terms as the plate. They are **deleted**, not redacted:
+**30 days** after the stay that holds them closed, or 30 days after they were taken when no stay holds them (a
+crossing no car made, a banned car refused at the entry). The owner set 30 days on 2026-10-26; it was one week. A
+car still inside keeps its pictures. `npm run purge` runs both rules.
 
 **A car on a banned list is held:** while it is listed, its vehicle is not redacted by the window above and its
 pictures are not deleted. Taken off the list, both rules apply again as to any other car.
 
-The arming loop's pictures are not stored anywhere, and nothing here touches them.
+**What was read of an unread car's plate** below the lane's confidence (0036, `sessions.entry_unsure_plate` and
+its confidence) is personal data like a plate: the purge nulls it with the stay's descriptors, on the sessions of
+every vehicle it redacts.
 
 ## What is never redacted
 

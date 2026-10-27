@@ -24,7 +24,12 @@
  *   * the purge redacts its key as it redacts a plate, and the candidate set
  *     names it `unread`;
  *   * nothing else changes: the close and the exit's lookup still take a plate
- *     or a ticket, and a request with neither is refused as before.
+ *     or a ticket, and a request with neither is refused as before;
+ *   * `no_open_command` is its own field, and `tailgater` keeps its meaning: an
+ *     unread car is never ban-listed, whatever its open says;
+ *   * what was read below the lane's confidence is kept on the stay and is not
+ *     an identity: no lookup finds it, the purge nulls it;
+ *   * the open's `event_id` -- now an identity's key -- is a UUID or a 400.
  */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -262,13 +267,118 @@ test('the purge redacts an unread key as it redacts a plate, and the row keeps i
     );
     return v;
   });
+  await withTenant(tenant, (c) =>
+    c.query(`UPDATE sessions SET entry_unsure_plate = 'UR4X7', entry_unsure_plate_confidence = 0.4
+              WHERE open_event_id = $1`, [key]),
+  );
   await redactExpiredVehicles(tenant);
   const row = await withTenant(tenant, async (c) =>
     (await c.query('SELECT plate, ticket_ref, unread_ref, color, redacted_at FROM vehicles WHERE id = $1', [id])).rows[0],
   );
+  const stay = await withTenant(tenant, async (c) =>
+    (await c.query('SELECT entry_unsure_plate, entry_unsure_plate_confidence FROM sessions WHERE open_event_id = $1', [key])).rows[0],
+  );
+  assert.deepEqual(stay, { entry_unsure_plate: null, entry_unsure_plate_confidence: null },
+    'what was read of the plate goes with the vehicle');
   assert.match(row.unread_ref, /^redacted:/, 'the key of the stay is replaced');
   assert.equal(row.plate, null, 'the purge gives an unread car no plate');
   assert.equal(row.ticket_ref, null);
   assert.equal(row.color, null);
   assert.ok(row.redacted_at);
+});
+
+// --- its own marker, and the ban list ---------------------------------------
+
+test('no_open_command is its own field; tailgater keeps its meaning', async () => {
+  const marked = await (await openStay(unread({ tailgater: false, no_open_command: true }))).json();
+  assert.equal(marked.session.no_open_command, true);
+  assert.equal(marked.session.tailgater, false, 'no_open_command does not make a tailgater');
+  const plain = await (await openStay({ plate: plate(), entry_at: minutesAgo(3), entry_confirmation: 'confirmed' })).json();
+  assert.equal(plain.session.no_open_command, false, 'the control: an ordinary open is not marked');
+  const res = await openStay(unread({ no_open_command: 'yes' }));
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /no_open_command must be true or false/);
+});
+
+test('a car nobody could read is never ban-listed, even marked a tailgater with a descriptor', async () => {
+  // A monthly with a dirty plate, through a raised barrier, at a garage that
+  // bans tailgaters: listed, it would be refused at every entry on a match
+  // nobody can check against a plate.
+  const banning = await createTenant('unread-ban');
+  const g = await buildWorld(banning, { hourlyMinor: 250 });
+  const entry = await issueDeviceToken(banning, g.entryLane, 'entry device');
+  await withTenant(banning, (c) =>
+    c.query('UPDATE garages SET ban_tailgaters = true WHERE tenant_id = $1 AND id = $2', [banning, g.garage]),
+  );
+  const open = async (body) =>
+    (await (await fetch(`${base}/api/v1/lane/sessions/open`, post(entry, body))).json()).session;
+  const listed = (sessionId) =>
+    withTenant(banning, async (c) =>
+      (await c.query('SELECT count(*)::int AS n FROM banned_vehicles WHERE session_id = $1', [sessionId])).rows[0].n,
+    );
+  const monthly = await open(unread({ tailgater: true, no_open_command: true, descriptor: 'opvid-opa-id/2:monthly' }));
+  assert.equal(await listed(monthly.id), 0, 'an unread car was put on the banned list');
+  const rules = await (
+    await fetch(`${base}/api/v1/lane/rules`, { headers: { authorization: `Bearer ${entry}` } })
+  ).json();
+  assert.deepEqual(rules.banned, [], 'and no lane is sent it as banned');
+  // THE CONTROL: the same open with a read plate is listed, so the refusal above
+  // is the read-plate rule and not a garage that lists nobody.
+  const read = await open({
+    plate: plate(), entry_at: minutesAgo(5), entry_confirmation: 'confirmed', tailgater: true,
+    descriptor: 'opvid-opa-id/2:read',
+  });
+  assert.equal(await listed(read.id), 1);
+});
+
+// --- what was seen, kept and not an identity -------------------------------
+
+test('what was read below the confidence is kept on the stay, and is not an identity', async () => {
+  const unsure = plate();
+  const res = await openStay(unread({ unsure_plate: unsure, unsure_plate_confidence: 0.42 }));
+  assert.equal(res.status, 201);
+  const { session } = await res.json();
+  assert.equal(session.entry_unsure_plate, unsure);
+  assert.equal(session.entry_unsure_plate_confidence, 0.42);
+  assert.equal((await vehicleOf(session.id)).plate, null, 'it never becomes the plate');
+  const lookup = await fetch(`${base}/api/v1/lane/sessions/open?plate=${unsure}`, {
+    headers: { authorization: `Bearer ${exitToken}` },
+  });
+  assert.equal(lookup.status, 404, 'no lookup finds a stay by it');
+  for (const [extra, pattern] of [
+    [{ unsure_plate: unsure }, /unsure_plate_confidence/],
+    [{ unsure_plate_confidence: 0.4 }, /unsure_plate must be/],
+    [{ unsure_plate: unsure, unsure_plate_confidence: 1.5 }, /unsure_plate_confidence/],
+    [{ unsure_plate: '   ', unsure_plate_confidence: 0.4 }, /unsure_plate must be/],
+    [{ unsure_plate: 'P'.repeat(33), unsure_plate_confidence: 0.4 }, /unsure_plate must be/],
+  ]) {
+    const refused = await openStay(unread(extra));
+    assert.equal(refused.status, 400, JSON.stringify(extra));
+    assert.match((await refused.json()).error, pattern);
+  }
+  const beside = await openStay({
+    plate: plate(), entry_at: minutesAgo(5), entry_confirmation: 'confirmed',
+    unsure_plate: unsure, unsure_plate_confidence: 0.4,
+  });
+  assert.equal(beside.status, 400, 'a read plate has no unsure one');
+  assert.match((await beside.json()).error, /only with plate_unreadable/);
+});
+
+// --- the open's event id -------------------------------------------------------
+
+test('the open\'s event_id is a UUID: an object, a redacted value, or anything else is refused', async () => {
+  const send = (eventId, body = unread()) =>
+    fetch(`${base}/api/v1/lane/sessions/open`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${entryToken}` },
+      body: JSON.stringify({ ...body, event_id: eventId }),
+    });
+  for (const value of [{ id: randomUUID() }, ['x'], 42, `redacted:${randomUUID()}`, 'evt-1', `${randomUUID()}x`, 'x'.repeat(300)]) {
+    const res = await send(value);
+    assert.equal(res.status, 400, JSON.stringify(value).slice(0, 60));
+    assert.match((await res.json()).error, /event_id must be the lane's own id/);
+  }
+  // THE CONTROLS: a lane's UUID opens, for an unread car and a read one.
+  assert.equal((await send(randomUUID())).status, 201);
+  assert.equal((await send(randomUUID(), { plate: plate(), entry_at: minutesAgo(2), entry_confirmation: 'confirmed' })).status, 201);
 });

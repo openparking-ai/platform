@@ -65,10 +65,10 @@ const SOURCE_BREAKS = [
     name: 'lane_sets_figure',
     why: 'a figure the lane sends on the open is stored',
     file: 'src/app.js',
-    from: '          tailgater,\n        });\n        if (opened.created)',
-    to: '          tailgater,\n          laneFigure: req.body?.occupancy_at_entry_bp,\n        });\n        if (opened.created)',
+    from: '          entryUnsurePlateConfidence: unsure.confidence,\n        });\n        if (opened.created)',
+    to: '          entryUnsurePlateConfidence: unsure.confidence,\n          laneFigure: req.body?.occupancy_at_entry_bp,\n        });\n        if (opened.created)',
     also: [
-      { file: 'src/repository.js', from: 'entryDescriptor = null, tailgater = false },', to: 'entryDescriptor = null, tailgater = false, laneFigure },' },
+      { file: 'src/repository.js', from: 'entryUnsurePlate = null, entryUnsurePlateConfidence = null,\n  },', to: 'entryUnsurePlate = null, entryUnsurePlateConfidence = null, laneFigure,\n  },' },
       { file: 'src/repository.js', from: '  const occupancyAtEntryBp = await occupancyNow(client, tenantId, garageId);', to: '  const occupancyAtEntryBp = laneFigure ?? await occupancyNow(client, tenantId, garageId);' },
     ],
   },

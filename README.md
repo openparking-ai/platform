@@ -91,7 +91,7 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 | `GET /api/v1/lane/rules` | what the lane caches so it can decide offline: the garage's plans whole, its space class, each linked module's register, the open stays with a cursor — the slow cadence |
 | `GET /api/v1/lane/stays?since=<cursor>` | every stay changed since the cursor, closed rows included — the fast cadence; without `since`, the full open set; every answer also carries the lane's own `lane` state and `board` |
 | `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` |
-| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater` (U7f); identified by a plate, a ticket, or `plate_unreadable: true` (0036) |
+| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater` (U7f); identified by a plate, a ticket, or `plate_unreadable: true` (0036), with an optional `no_open_command` and, for an unread car, `unsure_plate` and its confidence; `event_id` a UUID |
 | `POST /api/v1/lane/pictures` | a picture kept with an entry (U7f): `{picture_ref, event_id, taken_at, image}`, the image base64, a JPEG or a PNG, at most 3 MiB; idempotent on `picture_ref` |
 | `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation`; carries and echoes an optional `descriptor` |
 
@@ -145,9 +145,24 @@ open is the same row and the same stay. The database holds the rule too
 (`vehicles_exactly_one_identity` over three columns, `vehicles_tenant_unread_ref_key`).
 Nothing finds or closes a stay by it: the close and the exit's lookup take a
 plate or a ticket, as before, and matching an exit to an unread car's stay is
-not built here. The stay counts among the cars inside (0034) and is on the
-lane's feed with no plate and no ticket. `npm run unread-identity-fail-control`
-breaks each property in turn.
+not built here -- **until it is, an unread stay has no way to end**: a car
+counts as inside from its entry to its exit, with no age-out. The stay counts
+among the cars inside (0034) and is on the lane's feed with no plate and no
+ticket.
+
+**What was seen is kept, and is not an identity.** Beside `plate_unreadable`
+the open may carry `unsure_plate` and `unsure_plate_confidence` -- what the
+camera read below the lane's confidence, and that confidence, both or neither
+-- held on the stay as `entry_unsure_plate` for the exit's matching. No route
+finds a stay by it, nothing compares it to a plate, and no ban lists it; the
+purge nulls it with the stay's descriptors. Beside a plate or a ticket it is a
+`400`. **`no_open_command: true`** says the lane's loops saw the car go in and
+no open command let it in; it is its own field, and `tailgater` keeps its own
+meaning (*Pictures, tailgaters and banned cars*). **The open's `event_id` is a
+UUID**, as a lane mints it, or a `400`: it is now the key an unread car's
+vehicle is held under, so an object coerced to text or a value shaped like the
+purge's `redacted:` is refused. `npm run unread-identity-fail-control` breaks
+each property in turn.
 
 ### Every session records what saw the car
 
@@ -766,22 +781,26 @@ credential. `npm run setup-fail-control` breaks each property in turn.
 ### Pictures, tailgaters and banned cars (U7f, 0033)
 
 His answers, 2026-10-11: pictures at the closing loop and between the vend and it, kept one week after the car
-leaves; a tailgater whose identity is read is a stay like any other and pays at the exit; banning tailgaters is
+leaves (30 days since 2026-10-26, below); a tailgater whose identity is read is a stay like any other and pays at the exit; banning tailgaters is
 the owner's choice in the location setup, off until they turn it on, and so is whether the list covers this
 garage or all their garages; a ban lasts until someone takes the car off; no car is put on the list by hand.
 
 - **Pictures** (`entry_pictures`) are kept against the lane's event id of the entry record: a stay's open, a
-  tailgater nobody identified, a banned car refused. `npm run purge` removes them one week after the stay that
-  holds them closed, or one week after they were taken when no stay holds them. A car still inside keeps its
-  pictures, and so does a car on the list. The arming loop's pictures are not stored, here or anywhere.
-- **A tailgater stay** is opened with `tailgater: true` and prices at the exit as any other. Since
-  0036 the lane opens one for every car through the gate that no open command let in, read or
-  not: a car nobody could read is a stay with `plate_unreadable` (*A stay is identified...*),
-  and its pictures are kept with its stay's open.
+  crossing no car made, a banned car refused. Since 0036 a stay's pictures include the arming read's, the
+  ones its car was identified from. `npm run purge` removes them **30 days** after the stay that holds them
+  closed, or 30 days after they were taken when no stay holds them (the owner's answer of 2026-10-26; it was
+  one week). It is one number for every garage (`PICTURE_DAYS`); a longer keep for a garage that pays for
+  storage is not built. A car still inside keeps its pictures, and so does a car on the list.
+- **A tailgater stay** is opened with `tailgater: true` and prices at the exit as any other: a car no vend let
+  in whose plate was READ. Since 0036 the lane opens a stay for every car through the gate that no open command
+  let in, read or not, and marks it `no_open_command: true` -- its own field: a car nobody could read is a stay
+  (`plate_unreadable`, *A stay is identified...*) with `no_open_command` and never `tailgater`.
 - **Two settings** on `PATCH /garages/:id`, off by default: `ban_tailgaters` (true or false) and `ban_reach`
   (`garage` or `all`).
-- **The list** (`banned_vehicles`): with `ban_tailgaters` on, a tailgater stay opened with a `descriptor` is
-  listed. Nothing else lists a car. A ban reaches its own garage, or every garage of the account when the garage
+- **The list** (`banned_vehicles`): with `ban_tailgaters` on, a tailgater stay opened with a `descriptor` and
+  a READ plate is listed -- never a car nobody could read, whatever its open says (0036): a monthly with a dirty
+  plate through a raised barrier would otherwise be refused at every entry on a match nobody can check. Nothing
+  else lists a car. A ban reaches its own garage, or every garage of the account when the garage
   it was listed at says `all`. Each lane gets the bans that reach it on `GET /lane/rules` as `banned:
   [{id, descriptor}]`, and refuses a car whose descriptor matches one.
 - **While listed**, the car's vehicle is not redacted and its pictures are not removed. Taken off, both follow

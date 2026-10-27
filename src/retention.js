@@ -110,6 +110,13 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
             AND vehicle_id = ANY($2::uuid[])`,
         [tenantId, rows.map((r) => r.id)],
       );
+      // What was read of an unread car's plate below the lane's confidence
+      // (0036): a plate's text, so it goes with the descriptors.
+      await client.query(
+        `UPDATE sessions SET entry_unsure_plate = NULL, entry_unsure_plate_confidence = NULL
+          WHERE tenant_id = $1 AND entry_unsure_plate IS NOT NULL AND vehicle_id = ANY($2::uuid[])`,
+        [tenantId, rows.map((r) => r.id)],
+      );
       // The entitlement record (0015) names the identity the modules were
       // asked about, inside the argv and their answers. Nulled with the
       // descriptors; `exit_outcome` stays -- the outcome survives, who it was

@@ -207,9 +207,11 @@ jobs:
         # removes one property that makes that safe -- the open reading it,
         # one vehicle per unread car, alone and only `true`, the purge, the
         # candidate set's name for it, the count of cars inside and the lane's
-        # feed counting it, and the two halves of 0036's constraint -- and
-        # requires test/unread-identity.test.js to go red with at least one of
-        # its tests still green.
+        # feed counting it, an unread car never ban-listed, `no_open_command`
+        # stored, what was read below the confidence kept and purged and never
+        # beside a plate, the open's event id a UUID, and the two halves of
+        # 0036's constraint -- and requires test/unread-identity.test.js to go
+        # red with at least one of its tests still green.
         run: npm run unread-identity-fail-control
 
       - name: Descriptor fail-control
