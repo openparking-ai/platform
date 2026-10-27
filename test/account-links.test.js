@@ -244,7 +244,9 @@ test('AN INVITE: the command makes the tenant and one invite, sends ONE email, p
   const [row] = await invitesOf(email);
   assert.equal(row.tenant_id, tenant);
   assert.equal(row.token_hash, createHash('sha256').update(token).digest('hex'), 'only its SHA-256 is kept');
-  assert.equal(Math.round((row.expires_at - row.created_at) / 3600_000), 7 * 24, 'it lasts seven days');
+  // Whole days on the database's own calendar: a week that holds a clock change is 167 or 169 hours, any other 168.
+  const { rows: [span] } = await su.query('SELECT expires_at = created_at + make_interval(days => 7) AS a_calendar_week FROM operator_invites WHERE id = $1', [row.id]);
+  assert.equal(span.a_calendar_week, true, 'it lasts seven days');
   assert.equal(await adminOf(email), null, 'no admin until the link is used');
 
   const status = await call(main.base, '/api/v1/auth/invite/status', { body: { token } });

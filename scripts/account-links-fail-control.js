@@ -13,6 +13,12 @@
  * copy of `migrations/` with the statement edited out -- a rule held only by
  * the code is a rule one direct INSERT goes around -- and the suite runs
  * against it. Needs the same environment as the suite.
+ *
+ * A break with `measurable` runs only when that check, asked of the
+ * database, says today can show it; otherwise it is reported as not
+ * measurable today and not counted either way. `invite_counts_hours` is one:
+ * 168 hours and seven calendar days differ only when the database's next
+ * seven days hold a clock change.
  */
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -28,8 +34,24 @@ const OUTPUT = ['test/account-links-output.test.js'];
 const COVERAGE = ['test/rls-coverage.test.js'];
 const MIGRATION = '0032_operator_invites_and_password_resets.sql';
 
+/** Whether the database's own next seven days hold a clock change, so seven days are not 168 hours. */
+const CLOCK_CHANGE_WEEK = "SELECT extract(epoch FROM (now() + interval '7 days') - now()) / 3600 <> 168 AS yes, current_setting('TimeZone') AS zone";
+
 const BREAKS = [
   // --- check 1: the invite, end to end
+  {
+    name: 'invite_lasts_six_days',
+    why: 'an invite lasts six days, not seven',
+    suite: LINKS,
+    edits: [{ file: 'src/invites.js', from: 'now() + make_interval(days => $5)) RETURNING expires_at', to: 'now() + make_interval(days => $5 - 1)) RETURNING expires_at' }],
+  },
+  {
+    name: 'invite_counts_hours',
+    why: 'an invite lasts 168 hours, not seven days on the calendar',
+    suite: LINKS,
+    measurable: CLOCK_CHANGE_WEEK,
+    edits: [{ file: 'src/invites.js', from: 'now() + make_interval(days => $5)) RETURNING expires_at', to: 'now() + make_interval(hours => $5 * 24)) RETURNING expires_at' }],
+  },
   {
     name: 'old_link_accepts_after_resend',
     why: 'a replaced invite still reads as ready, so the old link accepts after a resend',
@@ -289,8 +311,29 @@ try {
   rmSync(intactDir, { recursive: true, force: true });
 }
 
+/** `measurable` asked of the suite's own database: `{yes, zone}`. */
+async function today(sql) {
+  const c = new pg.Client({ connectionString: process.env.APP_DATABASE_URL });
+  await c.connect();
+  try {
+    return (await c.query(sql)).rows[0];
+  } finally {
+    await c.end();
+  }
+}
+
+let unmeasured = 0;
+
 console.log('\n== control B: each break must make its suite FAIL ==');
 for (const brk of BREAKS) {
+  if (brk.measurable) {
+    const { yes, zone } = await today(brk.measurable);
+    if (!yes) {
+      console.log(`  ${brk.name.padEnd(30)} not measurable today: the database's next seven days (${zone}) hold no clock change`);
+      unmeasured += 1;
+      continue;
+    }
+  }
   const dir = stage();
   try {
     const missing = plant(dir, brk.edits ?? []) ?? (brk.schema ? await buildScratch(dir, brk.schema) : null);
@@ -317,4 +360,5 @@ if (failures) {
   console.error(`\n${failures} control(s) failed. Do not trust this round's invite and reset tests.`);
   process.exit(1);
 }
-console.log(`\nall controls OK — the suites fail on every one of the ${BREAKS.length} properties the invites and the reset rest on.`);
+const measured = BREAKS.length - unmeasured;
+console.log(`\nall controls OK — the suites fail on every one of the ${measured} properties measurable today that the invites and the reset rest on${unmeasured ? ` (${unmeasured} not measurable today)` : ''}.`);
