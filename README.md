@@ -91,6 +91,7 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 | `GET /api/v1/lane/rules` | what the lane caches so it can decide offline: the garage's plans whole, its space class, each linked module's register, the open stays with a cursor — the slow cadence |
 | `GET /api/v1/lane/stays?since=<cursor>` | every stay changed since the cursor, closed rows included — the fast cadence; without `since`, the full open set; every answer also carries the lane's own `lane` state and `board` |
 | `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` (1-64 of `A-Za-z0-9_-`) |
+| `POST /api/v1/lane/redeem-enrolment` | a QR shown at the lane: garage-pass binds the car or says why not; `open` only on covered; rate-limited per device; the token is kept nowhere |
 | `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater` (U7f); identified by a plate, a ticket, or `plate_unreadable: true` (0036), with an optional `no_open_command` and, for an unread car, `unsure_plate` and its confidence; `event_id` 1-64 of `A-Za-z0-9_-` |
 | `POST /api/v1/lane/pictures` | a picture kept with an entry (U7f): `{picture_ref, event_id, taken_at, image}`, the image base64, a JPEG or a PNG, at most 3 MiB; idempotent on `picture_ref` |
 | `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id` (1-64 of `A-Za-z0-9_-`); requires `exit_confirmation`; carries and echoes an optional `descriptor` |
@@ -1311,6 +1312,37 @@ builds a database for each module from its own migrations (`garage-pass.pin`,
 `monthly-billing.pin`; CI checks them out), seeds through their doors, and drives
 all of it through the lane's close. `npm run exit-outcomes-fail-control` breaks
 each property in turn.
+
+### A QR shown at the lane: garage-pass binds the car, or says why not
+
+A driver whose car the registers do not cover can scan the QR garage-pass
+issued for it. The lane presents what the scanner read with the identity its
+camera measured: `POST /api/v1/lane/redeem-enrolment` with `{token, vehicle,
+presented_at}` (`vehicle` null when it read none). This platform asks
+garage-pass through its own door, `redeem-enrolment`, under the garage's
+garage-pass link, with the device's own lane and direction — never the
+body's. The module spends the QR once, binds the car and answers the movement;
+both halves come back verbatim beside `open`, which is **true for a covered
+answer and nothing else**. A refused QR is not a refused car: the answer is the
+car's own, so a car the registers already cover still opens on its pass.
+
+- `200` — garage-pass answered; open or shut, and its sentence says why.
+- `409 qr_not_linked` — the garage names no garage-pass garage.
+- `409 qr_stale` — `presented_at` more than two minutes ago; `409 clock_skew`
+  ahead of this server's clock.
+- `429` — the device has presented ten QRs this minute.
+- `503 qr_unanswered` — garage-pass could not answer. The lane treats this as
+  offline: a QR cannot be checked, so a pass-only entry stays shut and the exit
+  is the attendant's.
+
+**The token and the plate are kept nowhere.** The token rides on the module's
+argv because that is its door, and nowhere else: not in the answer, not in an
+error, not in a log line, not in the `qr_presented` event, which records what
+happened to the QR (by its enrolment id) and to the gate, and whether the lane
+read an identity. A lane posts `qr_presented` itself only for a QR it could not
+present, with `answered: false` and nothing beyond `reason`, `direction` and
+`read_identity`. `test/lane-qr.test.js` runs against the real garage-pass;
+`npm run lane-qr-fail-control` breaks each property in turn.
 
 ### The rules payload: what the exit decides from, off the barrier's path
 

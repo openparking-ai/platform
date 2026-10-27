@@ -78,8 +78,12 @@ function scriptPath(script, env = process.env) {
   return env.ENTITLEMENT_BIN_DIR ? join(env.ENTITLEMENT_BIN_DIR, script) : script;
 }
 
-/** Run one door. Returns what it said and how it exited; throws only when it could not be run at all. */
-async function door(module, argv, { env = process.env, timeoutMs = 15_000 } = {}) {
+/**
+ * Run one door. Returns what it said and how it exited; throws only when it
+ * could not be run at all. The error names the script and why, never the
+ * argv: a QR's token rides on it (`redeem`).
+ */
+export async function door(module, argv, { env = process.env, timeoutMs = 15_000 } = {}) {
   const script = MODULES[module].script;
   try {
     const { stdout, stderr } = await run(scriptPath(script, env), argv, {
@@ -93,7 +97,7 @@ async function door(module, argv, { env = process.env, timeoutMs = 15_000 } = {}
       return { exit_code: err.code, stdout: err.stdout, stderr: err.stderr };
     }
     // ENOENT, a timeout, a signal: the door could not be run at all.
-    throw new EntitlementUnavailable(module, `${script} could not be run (${err.code ?? err.signal ?? err.message})`);
+    throw new EntitlementUnavailable(module, `${script} could not be run (${err.code ?? err.signal ?? 'no exit status'})`);
   }
 }
 

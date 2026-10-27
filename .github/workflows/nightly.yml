@@ -153,6 +153,8 @@ jobs:
 
       - name: Exit-outcomes fail-control
         run: npm run exit-outcomes-fail-control
+      - name: Lane QR fail-control
+        run: npm run lane-qr-fail-control
       - name: Validations fail-control
         run: npm run validations-fail-control
       - name: Validations-door fail-control
