@@ -236,11 +236,18 @@ const SOURCE_BREAKS = [
     to: "  const fits = waiting.filter((w) => w.read === 'unsure');",
   },
   {
+    name: 'answer_unreadable_inferred',
+    why: "a typed plate with no confirms answers the one waiting unreadable picture, with no character to agree with",
+    file: 'src/walks.js',
+    from: "  return fits.length === 1 ? fits[0].id : null;",
+    to: "  if (fits.length === 0 && waiting.length === 1 && waiting[0].read === 'none') return waiting[0].id;\n  return fits.length === 1 ? fits[0].id : null;",
+  },
+  {
     name: 'answer_among_several',
     why: "a typed plate answers one of several waiting reads",
     file: 'src/walks.js',
-    from: "  if (fits.length === 0 && waiting.length === 1 && waiting[0].read === 'none') return waiting[0].id;",
-    to: "  if (fits.length === 0 && waiting.length >= 1 && waiting[0].read === 'none') return waiting[0].id;",
+    from: "  return fits.length === 1 ? fits[0].id : null;",
+    to: "  return fits.length >= 1 ? fits[0].id : null;",
   },
   {
     name: 'answer_inferred_despite_ref',
@@ -545,6 +552,11 @@ const SCHEMA_BREAKS = [
     name: 'finished_sightings_change',
     why: "the app role may add to or change a closed walk's sightings",
     edits: [{ file: ADDED_0040, from: "    IF NOT walk_closed(NEW.walk_id) THEN\n      RETURN NEW;", to: "    IF true THEN\n      RETURN NEW;" }],
+  },
+  {
+    name: 'sighting_leaves_closed_walk',
+    why: "the app role may move a sighting out of a closed walk into an open walk's share",
+    edits: [{ file: ADDED_0040, from: "    IF TG_OP = 'UPDATE' AND NEW.walk_id IS DISTINCT FROM OLD.walk_id THEN", to: "    IF false THEN" }],
   },
   {
     name: 'finished_walk_lists_more',

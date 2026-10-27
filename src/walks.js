@@ -231,16 +231,14 @@ export function pictureDigest(bytes) {
  * (no `confirms`, no `client_ref`), or null. `waiting` are the walk's
  * sightings still waiting for a person (`unsure` or `none`, not answered).
  * Only where it can be told: the one `unsure` whose sure characters all
- * agree with the plate in their positions, or, with no such one, the one
- * sighting waiting when it is a `none`. Anything else is a new car.
+ * agree with the plate in their positions. A `none` has no character to
+ * agree with, so only `confirms` answers it. Anything else is a new car.
  */
 export function answersWaiting(typed, waiting) {
   const agrees = (w) => w.read === 'unsure' && w.plate_rule === typed.rule && w.plate_pattern?.length === typed.pattern.length
     && [...w.plate_pattern].every((c, i) => c === '?' || c === typed.pattern[i]);
   const fits = waiting.filter(agrees);
-  if (fits.length === 1) return fits[0].id;
-  if (fits.length === 0 && waiting.length === 1 && waiting[0].read === 'none') return waiting[0].id;
-  return null;
+  return fits.length === 1 ? fits[0].id : null;
 }
 
 /** The sighting's plate ID as the exit's matching takes it, or null: only a plate with sure characters is matched. */

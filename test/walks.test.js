@@ -384,11 +384,35 @@ test('AN ANSWER THAT DOES NOT SAY SO: a typed plate answers the one waiting read
 test('TWO READS WAITING: a typed plate that fits neither alone answers neither', async () => {
   readerOn();
   const g = await garage('wk-infer-two');
-  reader.state.identity = { plate: null, plate_characters: { state: 'unreadable', rule: RULE, pattern: null } };
+  reader.state.identity = { plate: 'TWW?234', plate_characters: read('TWW?234') };
   const walk = await startWalk(g);
   await seen(g, walk, picture());
   await seen(g, walk, picture());
   assert.equal((await seen(g, walk, typed('TWW1234'))).confirms, null);
+});
+
+test('AN UNREADABLE PICTURE IS ANSWERED BY NAME ONLY: a typed plate with no confirms is a car of its own, the picture stays not readable', async () => {
+  readerOn();
+  const g = await garage('wk-infer-none');
+  const x = await enter(g, { plate: 'XCR1111' });
+  const y = await enter(g, { plate: 'YCR2222' });
+  reader.state.identity = { plate: null, plate_characters: { state: 'unreadable', rule: RULE, pattern: null } };
+  const walk = await startWalk(g);
+  const body = picture();
+  const blur = await seen(g, walk, body);
+  const other = await seen(g, walk, typed('YCR2222'));
+  assert.equal(other.confirms, null, "a typed plate answered an unreadable picture it has no character in common with");
+  const again = await sight(g, walk, body);
+  assert.equal(again.status, 200);
+  assert.equal((await again.json()).sighting.id, blur.id);
+  const done = await finish(g, walk);
+  assert.deepEqual(done.lists.not_readable, [{ sighting: blur.id, plate: null, why: 'unreadable' }]);
+  assert.deepEqual(done.lists.seen_with_stay.map((r) => [r.stay, r.sightings]), [[y.id, [other.id]]]);
+  assert.deepEqual(done.lists.stay_not_seen.map((r) => r.stay), [x.id]);
+  const inferred = await withTenant(g.tenant, async (c) => (await c.query(
+    "SELECT count(*)::int AS n FROM garage_changes WHERE subject_id = $1 AND action = 'walk.sighting' AND after ? 'confirms_inferred'",
+    [walk.id])).rows[0].n);
+  assert.equal(inferred, 0);
 });
 
 test('ONE CAR SENT TWICE WITH NO STAY: a whole plate is listed once, with both sightings', async () => {
@@ -768,6 +792,42 @@ test('THE DATABASE KEEPS A CLOSED WALK AS IT ENDED: the app role reopens nothing
   const kept = await withTenant(g.tenant, async (c) => (await c.query(
     'SELECT list, count(*)::int AS n FROM walk_stays WHERE walk_id = $1 GROUP BY list ORDER BY list', [walk.id])).rows);
   assert.deepEqual(kept, [{ list: 'not_seen', n: 1 }, { list: 'seen', n: 1 }]);
+});
+
+test("A SIGHTING NEVER LEAVES ITS WALK: the app role moves none out of a closed walk into an open one's share", async () => {
+  readerOn();
+  const g = await garage('wk-db-move');
+  await enter(g, { plate: 'MOV1111' });
+  const two = await enter(g, { plate: 'MOV2222' });
+  const walk = await startWalk(g);
+  const plain = await seen(g, walk, typed('MOV1111'));
+  reader.state.identity = { plate: null, plate_characters: { state: 'unreadable', rule: RULE, pattern: null } };
+  const blur = await seen(g, walk, picture());
+  const answer = await seen(g, walk, { ...typed('MOV2222'), confirms: blur.id });
+  await finish(g, walk);
+  const night = await person(g, 'night desk');
+  const stale = await startWalk(night);
+  const staleOne = await seen(night, stale, typed('MOV1111'));
+  await withTenant(g.tenant, (c) => c.query(
+    'UPDATE walks SET started_at = started_at - make_interval(hours => $2) WHERE id = $1', [stale.id, WALK_ABANDON_HOURS + 1]));
+  const open = await startWalk(night);
+  const other = await garage('wk-db-move-other');
+  const refused = (sql, params, why) => assert.rejects(withTenant(g.tenant, (c) => c.query(sql, params)), why);
+  for (const s of [plain, blur, answer]) {
+    await refused('UPDATE walk_sightings SET walk_id = $2 WHERE id = $1', [s.id, open.id], /walk_sightings_frozen/);
+  }
+  await refused('UPDATE walk_sightings SET walk_id = $2 WHERE walk_id = $1', [walk.id, open.id], /walk_sightings_frozen/);
+  await refused('UPDATE walk_sightings SET walk_id = $2 WHERE id = $1', [staleOne.id, open.id], /walk_sightings_frozen/);
+  await refused('UPDATE walk_sightings SET tenant_id = $2 WHERE id = $1', [plain.id, other.tenant], /walk_sightings_frozen/);
+  const openOne = await seen(night, open, typed('MOV2222'));
+  await refused('UPDATE walk_sightings SET tenant_id = $2 WHERE id = $1', [openOne.id, other.tenant], /row-level security/);
+  await refused('UPDATE walk_stays SET walk_id = $2 WHERE walk_id = $1', [walk.id, open.id], /permission denied/);
+  const onEach = await withTenant(g.tenant, async (c) => (await c.query(
+    'SELECT walk_id, count(*)::int AS n FROM walk_sightings WHERE walk_id = ANY($1::uuid[]) GROUP BY walk_id', [[walk.id, stale.id, open.id]])).rows);
+  assert.deepEqual(new Map(onEach.map((r) => [r.walk_id, r.n])), new Map([[walk.id, 3], [stale.id, 1], [open.id, 1]]));
+  const shown = (await (await call(g.op, 'GET', `/garages/${g.id}/walks/${walk.id}`)).json()).walk;
+  assert.deepEqual(new Set(shown.sightings.map((s) => s.id)), new Set([plain.id, blur.id, answer.id]));
+  assert.ok(shown.lists.seen_with_stay.some((r) => r.stay === two.id && r.sightings.includes(answer.id)));
 });
 
 // --- retention ------------------------------------------------------------------------
