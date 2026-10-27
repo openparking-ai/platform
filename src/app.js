@@ -33,6 +33,7 @@ import * as exitMatch from './exitMatch.js';
 import * as exitPicker from './exitPicker.js';
 import * as exitPayments from './exitPayments.js';
 import * as textReceipt from './textReceipt.js';
+import * as stuck from './stuckStays.js';
 import { connectConfig, StripeError, StripeUnreachable } from './stripe.js';
 import { garageCurrency, garageName, garageSpaces, garageTimezone } from './garageFields.js';
 import { verifyUtf8 } from './utf8Body.js';
@@ -96,6 +97,7 @@ export const ID_PARAMS = Object.freeze({
     banId: () => new HttpError(404, 'banned car not found', 'banned_car_not_found'),
     pictureId: () => new HttpError(404, 'picture not found'),
     exitId: () => new HttpError(404, 'exit case not found', 'exit_not_found'),
+    stayId: () => new HttpError(404, 'stay not found', 'stay_not_found'),
   }),
   lane: Object.freeze({
     sessionId: () => conflict('stay_not_open', STAY_NOT_OPEN),
@@ -742,6 +744,8 @@ export const CLOCK_SKEW = 'clock_skew';
 // Checked before the port opens (src/startSettings.js): a whole number of
 // seconds, 0 to 3600.
 const MAX_CLOCK_SKEW_SECONDS = startSetting('MAX_CLOCK_SKEW_SECONDS');
+/** How far apart an exit lane's clock and an entry lane's may be: each off by the tolerance, opposite ways. */
+const LANE_CLOCKS_APART_MS = 2 * MAX_CLOCK_SKEW_SECONDS * 1000;
 
 /**
  * Refuse a lane time that has not happened yet.
@@ -2108,6 +2112,19 @@ export function createApp() {
           entryId,
         });
         if (opened.created) await bans.listIfBanned(client, tenantId, { garage, session: opened.session, vehicle });
+        // A stay of this car the new entry ended (0039), or this open itself
+        // stored ended because a later stay of the car is already here.
+        const endedNow = [...opened.superseded, ...(opened.created && opened.session.ended ? [opened.session] : [])];
+        if (endedNow.length) {
+          await repo.appendEvents(client, tenantId, endedNow.map((s) => ({
+            garageId,
+            laneId,
+            eventId: `${stuck.STAY_ENDED_EVENT_KIND}:${s.id}`,
+            kind: stuck.STAY_ENDED_EVENT_KIND,
+            occurredAt: s.exit_at,
+            detail: { actor: 'platform:open', session_id: s.id, reason: 'superseded', by_session: s.ended.by_session, exit_at: s.exit_at },
+          })));
+        }
         return opened;
       });
 
@@ -2786,7 +2803,8 @@ export function createApp() {
         'exit_confirmation',
         EXIT_CONFIRMATIONS,
       );
-      const exitAt = refuseFuture(parseTime(req.body?.exit_at, 'exit_at'), 'exit_at');
+      const sentExitAt = refuseFuture(parseTime(req.body?.exit_at, 'exit_at'), 'exit_at');
+      let exitAt = sentExitAt;
 
       // THE GATE (0014), at the other end: an inactive garage closes no stay.
       // Activation is monotonic, so a stay that exists was opened at an
@@ -2828,22 +2846,45 @@ export function createApp() {
         // from a plate, so a stale exit from an earlier visit can never land on
         // a later one. When it does not (it was offline at the exit), fall back
         // to the plate with the ordering guard below.
-        const open = exitCase
+        let open = exitCase
           ? openByCase
           : named
             ? await repo.findOpenSessionById(client, tenantId, garageId, named)
             : await repo.findOpenSession(client, tenantId, garageId, vehicle.id);
 
+        // A LATE CLOSE FOR AN ENDED STAY (0039): the stay a later entry of
+        // the car superseded, or a person ended, whose time inside holds this
+        // exit -- named, or by the car's whole plate or ticket. It is that
+        // stay's exit: the stay closes and prices from it, and `ended` goes.
+        // Asked before the open stay's ordering guard below: an exit before
+        // the car's current stay came in may be the exit of the one before.
+        let wasEnded = null;
+        if (!exitCase && (!open || exitAt < open.entry_at)) {
+          wasEnded = await repo.endedStayAt(client, tenantId, garageId,
+            named ? { sessionId: named } : { vehicleId: vehicle.id }, exitAt);
+          if (wasEnded) open = wasEnded;
+        }
         if (!open) {
           throw new HttpError(
             404,
             named
               ? 'the named session is not open in this garage'
               : 'no open session for this vehicle',
+            named ? 'session_not_open' : 'no_open_stay',
           );
         }
         if (!exitCase && sessionId && open.vehicle_id !== vehicle.id) {
           throw conflict('session_vehicle_mismatch', 'the named session belongs to a different vehicle');
+        }
+
+        // TWO LANE CLOCKS APART (0039): each lane may be MAX_CLOCK_SKEW_SECONDS
+        // off, so an exit up to twice that before its stay's entry is the
+        // same car on two clocks. It closes the stay at its entry, and an
+        // event keeps the time the lane sent.
+        let clocksApart = false;
+        if (exitAt < open.entry_at && open.entry_at - exitAt <= LANE_CLOCKS_APART_MS) {
+          exitAt = new Date(open.entry_at);
+          clocksApart = true;
         }
 
         if (exitAt < open.entry_at) {
@@ -3029,6 +3070,26 @@ export function createApp() {
           decisionInputs,
           validation: validated.record,
         });
+        if (wasEnded || clocksApart) {
+          await repo.appendEvents(client, tenantId, [
+            ...(wasEnded ? [{
+              garageId,
+              laneId,
+              eventId: `${stuck.ENDED_STAY_CLOSED_EVENT_KIND}:${closed.id}`,
+              kind: stuck.ENDED_STAY_CLOSED_EVENT_KIND,
+              occurredAt: exitAt,
+              detail: { actor: 'platform:close', session_id: closed.id, close_event_id: String(closeEventId), was: wasEnded.ended },
+            }] : []),
+            ...(clocksApart ? [{
+              garageId,
+              laneId,
+              eventId: `${stuck.EXIT_BEFORE_ENTRY_EVENT_KIND}:${closed.id}`,
+              kind: stuck.EXIT_BEFORE_ENTRY_EVENT_KIND,
+              occurredAt: exitAt,
+              detail: { actor: 'platform:close', session_id: closed.id, close_event_id: String(closeEventId), exit_at_sent: sentExitAt.toISOString(), entry_at: closed.entry_at },
+            }] : []),
+          ]);
+        }
         const releasedBySweep = validated.record?.released_by === 'sweep';
         const releasedByClose = validated.releaseAfter && !releasedBySweep && heldAtClose?.state !== 'releasing';
         if (releasedByClose || releasedBySweep) {
@@ -3339,6 +3400,74 @@ export function createApp() {
         return updated;
       });
       res.json({ exit: exits.presentForPerson(await cancelForPerson(req.tenantId, row.garage_id, row)) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * THE STAYS THAT LOOK STUCK (0039): this garage's open stays that came in
+   * at least `older_than_hours` ago (72 by default), oldest first, for a
+   * person to end. A read.
+   */
+  operator.get('/garages/:garageId/stays/stuck', async (req, res, next) => {
+    try {
+      const hours = stuck.olderThanHours(req.query.older_than_hours);
+      const stays = await withTenant(req.tenantId, async (client) => {
+        await ownGarage(client, req);
+        return stuck.stuckStays(client, req.tenantId, req.params.garageId, { hours });
+      });
+      res.json({ older_than_hours: hours, stays: stays.map(stuck.presentStuck) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * A PERSON ENDS A STAY NOTHING CLOSED, `{outcome, reason, left_at?}`:
+   * `ended` (the car left, at `left_at` or now) or `abandoned` (written off,
+   * now). Closed unpriced, with who and why on the stay, an event beside it
+   * and a line in the change log. Once: only an open stay ends. Not while a
+   * car is at an exit lane on it -- a person lets that one out there.
+   */
+  operator.post('/garages/:garageId/stays/:stayId/end', async (req, res, next) => {
+    try {
+      const ask = stuck.endRequest(req.body, parseTime);
+      const ended = await changeTx(req, async (client) => {
+        const garage = await ownGarage(client, req);
+        const stay = await repo.getSession(client, req.tenantId, req.params.stayId);
+        if (!stay || stay.garage_id !== garage.id) throw new HttpError(404, 'stay not found', 'stay_not_found');
+        if (stay.exit_at) throw conflict('stay_not_open', 'this stay is not open: it has already been closed or ended');
+        if (await stuck.atAnExit(client, req.tenantId, stay.id)) {
+          throw conflict('stay_at_an_exit', 'a car is at an exit lane on this stay: let it out there instead');
+        }
+        const now = new Date();
+        const leftAt = ask.leftAt ? refuseFuture(ask.leftAt, 'left_at', now) : now;
+        if (leftAt < stay.entry_at) throw new HttpError(400, 'left_at is before the stay came in', 'left_at_before_entry');
+        const actor = await changes.who(client, req.change);
+        const by = `${actor.kind}:${actor.name ?? actor.id ?? ''}`.slice(0, 300);
+        const row = await repo.endStay(client, req.tenantId, stay.id, {
+          reason: ask.outcome, exitAt: leftAt, record: { by, why: ask.reason },
+        });
+        if (!row) throw conflict('stay_not_open', 'this stay is not open: it has already been closed or ended');
+        await repo.appendEvents(client, req.tenantId, [{
+          garageId: garage.id,
+          laneId: null,
+          eventId: `${stuck.STAY_ENDED_EVENT_KIND}:${row.id}`,
+          kind: stuck.STAY_ENDED_EVENT_KIND,
+          occurredAt: now,
+          detail: { actor: by, session_id: row.id, reason: ask.outcome, why: ask.reason, exit_at: row.exit_at },
+        }]);
+        await changes.record(client, req.change, {
+          garageId: garage.id,
+          action: 'stay.end',
+          subject: { kind: 'stay', id: row.id, name: null },
+          before: { open: true },
+          after: { open: false, outcome: ask.outcome, reason: ask.reason, exit_at: row.exit_at },
+        });
+        return row;
+      });
+      res.json({ stay: stuck.presentEnded(ended) });
     } catch (err) {
       next(err);
     }
@@ -3997,6 +4126,7 @@ export const WRITE_ROUTES = Object.freeze([
   ['POST', '/garages/:garageId/banned/:banId/remove', 'garage.banned_car_remove'],
   ['POST', '/garages/:garageId/exits/:exitId/let-out', 'exit.let_out'],
   ['POST', '/garages/:garageId/exits/:exitId/pay', 'exit.payment_start'],
+  ['POST', '/garages/:garageId/stays/:stayId/end', 'stay.end'],
 ]);
 
 const WRITE_PATTERNS = WRITE_ROUTES.map(([method, path, action]) => [

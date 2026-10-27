@@ -238,6 +238,18 @@ jobs:
         # go red.
         run: npm run exit-payments-fail-control
 
+      - name: Stay-endings fail-control
+        # A stay no exit closed (0039). Each break removes one property the
+        # ending rests on -- the same car again later superseding its old stay
+        # unpriced, within one arrival the same stay, an earlier entry stored
+        # ended, an unread car never superseding; the count at the car's own
+        # entry; a late close finding the stay it ended; the clocks apart on
+        # a close; the named 404s; the stuck list; a person ending a stay
+        # once, with a reason, not at an exit, not another garage's, the
+        # held validation released and the change logged -- and three of
+        # 0039's guards, and requires test/stay-endings.test.js to go red.
+        run: npm run stay-endings-fail-control
+
       - name: Descriptor fail-control
         # A session carries the appearance descriptor its entry read produced
         # (migration 0009) and the one its exit read produced (0010). Each break

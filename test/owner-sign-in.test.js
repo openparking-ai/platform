@@ -974,7 +974,7 @@ test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, not JSON, oversized or
   // U4's 22, U4b's four people-to-tell writes and U4c's four board writes,
   // U7f's one, U7g's try: a POST that changes nothing but reads a body, and
   // 0037's exit let out by a person.
-  assert.equal(changing.length, 34, `the walk found ${changing.length} non-GET operator routes`);
+  assert.equal(changing.length, 35, `the walk found ${changing.length} non-GET operator routes`);
   const cases = [
     { name: 'malformed', raw: '{"name": "Echo-Me-Back", oops', headers: {}, status: 400, body: BODY_UNREADABLE },
     // The parser's own text for this one quotes what was sent.
@@ -1012,7 +1012,7 @@ test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, not JSON, oversized or
       }
     }
   }
-  assert.equal(answers, 34 * spellings.length * cases.length * 2);
+  assert.equal(answers, 35 * spellings.length * cases.length * 2);
   assert.deepEqual(wrong, []);
 });
 

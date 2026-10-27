@@ -113,9 +113,9 @@ const SOURCE_BREAKS = [
     name: 'unread_not_counted',
     why: 'the count of cars inside leaves unread cars out',
     file: 'src/repository.js',
-    from: '              WHERE s.tenant_id = g.tenant_id AND s.garage_id = g.id AND s.exit_at IS NULL) AS inside',
+    from: '                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside',
     to:
-      '              WHERE s.tenant_id = g.tenant_id AND s.garage_id = g.id AND s.exit_at IS NULL' +
+      '                AND (s.exit_at IS NULL OR s.exit_at > $3)' +
       ' AND s.vehicle_id NOT IN (SELECT id FROM vehicles WHERE unread_ref IS NOT NULL)) AS inside',
   },
   {

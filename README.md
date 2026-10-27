@@ -637,7 +637,7 @@ breaks each property in turn.
     GET /api/v1/garages/<id>/stays/closed?from=<instant>&to=<instant>[&limit=<n>][&after=<next>]
         {garage_id, from, to, limit, next,
          stays: [{entry_at, exit_at, fee_minor, subtotal_minor, currency, exit_outcome, pricing_refused,
-                  occupancy_at_entry_bp}]}
+                  occupancy_at_entry_bp, ended}]}
 
 The garage's own history: the stays that **closed** in `[from, to)`, oldest exit
 first, a page at a time (`next` is the `after` for the following page, `null`
@@ -1133,8 +1133,12 @@ that. The engine counts nothing; this platform counts, and hands it the figure.
   return it. The garage map writes its count of switched-on spots here; without
   a map the owner types it. Anything else is `400 garage_spaces_refused`.
 - **`sessions.occupancy_at_entry_bp`**: `floor(10000 x cars inside / spaces)`,
-  at most 10000, set when the stay opens: every open stay of the garage, any
-  kind of space, a car nobody could read included (0036), before this one.
+  at most 10000, set when the stay opens: every stay of the garage, any kind
+  of space, a car nobody could read included (0036), that was inside **at
+  this car's own entry** -- came in by then and had not come out by then.
+  A lane that delivers its open late counts the cars that were in when the
+  car came in, not when the open arrived; nothing ages a stay out of the
+  count (a stay no exit closed leaves it when it is ended, 0039 below).
   Counted inside the open's transaction behind
   a per-garage lock, so two lanes opening at once count each other (n and n+1,
   never n twice). Null when the garage has no `spaces`. **No lane sets it**:
@@ -1754,6 +1758,58 @@ A payment is never deleted, is forced under row-level security, names only
 its own account's case and stay (a trigger). What it pays for, its amount
 and its intent never change; once succeeded or canceled it stays so; its
 receipt is written once.
+
+### Ending a stay no exit closed (0039)
+
+A car can leave without its exit being seen: a lane down, a gate up, a car
+that tailgated out. Its stay would sit open for ever, count as inside and
+price the next car on a fuller garage. A stay no exit closed is **ended**:
+`exit_at` set, no exit lane, no close event, **unpriced** (no fee, no
+pricing) and `sessions.ended` saying why --
+`{reason: "superseded", at, by_session}`, or `{reason: "ended" | "abandoned",
+at, by, why}` when a person decided.
+
+- **The same car again.** One vehicle row is one whole plate or ticket. An
+  open for a car that already has an open stay, at an entry more than
+  `REAPPROACH_MINUTES` later (default 10, 1 to 60), means the old stay had
+  ended by then: it is ended as superseded at the new entry and the new
+  visit gets its own stay, never folded into the old one. Within
+  `REAPPROACH_MINUTES` it is one arrival -- a car backing out and coming in
+  again -- and the open answers the stay already open. An open whose entry is
+  **earlier** than a stay of the car already here is an earlier visit
+  delivered late: it is stored already ended, superseded by the next. A car
+  nobody could read (0036) is a vehicle of its own every time, so it never
+  supersedes another. Each superseded stay is a `stay_ended` event.
+- **A late close.** A close whose exit falls inside a stay that was ended
+  (superseded or by a person) closes that stay after all: `ended` cleared,
+  priced like any close, and an `ended_stay_closed` event. A close whose exit
+  is before the stay's entry by no more than twice `MAX_CLOCK_SKEW_SECONDS`
+  is the two lanes' clocks apart: the exit is taken as the entry, with an
+  `exit_before_entry` event. A close with nothing to close names why:
+  `404 session_not_open` for a stay named by id, `404 no_open_stay` for a
+  plate or ticket with no open stay.
+- **The stays looking stuck** --
+  `GET /api/v1/garages/:garageId/stays/stuck?older_than_hours=72` (an
+  operator token; 1 to 2160, default 72): the open stays that came in before
+  then, oldest first, as `{id, plate, plate_whole, ticket, unread,
+  entered_at, entry_lane, at_exit, last_seen_on_walk, why}`.
+- **A person ends one** --
+  `POST /api/v1/garages/:garageId/stays/:stayId/end {outcome, reason, left_at?}`:
+  `outcome` is `"ended"` (the car left; `left_at`, if given, is when -- not
+  before its entry, not in the future) or `"abandoned"` (the car is gone and
+  nobody knows when; no `left_at`). `reason` is required. Once: an ended
+  stay is `409 stay_not_open`. Not while a car is at an exit on that stay
+  (`409 stay_at_an_exit`: the exit decides). A validation held on the stay is
+  handed to the release. A `stay_ended` event and a `stay.end` change-log line,
+  which names the stay and no vehicle.
+
+The past stays (`GET /garages/:garageId/stays/closed`) carry `ended`, the
+reason, on a stay that was ended. The database holds the shape: an ended stay
+is unpriced, has no exit lane or close event, a known reason, and who and why
+when a person decided.
+
+`test/stay-endings.test.js` holds each; `npm run stay-endings-fail-control`
+breaks each in turn.
 
 ## Deploying
 
