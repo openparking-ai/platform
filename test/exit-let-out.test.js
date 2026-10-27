@@ -325,7 +325,7 @@ test("a person's close naming the case cancels its payment and writes the stay l
   assert.deepEqual([lines[0].actor_kind, lines[0].actor_id, lines[0].actor_name], ['computer', g.exitDeviceId, 'exit']);
   assert.deepEqual(
     { ...lines[0].after },
-    { let_out: true, at_lane: true, authority: 'human_open_now', stay_id: exit.session_id, paid: false, owed_minor: exit.fee.fee_minor, currency: 'USD', payment: 'canceled' },
+    { let_out: true, at_lane: true, authority: 'human_open_now', flagged: false, stay_id: exit.session_id, paid: false, owed_minor: exit.fee.fee_minor, currency: 'USD', payment: 'canceled' },
   );
   const shown = await (await call(g.op, 'GET', `/garages/${g.world.garage}/changes`)).json();
   assert.ok(JSON.stringify(shown).includes('"computer"'), 'the change log reads the lane computer as who');
@@ -350,6 +350,31 @@ test('a close for a case owing with no payment started is let out too, and the r
   const lines = await letOutLines(g, exit.id);
   assert.equal(lines.length, 1, 'one line, though the close came twice');
   assert.equal(lines[0].after.authority, null);
+  assert.equal(lines[0].after.flagged, false);
+});
+
+test("a person's close that opened and flagged the exit is taken; the stay and the change log say it was flagged", async () => {
+  const g = await garage('close-flagged');
+  const exit = await owing(g);
+  const started = await pay(g, exit.id);
+  const eventId = randomUUID();
+  const res = await close(g, exit.id, { event_id: eventId, let_out_by: 'human_open_and_flag' });
+  assert.equal(res.status, 200, await res.clone().text());
+  const out = await res.json();
+  assert.equal(intentOf(started).status, 'canceled');
+  assert.deepEqual(
+    [out.session.fee_minor, out.session.let_out.paid, out.session.let_out.by, out.session.let_out.reason],
+    [null, false, `lane_device:${g.exitDeviceId}`, 'human_open_and_flag'],
+  );
+  const replay = await close(g, exit.id, { event_id: eventId, let_out_by: 'human_open_and_flag' });
+  assert.equal(replay.status, 200);
+  const lines = await letOutLines(g, exit.id);
+  assert.equal(lines.length, 1, 'one line, though the close came twice');
+  assert.deepEqual([lines[0].actor_kind, lines[0].actor_id], ['computer', g.exitDeviceId]);
+  assert.deepEqual(
+    { ...lines[0].after },
+    { let_out: true, at_lane: true, authority: 'human_open_and_flag', flagged: true, stay_id: exit.session_id, paid: false, owed_minor: exit.fee.fee_minor, currency: 'USD', payment: 'canceled' },
+  );
 });
 
 test('a close whose payment Stripe cannot settle now is a 503 the lane retries; the stay stays open until then', async () => {
@@ -469,6 +494,7 @@ test('every route here answers only its own account, garage and lane', async () 
     ['POST', `/lane/exits/${exit.id}/pay/cancel`],
     ['POST', `/lane/exits/${word.id}/word`, { entry_at: `${ago(30).slice(0, 19)}Z` }],
     ['POST', '/lane/sessions/close', { event_id: randomUUID(), exit_id: exit.id, exit_at: ago(0.1), exit_confirmation: 'confirmed', let_out_by: 'human_open_now' }],
+    ['POST', '/lane/sessions/close', { event_id: randomUUID(), exit_id: exit.id, exit_at: ago(0.1), exit_confirmation: 'confirmed', let_out_by: 'human_open_and_flag' }],
   ]) {
     const res = await call(other.exit, method, path, body);
     assert.deepEqual([res.status, (await res.json()).code], [404, 'exit_not_found'], `${path} from another account`);
@@ -485,6 +511,7 @@ test('every route here answers only its own account, garage and lane', async () 
     [`/lane/exits/${exit.id}/pay/cancel`],
     [`/lane/exits/${word.id}/word`, { entry_at: `${ago(30).slice(0, 19)}Z` }],
     ['/lane/sessions/close', { event_id: randomUUID(), exit_id: exit.id, exit_at: ago(0.1), exit_confirmation: 'confirmed', let_out_by: 'human_open_now' }],
+    ['/lane/sessions/close', { event_id: randomUUID(), exit_id: exit.id, exit_at: ago(0.1), exit_confirmation: 'confirmed', let_out_by: 'human_open_and_flag' }],
   ]) {
     const res = await call(g2, 'POST', path, body);
     assert.deepEqual([res.status, (await res.json()).code], [404, 'exit_not_found'], `${path} from another garage`);
@@ -508,7 +535,7 @@ test('the close refuses a let_out_by the lane does not name, or one with no case
   const exit = await owing(g);
   const odd = await close(g, exit.id, { let_out_by: 'the caller asked' });
   assert.equal(odd.status, 400);
-  assert.match((await odd.json()).error, /let_out_by must be one of display_code_confirmed, human_open_now/);
+  assert.match((await odd.json()).error, /let_out_by must be one of display_code_confirmed, human_open_now, human_open_and_flag/);
   const noCase = await call(g.exit, 'POST', '/lane/sessions/close', {
     event_id: randomUUID(), plate: 'NOCASE1', exit_at: ago(0.1), exit_confirmation: 'confirmed', let_out_by: 'human_open_now',
   });

@@ -70,7 +70,10 @@ export function idFields(body) {
 }
 
 /** The authorities a person at the lane opens the barrier on, as the lane's vend names them. */
-export const LET_OUT_AUTHORITIES = Object.freeze(['display_code_confirmed', 'human_open_now']);
+export const LET_OUT_AUTHORITIES = Object.freeze(['display_code_confirmed', 'human_open_now', 'human_open_and_flag']);
+
+/** The authority on which the person opened and flagged the exit for review. */
+export const FLAGGED_AUTHORITY = 'human_open_and_flag';
 
 /** The close's `let_out_by`: one of LET_OUT_AUTHORITIES, on a close that names its case; or null. */
 export function letOutByField(value, exitId) {

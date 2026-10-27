@@ -23,6 +23,8 @@
  *   let_out_at_quoted_fee        a car let out unpaid is written at the fee it was quoted
  *   let_out_unlogged             a person's opening leaves no line in the change log
  *   let_out_by_unnamed           the stay does not name the lane computer that let it out
+ *   flagged_opening_refused      a person's close that opened and flagged is refused
+ *   flag_dropped_from_line       the change log does not say the opening was flagged
  *   attendant_line_doubled       an attendant's let-out gets a second line at the close
  *   past_stay_hides_let_out      the past stays do not say a stay was let out unpaid
  *   offset_less_time_taken       a driver's entry time without an offset is taken
@@ -148,6 +150,20 @@ const SOURCE_BREAKS = [
     name: 'let_out_by_unnamed',
     why: 'the stay does not name the lane computer that let it out',
     edits: [{ file: 'src/app.js', from: 'by: `lane_device:${deviceId}`', to: "by: 'lane'" }],
+  },
+  {
+    name: 'flagged_opening_refused',
+    why: "a person's close that opened and flagged is refused",
+    edits: [{
+      file: 'src/exits.js',
+      from: "['display_code_confirmed', 'human_open_now', 'human_open_and_flag']",
+      to: "['display_code_confirmed', 'human_open_now']",
+    }],
+  },
+  {
+    name: 'flag_dropped_from_line',
+    why: 'the change log does not say the opening was flagged',
+    edits: [{ file: 'src/app.js', from: '        flagged: letOutBy === exits.FLAGGED_AUTHORITY,', to: '        flagged: false,' }],
   },
   {
     name: 'attendant_line_doubled',

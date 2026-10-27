@@ -2783,6 +2783,7 @@ export function createApp() {
         let_out: true,
         at_lane: true,
         authority: letOutBy,
+        flagged: letOutBy === exits.FLAGGED_AUTHORITY,
         stay_id: exitCase.session_id,
         paid: exitCase.payment?.status === 'succeeded',
         owed_minor: letOut?.owed_minor ?? null,
