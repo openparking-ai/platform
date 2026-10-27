@@ -20,6 +20,8 @@
  * would violate the constraint and fail the whole purge; writing it into
  * neither would leave a ticket — which a person read out loud and which
  * identifies a stay — as the one piece of identity retention could not remove.
+ * A car whose plate nobody could read (0036) carries `unread_ref`, the key of
+ * its one stay, and it is redacted the same way, so the row keeps its shape.
  *
  * A SHADOW SEARCH (migration 0011) ages out with the stay it shadowed: the
  * row's session references -- `session_id`, `candidate_ids`, `matched_ids` --
@@ -85,6 +87,8 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
                                   ELSE 'redacted:' || v.id END,
               ticket_ref   = CASE WHEN v.ticket_ref IS NULL THEN NULL
                                   ELSE 'redacted:' || v.id END,
+              unread_ref   = CASE WHEN v.unread_ref IS NULL THEN NULL
+                                  ELSE 'redacted:' || v.id END,
               plate_region = NULL,
               make         = NULL,
               model        = NULL,
@@ -104,6 +108,13 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
           WHERE tenant_id = $1
             AND (entry_descriptor IS NOT NULL OR exit_descriptor IS NOT NULL)
             AND vehicle_id = ANY($2::uuid[])`,
+        [tenantId, rows.map((r) => r.id)],
+      );
+      // What was read of an unread car's plate below the lane's confidence
+      // (0036): a plate's text, so it goes with the descriptors.
+      await client.query(
+        `UPDATE sessions SET entry_unsure_plate = NULL, entry_unsure_plate_confidence = NULL
+          WHERE tenant_id = $1 AND entry_unsure_plate IS NOT NULL AND vehicle_id = ANY($2::uuid[])`,
         [tenantId, rows.map((r) => r.id)],
       );
       // The entitlement record (0015) names the identity the modules were

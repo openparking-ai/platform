@@ -81,6 +81,8 @@ jobs:
         run: npm run devices-and-codes-fail-control
       - name: Ticket-identity fail-control
         run: npm run ticket-identity-fail-control
+      - name: Unread-identity fail-control
+        run: npm run unread-identity-fail-control
       - name: Descriptor fail-control
         run: npm run descriptor-fail-control
       - name: Shadow-run fail-control

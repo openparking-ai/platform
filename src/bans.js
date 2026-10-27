@@ -3,14 +3,15 @@
  *
  * PICTURES. A lane sends the pictures it took between the vend and the closing
  * loop, and at the closing loop, each against the lane's event id of the entry
- * record it belongs to: a stay's open, a tailgater nobody identified, a banned
- * car refused. They are removed one week after the car left -- the stay's exit
- * -- or, when no stay holds them, one week after they were taken. A car still
- * inside keeps them, and so does a car on the list. The arming loop's pictures
- * are not here and nothing here touches them: none is stored anywhere.
+ * record it belongs to: a stay's open, a crossing no car made, a banned car
+ * refused -- and, since 0036, the arming read's pictures of the stay's car.
+ * They are removed `PICTURE_DAYS` (30) after the car left -- the stay's exit
+ * -- or, when no stay holds them, 30 days after they were taken. A car still
+ * inside keeps them, and so does a car on the list.
  *
  * THE LIST. With the garage's "ban tailgaters" on, a tailgater stay opened
- * there with an identity read is listed; nothing else lists a car, and there
+ * there with a PLATE read is listed -- never a car nobody could read (0036);
+ * nothing else lists a car, and there
  * is no route that does. Its reach is the listing garage's `ban_reach`, read
  * when a lane loads its list: this garage, or every garage of the account.
  * A lane matches a car against the list by its descriptor (the OPA ID), the
@@ -24,8 +25,12 @@
  */
 import sharp from 'sharp';
 
-/** How long a picture is kept after the car left. His answer: one week. */
-export const PICTURE_DAYS = 7;
+/**
+ * How long a picture is kept after the car left. The owner's answer
+ * (2026-10-26): 30 days -- it was one week (2026-10-11). One number for every
+ * garage; a longer keep for a garage that pays for storage is not built.
+ */
+export const PICTURE_DAYS = 30;
 
 /** The largest picture a lane may send, in bytes, as the table holds it. */
 export const PICTURE_MAX_BYTES = 3 * 1024 * 1024;
@@ -99,8 +104,13 @@ export async function storePicture(client, tenantId, { garageId, laneId, picture
  * List a tailgater stay, if its garage bans tailgaters and the lane read the
  * car's identity. Called on the stay's open, in its transaction.
  */
-export async function listIfBanned(client, tenantId, { garage, session }) {
+export async function listIfBanned(client, tenantId, { garage, session, vehicle }) {
   if (!session.tailgater || !garage.ban_tailgaters || !session.entry_descriptor) return false;
+  // A READ PLATE, OR NO LISTING (0036). A car nobody could read is never
+  // listed, whatever its open says: a monthly with a dirty plate through a
+  // raised barrier would otherwise be refused at every entry on a descriptor
+  // match nobody can check against a plate.
+  if (!vehicle?.plate) return false;
   const { rows } = await client.query(
     `INSERT INTO banned_vehicles (tenant_id, garage_id, session_id)
      VALUES ($1, $2, $3)
@@ -205,8 +215,8 @@ export async function pictureOfBan(client, tenantId, garageId, banId, pictureId)
 }
 
 /**
- * Remove the pictures whose week is over: one week after the stay that holds
- * them closed, or one week after they were taken when no stay holds them. A
+ * Remove the pictures whose 30 days are over: 30 days after the stay that holds
+ * them closed, or 30 days after they were taken when no stay holds them. A
  * stay still open keeps its pictures, and so does a stay on the list.
  */
 export async function removeExpiredPictures(client, tenantId, { now = null } = {}) {

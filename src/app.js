@@ -229,11 +229,13 @@ const LANE_EVENT_KINDS = [
   // `entry_unconfirmable` is a lane with no closing loops at all, and
   // `entry_pending` is the vend itself. A stream of these is the stuck-boom
   // symptom: the camera's job has changed from deciding to recording, and
-  // this is the record. It does NOT open a session and it is NOT an
-  // `entry_confirmation` value -- that column answers "did anything see the
-  // car cross" (yes, the loops did); this kind answers "did anything admit
-  // it" (no), and migration 0006 says an entry nothing confirmed is not a
-  // session at all. Not counted by `reconcile.js`.
+  // this is the record. It is NOT an `entry_confirmation` value -- that column
+  // answers "did anything see the car cross" (yes, the loops did); this kind
+  // answers "did anything admit it" (no). The CAR is a stay all the same (the
+  // owner's rule, 2026-10-26: the loops and the pictures make the entry): the
+  // lane opens one beside this event through `/sessions/open`, `confirmed`,
+  // `tailgater: true`, with a plate or `plate_unreadable` (0036). Not counted
+  // by `reconcile.js`.
   'entry_unadmitted',
   'entry_unconfirmable',
   'exit_backed_in',
@@ -280,6 +282,17 @@ function confirmation(value, label, allowed = CONFIRMATIONS) {
  * binding is the identity module's job; `vehicles_exactly_one_identity` in
  * migration 0007 is what stops it being done accidentally in this one.
  *
+ * AND A THIRD, ON AN ENTRY'S OPEN ONLY (0036): `plate_unreadable: true` -- a
+ * car the lane's loops saw go in whose plate nobody could read. The owner's
+ * rule makes every such car a stay ("unreadable" is part of the car's
+ * identity, not a failure to have one), and before this it had no identity to
+ * open one on. It is alone or it is refused: beside a plate it would say the
+ * plate was both read and not read, and beside a ticket it would be two cars.
+ * The stay's vehicle is a row of its own, keyed on the open's event id, so two
+ * unread cars are never one (src/repository.js `upsertVehicle`). Nothing finds
+ * or closes a stay by it: the close and the exit's lookup take a plate or a
+ * ticket, as before.
+ *
  * `ticket_ref` IS OPAQUE TO THIS PLATFORM. What is checked is a closed alphabet
  * and a length, and nothing else: no signature, no expiry, no issuer. The agent
  * that mints and verifies tickets is a different module and this is not it, so
@@ -293,6 +306,49 @@ function confirmation(value, label, allowed = CONFIRMATIONS) {
  * a device token's worth of text becoming a vehicle's identity.
  */
 const TICKET_REF_SHAPE = /^[A-Z0-9-]{6,64}$/;
+
+/**
+ * A lane's id for anything it records (0036), on every route that takes one --
+ * an open, a close, a log event: 1 to 64 characters of letters, digits, hyphen
+ * and underscore. Our lane mints a UUID; another lane's own scheme (`tp-0001`)
+ * fits too. The open's id is now also the key an unread car's vehicle is held
+ * under, so it is checked for its shape like any identity -- a JSON object
+ * would otherwise reach the database as `[object Object]`, a value shaped like
+ * the purge's `redacted:<id>` would be a live key that reads as a redacted one,
+ * and an unbounded one is a row an attacker chooses the size of.
+ */
+const LANE_EVENT_ID_SHAPE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** `value` as a lane's event id, or a 400 naming the rule. */
+function laneEventId(value, label = 'event_id') {
+  if (typeof value !== 'string' || !LANE_EVENT_ID_SHAPE.test(value)) {
+    throw bad(`${label} must be 1 to 64 characters of A-Z, a-z, 0-9, hyphen and underscore`);
+  }
+  return value;
+}
+
+/**
+ * What the camera read of an UNREAD car's plate below the lane's confidence,
+ * and that confidence (0036): `unsure_plate` and `unsure_plate_confidence`,
+ * both or neither, and only beside `plate_unreadable: true` -- a car whose
+ * plate was read has a plate, and a ticket is asserted, not read. Kept on the
+ * stay for the exit's matching and never an identity.
+ */
+function unsurePlateFields(body, { plateUnreadable }) {
+  const plate = body?.unsure_plate ?? null;
+  const confidence = body?.unsure_plate_confidence ?? null;
+  if (plate === null && confidence === null) return { plate: null, confidence: null };
+  if (!plateUnreadable) {
+    throw bad('unsure_plate goes only with plate_unreadable: true -- a plate read with confidence is the plate');
+  }
+  if (typeof plate !== 'string' || plate.trim() === '' || plate.length > PLATE_MAX) {
+    throw bad(`unsure_plate must be a string of at most ${PLATE_MAX} characters and not only whitespace`);
+  }
+  if (typeof confidence !== 'number' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+    throw bad('unsure_plate_confidence must be a number from 0 to 1, given with unsure_plate');
+  }
+  return { plate, confidence };
+}
 
 /** An ISO 8601 instant with an offset, to the microsecond: what is handed to `timestamptz` as an instant. */
 const INSTANT_SHAPE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$/;
@@ -562,9 +618,21 @@ async function taxFactsForDecision(client, tenantId, garageId, decision) {
  * A third party calls this route without going through our lane at all, which
  * is the premise of the whole project, so this side does its own typing.
  */
-function laneIdentity(source, { where = 'body' } = {}) {
+function laneIdentity(source, { where = 'body', unreadable = false } = {}) {
   const plate = source?.plate ?? null;
   const ticketRef = source?.ticket_ref ?? null;
+  const plateUnreadable = unreadable ? (source?.plate_unreadable ?? null) : null;
+  if (plateUnreadable !== null) {
+    if (plateUnreadable !== true) {
+      throw bad('plate_unreadable must be true when given: a car whose plate nobody could read');
+    }
+    if (plate !== null || ticketRef !== null) {
+      throw bad(
+        'plate_unreadable is an identity of its own: send it with neither plate nor ticket_ref',
+      );
+    }
+    return { plate: null, ticketRef: null, plateUnreadable: true };
+  }
   if (Boolean(plate) === Boolean(ticketRef)) {
     throw bad(
       `exactly one of plate or ticket_ref is required in the ${where}; ` +
@@ -587,7 +655,11 @@ function laneIdentity(source, { where = 'body' } = {}) {
       );
     }
   }
-  return { plate: plate ? String(plate) : null, ticketRef: ticketRef ? String(ticketRef) : null };
+  return {
+    plate: plate ? String(plate) : null,
+    ticketRef: ticketRef ? String(ticketRef) : null,
+    plateUnreadable: false,
+  };
 }
 
 /**
@@ -1894,7 +1966,7 @@ export function createApp() {
         return {
           garageId,
           laneId,
-          eventId: String(e.event_id),
+          eventId: laneEventId(e.event_id, 'every event_id'),
           kind: eventKind(e.kind),
           // The same bound as an entry_at and an exit_at, on the third
           // lane-supplied time. A future-dated event satisfies every window a
@@ -1957,21 +2029,40 @@ export function createApp() {
         attributes = null,
       } = req.body ?? {};
       const entryDescriptor = descriptorField(req.body?.descriptor);
-      // Exactly one of plate or ticket_ref. A lane that sends only a plate is
-      // an older lane and is unchanged by this; a lane that sends a ticket is
-      // the intercom completing an identity for a driver the camera could not
-      // read.
-      const { plate, ticketRef } = laneIdentity(req.body);
+      // Exactly one of plate or ticket_ref -- or, on an open only, a plate
+      // nobody could read (0036). A lane that sends only a plate is an older
+      // lane and is unchanged by this; a lane that sends a ticket is the
+      // intercom completing an identity for a driver the camera could not
+      // read; a lane that sends `plate_unreadable` is recording a car its
+      // loops saw go in, which is a stay whatever opened the barrier.
+      const { plate, ticketRef, plateUnreadable } = laneIdentity(req.body, { unreadable: true });
       const entryConfirmation = confirmation(req.body?.entry_confirmation, 'entry_confirmation');
-      // A car through the gate that no vend let in, whose identity the lane
-      // read at the closing loop (U7f): a stay like any other, which pays at
-      // the exit -- and, where the garage bans tailgaters, a car on its list.
-      const tailgater = req.body?.tailgater ?? false;
-      if (typeof tailgater !== 'boolean') throw bad('tailgater must be true or false when given');
+      // A car through the gate that no open command let in, identified at the
+      // closing loop (U7f; and, since the owner's rule of 2026-10-26, read or
+      // not): a stay like any other, which pays at the exit -- and, where the
+      // garage bans tailgaters, a car on its list.
+      const tailgaterSaid = req.body?.tailgater ?? false;
+      if (typeof tailgaterSaid !== 'boolean') throw bad('tailgater must be true or false when given');
+      // NEVER A CAR NOBODY COULD READ (0036): `tailgater` is a car no vend let
+      // in whose plate was read. An unread open that says otherwise is stored
+      // as not one -- the stay is never refused over it -- so no unread car is
+      // a tailgater in the data, whatever a lane sent.
+      const tailgater = tailgaterSaid && !plateUnreadable;
+      // A car the lane's loops saw go in that no open command let in (0036),
+      // read or not. Its own field: `tailgater` above keeps its own meaning.
+      const noOpenCommand = req.body?.no_open_command ?? false;
+      if (typeof noOpenCommand !== 'boolean') throw bad('no_open_command must be true or false when given');
+      // What was read of an unread car's plate below the lane's confidence
+      // (0036): kept, never an identity.
+      const unsure = unsurePlateFields(req.body, { plateUnreadable });
       // Required, not optional. Without it there is no key to be idempotent on
       // and the only thing left to check is state -- which is exactly how a
       // replay arriving after the car has left opens a second, phantom session.
       if (!openEventId) throw bad('event_id is required');
+      // AND OF ONE SHAPE (0036): it is the key an unread car's vehicle is held
+      // under -- never an object coerced to text, never `redacted:...`, never
+      // a device token's worth (`LANE_EVENT_ID_SHAPE`).
+      laneEventId(openEventId);
       const entryAt = refuseFuture(parseTime(req.body?.entry_at, 'entry_at'), 'entry_at');
 
       // THE GATE (0014): an inactive garage opens no stay. Recorded, then
@@ -1982,7 +2073,12 @@ export function createApp() {
 
       const result = await withTenant(tenantId, async (client) => {
         const vehicle = await repo.upsertVehicle(client, tenantId, {
-          plate, ticketRef, plateRegion, seenAt: entryAt, make, model, color, attributes,
+          plate,
+          ticketRef,
+          // The one stay this unread car is (0036): keyed on the open's own
+          // event id, so its replay is its row and a second car is another.
+          unreadRef: plateUnreadable ? String(openEventId) : null,
+          plateRegion, seenAt: entryAt, make, model, color, attributes,
         });
         const opened = await repo.openSession(client, tenantId, {
           garageId,
@@ -1994,8 +2090,11 @@ export function createApp() {
           entryConfirmation,
           entryDescriptor,
           tailgater,
+          noOpenCommand,
+          entryUnsurePlate: unsure.plate,
+          entryUnsurePlateConfidence: unsure.confidence,
         });
-        if (opened.created) await bans.listIfBanned(client, tenantId, { garage, session: opened.session });
+        if (opened.created) await bans.listIfBanned(client, tenantId, { garage, session: opened.session, vehicle });
         return opened;
       });
 
@@ -2024,9 +2123,9 @@ export function createApp() {
    *   {picture_ref, event_id, taken_at, image}
    * `image` is the picture as base64, a JPEG or a PNG by its first bytes, at
    * most PICTURE_MAX_BYTES; `event_id` is the lane's id of the entry record it
-   * belongs to (a stay's open, a tailgater nobody identified, a banned car
+   * belongs to (a stay's open, a crossing no car made, a banned car
    * refused); `picture_ref` is the lane's own id for it, so a resend is the
-   * same picture. Kept one week after the car left, and only as it is once
+   * same picture. Kept 30 days after the car left, and only as it is once
    * decoded and written fresh (src/bans.js).
    */
   lane.post('/pictures', readPicture, async (req, res, next) => {
@@ -2221,6 +2320,7 @@ export function createApp() {
       // in and a stay that stays open and unbilled for ever.
       const { plate, ticketRef } = laneIdentity(req.body);
       if (!closeEventId) throw bad('event_id is required');
+      laneEventId(closeEventId);
       const exitConfirmation = confirmation(
         req.body?.exit_confirmation,
         'exit_confirmation',

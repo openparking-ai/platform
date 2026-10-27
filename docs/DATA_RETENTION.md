@@ -37,6 +37,7 @@ everything identifying is replaced:
 ```
 plate         -> 'redacted:<row id>'   (keeps the unique index satisfied, carries nothing)
 ticket_ref    -> 'redacted:<row id>'   (the same, for a stay identified by a ticket)
+unread_ref    -> 'redacted:<row id>'   (the same, for a car whose plate nobody could read)
 plate_region  -> NULL
 make          -> NULL
 model         -> NULL
@@ -57,6 +58,15 @@ constraint and fail the whole purge, and filling neither would leave the ticket
 as the one identity retention could not remove. `test/retention.test.js` asserts
 the redaction and carries the control that a ticket inside the window is left
 alone.
+
+**Added with migration 0036:** a car the lane's loops saw go in and whose plate
+nobody could read is a stay too, and its vehicle carries neither a plate nor a
+ticket but `unread_ref` -- the lane's event id of that stay's open, one row per
+unread car. It is not a plate and names no person, but it is the key of a car's
+stay, so it is redacted the same way, on the same window, in the same statement,
+and the row keeps exactly one identity. What was measured of the car -- make,
+model, colour -- goes as it does for a plate. `test/unread-identity.test.js`
+asserts it.
 
 **Added with migration 0008:** the same constraint also refuses an identity that
 is an EMPTY STRING in either column. `'' IS NULL` is false, so 0007's XOR alone
@@ -138,15 +148,18 @@ an operator token, not a person, and is append-only like every event.
 
 ## Pictures kept with an entry (U7f, 0033)
 
-A lane sends the pictures it took between the vend and the closing loop, and at the closing loop. They are personal
-data on the same terms as the plate. They are **deleted**, not redacted: one week after the stay that holds them
-closed, or one week after they were taken when no stay holds them (a tailgater nobody identified, a banned car
-refused at the entry). A car still inside keeps its pictures. `npm run purge` runs both rules.
+A lane sends the pictures it took of the car at its arming read (since 0036), between the vend and the closing loop,
+and at the closing loop. They are personal data on the same terms as the plate. They are **deleted**, not redacted:
+**30 days** after the stay that holds them closed, or 30 days after they were taken when no stay holds them (a
+crossing no car made, a banned car refused at the entry). The owner set 30 days on 2026-10-26; it was one week. A
+car still inside keeps its pictures. `npm run purge` runs both rules.
 
 **A car on a banned list is held:** while it is listed, its vehicle is not redacted by the window above and its
 pictures are not deleted. Taken off the list, both rules apply again as to any other car.
 
-The arming loop's pictures are not stored anywhere, and nothing here touches them.
+**What was read of an unread car's plate** below the lane's confidence (0036, `sessions.entry_unsure_plate` and
+its confidence) is personal data like a plate: the purge nulls it with the stay's descriptors, on the sessions of
+every vehicle it redacts.
 
 ## What is never redacted
 
