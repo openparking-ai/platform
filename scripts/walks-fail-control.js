@@ -456,8 +456,8 @@ const SOURCE_BREAKS = [
     name: 'threshold_setting_dropped',
     why: "the garage's walk threshold is never saved",
     file: 'src/app.js',
-    from: "        walk_complete_percent: walkComplete,\n      };",
-    to: "      };",
+    from: "        walk_complete_percent: walkComplete,\n        stuck_after_hours: stuckAfter,",
+    to: "        stuck_after_hours: stuckAfter,",
   },
   {
     name: 'stuck_reason_not_seen',

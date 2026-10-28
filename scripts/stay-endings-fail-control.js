@@ -165,7 +165,7 @@ const SOURCE_BREAKS = [
     name: 'stuck_any_hours',
     why: 'any older_than_hours is taken',
     file: 'src/stuckStays.js',
-    from: '  if (!Number.isInteger(n) || n < STUCK_MIN_HOURS || n > STUCK_MAX_HOURS) {',
+    from: '  if (!hoursInBounds(n)) {',
     to: '  if (false) {',
   },
   {

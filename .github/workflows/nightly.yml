@@ -91,6 +91,8 @@ jobs:
         run: npm run stay-endings-fail-control
       - name: Inventory walks fail-control
         run: npm run walks-fail-control
+      - name: Garage clean-up fail-control
+        run: npm run stay-cleanup-fail-control
       - name: Descriptor fail-control
         run: npm run descriptor-fail-control
       - name: Shadow-run fail-control

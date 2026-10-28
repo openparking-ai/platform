@@ -104,7 +104,7 @@ export async function closedStays(client, tenantId, garageId, { from, to, limit,
     `SELECT s.id, to_json(s.exit_at) #>> '{}' AS exit_key,
             s.entry_at, s.exit_at, s.fee_minor, s.subtotal_minor, s.currency, s.exit_outcome,
             (s.pricing_refusal IS NOT NULL) AS pricing_refused, s.occupancy_at_entry_bp,
-            s.ended->>'reason' AS ended
+            s.ended->>'reason' AS ended, s.ended->'owed'->'fee_minor' AS owed_minor
        FROM sessions s
       WHERE s.tenant_id = $1 AND s.garage_id = $2
         AND s.exit_at >= $3 AND s.exit_at < $4
@@ -127,7 +127,10 @@ export async function closedStays(client, tenantId, garageId, { from, to, limit,
  * `fee_minor` is null on a covered stay and on one the engine refused to price
  * (`pricing_refused`), which is not a stay that paid nothing. `ended` names
  * how a stay no exit closed ended (0039) -- `superseded`, `ended` or
- * `abandoned` -- and is null on every stay an exit closed.
+ * `abandoned` -- and is null on every stay an exit closed. `owed_minor` is
+ * what a stay a person ended because the car left owes (0043) -- its
+ * `fee_minor` stays null, because nothing was paid -- and null on every
+ * other stay, or when the rates refused to price it.
  */
 function present(row) {
   return {
@@ -141,5 +144,6 @@ function present(row) {
     // How full the garage was when the car came in (0034), or null.
     occupancy_at_entry_bp: row.occupancy_at_entry_bp,
     ended: row.ended,
+    owed_minor: row.owed_minor === null || row.owed_minor === undefined ? null : Number(row.owed_minor),
   };
 }

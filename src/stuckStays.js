@@ -16,7 +16,13 @@
  * stay the garage's latest finished walk did not see is listed whatever its
  * age (`why: "not_seen_on_walk"`), and `last_seen_on_walk` is when a
  * finished walk last saw it. Any other stay is listed for its age
- * (`why: "old"`).
+ * (`why: "old"`): older than the garage's `stuck_after_hours` (0043, 24
+ * unless the garage sets another), or the age the reader asks for.
+ *
+ * A stay a person ended because the car left OWES what its exit would have
+ * charged (0043): priced as the exit prices, at the time the person said
+ * it left, and kept on `ended.owed`. Nothing is charged: the stay stays
+ * unpriced, and the garage collects what it owes its own way.
  */
 import { HttpError } from './errors.js';
 
@@ -25,24 +31,41 @@ export const STAY_ENDED_EVENT_KIND = 'stay_ended';
 export const ENDED_STAY_CLOSED_EVENT_KIND = 'ended_stay_closed';
 export const EXIT_BEFORE_ENTRY_EVENT_KIND = 'exit_before_entry';
 
-/** How old an open stay is before it is listed, by default, and the bounds of the setting. */
-export const STUCK_DEFAULT_HOURS = 72;
+/** How old an open stay is before it is listed, for a garage that set nothing (0043), and the bounds of the setting. */
+export const STUCK_DEFAULT_HOURS = 24;
 export const STUCK_MIN_HOURS = 1;
 export const STUCK_MAX_HOURS = 90 * 24;
 /** At most this many stays in one answer, oldest first. */
 export const STUCK_LIMIT = 500;
 export const REASON_MAX = 500;
+/** At most this many entry pictures named for one listed stay, newest first. */
+export const PICTURES_PER_STAY = 4;
+
+// Control characters: a reason is shown back to people, in a screen and in
+// the change log, as the words they typed and nothing else.
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 const bad = (message, code) => new HttpError(400, message, code);
 
-/** `older_than_hours` from the query: a whole number of hours in bounds, or the default. */
-export function olderThanHours(raw) {
-  if (raw === undefined) return STUCK_DEFAULT_HOURS;
+const hoursInBounds = (n) => Number.isInteger(n) && n >= STUCK_MIN_HOURS && n <= STUCK_MAX_HOURS;
+
+/** `older_than_hours` from the query: a whole number of hours in bounds, or the garage's own setting. */
+export function olderThanHours(raw, garageHours = STUCK_DEFAULT_HOURS) {
+  if (raw === undefined) return garageHours;
   const n = typeof raw === 'string' && /^\d{1,4}$/.test(raw) ? Number(raw) : NaN;
-  if (!Number.isInteger(n) || n < STUCK_MIN_HOURS || n > STUCK_MAX_HOURS) {
+  if (!hoursInBounds(n)) {
     throw bad(`older_than_hours must be a whole number of hours from ${STUCK_MIN_HOURS} to ${STUCK_MAX_HOURS}`, 'older_than_hours_invalid');
   }
   return n;
+}
+
+/** The garage's `stuck_after_hours` as an owner sends it (PATCH), checked. Undefined when not sent. */
+export function stuckAfterHours(raw) {
+  if (raw === undefined) return undefined;
+  if (!hoursInBounds(raw)) {
+    throw bad(`stuck_after_hours must be a whole number of hours from ${STUCK_MIN_HOURS} to ${STUCK_MAX_HOURS} when given`, 'stuck_after_hours_invalid');
+  }
+  return raw;
 }
 
 /** `{outcome, reason, left_at?}` as a person sends it, checked. `leftAt` is a Date or null. */
@@ -52,6 +75,9 @@ export function endRequest(body, parseTime) {
   const reason = body?.reason;
   if (typeof reason !== 'string' || reason.trim().length === 0 || reason.length > REASON_MAX) {
     throw bad(`reason is required: why the stay is ended, at most ${REASON_MAX} characters`, 'reason_required');
+  }
+  if (CONTROL.test(reason)) {
+    throw bad('reason must be words on one line: no line breaks or control characters', 'reason_invalid');
   }
   let leftAt = null;
   if (body?.left_at !== undefined && body?.left_at !== null) {
@@ -69,7 +95,7 @@ export function endRequest(body, parseTime) {
  */
 export async function stuckStays(client, tenantId, garageId, { hours, now = new Date() }) {
   const { rows } = await client.query(
-    `SELECT s.id, s.entry_at, s.entry_plate_pattern, v.plate, v.ticket_ref, v.unread_ref, l.name AS entry_lane,
+    `SELECT s.id, s.entry_at, s.open_event_id, s.entry_plate_pattern, v.plate, v.ticket_ref, v.unread_ref, l.name AS entry_lane,
             EXISTS (SELECT 1 FROM exits x
                      WHERE x.tenant_id = s.tenant_id AND x.session_id = s.id AND x.closed_at IS NULL) AS at_exit
        FROM sessions s
@@ -92,7 +118,7 @@ export async function openStaysAmong(client, tenantId, garageId, ids, except) {
   const wanted = ids.filter((id) => !except.has(id));
   if (wanted.length === 0) return [];
   const { rows } = await client.query(
-    `SELECT s.id, s.entry_at, s.entry_plate_pattern, v.plate, v.ticket_ref, v.unread_ref, l.name AS entry_lane,
+    `SELECT s.id, s.entry_at, s.open_event_id, s.entry_plate_pattern, v.plate, v.ticket_ref, v.unread_ref, l.name AS entry_lane,
             EXISTS (SELECT 1 FROM exits x
                      WHERE x.tenant_id = s.tenant_id AND x.session_id = s.id AND x.closed_at IS NULL) AS at_exit
        FROM sessions s
@@ -106,8 +132,45 @@ export async function openStaysAmong(client, tenantId, garageId, ids, except) {
   return rows;
 }
 
+/**
+ * The entry pictures (0033) of the listed stays' opens, newest first, at
+ * most PICTURES_PER_STAY each: a map from the open's event id to
+ * `[{id, taken_at}]`. Only this garage's pictures.
+ */
+export async function entryPictures(client, tenantId, garageId, eventIds) {
+  const byEvent = new Map();
+  if (eventIds.length === 0) return byEvent;
+  const { rows } = await client.query(
+    `SELECT id, event_id, taken_at FROM (
+       SELECT p.id, p.event_id, p.taken_at,
+              row_number() OVER (PARTITION BY p.event_id ORDER BY p.taken_at DESC, p.id) AS n
+         FROM entry_pictures p
+        WHERE p.tenant_id = $1 AND p.garage_id = $2 AND p.event_id = ANY($3::text[])) ranked
+      WHERE n <= $4
+      ORDER BY event_id, taken_at DESC, id`,
+    [tenantId, garageId, eventIds, PICTURES_PER_STAY],
+  );
+  for (const r of rows) {
+    if (!byEvent.has(r.event_id)) byEvent.set(r.event_id, []);
+    byEvent.get(r.event_id).push({ id: r.id, taken_at: r.taken_at });
+  }
+  return byEvent;
+}
+
+/** One entry picture of an open or closed stay of this garage, as the image itself, or null. */
+export async function stayPicture(client, tenantId, garageId, stayId, pictureId) {
+  const { rows } = await client.query(
+    `SELECT p.content_type, p.image
+       FROM sessions s
+       JOIN entry_pictures p ON p.tenant_id = s.tenant_id AND p.garage_id = s.garage_id AND p.event_id = s.open_event_id
+      WHERE s.tenant_id = $1 AND s.garage_id = $2 AND s.id = $3 AND p.id = $4`,
+    [tenantId, garageId, stayId, pictureId],
+  );
+  return rows[0] ?? null;
+}
+
 /** A listed stay, in the shape the attendant's app reads, with what the walks say of it. */
-export function presentStuck(r, walks = { lastSeen: new Map(), notSeenLast: new Set() }) {
+export function presentStuck(r, walks = { lastSeen: new Map(), notSeenLast: new Set() }, pictures = new Map()) {
   return {
     id: r.id,
     plate: r.plate ?? r.entry_plate_pattern ?? null,
@@ -119,16 +182,39 @@ export function presentStuck(r, walks = { lastSeen: new Map(), notSeenLast: new 
     at_exit: r.at_exit,
     last_seen_on_walk: walks.lastSeen.get(r.id) ?? null,
     why: walks.notSeenLast.has(r.id) ? 'not_seen_on_walk' : 'old',
+    pictures: pictures.get(r.open_event_id) ?? [],
   };
 }
 
-/** An ended stay, as the person who ended it reads it back. */
+/**
+ * What a stay a person ended because the car left owes (0043), from the
+ * exit's own quote: the modules asked, then the rates, then the tax.
+ * `fee_minor` 0 when covered, null when the rates refused to price it.
+ */
+export function owedOf(quote) {
+  const covered = quote.outcome === 'covered';
+  return {
+    outcome: covered ? 'covered' : 'transient',
+    fee_minor: covered ? 0 : quote.fee_minor,
+    subtotal_minor: covered ? 0 : quote.subtotal_minor,
+    currency: quote.currency,
+    breakdown: covered ? [] : quote.breakdown,
+    plan_version: quote.plan_version ?? null,
+    covered_by: quote.covered_by,
+    refused: !covered && quote.refusal !== null,
+  };
+}
+
+/** An ended stay, as the person who ended it reads it back: what it owes, when the car left. */
 export function presentEnded(s) {
+  const owed = s.ended?.owed ?? null;
   return {
     id: s.id,
     entered_at: s.entry_at,
     exit_at: s.exit_at,
     ended: s.ended,
+    owed_minor: owed ? owed.fee_minor : null,
+    currency: s.currency,
   };
 }
 

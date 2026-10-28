@@ -163,6 +163,10 @@ export async function consult({ garage, identity, laneId, entryAt, exitAt }, opt
       record[module] = { consulted: false, reason: 'not linked: the garage names no garage in this module' };
       continue;
     }
+    if (module === 'garage_pass' && laneId === null) {
+      record[module] = { consulted: false, reason: 'no lane to ask at: a person ended this stay, and a pass answers for a lane' };
+      continue;
+    }
     const answer = await ask(module, link, { identity, laneId, entryAt, exitAt }, options);
     record[module] = answer;
     if (answer.covered) coveredBy.push(module);

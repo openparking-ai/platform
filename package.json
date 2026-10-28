@@ -22,6 +22,8 @@
     "exit-payments-fail-control": "node scripts/exit-payments-fail-control.js",
     "stay-endings-fail-control": "node scripts/stay-endings-fail-control.js",
     "walks-fail-control": "node scripts/walks-fail-control.js",
+    "stay-cleanup-fail-control": "node scripts/stay-cleanup-fail-control.js",
+    "occupancy-plan": "node scripts/occupancy-plan.js",
     "descriptor-fail-control": "node scripts/descriptor-fail-control.js",
     "shadow-fail-control": "node scripts/shadow-fail-control.js",
     "rate-plans-fail-control": "node scripts/rate-plans-fail-control.js",
