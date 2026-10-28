@@ -365,8 +365,8 @@ const SOURCE_BREAKS = [
     name: 'stuck_ignores_walks',
     why: "the stuck list does not list the stays the latest walk missed",
     file: 'src/app.js',
-    from: "        const unseen = await stuck.openStaysAmong(client, req.tenantId, req.params.garageId, [...facts.notSeenLast],",
-    to: "        const unseen = await stuck.openStaysAmong(client, req.tenantId, req.params.garageId, [],",
+    from: "        const unseen = await stuck.openStaysAmong(client, req.tenantId, garage.id, [...facts.notSeenLast],",
+    to: "        const unseen = await stuck.openStaysAmong(client, req.tenantId, garage.id, [],",
   },
   {
     name: 'stuck_any_walk',
