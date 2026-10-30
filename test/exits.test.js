@@ -118,6 +118,20 @@ async function picture(tok, eventId) {
 
 const atExit = (g, body) => call(g.exit, 'POST', '/lane/exits', { event_id: randomUUID(), exit_at: ago(0.5), ...body });
 
+/** The case's fee, paid: the record as it stands once Stripe said succeeded (0038). Unpaid, a close is a let-out (0042). */
+async function paid(g, exit, amountMinor = exit.fee.fee_minor) {
+  await withTenant(g.tenant, async (c) => {
+    const { rows } = await c.query(
+      `INSERT INTO exit_payments (tenant_id, garage_id, exit_id, session_id, channel, account_id, payment_intent_id,
+                                  amount_minor, currency, stripe_status, started_by)
+       VALUES ($1, $2, $3, $4, 'phone_reader', 'acct_stubexits', 'pi_stub' || replace(gen_random_uuid()::text, '-', ''),
+               $5, 'usd', 'requires_payment_method', 'platform:exit')
+       RETURNING id`,
+      [g.tenant, g.world.garage, exit.id, exit.session_id, amountMinor]);
+    await c.query(`UPDATE exit_payments SET status = 'succeeded', succeeded_at = now(), stripe_status = 'succeeded' WHERE id = $1`, [rows[0].id]);
+  });
+}
+
 before(async () => {
   engine = await startRateEngine();
   process.env.RATE_ENGINE_URL = engine.url;
@@ -152,6 +166,7 @@ test('an entry keeps its ID, the exit finds the stay by it, and the close writes
   assert.ok(exit.fee.fee_minor > 0, 'a 90-minute stay at 2.50 an hour costs something');
   assert.deepEqual([exit.settled, exit.needs], [false, 'payment'], 'a fee above zero does not open the gate');
 
+  await paid(g, exit);
   const closed = await call(g.exit, 'POST', '/lane/sessions/close', {
     event_id: randomUUID(), exit_id: exit.id, exit_at: ago(0.2), exit_confirmation: 'confirmed',
   });
@@ -272,6 +287,7 @@ test('the close writes the case\'s figures -- the fee shown and paid -- and neve
     `UPDATE exits SET quote = quote || jsonb_build_object('fee_minor', 777, 'subtotal_minor', 777,
                                                           'pre_tax', (quote->'pre_tax') || jsonb_build_object('feeMinor', 777))
       WHERE id = $1`, [exit.id]));
+  await paid(g, exit, 777);
   const closed = await call(g.exit, 'POST', '/lane/sessions/close', { event_id: randomUUID(), exit_id: exit.id, exit_at: ago(0.2), exit_confirmation: 'confirmed' });
   const out = await closed.json();
   assert.equal(out.session.id, session.id);

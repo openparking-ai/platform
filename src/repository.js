@@ -369,9 +369,11 @@ export async function closeSession(
     // THE VALIDATION RECORD (0019): null when the close carried no phone.
     // It never holds the phone number.
     validation = null,
+    // LET OUT WITH NOTHING PAID (0042): the record, and then no fee.
+    letOut = null,
   },
 ) {
-  const priced = pricing.outcome !== 'covered' && pricing.refusal === undefined;
+  const priced = pricing.outcome !== 'covered' && pricing.refusal === undefined && letOut === null;
   // THE PRE-TAX SUBTOTAL (0023), on a priced stay only. The table refuses a
   // row whose subtotal and tax lines do not add up to its fee.
   const subtotal = priced && pricing.subtotalMinor !== undefined ? pricing.subtotalMinor : null;
@@ -382,7 +384,7 @@ export async function closeSession(
             fee_minor = $8, plan_version = $9, breakdown = $10, space_class = $11,
             pricing_refusal = $12, exit_outcome = $13, entitlement = $14,
             decided_by = $15, decision_inputs = $16, validation = $17,
-            subtotal_minor = $18, ended = NULL
+            subtotal_minor = $18, let_out = $19, ended = NULL
       WHERE tenant_id = $1 AND id = $2 AND (exit_at IS NULL OR ended IS NOT NULL)
       RETURNING *`,
     [tenantId, sessionId, exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor,
@@ -396,7 +398,8 @@ export async function closeSession(
      decidedBy,
      decisionInputs === null || decisionInputs === undefined ? null : JSON.stringify(decisionInputs),
      validation === null || validation === undefined ? null : JSON.stringify(validation),
-     subtotal],
+     subtotal,
+     letOut === null ? null : JSON.stringify(letOut)],
   );
   return rows[0] ?? null;
 }

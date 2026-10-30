@@ -37,11 +37,13 @@
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
  * statement edited out, so the property genuinely never existed. 0039
- * replaces both constraints again, so each break edits it out there too.
+ * replaces both constraints again, and 0042 the shape constraint, so each
+ * break edits them out there too.
  *
  *   no_priced_or_refused     the closed-stay shape constraint (0015's
  *                            `sessions_closed_is_covered_priced_or_refused`,
- *                            which replaced 0013's, and 0039's six shapes)
+ *                            which replaced 0013's, 0039's six shapes and
+ *                            0042's seven)
  *                            never created: a closed stay may carry half a
  *                            pricing, or a fee and a refusal at once.
  *   closed_still_needs_fee   0002's `sessions_closed_is_complete` is never
@@ -146,6 +148,15 @@ const SCHEMA_BREAKS = [
       },
       {
         file: '0039_stay_endings.sql',
+        from: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_covered_priced_or_refused;
+ALTER TABLE sessions
+  ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused CHECK (`,
+        to: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled;
+ALTER TABLE sessions
+  ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused_disabled CHECK (true OR`,
+      },
+      {
+        file: '0042_let_out_by_a_person.sql',
         from: `ALTER TABLE sessions DROP CONSTRAINT sessions_closed_is_covered_priced_or_refused;
 ALTER TABLE sessions
   ADD CONSTRAINT sessions_closed_is_covered_priced_or_refused CHECK (`,

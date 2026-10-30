@@ -1654,6 +1654,33 @@ lane, with the candidates and what the picker said;
 once, with who and why on the case, an `exit_let_out_by_person` event, and an
 `exit.let_out` change-log line.
 
+**A second case for the same stay supersedes the first** (0045). A stay has
+one open case at a time, and the lane drops its case when the car leaves the
+loop unsettled: the gate faulted, the car backed off, the driver went to
+fetch a card or to the other exit lane. When the car comes back -- to the
+same lane or another -- its new case takes the old one's place, never a
+second open case:
+
+- the old case's open payment is canceled at Stripe first, and cleared from
+  its reader, outside any transaction; a card being authorised on it, or
+  Stripe out of reach, is `503 payment_unsettled` with nothing written, and
+  the lane sends the case again;
+- if the old payment had already succeeded, the new case carries the fee it
+  paid and is settled `why: "paid"` (`paid_at_exit` names the old case, and
+  `payment` is that payment): **"I paid, the gate didn't open" -- the paid
+  stay opens.** The stay closes priced at what was paid. Nothing is charged
+  twice: one live or paid payment per stay;
+- the old case is closed with no close event and `ended: {why:
+  "superseded", superseded_by}` on the lane's read; an `exit_superseded`
+  event, and an `exit.superseded` change-log line by the lane computer,
+  naming both cases, the stay and how the old payment stood -- no plate.
+
+A case the platform closed answers its lane's close, payment, word and
+let-out with `409 exit_closed`.
+
+The poll, the driver's word and the receipt answer only at the case's own
+lane (`409 exit_on_another_lane`).
+
 **The close** takes `exit_id` instead of a plate. A case with a stay closes it
 — an unread one included — writing the case's own figures (the fee shown, as
 `asDecided`), never a second price. A case with no stay (the driver's word, or
@@ -1705,9 +1732,19 @@ touches a card number.
   reader bound to that lane (`process_payment_intent`). The answer's `sent`
   is `true`, `false` (the intent was not waiting for a card: paid or being
   paid), or `"unknown"` (the reader did not acknowledge in time; it may have
-  it — the poll says). `POST .../pay/cancel` clears the reader; the intent
-  stays to be tried again, and a card already being authorised cannot be
-  stopped (`409 reader_busy`).
+  it — the poll says). `POST .../pay/cancel` cancels the intent at Stripe,
+  idempotently, and clears the reader while it shows it; a card that already
+  paid is never canceled (`409 exit_paid`), and a card being authorised is
+  not cut off (`409 payment_in_progress`).
+- **The reader holding another car's fee.** Stripe refuses a new payment
+  while the reader is busy (`terminal_reader_busy`). The reader is then read:
+  this case's own intent already waiting for its card is `sent: true`;
+  another case's intent -- a car gone whose cancel did not land -- is
+  canceled at Stripe and cleared from the reader first, then this case's is
+  sent, so a driver never pays another car's fee; one that paid in that
+  instant is recorded paid, never canceled. A card being authorised on it,
+  or an action this platform did not start, is `409 reader_busy` and nothing
+  is touched.
 - **At an attendant's phone** — `POST /api/v1/garages/:garageId/exits/:exitId/pay`
   (an operator token) creates the same intent and answers its
   `client_secret` for Stripe's Terminal SDK on the phone, with an
@@ -1738,6 +1775,19 @@ decides). The reader's own refusals are named: `503 reader_offline`,
 **A person who lets the car out** while a payment is open cancels the
 intent, so no card is taken for a settled exit; if Stripe says it had
 already succeeded, that is recorded instead — paid and let out.
+
+**Checked against Stripe itself.** The suite runs against a stand-in
+(`test/stripe-stub.js`); `node scripts/stripe-test-mode-check.js` runs the
+platform's own payment calls against Stripe's **test mode** with a simulated
+reader: an intent made once per case, handed to the reader, a second one
+refused while the reader is busy, the reader cleared and an intent canceled
+with its key, a declined card, a good card on the same intent, and a cancel
+of the paid intent refused. It takes only a test key (`sk_test_` or
+`rk_test_`, from the file `STRIPE_TEST_KEY_FILE` names, or `STRIPE_API_KEY`)
+and refuses any other before anything is sent; it never prints the key.
+`STRIPE_TEST_ACCOUNT` (an `acct_` id) is the test connected account it acts
+on as a garage's own; unset, the key's own account. With no key it runs
+nothing (exit 2). It is never run by CI, which holds no key.
 
 **Offline.** The lane's reader is driven from here, so it takes no card
 while it or Stripe is offline: the case still needs payment and a person
@@ -1812,12 +1862,21 @@ at, by, why}` when a person decided.
   goes into the change log as typed, so it must not name the car**: a
   screen that asks for it says so in its help text ("why the stay ended --
   do not type the plate: the reason goes to the change log"). Once: an
-  ended stay is `409 stay_not_open`. Not while a car is at an exit on that
-  stay (`409 stay_at_an_exit`: the exit decides). A validation held on the
-  stay is handed to the release. A `stay_ended` event and a `stay.end`
-  change-log line -- who and when, as every line; the stay by its id and no
+  ended stay is `409 stay_not_open`. **An exit case left open on the stay**
+  -- the car left the lane without its close, after a let-out or not --
+  **never blocks it** (0045): the case's unpaid payment is canceled at
+  Stripe first, then the case is closed with `ended: {why: "stay_ended",
+  by}`; a payment that succeeded stays paid, is never canceled, and the
+  stay's `ended` carries it (`paid: {exit_id, amount_minor, currency}`,
+  with `exit_cases`). A card being authorised at that moment: `409
+  payment_in_progress`, nothing changed; Stripe out of reach: `503
+  payment_unsettled`. A validation held on the stay is handed to the
+  release. A `stay_ended` event and a `stay.end` change-log line -- who and
+  when, as every line; the stay by its id, the cases it closed and no
   vehicle; `before: {open, entered_at, exit_at}`, `after: {open, outcome,
-  reason, entered_at, exit_at, owed_minor, currency}`.
+  reason, entered_at, exit_at, owed_minor, currency}`, with
+  `exit_cases_closed` when it closed a case and `paid_minor` when one had
+  paid.
 - **What an ended stay owes (0043).** A stay that `ended` owes what its exit
   would have charged at `left_at`: the exit's own quote -- the modules
   asked, then the rates, then the tax. Garage-pass answers for a lane and no
@@ -1839,7 +1898,8 @@ at, by, why}` when a person decided.
 
 The past stays (`GET /garages/:garageId/stays/closed`) carry `ended`, the
 reason, on a stay that was ended, and `owed_minor` beside a null `fee_minor`
-on one that owes, with `pass_unasked`. The database holds the shape: an ended stay is unpriced,
+on one that owes, with `pass_unasked`; a stay a person let out owing (0042)
+is `let_out_unpaid`, with what it owed as `owed_minor`. The database holds the shape: an ended stay is unpriced,
 has no exit lane or close event, a known reason, and who and why when a
 person decided; only a stay that `ended` may owe, in its own currency, a
 whole number of minor units, nothing when covered.

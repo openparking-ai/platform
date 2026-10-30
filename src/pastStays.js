@@ -105,7 +105,8 @@ export async function closedStays(client, tenantId, garageId, { from, to, limit,
             s.entry_at, s.exit_at, s.fee_minor, s.subtotal_minor, s.currency, s.exit_outcome,
             (s.pricing_refusal IS NOT NULL) AS pricing_refused, s.occupancy_at_entry_bp,
             s.ended->>'reason' AS ended, (s.ended->'owed'->>'pass_unasked')::boolean AS pass_unasked,
-            COALESCE(s.ended->'owed'->'fee_minor') AS owed_minor
+            (s.let_out IS NOT NULL) AS let_out_unpaid,
+            COALESCE(s.ended->'owed'->'fee_minor', s.let_out->'owed_minor') AS owed_minor
        FROM sessions s
       WHERE s.tenant_id = $1 AND s.garage_id = $2
         AND s.exit_at >= $3 AND s.exit_at < $4
@@ -130,12 +131,14 @@ export async function closedStays(client, tenantId, garageId, { from, to, limit,
  * how a stay no exit closed ended (0039) -- `superseded`, `ended` or
  * `abandoned` -- and is null on every stay an exit closed. `owed_minor` is
  * what a stay a person ended because the car left owes (0043) -- its
- * `fee_minor` stays null, because nothing was paid -- and null on every
- * other stay, or when the rates refused to price it. (Read from wherever a
- * stay keeps what it owes: one COALESCE, so another place is one more
- * argument.) `pass_unasked` is true on such a stay whose garage links a pass
- * and had no exit lane to ask it at, false when the pass was asked or none
- * is linked, and null where nothing is owed or it was not recorded.
+ * `fee_minor` stays null, because nothing was paid -- and what a stay a
+ * person let out owing (0042) owed. It is null on every other stay, or when
+ * the rates refused to price it. (Read from wherever a stay keeps what it
+ * owes: one COALESCE, so another place is one more argument.)
+ * `let_out_unpaid` is a stay a person let out owing, with nothing paid: its
+ * fee is null. `pass_unasked` is true on an ended stay whose garage links a
+ * pass and had no exit lane to ask it at, false when the pass was asked or
+ * none is linked, and null where nothing is owed or it was not recorded.
  */
 function present(row) {
   return {
@@ -149,6 +152,7 @@ function present(row) {
     // How full the garage was when the car came in (0034), or null.
     occupancy_at_entry_bp: row.occupancy_at_entry_bp,
     ended: row.ended,
+    let_out_unpaid: row.let_out_unpaid,
     owed_minor: row.owed_minor === null || row.owed_minor === undefined ? null : Number(row.owed_minor),
     pass_unasked: row.pass_unasked ?? null,
   };
