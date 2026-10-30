@@ -71,6 +71,7 @@ const SNAPSHOT_BLOCK = `        if (exitDescriptor !== null) {
           decidedBy,
           decisionInputs,
           validation: validated.record,
+          letOut,
         });
 `;
 
@@ -91,6 +92,7 @@ const BREAKS = [
           decidedBy,
           decisionInputs,
           validation: validated.record,
+          letOut,
         });
 
         if (exitDescriptor !== null) {

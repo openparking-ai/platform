@@ -279,17 +279,29 @@ test('ENDED: the car left when the person says, never before its entry or in the
   assert.equal(new Date((await stay(g, s.id)).exit_at).toISOString(), leftAt);
 });
 
-test('NOT WHILE A CAR IS AT AN EXIT on the stay, not another garage\'s stay, and an unread stay ends like any other', async () => {
+test('AN EXIT CASE LEFT OPEN never blocks the end: the end closes it, says so in the change log; not another garage\'s stay, and an unread stay ends like any other', async () => {
   const g = await garage('se-guards');
   const s = await open(g, { plate: plate(), entry_at: hoursAgo(100) });
-  await withTenant(g.tenant, (c) => c.query(
+  // A case the lane dropped when the car left the loop: no close ever came.
+  const exitId = (await withTenant(g.tenant, (c) => c.query(
     `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method, session_id)
-     VALUES ($1, $2, $3, 'se' || replace(gen_random_uuid()::text, '-', ''), now(), 'single', $4)`,
-    [g.tenant, g.id, g.world.exitLane, s.id]));
+     VALUES ($1, $2, $3, 'se' || replace(gen_random_uuid()::text, '-', ''), now(), 'single', $4) RETURNING id`,
+    [g.tenant, g.id, g.world.exitLane, s.id]))).rows[0].id;
   assert.equal((await stuckList(g)).stays[0].at_exit, true);
-  const atExit = await end(g, s.id, { outcome: 'abandoned', reason: 'x' });
-  assert.equal(atExit.status, 409);
-  assert.equal((await atExit.json()).code, 'stay_at_an_exit');
+  const atExit = await end(g, s.id, { outcome: 'abandoned', reason: 'left the loop, never came back' });
+  assert.equal(atExit.status, 200, await atExit.clone().text());
+  const after = await stay(g, s.id);
+  assert.deepEqual([after.ended.reason, after.ended.exit_cases], ['abandoned', [exitId]]);
+  const theCase = await withTenant(g.tenant, async (c) => (await c.query('SELECT * FROM exits WHERE id = $1', [exitId])).rows[0]);
+  assert.ok(theCase.closed_at, 'the case is closed');
+  assert.equal(theCase.close_event_id, null, 'by the platform, not by a lane close');
+  assert.deepEqual([theCase.ended.why, theCase.ended.by], ['stay_ended', 'key:desk']);
+  const line = await withTenant(g.tenant, async (c) => (await c.query(
+    `SELECT after FROM garage_changes WHERE tenant_id = $1 AND action = 'stay.end' AND subject_id = $2`, [g.tenant, s.id])).rows);
+  assert.equal(line.length, 1);
+  assert.deepEqual(line[0].after.exit_cases_closed, [{ exit_id: exitId, payment: null }]);
+  const listed = await (await call(g.op, 'GET', `/garages/${g.id}/exits`)).json();
+  assert.equal(listed.exits.some((e) => e.id === exitId), false, 'no longer at a lane for the attendant');
 
   // Another garage of the same account: the route names the garage, and a
   // stay of the other one is not found there.
