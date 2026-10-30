@@ -3558,8 +3558,13 @@ export function createApp() {
 
   operator.post('/garages/:garageId/walks/:walkId/sightings', readPicture, async (req, res, next) => {
     try {
-      if (!sightingLimiter.take(`${req.actor.kind}:${req.actor.id}`)) {
-        throw new HttpError(429, `at most ${walks.SIGHTINGS_PER_MINUTE} sightings a minute; send the rest in a minute`, 'too_many_sightings');
+      // The phone waits the `Retry-After` it is sent and keeps the picture
+      // until it is saved: whole seconds until this key's minute ends.
+      const limit = sightingLimiter.attempt(`${req.actor.kind}:${req.actor.id}`);
+      if (!limit.allowed) {
+        const refusal = new HttpError(429, `at most ${walks.SIGHTINGS_PER_MINUTE} sightings a minute; send the rest in a minute`, 'too_many_sightings');
+        refusal.retryAfter = limit.retryAfterSeconds;
+        throw refusal;
       }
       const ask = walks.sightingRequest(req.body);
       const takenAt = ask.takenAt === null ? new Date() : refuseFuture(parseTime(ask.takenAt, 'taken_at'), 'taken_at');
@@ -3615,7 +3620,7 @@ export function createApp() {
         }
         if (walkClosed(walk)) throw walkClosed(walk);
         if (await walks.sightingCount(client, req.tenantId, walk.id) >= walks.SIGHTINGS_MAX) {
-          throw conflict('too_many_sightings', `a walk holds at most ${walks.SIGHTINGS_MAX} sightings: finish it and start another`);
+          throw conflict('walk_full', `a walk holds at most ${walks.SIGHTINGS_MAX} sightings: finish it and start another`);
         }
         if (ask.confirms) {
           const earlier = await walks.getSighting(client, req.tenantId, walk.id, ask.confirms);
@@ -4016,6 +4021,10 @@ export function createApp() {
       return res.status(503).json(unavailableAnswer(err, req.method));
     }
     const status = err.status ?? 500;
+    // How long to wait, on a refusal that says so: whole seconds, at least 1.
+    if (err instanceof HttpError && Number.isInteger(err.retryAfter) && err.retryAfter >= 1 && (status === 429 || status === 503)) {
+      res.set('Retry-After', String(err.retryAfter));
+    }
     // A NAMED 5xx is ours and says what failed upstream -- Stripe refused, or
     // could not be reached -- and the operator needs that sentence. Anything
     // else at 5xx is an internal error and says nothing.

@@ -1879,10 +1879,13 @@ like that usually saw too little of the garage to feed the stuck list (see
   - `taken_at`: when the picture was taken (not in the future); the time it
     arrived otherwise.
   - Refused: `409 walk_finished` on a finished walk, `409 walk_abandoned` on
-    an abandoned one; `409 too_many_sightings` past 5000 on one walk;
-    `429 too_many_sightings` past `SIGHTINGS_PER_MINUTE` (120) a minute from
-    one key, before the picture is opened, since every picture is opened by
-    the same one-at-a-time decoder as the lanes' pictures;
+    an abandoned one; `409 walk_full` past 5000 on one walk (finish it and
+    start another); `429 too_many_sightings` past `SIGHTINGS_PER_MINUTE`
+    (120) a minute from one key, before the picture is opened, since every
+    picture is opened by the same one-at-a-time decoder as the lanes'
+    pictures -- with `Retry-After`, the whole seconds (at least 1) until that
+    key's minute ends: the phone waits that long and keeps the picture until
+    it is saved;
     `400 confirms_invalid` for `confirms` that is not a sighting of this walk and `409 sighting_already_confirmed` for one a
     later sighting already answers; `400 picture_invalid` for a picture that
     does not open; `503 reader_unanswered` when vehicle-id did not answer

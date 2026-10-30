@@ -15,7 +15,8 @@ import { randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import { createApp } from '../src/app.js';
 import { redactExpiredVehicles } from '../src/retention.js';
-import { WALK_ABANDON_HOURS, SIGHTINGS_PER_MINUTE, WALK_COMPLETE_DEFAULT_PERCENT } from '../src/walks.js';
+import { WALK_ABANDON_HOURS, SIGHTINGS_PER_MINUTE, SIGHTINGS_MAX, WALK_COMPLETE_DEFAULT_PERCENT } from '../src/walks.js';
+import { addressLimiter } from '../src/signIn.js';
 import { fold } from '../src/exitMatch.js';
 import {
   pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, activateGarage, superuserClient,
@@ -444,9 +445,46 @@ test(`TOO MANY SIGHTINGS: a key sends at most ${SIGHTINGS_PER_MINUTE} a minute, 
   const res = await sight(g, walk, picture());
   assert.equal(res.status, 429);
   assert.equal((await res.json()).code, 'too_many_sightings');
+  // The phone waits what it is told and keeps the picture: whole seconds, at least 1, within the minute.
+  const wait = res.headers.get('retry-after');
+  assert.match(wait ?? '', /^[1-9][0-9]*$/, `Retry-After in whole seconds, got ${wait}`);
+  assert.ok(Number(wait) >= 1 && Number(wait) <= 60, wait);
   assert.equal(reader.state.requests.length, 0);
   const other = await person(g, 'second desk');
   assert.equal((await sight(other, await startWalk(other), picture())).status, 201, "another key's minute is its own");
+});
+
+test('THE LIMIT\'S WAIT: whole seconds until the key\'s minute ends, rounded up, never 0; a new minute starts afresh', () => {
+  let at = 1_000_000;
+  const limiter = addressLimiter({ max: 2, windowSeconds: 60, now: () => at });
+  assert.deepEqual(limiter.attempt('k'), { allowed: true, resetAt: 1_060_000, retryAfterSeconds: 60 });
+  at += 100;
+  assert.equal(limiter.take('k'), true);
+  at += 30_050;
+  assert.deepEqual(limiter.attempt('k'), { allowed: false, resetAt: 1_060_000, retryAfterSeconds: 30 }, '29.85 s left is 30');
+  at = 1_059_999;
+  assert.equal(limiter.attempt('k').retryAfterSeconds, 1, 'a millisecond left is still a second');
+  assert.equal(limiter.attempt('other').allowed, true, "another key's minute is its own");
+  at = 1_060_000;
+  assert.deepEqual(limiter.attempt('k'), { allowed: true, resetAt: 1_120_000, retryAfterSeconds: 60 });
+});
+
+test('A WALK FULL at 5000 sightings: 409 walk_full -- not the 429 of a minute -- and no Retry-After, since waiting does not help', async () => {
+  readerOff();
+  const g = await garage('wk-full');
+  const walk = await startWalk(g);
+  await withTenant(g.tenant, (c) => c.query(
+    `INSERT INTO walk_sightings (tenant_id, walk_id, read, plate, taken_at, added_by)
+     SELECT $1, $2, 'typed', 'FUL' || n, now(), 'key:desk' FROM generate_series(1, $3::int) AS n`,
+    [g.tenant, walk.id, SIGHTINGS_MAX]));
+  const res = await sight(g, walk, typed('FUL0001X'));
+  assert.equal(res.status, 409, await res.clone().text());
+  const body = await res.json();
+  assert.equal(body.code, 'walk_full');
+  assert.match(body.error, /finish it and start another/);
+  assert.equal(res.headers.get('retry-after'), null);
+  const count = await withTenant(g.tenant, async (c) => Number((await c.query('SELECT count(*) FROM walk_sightings WHERE walk_id = $1', [walk.id])).rows[0].count));
+  assert.equal(count, SIGHTINGS_MAX, 'nothing more kept');
 });
 
 test('A PICK ON A FINISHED WALK: refused, and the finished lists keep the read unpicked', async () => {

@@ -54,6 +54,12 @@
  *   threshold_setting_unchecked the garage's walk threshold takes anything
  *   threshold_setting_dropped   the garage's walk threshold is never saved
  *   stuck_reason_not_seen       the stuck list sends `not_seen`, not `not_seen_on_walk`
+ *   sightings_unlimited         a key sends any number of sightings a minute
+ *   no_retry_after              the 429 for too many sightings says nothing of how long to wait
+ *   retry_after_unsent          the error answer drops a refusal's Retry-After
+ *   retry_after_zero            the wait is rounded down, to 0 in a minute's last second
+ *   walk_full_is_429_code       a full walk answers the 429's code, too_many_sightings
+ *   walk_never_full             a walk takes sightings past 5000
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with one
  * statement of 0040 edited, so the property genuinely never existed there.
@@ -267,8 +273,8 @@ const SOURCE_BREAKS = [
     name: 'sightings_unlimited',
     why: "a key sends any number of sightings a minute",
     file: 'src/app.js',
-    from: "      if (!sightingLimiter.take(`${req.actor.kind}:${req.actor.id}`)) {",
-    to: "      if (false) {",
+    from: '      if (!limit.allowed) {',
+    to: '      if (false) {',
   },
   {
     name: 'pick_on_finished',
@@ -493,6 +499,41 @@ const SOURCE_BREAKS = [
     file: 'src/app.js',
     from: "          before: null, after: { sighting: row.id, read: row.read, confirms: row.confirms, ...(",
     to: "          before: null, after: { sighting: row.id, read: row.read, plate: row.plate, confirms: row.confirms, ...(",
+  },
+  {
+    name: 'no_retry_after',
+    why: 'the 429 for too many sightings says nothing of how long to wait',
+    file: 'src/app.js',
+    from: '        refusal.retryAfter = limit.retryAfterSeconds;\n',
+    to: '',
+  },
+  {
+    name: 'retry_after_unsent',
+    why: "the error answer drops a refusal's Retry-After",
+    file: 'src/app.js',
+    from: "      res.set('Retry-After', String(err.retryAfter));",
+    to: '',
+  },
+  {
+    name: 'retry_after_zero',
+    why: "the wait is rounded down, to 0 in a minute's last second",
+    file: 'src/signIn.js',
+    from: '      retryAfterSeconds: Math.max(1, Math.ceil((entry.resetAt - at) / 1000)),',
+    to: '      retryAfterSeconds: Math.floor((entry.resetAt - at) / 1000),',
+  },
+  {
+    name: 'walk_full_is_429_code',
+    why: "a full walk answers the 429's code, too_many_sightings",
+    file: 'src/app.js',
+    from: "          throw conflict('walk_full', ",
+    to: "          throw conflict('too_many_sightings', ",
+  },
+  {
+    name: 'walk_never_full',
+    why: 'a walk takes sightings past 5000',
+    file: 'src/app.js',
+    from: '        if (await walks.sightingCount(client, req.tenantId, walk.id) >= walks.SIGHTINGS_MAX) {',
+    to: '        if (false) {',
   },
 ];
 
