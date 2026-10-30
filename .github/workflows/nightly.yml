@@ -119,6 +119,8 @@ jobs:
         run: npm run fill-rule-fail-control
       - name: Pictures-and-bans fail-control
         run: npm run bans-fail-control
+      - name: Picture-retention fail-control
+        run: npm run picture-retention-fail-control
       - name: Rates-and-open fail-control
         run: npm run rates-and-open-fail-control
       - name: Owner-language fail-control

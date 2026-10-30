@@ -790,10 +790,10 @@ garage or all their garages; a ban lasts until someone takes the car off; no car
 
 - **Pictures** (`entry_pictures`) are kept against the lane's event id of the entry record: a stay's open, a
   crossing no car made, a banned car refused. Since 0036 a stay's pictures include the arming read's, the
-  ones its car was identified from. `npm run purge` removes them **30 days** after the stay that holds them
-  closed, or 30 days after they were taken when no stay holds them (the owner's answer of 2026-10-26; it was
-  one week). It is one number for every garage (`PICTURE_DAYS`); a longer keep for a garage that pays for
-  storage is not built. A car still inside keeps its pictures, and so does a car on the list.
+  ones its car was identified from. They are removed **30 days** after they were taken (the owner's answer
+  of 2026-10-26; it was one week), by the picture job, *Picture retention* below. A car still inside keeps
+  its pictures, then for 30 days after it left, and for as long as its customer has paid picture storage; a
+  car on the list keeps them.
 - **A tailgater stay** is opened with `tailgater: true` and prices at the exit as any other: a car no vend let
   in whose plate was READ. Since 0036 the lane opens a stay for every car through the gate that no open command
   let in, read or not, and marks it `no_open_command: true` -- its own field: a car nobody could read is a stay
@@ -1968,8 +1968,9 @@ like that usually saw too little of the garage to feed the stuck list (see
     It is opened and written fresh (no metadata, no location), sent to the
     deployment's vehicle-id to read. That fresh picture is kept
     `PICTURE_DAYS` (30) from when it was taken, as a lane's picture is, so a
-    person can look at it again; then it is forgotten and the sighting keeps
-    what was read. The reader is fast-alpr, the one plate reader.
+    person can look at it again -- longer when a finished walk listed it as
+    seeing a stay (*Picture retention*) -- then it is forgotten and the
+    sighting keeps what was read. The reader is fast-alpr, the one plate reader.
   - `plate`: a plate the person typed or confirmed, with `confirmed: true`
     (`400 plate_not_confirmed` without it): letters and digits, 1 to 10 once
     spaces and dashes are taken out. A sighting with a plate is matched on
@@ -1993,10 +1994,13 @@ like that usually saw too little of the garage to feed the stuck list (see
   - `taken_at`: when the picture was taken (not in the future); the time it
     arrived otherwise.
   - Refused: `409 walk_finished` on a finished walk, `409 walk_abandoned` on
-    an abandoned one; `409 too_many_sightings` past 5000 on one walk;
-    `429 too_many_sightings` past `SIGHTINGS_PER_MINUTE` (120) a minute from
-    one key, before the picture is opened, since every picture is opened by
-    the same one-at-a-time decoder as the lanes' pictures;
+    an abandoned one; `409 walk_full` past 5000 on one walk (finish it and
+    start another); `429 too_many_sightings` past `SIGHTINGS_PER_MINUTE`
+    (120) a minute from one key, before the picture is opened, since every
+    picture is opened by the same one-at-a-time decoder as the lanes'
+    pictures -- with `Retry-After`, the whole seconds (at least 1) until that
+    key's minute ends: the phone waits that long and keeps the picture until
+    it is saved;
     `400 confirms_invalid` for `confirms` that is not a sighting of this walk and `409 sighting_already_confirmed` for one a
     later sighting already answers; `400 picture_invalid` for a picture that
     does not open; `503 reader_unanswered` when vehicle-id did not answer
@@ -2094,11 +2098,40 @@ share.
 The walks hold plates and are personal data: a walk is deleted with its
 sightings once it finished or was abandoned -- or, neither, started --
 longer ago than the tenant's retention window (`retention_days`), in the
-same purge as the vehicles. That purge also forgets each walk picture past
-its 30 days. **Not built yet:** keeping a walk picture with a stay a person
-ended, or with an exit decision, beyond those 30 days, and keeping pictures
-longer where the garage pays for storage. Today every walk picture goes at
-30 days.
+same purge as the vehicles -- and not while one of its pictures is still
+kept: deleting the walk would take the picture with it. Its pictures go by
+the picture job (*Picture retention*). One car's kept picture does not keep
+the others' plates (0046): past the window, a sighting whose picture is gone
+has its plate, its characters and the readers' plates blanked
+(`plate_blanked_at`), and the lists keep a plate only on the
+`seen_with_stay` row of the stay that keeps the picture; rows, stay ids and
+what was read stay. The freeze triggers allow exactly that blanking on a
+closed walk, and nothing else.
+
+### Picture retention
+
+The lane's pictures (`entry_pictures`, 0033) and the walk's (0040) are
+removed by one scheduled job, `npm run purge-pictures`, daily (`npm run
+purge` runs it too, first), one tenant at a time under that tenant's row
+security. It prints one line, counts only: `pictures: N tenant(s); removed
+L lane picture(s) and W walk picture(s).`
+
+- **30 days after it was taken**, a picture goes. A day is 24 hours,
+  whatever the database's time zone; the 30th day over is gone, so a
+  picture exactly 30 days old is removed and one a second younger is kept.
+- **A stay keeps the pictures it holds**: the lane's of its entry, and a
+  walk's that a finished walk listed as seeing it (in `seen_with_stay`,
+  itself or through the typed plate that answered it). It keeps them while
+  the car is inside, then for 30 days after it left -- by the exit, or by a
+  person ending it -- and while its customer has paid picture storage.
+- **Paid storage** is `sessions.pictures_paid_until` (0041): the time up to
+  which the stay's customer has paid to keep its pictures. **Nothing writes
+  it yet**: a storage fee is money, taken where a stay's money is (the
+  payment at the exit), and that payment does not take one.
+- **A car on the banned list** keeps its lane pictures while listed.
+- **An exit decision** keeps no picture of its own: no exit case points at
+  a walk picture. The walk pictures of the stay it closed are the stay's,
+  kept with the stay, as above.
 
 ## Deploying
 
