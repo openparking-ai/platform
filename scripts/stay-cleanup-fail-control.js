@@ -3,7 +3,8 @@
  * The control for the garage clean-up (0043).
  *
  * Every property below is broken, one at a time, and `test/stay-cleanup.test.js`
- * with `test/change-log.test.js` is REQUIRED to go red -- with at least one
+ * with `test/stay-cleanup-passes.test.js` (the real garage-pass) and
+ * `test/change-log.test.js` is REQUIRED to go red -- with at least one
  * test still green, so a break that stops the files running is not mistaken
  * for one the tests caught. A pass is the failure.
  *
@@ -28,6 +29,14 @@
  *   line_owed_missing           the change-log line does not say what the stay owes
  *   line_names_plate            the change-log line names the car's plate
  *   event_owed_missing          the stay's event does not say what it owes
+ *   pass_never_asked            a pass holder a person ended is priced with no lane to ask the pass at
+ *   pass_first_lane_only        the pass is asked at the garage's first exit lane only
+ *   pass_unasked_unsaid         a pass not asked for want of an exit lane is not said
+ *   pass_unasked_not_answered   the end's answer does not say the pass was not asked
+ *   past_pass_unasked_missing   the past stays do not say the pass was not asked
+ *   owed_record_dropped         what the modules said is not kept on what an ended stay owes
+ *   owed_record_kept_forever    what the modules said outlives the vehicle's retention window
+ *   ended_pass_always_covers    a pass asked at the exit lanes covers a car it does not cover
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with one
  * statement of 0043 edited, so the property genuinely never existed there.
@@ -137,8 +146,8 @@ const SOURCE_BREAKS = [
     name: 'owed_at_now',
     why: 'an ended stay is priced to now, not to when the car left',
     file: 'src/app.js',
-    from: '  const quote = await quoteStay(client, { tenantId, garage, laneId: null, session: stay, vehicle, exitAt: leftAt });',
-    to: '  const quote = await quoteStay(client, { tenantId, garage, laneId: null, session: stay, vehicle, exitAt: leftAt && new Date() });',
+    from: '    tenantId, garage, laneId: null, exitLaneIds: rows.map((r) => r.id), session: stay, vehicle, exitAt: leftAt,',
+    to: '    tenantId, garage, laneId: null, exitLaneIds: rows.map((r) => r.id), session: stay, vehicle, exitAt: leftAt && new Date(),',
   },
   {
     name: 'past_owed_missing',
@@ -182,6 +191,62 @@ const SOURCE_BREAKS = [
     from: 'exit_at: row.exit_at, owed_minor: owedMinor },',
     to: 'exit_at: row.exit_at },',
   },
+  {
+    name: 'pass_never_asked',
+    why: 'a pass holder a person ended is priced with no lane to ask the pass at',
+    file: 'src/app.js',
+    from: '    tenantId, garage, laneId: null, exitLaneIds: rows.map((r) => r.id), session: stay,',
+    to: '    tenantId, garage, laneId: null, exitLaneIds: [], session: stay,',
+  },
+  {
+    name: 'pass_first_lane_only',
+    why: "the pass is asked at the garage's first exit lane only",
+    file: 'src/entitlement.js',
+    from: '      for (const lane of lanes) {',
+    to: '      for (const lane of lanes.slice(0, 1)) {',
+  },
+  {
+    name: 'pass_unasked_unsaid',
+    why: 'a pass not asked for want of an exit lane is not said',
+    file: 'src/entitlement.js',
+    from: "        record[module] = { consulted: false, unasked: true, reason: 'no exit lane to ask at",
+    to: "        record[module] = { consulted: false, reason: 'no exit lane to ask at",
+  },
+  {
+    name: 'pass_unasked_not_answered',
+    why: "the end's answer does not say the pass was not asked",
+    file: 'src/stuckStays.js',
+    from: '    pass_unasked: owed ? owed.pass_unasked === true : null,',
+    to: '    pass_unasked: owed ? false : null,',
+  },
+  {
+    name: 'past_pass_unasked_missing',
+    why: 'the past stays do not say the pass was not asked',
+    file: 'src/pastStays.js',
+    from: '    pass_unasked: row.pass_unasked ?? null,',
+    to: '    pass_unasked: null,',
+  },
+  {
+    name: 'owed_record_dropped',
+    why: 'what the modules said is not kept on what an ended stay owes',
+    file: 'src/stuckStays.js',
+    from: '    entitlement: quote.entitlement ?? null,',
+    to: '',
+  },
+  {
+    name: 'ended_pass_always_covers',
+    why: 'a pass asked at the exit lanes covers a car it does not cover',
+    file: 'src/entitlement.js',
+    from: "      if (atLanes.some((a) => a.covered)) coveredBy.push('garage_pass');",
+    to: "      coveredBy.push('garage_pass');",
+  },
+  {
+    name: 'owed_record_kept_forever',
+    why: "what the modules said outlives the vehicle's retention window",
+    file: 'src/retention.js',
+    from: "        `UPDATE sessions SET ended = ended #- '{owed,entitlement}'",
+    to: '        `UPDATE sessions SET ended = ended',
+  },
 ];
 
 const ADDED_0043 = '0043_stay_cleanup.sql';
@@ -223,7 +288,7 @@ const SCHEMA_BREAKS = [
   },
 ];
 
-const SUITE = ['--test', 'test/stay-cleanup.test.js', 'test/change-log.test.js'];
+const SUITE = ['--test', 'test/stay-cleanup.test.js', 'test/stay-cleanup-passes.test.js', 'test/change-log.test.js'];
 
 function stage() {
   const dir = mkdtempSync(join(tmpdir(), 'openparking-stay-cleanup-control-'));

@@ -74,7 +74,7 @@ export function endRequest(body, parseTime) {
   if (!OUTCOMES.includes(outcome)) throw bad(`outcome must be one of ${OUTCOMES.join(', ')}`, 'outcome_invalid');
   const reason = body?.reason;
   if (typeof reason !== 'string' || reason.trim().length === 0 || reason.length > REASON_MAX) {
-    throw bad(`reason is required: why the stay is ended, at most ${REASON_MAX} characters`, 'reason_required');
+    throw bad(`reason is required: why the stay is ended, at most ${REASON_MAX} characters; no plate -- the reason goes to the change log`, 'reason_required');
   }
   if (CONTROL.test(reason)) {
     throw bad('reason must be words on one line: no line breaks or control characters', 'reason_invalid');
@@ -202,6 +202,13 @@ export function owedOf(quote) {
     plan_version: quote.plan_version ?? null,
     covered_by: quote.covered_by,
     refused: !covered && quote.refusal !== null,
+    // A pass the garage links was not asked: the garage has no exit lane to
+    // ask it at. The admin shows it beside what is owed.
+    pass_unasked: quote.entitlement?.garage_pass?.unasked === true,
+    // What each module was asked and said, kept as the close keeps it on a
+    // stay an exit closed (0015). It names the car: the retention purge
+    // takes it out with the vehicle (src/retention.js).
+    entitlement: quote.entitlement ?? null,
   };
 }
 
@@ -214,6 +221,9 @@ export function presentEnded(s) {
     exit_at: s.exit_at,
     ended: s.ended,
     owed_minor: owed ? owed.fee_minor : null,
+    // True when the garage links a pass and had no exit lane to ask it at:
+    // what is owed was priced without it. Null on a stay that owes nothing.
+    pass_unasked: owed ? owed.pass_unasked === true : null,
     currency: s.currency,
   };
 }

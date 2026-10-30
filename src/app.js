@@ -4257,10 +4257,10 @@ async function priceStay({ garage, plans, session, exitAt }) {
  * about by the modules (they hold plates), so it prices as a transient and
  * says why. `vehicle` null: the driver's word, which no module is asked about.
  */
-async function quoteStay(client, { tenantId, garage, laneId, session, vehicle, exitAt }) {
+async function quoteStay(client, { tenantId, garage, laneId, exitLaneIds = null, session, vehicle, exitAt }) {
   const identity = vehicle?.plate ?? vehicle?.ticket_ref ?? null;
   const asked = identity
-    ? await entitlement.consult({ garage, identity, laneId, entryAt: session.entry_at, exitAt })
+    ? await entitlement.consult({ garage, identity, laneId, exitLaneIds, entryAt: session.entry_at, exitAt })
     : {
         outcome: entitlement.EXIT_OUTCOMES.TRANSIENT,
         covered_by: [],
@@ -4304,12 +4304,21 @@ async function quoteStay(client, { tenantId, garage, laneId, session, vehicle, e
 
 /**
  * WHAT A STAY A PERSON ENDED OWES (0043): the exit's own quote at the time
- * the person said the car left. No exit lane was crossed, so garage-pass,
- * which answers for a lane, is not asked; monthly billing is.
+ * the person said the car left. No exit lane was crossed, and garage-pass
+ * answers for a lane: it is asked at each of the garage's exit lanes, and a
+ * pass any of them covers covers the stay, as it would have at the exit.
+ * With no exit lane it is not asked, and the ending says so
+ * (`pass_unasked`). Monthly billing is asked as at any exit.
  */
 async function owedForEnded(client, { tenantId, garage, stay, leftAt }) {
   const vehicle = await exits.vehicleOf(client, tenantId, stay.vehicle_id);
-  const quote = await quoteStay(client, { tenantId, garage, laneId: null, session: stay, vehicle, exitAt: leftAt });
+  const { rows } = await client.query(
+    `SELECT id FROM lanes WHERE tenant_id = $1 AND garage_id = $2 AND direction = 'exit' ORDER BY created_at, id`,
+    [tenantId, garage.id],
+  );
+  const quote = await quoteStay(client, {
+    tenantId, garage, laneId: null, exitLaneIds: rows.map((r) => r.id), session: stay, vehicle, exitAt: leftAt,
+  });
   return stuck.owedOf(quote);
 }
 

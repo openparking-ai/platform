@@ -140,17 +140,17 @@ export async function startEntitlementModules() {
         throw new Error(`garage-pass ${argv[0]} exited ${err.code}: ${err.stdout}\n${err.stderr}`);
       }
     },
-    async gpGarage(id, timezone = 'America/New_York') {
+    async gpGarage(id, timezone = 'America/New_York', { transientAvailable = true } = {}) {
       const file = join(process.env.TMPDIR || '/tmp', `gp-garage-${randomUUID()}.json`);
-      await (await import('node:fs/promises')).writeFile(file, JSON.stringify({ id, timezone, transient_available: true }));
+      await (await import('node:fs/promises')).writeFile(file, JSON.stringify({ id, timezone, transient_available: transientAvailable }));
       return this.gp('create-garage', '--garage', file);
     },
-    async gpPass(passId, garages, { validFrom = '2026-01-01', validTo = '2026-12-31', state = 'active' } = {}) {
+    async gpPass(passId, garages, { validFrom = '2026-01-01', validTo = '2026-12-31', state = 'active', allowedLanes = null } = {}) {
       const file = join(process.env.TMPDIR || '/tmp', `gp-pass-${randomUUID()}.json`);
       await (await import('node:fs/promises')).writeFile(file, JSON.stringify({
         id: passId, garage_ids: garages, label: 'Fleet',
         holder: { email: 'holder@example.com', name: 'A Holder', phone: null },
-        terms: { valid_from: validFrom, valid_to: validTo, windows: [], max_stay_minutes: null, visit_allowance: null, directions: ['entry', 'exit'], allowed_lanes: null },
+        terms: { valid_from: validFrom, valid_to: validTo, windows: [], max_stay_minutes: null, visit_allowance: null, directions: ['entry', 'exit'], allowed_lanes: allowedLanes },
         state,
       }));
       return this.gp('create-pass', '--garage', garages[0], '--pass', file, '--by', 'the harness', '--at', '2026-01-01T00:00:00+00:00');

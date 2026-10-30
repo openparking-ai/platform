@@ -17,6 +17,7 @@ import { createApp } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
+import { redactExpiredVehicles } from '../src/retention.js';
 
 let engine;
 let server;
@@ -185,8 +186,9 @@ test('EACH LISTED STAY CARRIES ITS ENTRY: when, the plate as read, the lane, and
 
 test('END: the car left at the chosen time and owes exactly what its exit then would have charged; the stay stays unpriced and nothing is charged', async () => {
   const g = await garage('cl-end');
-  const entryAt = hoursAgo(100);
+  // From one instant: two readings of the clock a millisecond apart are 50 hours and a millisecond, a 51st hour.
   const leftAt = hoursAgo(50);
+  const entryAt = new Date(new Date(leftAt).getTime() - 50 * 3600_000).toISOString();
   const closedPlate = plate();
   await open(g, { plate: closedPlate, entry_at: entryAt });
   const exitRes = await close(g, { plate: closedPlate, exit_at: leftAt });
@@ -225,6 +227,30 @@ test('END AN UNREAD CAR: priced as a car nobody could ask a pass about, and owed
   assert.equal(res.status, 200, await res.clone().text());
   assert.equal((await res.json()).stay.owed_minor, 750);
   assert.equal((await stay(g, s.id)).ended.owed.outcome, 'transient');
+});
+
+test('WHAT THE MODULES SAID is kept on what an ended stay owes, and goes with the vehicle at the retention window; what it owed stays', async () => {
+  const g = await garage('cl-owed-record');
+  const carPlate = plate();
+  const at = Date.now();
+  const s = await open(g, { plate: carPlate, entry_at: new Date(at - 80 * 3600_000).toISOString() });
+  const res = await end(g, s.id, { outcome: 'ended', reason: 'gone', left_at: new Date(at - 76 * 3600_000).toISOString() });
+  assert.equal(res.status, 200, await res.clone().text());
+  const body = (await res.json()).stay;
+  assert.deepEqual([body.owed_minor, body.pass_unasked], [1000, false], 'no pass linked: nothing unasked');
+  const before = (await stay(g, s.id)).ended.owed;
+  assert.equal(before.entitlement.identity, carPlate, 'the record names what was asked about');
+  assert.deepEqual(Object.keys(before.entitlement).sort(), ['asked_at', 'covered_by', 'garage_pass', 'identity', 'monthly_billing']);
+
+  await withTenant(g.tenant, (c) => c.query(
+    `INSERT INTO tenant_settings (tenant_id, vehicle_retention_days) VALUES ($1, 1)
+     ON CONFLICT (tenant_id) DO UPDATE SET vehicle_retention_days = 1`, [g.tenant]));
+  const purged = await redactExpiredVehicles(g.tenant);
+  assert.ok(purged.redacted >= 1);
+  const after = (await stay(g, s.id)).ended;
+  assert.equal(after.owed.entitlement, undefined, 'out with the vehicle');
+  assert.deepEqual([after.owed.fee_minor, after.owed.outcome, after.reason], [1000, 'transient', 'ended'], 'what it owed is kept');
+  assert.ok(!JSON.stringify(after).includes(carPlate));
 });
 
 test('ABANDON: written off, owing nothing -- no price on the stay and none owed', async () => {

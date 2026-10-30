@@ -1808,7 +1808,10 @@ at, by, why}` when a person decided.
   before its entry, not in the future) or `"abandoned"` (the car is gone and
   nobody knows when; no `left_at`). `reason` is required, at most 500
   characters on one line (`400 reason_invalid` for a line break or a
-  control character), and kept as typed: a screen shows it as text. Once: an
+  control character), and kept as typed: a screen shows it as text. **It
+  goes into the change log as typed, so it must not name the car**: a
+  screen that asks for it says so in its help text ("why the stay ended --
+  do not type the plate: the reason goes to the change log"). Once: an
   ended stay is `409 stay_not_open`. Not while a car is at an exit on that
   stay (`409 stay_at_an_exit`: the exit decides). A validation held on the
   stay is handed to the release. A `stay_ended` event and a `stay.end`
@@ -1816,11 +1819,18 @@ at, by, why}` when a person decided.
   vehicle; `before: {open, entered_at, exit_at}`, `after: {open, outcome,
   reason, entered_at, exit_at, owed_minor, currency}`.
 - **What an ended stay owes (0043).** A stay that `ended` owes what its exit
-  would have charged at `left_at`: the exit's own quote -- monthly billing
+  would have charged at `left_at`: the exit's own quote -- the modules
   asked, then the rates, then the tax. Garage-pass answers for a lane and no
-  lane was crossed, so it is not asked, and the record says so. It is kept
-  on `ended.owed` (`{outcome, fee_minor, subtotal_minor, currency, breakdown,
-  plan_version, covered_by, refused}`) and answered as `owed_minor`: 0 when
+  lane was crossed, so it is asked at **each of the garage's exit lanes**,
+  and a pass any of them covers covers the stay, as it would have at the
+  exit (the record lists the lanes asked, `asked_at_lanes`). A garage with
+  no exit lane has nowhere to ask: the pass is not asked, and the ending
+  says so -- `pass_unasked: true`, on `ended.owed`, in the end's answer and
+  in the past stays -- so a person can see what was priced without it. It
+  is kept on `ended.owed` (`{outcome, fee_minor, subtotal_minor, currency,
+  breakdown, plan_version, covered_by, refused, pass_unasked, entitlement}`;
+  `entitlement` is what each module was asked and said, and the retention
+  purge takes it out with the vehicle) and answered as `owed_minor`: 0 when
   covered, null when the rates refused to price it. **Nothing is charged**,
   whatever card the car has: the stay stays unpriced (`fee_minor` is what a
   stay paid at its exit), and the garage collects what it owes its own way.
@@ -1829,7 +1839,7 @@ at, by, why}` when a person decided.
 
 The past stays (`GET /garages/:garageId/stays/closed`) carry `ended`, the
 reason, on a stay that was ended, and `owed_minor` beside a null `fee_minor`
-on one that owes. The database holds the shape: an ended stay is unpriced,
+on one that owes, with `pass_unasked`. The database holds the shape: an ended stay is unpriced,
 has no exit lane or close event, a known reason, and who and why when a
 person decided; only a stay that `ended` may owe, in its own currency, a
 whole number of minor units, nothing when covered.
