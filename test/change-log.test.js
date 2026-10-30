@@ -434,6 +434,70 @@ const WRITES = [
     state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM banned_vehicles WHERE id = $1', [s.ban.id]),
   },
   {
+    action: 'exit.let_out',
+    // A car at an exit that found no stay (0037), written as the lane's ask
+    // writes it, and let out by a person.
+    setup: async () => {
+      const g = await newGarage(base, a);
+      const lane = await newLane(base, a, g.id, 'Out', 'exit');
+      const exit = await withTenant(a.tenant, async (c) => (await c.query(
+        `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+         VALUES ($1, $2, $3, 'cl' || replace(gen_random_uuid()::text, '-', ''), now(), 'none') RETURNING id`,
+        [a.tenant, g.id, lane.id])).rows[0]);
+      return { g, exit };
+    },
+    run: (s) => call(base, 'POST', `/garages/${s.g.id}/exits/${s.exit.id}/let-out`, { as: a, body: { reason: 'paper ticket shown' } }),
+    line: (l, s) => assert.deepEqual([l.subject_kind, l.subject_id, l.before, l.after], ['exit', s.exit.id, { let_out: false }, { let_out: true, reason: 'paper ticket shown' }]),
+    state: (s) => one(a.tenant, "SELECT person->>'reason' AS reason FROM exits WHERE id = $1", [s.exit.id]),
+  },
+  {
+    action: 'exit.payment_start',
+    // A case that owes a fee (0038), paid at a phone reader: the line is
+    // written when the payment is started, once.
+    setup: async () => {
+      const s = await paidGarage();
+      const entry = await newLane(base, a, s.g.id, 'Pay entry', 'entry');
+      const exit = await withTenant(a.tenant, async (c) => {
+        const stay = (await c.query(
+          `WITH v AS (INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'CL-' || gen_random_uuid()) RETURNING id)
+           INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency, open_event_id, entry_confirmation)
+           SELECT $1, $2, v.id, $3, now() - interval '2 hours', 'USD', gen_random_uuid()::text, 'confirmed' FROM v RETURNING id`,
+          [a.tenant, s.g.id, entry.id])).rows[0].id;
+        return (await c.query(
+          `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method, session_id, quote)
+           VALUES ($1, $2, $3, 'cl' || replace(gen_random_uuid()::text, '-', ''), now(), 'single', $4,
+                   '{"outcome": "transient", "fee_minor": 500, "currency": "USD"}') RETURNING id`,
+          [a.tenant, s.g.id, s.exit.id, stay])).rows[0];
+      });
+      return { ...s, exitCase: exit };
+    },
+    run: (s) => call(base, 'POST', `/garages/${s.g.id}/exits/${s.exitCase.id}/pay`, { as: a }),
+    line: (l, s) => assert.deepEqual([l.subject_kind, l.subject_id, l.before, l.after],
+      ['exit', s.exitCase.id, { payment: null }, { payment: 'started', amount_minor: 500, currency: 'usd', channel: 'phone_reader' }]),
+    state: (s) => one(a.tenant, 'SELECT count(*)::int AS n FROM exit_payments WHERE exit_id = $1', [s.exitCase.id]),
+  },
+  {
+    action: 'stay.end',
+    // A stay nothing closed (0039), abandoned by a person: the line names
+    // the stay by its id and no vehicle.
+    setup: async () => {
+      const g = await newGarage(base, a);
+      const entry = await newLane(base, a, g.id, 'Stuck entry', 'entry');
+      const stay = await withTenant(a.tenant, async (c) => (await c.query(
+        `WITH v AS (INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'CL-' || gen_random_uuid()) RETURNING id)
+         INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency, open_event_id, entry_confirmation)
+         SELECT $1, $2, v.id, $3, now() - interval '5 days', 'USD', gen_random_uuid()::text, 'confirmed' FROM v RETURNING id`,
+        [a.tenant, g.id, entry.id])).rows[0]);
+      return { g, stay };
+    },
+    run: (s) => call(base, 'POST', `/garages/${s.g.id}/stays/${s.stay.id}/end`, { as: a, body: { outcome: 'abandoned', reason: 'not seen on three walks' } }),
+    line: (l, s) => {
+      assert.deepEqual([l.subject_kind, l.subject_id, l.subject_name, l.before], ['stay', s.stay.id, null, { open: true }]);
+      assert.deepEqual([l.after.open, l.after.outcome, l.after.reason], [false, 'abandoned', 'not seen on three walks']);
+    },
+    state: (s) => one(a.tenant, "SELECT ended->>'reason' AS reason FROM sessions WHERE id = $1", [s.stay.id]),
+  },
+  {
     action: 'lane.board_prices',
     setup: async () => {
       const g = await newGarage(base, a);
@@ -471,7 +535,7 @@ function routeTable(expressApp) {
   return out;
 }
 
-test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 31 -- and every one has a recipe here, or is always refused', () => {
+test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 34 -- and every one has a recipe here, or is always refused', () => {
   const reads = READ_POSTS.map(([m, p]) => `${m} ${p}`);
   const writes = routeTable(expressApp).filter((r) => r.mount === '/api/v1' && r.method !== 'GET').map((r) => `${r.method} ${r.path}`);
   assert.deepEqual(writes.filter((w) => !reads.includes(w)).sort(), WRITE_ROUTES.map(([m, p]) => `${m} ${p}`).sort());
@@ -481,13 +545,15 @@ test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 
   // 22 from U4, U4b's four: a person added, changed, removed, and what they
   // get; and U4c's four: a board message added, changed, removed, and a
   // lane's price switch.
-  // And U7f's one: a banned car taken off the list.
-  assert.equal(WRITE_ROUTES.length, 31);
+  // And U7f's one: a banned car taken off the list; and 0037's: a car at an
+  // exit let out by a person; 0038's: a payment started at a phone reader;
+  // and 0039's: a stay nothing closed, ended by a person.
+  assert.equal(WRITE_ROUTES.length, 34);
   const covered = new Set([...WRITES.map((w) => w.action), ...ALWAYS_REFUSED]);
   assert.deepEqual(WRITE_ROUTES.map(([, , action]) => action).filter((x) => !covered.has(x)), [], 'a write route with no recipe here');
   // The owner's one write outside the operator router: the language.
   assert.deepEqual(routeTable(expressApp).filter((r) => r.mount === '/api/v1/auth' && r.method === 'PUT').map((r) => r.path), ['/language']);
-  assert.equal(WRITES.length, 31, '30 operator writes that can succeed, and the language: 32 writes with the retired rates route');
+  assert.equal(WRITES.length, 34, '33 operator writes that can succeed, and the language: 35 writes with the retired rates route');
 });
 
 test('EVERY WRITE: one change, exactly one line -- who, what, before and after -- by the session, and by the key the same way', async () => {

@@ -5,6 +5,8 @@
  * context is set and the queries still carry their own `WHERE tenant_id = $1`.
  * Two independent controls, as docs/RLS_TEMPLATE.md requires.
  */
+import { randomUUID } from 'node:crypto';
+import { startSetting } from './startSettings.js';
 
 const VEHICLE_COLUMNS = 'id, plate, plate_region, ticket_ref, make, model, color';
 
@@ -123,7 +125,7 @@ export async function openSession(
   tenantId,
   {
     garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation, entryDescriptor = null, tailgater = false,
-    noOpenCommand = false, entryUnsurePlate = null, entryUnsurePlateConfidence = null,
+    noOpenCommand = false, entryUnsurePlate = null, entryUnsurePlateConfidence = null, entryId = null,
   },
 ) {
   // Keyed on the event, so a replay is recognised whether the session it
@@ -140,39 +142,63 @@ export async function openSession(
       conflict.code = 'EVENT_ID_VEHICLE_CONFLICT';
       throw conflict;
     }
-    return { session: alreadyOpened, created: false };
+    return { session: alreadyOpened, created: false, superseded: [] };
   }
-
-  const existing = await findOpenSession(client, tenantId, garageId, vehicleId);
-  if (existing) return { session: existing, created: false };
 
   // HOW FULL THE GARAGE WAS WHEN THIS CAR CAME IN (0034), counted behind the
   // garage's lock: a second open of the same garage waits here until this one
   // commits, then counts this car too -- two lanes opening at once see n and
-  // n+1, never n twice. Read here and nowhere else; no lane sends it.
+  // n+1, never n twice. The car's own stays are read behind it too.
   await lockGarageOpens(client, garageId);
-  const occupancyAtEntryBp = await occupancyNow(client, tenantId, garageId);
+
+  // THE SAME CAR AGAIN (0039): one vehicle row is one whole plate or ticket,
+  // and an unread car is a row of its own (0036). Two entries within one
+  // arrival (REAPPROACH_MINUTES) are one stay. Further apart, the old stay
+  // had ended by the later entry: it is ended as superseded and the new
+  // visit gets its own stay. Never folded into the old one, which would bill
+  // the new visit from the old entry.
+  const existing = await findOpenSession(client, tenantId, garageId, vehicleId);
+  if (existing && Math.abs(entryAt - existing.entry_at) <= reapproachMinutes() * 60_000) {
+    return { session: existing, created: false, superseded: [] };
+  }
+  const id = randomUUID();
+  // An entry earlier than a stay of the car already here -- the one open now,
+  // or one already closed -- is an earlier visit arriving late: it is stored
+  // ended, superseded by the next of them.
+  const endedBy = await nextStayOf(client, tenantId, garageId, vehicleId, entryAt);
 
   // The check above handles the ordinary replay. This savepoint handles the
   // race: two lanes, or a retry arriving while the first request is still in
   // flight. Without it, the unique violation aborts the whole transaction and
   // the recovery SELECT fails with 25P02 instead of returning the session --
-  // a replayed entry then 500s and the lane retries it forever.
+  // a replayed entry then 500s and the lane retries it forever. Taken before
+  // the old stay is ended, so a race undoes that too.
   await client.query('SAVEPOINT open_session');
   try {
+    const superseded = existing && existing.entry_at < entryAt
+      ? [await endStay(client, tenantId, existing.id, { reason: 'superseded', exitAt: entryAt, record: { by_session: id } })].filter(Boolean)
+      : [];
+    // Counted at the car's own entry, not when its open arrived: a lane
+    // that delivers late counts the cars that were in when this one came in.
+    const occupancyAtEntryBp = await occupancyAt(client, tenantId, garageId, entryAt);
+    const ended = endedBy ? endedRecord('superseded', { by_session: endedBy.id }) : null;
     const { rows } = await client.query(
-      `INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+      `INSERT INTO sessions (id, tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
                              open_event_id, entry_confirmation, entry_descriptor, tailgater,
                              occupancy_at_entry_bp, no_open_command, entry_unsure_plate,
-                             entry_unsure_plate_confidence)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                             entry_unsure_plate_confidence, entry_plate_state, entry_plate_rule,
+                             entry_plate_pattern, entry_colour_code, entry_size, exit_at, ended)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
        RETURNING *`,
-      [tenantId, garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation,
+      [id, tenantId, garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation,
        entryDescriptor, tailgater, occupancyAtEntryBp,
-       noOpenCommand, entryUnsurePlate, entryUnsurePlateConfidence],
+       noOpenCommand, entryUnsurePlate, entryUnsurePlateConfidence,
+       entryId?.plate?.state ?? null, entryId?.plate?.rule ?? null, entryId?.plate?.pattern ?? null,
+       entryId?.colour_code ?? null, entryId?.size ?? null,
+       endedBy ? endedBy.entry_at : null, ended === null ? null : JSON.stringify(ended)],
     );
     await client.query('RELEASE SAVEPOINT open_session');
-    return { session: rows[0], created: true };
+    return { session: rows[0], created: true, superseded };
   } catch (err) {
     await client.query('ROLLBACK TO SAVEPOINT open_session');
     // 23505: somebody else got there between our check and our insert -- either
@@ -183,8 +209,82 @@ export async function openSession(
       (await findSessionByOpenEvent(client, tenantId, openEventId)) ??
       (await findOpenSession(client, tenantId, garageId, vehicleId));
     if (!raced) throw err;
-    return { session: raced, created: false };
+    return { session: raced, created: false, superseded: [] };
   }
+}
+
+/** The car's first stay here that came in after `at`, open or closed, or null. */
+async function nextStayOf(client, tenantId, garageId, vehicleId, at) {
+  const { rows } = await client.query(
+    `SELECT * FROM sessions
+      WHERE tenant_id = $1 AND garage_id = $2 AND vehicle_id = $3 AND entry_at > $4
+      ORDER BY entry_at, id
+      LIMIT 1`,
+    [tenantId, garageId, vehicleId, at],
+  );
+  return rows[0] ?? null;
+}
+
+/** How far apart two entries of one car may be and still be one arrival (src/startSettings.js). */
+export const reapproachMinutes = () => startSetting('REAPPROACH_MINUTES');
+
+/** What `sessions.ended` holds (0039): the reason, when, and what the caller adds. */
+function endedRecord(reason, record = {}) {
+  return { reason, at: new Date().toISOString(), ...record };
+}
+
+/**
+ * END A STAY NO EXIT CLOSED (0039): `superseded` by a later entry of the same
+ * car, or `ended` / `abandoned` by a person. Closed UNPRICED with its reason,
+ * at `exitAt` -- never before the stay's own entry -- with no exit lane,
+ * close event or outcome: the sixth shape of a closed stay. A validation
+ * claim it still held is handed to the release (`releasing`), as a close
+ * hands one it did not record; the validation sweep gives it back. Null when
+ * the stay is not open.
+ */
+export async function endStay(client, tenantId, sessionId, { reason, exitAt, record = {} }) {
+  const ended = endedRecord(reason, record);
+  const { rows } = await client.query(
+    `UPDATE sessions
+        SET exit_at = GREATEST($3::timestamptz, entry_at), ended = $4,
+            validation = CASE WHEN validation->>'state' IN ('claiming', 'held')
+                              THEN validation || jsonb_build_object('state', 'releasing', 'releasing_at', $5::text,
+                                                                    'released_by', 'ended', 'reason', $6::text)
+                              ELSE validation END
+      WHERE tenant_id = $1 AND id = $2 AND exit_at IS NULL
+      RETURNING *`,
+    [tenantId, sessionId, exitAt, JSON.stringify(ended), ended.at, `the stay was ended: ${reason}`],
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * The ENDED stay (0039) whose time inside holds `at`: of this car, or the
+ * one named. A late close is that stay's exit.
+ *
+ * A SUPERSEDED stay's time inside runs to its `exit_at`, the later entry
+ * that ended it: the car had left by then. A stay a PERSON ended or
+ * abandoned has an `exit_at` that says only what the person knew -- the car
+ * may still have been inside -- so its time inside runs to the car's next
+ * entry at this garage, or on with none: an exit that would have closed the
+ * stay had nobody ended it still closes it.
+ */
+export async function endedStayAt(client, tenantId, garageId, { vehicleId = null, sessionId = null }, at) {
+  const { rows } = await client.query(
+    `SELECT s.* FROM sessions s
+      WHERE s.tenant_id = $1 AND s.garage_id = $2 AND s.ended IS NOT NULL
+        AND ($3::uuid IS NULL OR s.vehicle_id = $3) AND ($4::uuid IS NULL OR s.id = $4)
+        AND s.entry_at <= $5
+        AND CASE WHEN s.ended->>'reason' <> 'superseded'
+                 THEN NOT EXISTS (SELECT 1 FROM sessions n
+                                   WHERE n.tenant_id = s.tenant_id AND n.garage_id = s.garage_id AND n.vehicle_id = s.vehicle_id
+                                     AND n.entry_at > s.entry_at AND n.entry_at <= $5)
+                 ELSE s.exit_at >= $5 END
+      ORDER BY s.entry_at DESC, s.id DESC
+      LIMIT 1`,
+    [tenantId, garageId, vehicleId, sessionId, at],
+  );
+  return rows[0] ?? null;
 }
 
 /**
@@ -208,21 +308,33 @@ export async function lockGarageOpens(client, garageId) {
 }
 
 /**
- * How full the garage is now: every car inside -- every open stay, whatever
- * kind of space it is in -- against the garage's number of spaces (0034).
- * Null when the garage has none.
+ * The cars inside the garage at `at`, and its number of spaces: every stay,
+ * whatever kind of space it is in, that came in by then and had not left by
+ * then. A car is inside from its entry until it comes out; nothing ages a
+ * stay out. A stay leaves the count at its `exit_at`: its exit, the later
+ * entry of the same car (superseded), or when a person ended it (0039).
  */
-export async function occupancyNow(client, tenantId, garageId) {
+export async function insideAt(client, tenantId, garageId, at) {
   const { rows } = await client.query(
     `SELECT g.spaces,
             (SELECT count(*)::int FROM sessions s
-              WHERE s.tenant_id = g.tenant_id AND s.garage_id = g.id AND s.exit_at IS NULL) AS inside
+              WHERE s.tenant_id = g.tenant_id AND s.garage_id = g.id AND s.entry_at <= $3
+                AND (s.exit_at IS NULL OR s.exit_at > $3)) AS inside
        FROM garages g
       WHERE g.tenant_id = $1 AND g.id = $2`,
-    [tenantId, garageId],
+    [tenantId, garageId, at],
   );
-  if (!rows[0]) return null;
-  return occupancyBp(rows[0].inside, rows[0].spaces);
+  return rows[0] ?? null;
+}
+
+/**
+ * How full the garage was at `at` (0034): the cars inside then against its
+ * number of spaces. Null when the garage has none.
+ */
+export async function occupancyAt(client, tenantId, garageId, at) {
+  const row = await insideAt(client, tenantId, garageId, at);
+  if (!row) return null;
+  return occupancyBp(row.inside, row.spaces);
 }
 
 /**
@@ -257,9 +369,11 @@ export async function closeSession(
     // THE VALIDATION RECORD (0019): null when the close carried no phone.
     // It never holds the phone number.
     validation = null,
+    // LET OUT WITH NOTHING PAID (0042): the record, and then no fee.
+    letOut = null,
   },
 ) {
-  const priced = pricing.outcome !== 'covered' && pricing.refusal === undefined;
+  const priced = pricing.outcome !== 'covered' && pricing.refusal === undefined && letOut === null;
   // THE PRE-TAX SUBTOTAL (0023), on a priced stay only. The table refuses a
   // row whose subtotal and tax lines do not add up to its fee.
   const subtotal = priced && pricing.subtotalMinor !== undefined ? pricing.subtotalMinor : null;
@@ -270,8 +384,8 @@ export async function closeSession(
             fee_minor = $8, plan_version = $9, breakdown = $10, space_class = $11,
             pricing_refusal = $12, exit_outcome = $13, entitlement = $14,
             decided_by = $15, decision_inputs = $16, validation = $17,
-            subtotal_minor = $18
-      WHERE tenant_id = $1 AND id = $2 AND exit_at IS NULL
+            subtotal_minor = $18, let_out = $19, ended = NULL
+      WHERE tenant_id = $1 AND id = $2 AND (exit_at IS NULL OR ended IS NOT NULL)
       RETURNING *`,
     [tenantId, sessionId, exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor,
      priced ? pricing.feeMinor : null,
@@ -284,7 +398,8 @@ export async function closeSession(
      decidedBy,
      decisionInputs === null || decisionInputs === undefined ? null : JSON.stringify(decisionInputs),
      validation === null || validation === undefined ? null : JSON.stringify(validation),
-     subtotal],
+     subtotal,
+     letOut === null ? null : JSON.stringify(letOut)],
   );
   return rows[0] ?? null;
 }

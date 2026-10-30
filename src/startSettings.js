@@ -22,6 +22,9 @@ export const START_SETTINGS = Object.freeze({
   // How long a lane computer may go unheard before its lane counts as not
   // connected: the one place this is set (src/setup.js). A day at most.
   LANE_QUIET_MINUTES: { min: 1, max: 1440, fallback: 5 },
+  // Two entries of one car this close together are one arrival; further
+  // apart, the later one ends the earlier stay as superseded (0039).
+  REAPPROACH_MINUTES: { min: 1, max: 60, fallback: 10 },
 });
 
 /** The value, or `why` it is not one. Unset is the default. */

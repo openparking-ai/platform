@@ -292,6 +292,8 @@ const NAMES_A_LANE = {
   'lane_readers.lane_id': 'history',
   // Written at a close with the stay's own exit lane, beside its close event, which the purge never reaches (0011).
   'shadow_searches.exit_lane_id': 'history',
+  // A car at an exit, and how it was let out (0037): never deleted.
+  'exits.lane_id': 'history',
   'board_message_lanes.lane_id': 'board',
   // A picture kept with an entry (0033). A lane that took one has the entry's
   // stay or event too, which keep the lane; a picture alone goes with it.
@@ -340,6 +342,9 @@ test('F1 check 3. THE SWEEP: every column that names a lane is listed, and remov
         `INSERT INTO shadow_searches (tenant_id, garage_id, session_id, exit_lane_id, close_event_id, candidate_ids, candidates_open, candidates_with_descriptor, true_stay_comparable, redacted_at)
          VALUES ($1,$2,NULL,$3,$4,NULL,0,0,false,now())`, [a.tenant, g.id, lane, ev]);
     },
+    'exits.lane_id': (c, lane) => c.query(
+      `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+       VALUES ($1,$2,$3,'f1x' || replace(gen_random_uuid()::text, '-', ''),now(),'none')`, [a.tenant, g.id, lane]),
   };
   const helper = await newLane(base, a, g.id, 'Helper', 'entry');
   for (const [col, fate] of Object.entries(NAMES_A_LANE)) {

@@ -214,6 +214,55 @@ jobs:
         # red with at least one of its tests still green.
         run: npm run unread-identity-fail-control
 
+      - name: Exit-case fail-control
+        # The car at an exit, found by its ID (0037). Each break removes one
+        # property the exit rests on -- the matcher's exclusions (a differing
+        # sure character, colour or size, unreadable against read), folding,
+        # a clear winner, the picker sent pictures only, within a limit, once,
+        # never with a car hidden, its answer one number; the driver's word
+        # bounded and once; the gate settled only at zero, covered or by a
+        # named person; the close writing the case's fee; the entry's ID kept
+        # and purged -- and two halves of 0037's constraints, and requires
+        # test/exit-match.test.js and test/exits.test.js to go red.
+        run: npm run exits-fail-control
+
+      - name: Exit-payments fail-control
+        # Paying at the exit (0038). Each break removes one property the
+        # payment rests on -- the intent the case's fee, in person, captured
+        # at once, on the garage's account, one per case by its idempotency
+        # key; paid only at the recorded amount; the reader's refusals named
+        # and a timeout never a failure; only this lane's reader; a person's
+        # letting out canceling the intent; the poll reading Stripe; a text
+        # receipt once, paid, US and Canada only, the number not kept -- and
+        # three of 0038's guards, and requires test/exit-payments.test.js to
+        # go red.
+        run: npm run exit-payments-fail-control
+
+      - name: Exit-let-out fail-control
+        # Canceling an exit's payment, and a car a person let out (0042).
+        # Each break removes one property -- the cancel canceling the intent
+        # at Stripe with its idempotency key, never a paid one, never under a
+        # card being authorised, the reader cleared only while it shows the
+        # case's intent, a canceled payment never taken again; the close
+        # canceling first and writing the stay let out unpaid, never at the
+        # quoted fee, with the lane computer named and the line in the change
+        # log once; the past stays saying so; a driver's time with its
+        # offset; each route only its own garage and lane -- and three of
+        # 0042's guards, and requires test/exit-let-out.test.js to go red.
+        run: npm run exit-let-out-fail-control
+
+      - name: Stay-endings fail-control
+        # A stay no exit closed (0039). Each break removes one property the
+        # ending rests on -- the same car again later superseding its old stay
+        # unpriced, within one arrival the same stay, an earlier entry stored
+        # ended, an unread car never superseding; the count at the car's own
+        # entry; a late close finding the stay it ended; the clocks apart on
+        # a close; the named 404s; the stuck list; a person ending a stay
+        # once, with a reason, not at an exit, not another garage's, the
+        # held validation released and the change logged -- and three of
+        # 0039's guards, and requires test/stay-endings.test.js to go red.
+        run: npm run stay-endings-fail-control
+
       - name: Descriptor fail-control
         # A session carries the appearance descriptor its entry read produced
         # (migration 0009) and the one its exit read produced (0010). Each break

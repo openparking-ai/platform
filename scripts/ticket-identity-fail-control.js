@@ -106,9 +106,9 @@ const SOURCE_BREAKS = [
     name: 'close_plate_only',
     why: 'a ticket stay can never be closed or billed',
     file: 'src/app.js',
-    from: `      const { plate, ticketRef } = laneIdentity(req.body);
+    from: `      const { plate, ticketRef } = exitId ? { plate: null, ticketRef: null } : laneIdentity(req.body);
       if (!closeEventId) throw bad('event_id is required');`,
-    to: `      const { plate } = laneIdentity(req.body);
+    to: `      const { plate } = exitId ? { plate: null } : laneIdentity(req.body);
       const ticketRef = null;
       if (!closeEventId) throw bad('event_id is required');`,
   },

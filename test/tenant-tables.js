@@ -13,6 +13,35 @@
 
 export const TENANT_TABLES = [
   {
+    table: 'exits',
+    // A car at an exit that found no stay (0037): each its own event id.
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+         VALUES ($1, $2, $3, 'tt' || replace(gen_random_uuid()::text, '-', ''), now(), 'none')
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    // The record of why a car was let out: updated as it settles, never deleted.
+    noDelete: true,
+  },
+  {
+    table: 'exit_payments',
+    // A payment started at a phone reader (0038) for a case of its own.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH e AS (
+           INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+           VALUES ($1, $2, $3, 'tp' || replace(gen_random_uuid()::text, '-', ''), now(), 'none') RETURNING id)
+         INSERT INTO exit_payments (tenant_id, garage_id, exit_id, channel, account_id, payment_intent_id, amount_minor, currency, started_by)
+         SELECT $1, $2, e.id, 'phone_reader', 'acct_tt', 'pi_tt' || replace(gen_random_uuid()::text, '-', ''), 500, 'usd', 'test' FROM e
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    // The record of money taken: never deleted.
+    noDelete: true,
+  },
+  {
     table: 'entry_pictures',
     // A picture kept with an entry (0033): each its own picture_ref, so rows
     // collide with nothing but a policy.

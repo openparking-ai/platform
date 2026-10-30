@@ -72,7 +72,7 @@ test('rename: the new name is kept; an empty, too long or control-character name
 
 // --- check 3: history is never lost ---------------------------------------------------
 
-test('remove: a lane that was never used goes; one with a stay, a computer, a card reader or an event is refused by name and stays', async () => {
+test('remove: a lane that was never used goes; one with a stay, a computer, a card reader, an event or an exit case is refused by name and stays', async () => {
   const { g } = await garageWithLanes();
   const spare = await newLane(base, a, g.id, 'Spare', 'entry');
   const gone = await call(base, 'DELETE', `/lanes/${spare.id}`, { as: a });
@@ -80,7 +80,7 @@ test('remove: a lane that was never used goes; one with a stay, a computer, a ca
   assert.equal(await laneRow(a.tenant, spare.id), null);
 
   const used = {};
-  for (const kind of ['stay', 'computer', 'reader', 'event', 'cancelled computer']) {
+  for (const kind of ['stay', 'computer', 'reader', 'event', 'cancelled computer', 'exit case']) {
     const lane = await newLane(base, a, g.id, `Used by ${kind}`, kind === 'stay' ? 'entry' : 'exit');
     used[kind] = lane.id;
     await withTenant(a.tenant, async (c) => {
@@ -97,6 +97,10 @@ test('remove: a lane that was never used goes; one with a stay, a computer, a ca
           `INSERT INTO lane_readers (tenant_id, garage_id, lane_id, account_id, location_id, reader_id, label, bound_by)
            VALUES ($1,$2,$3,'acct_stubU4','tml_stubU4', 'tmr_u4' || replace(gen_random_uuid()::text, '-', ''),'R','test')`, [a.tenant, g.id, lane.id]);
         await c.query(`UPDATE lane_readers SET unbound_at = now(), unbound_by = 'test' WHERE lane_id = $1`, [lane.id]);
+      } else if (kind === 'exit case') {
+        await c.query(
+          `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method) VALUES ($1,$2,$3,gen_random_uuid()::text,now(),'none')`,
+          [a.tenant, g.id, lane.id]);
       } else {
         await c.query(`INSERT INTO events (tenant_id, garage_id, lane_id, event_id, kind, occurred_at, detail) VALUES ($1,$2,$3,gen_random_uuid()::text,'loop_tripped',now(),'{}')`,
           [a.tenant, g.id, lane.id]);
@@ -112,7 +116,9 @@ test('remove: a lane that was never used goes; one with a stay, a computer, a ca
     assert.equal(await snapshot(a.tenant), before, `${kind}: nothing changed`);
   }
   const stay = await call(base, 'DELETE', `/lanes/${used.stay}`, { as: a });
-  assert.deepEqual(stay.json.details, { stays: 1, computers: 0, card_readers: 0, events: 0 });
+  assert.deepEqual(stay.json.details, { stays: 1, computers: 0, card_readers: 0, exit_cases: 0, events: 0 });
+  const exitCase = await call(base, 'DELETE', `/lanes/${used['exit case']}`, { as: a });
+  assert.deepEqual(exitCase.json.details, { stays: 0, computers: 0, card_readers: 0, exit_cases: 1, events: 0 });
 });
 
 // --- check 5: closing -------------------------------------------------------------------
