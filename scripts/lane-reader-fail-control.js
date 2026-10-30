@@ -113,7 +113,7 @@ const SOURCE_BREAKS = [
     name: 'location_read_dropped',
     why: 'the read of the Location is not there',
     file: 'src/app.js',
-    from: "  operator.get('/garages/:garageId/stripe-account/location', connectRoute(async (req, res) => {\n" +
+    from: "  operator.get('/garages/:garageId/stripe-account/location', may('payments:read'), connectRoute(async (req, res) => {\n" +
       '    const row = await terminal.readLocation(req.tenantId, req.params.garageId);\n' +
       '    res.json({ location: terminal.presentLocation(row) });\n' +
       '  }));\n',

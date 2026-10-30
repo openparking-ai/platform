@@ -129,8 +129,8 @@ const SOURCE_BREAKS = [
     why: "an unreadable body is answered with the parser's text",
     suite: SIGN_IN,
     file: 'src/signIn.js',
-    from: '    if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);\n    // A stored hash',
-    to: '    if (err?.unreadable) return refuse(req, res, 400, { error: err.cause?.message, code: UNREADABLE.code });\n    // A stored hash',
+    from: '    if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);\n    if (err?.passkeyUnreadable) {',
+    to: '    if (err?.unreadable) return refuse(req, res, 400, { error: err.cause?.message, code: UNREADABLE.code });\n    if (err?.passkeyUnreadable) {',
   },
   {
     name: 'query_read',
