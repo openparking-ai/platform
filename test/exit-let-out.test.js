@@ -21,7 +21,23 @@
  *   * the change log names the lane computer that let the car out, the
  *     case and the stay; an attendant's let-out is theirs;
  *   * a driver's entry time without an offset is refused with 400;
- *   * every route here answers only its own account, garage and lane.
+ *   * every route here answers only its own account, garage and lane;
+ *   * A SECOND CASE FOR THE SAME STAY (0045) supersedes the open one, never
+ *     a 500: the old intent canceled at Stripe and cleared from the reader
+ *     first; if it had paid, the new case is settled paid on the fee it
+ *     paid and the stay closes priced -- the paid stay opens; Stripe unable
+ *     to settle now is a 503 with nothing written; the superseding is in
+ *     the change log by the lane computer, with no plate;
+ *   * A PERSON'S END with a case open closes the case -- the unpaid intent
+ *     canceled at Stripe first, a paid one never canceled and named on the
+ *     end -- and a card being authorised is 409 with nothing changed;
+ *   * THE READER HOLDING ANOTHER CAR'S FEE: that intent is canceled at
+ *     Stripe and cleared before this case's is sent; one that paid in the
+ *     instant is recorded paid, never canceled; an action this platform did
+ *     not start is never touched; and the stand-in refuses a new action
+ *     while one is in progress, as Stripe does;
+ *   * the receipt, the driver's word and the poll answer only at the case's
+ *     own lane.
  */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -31,6 +47,10 @@ import { pool, withTenant, createTenant, buildWorld, storePlan, flatHourlyPlan, 
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import { startRateEngine } from './rate-engine.js';
 import { startStripeStub } from './stripe-stub.js';
+import http from 'node:http';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Assembled at runtime: a key-shaped literal is refused in this repository even when invented.
 const KEY = ['rk', 'test', 'stubKeyForTheSuiteOnly000'].join('_');
@@ -555,4 +575,328 @@ test('the database holds a let-out stay unpaid: never with a fee, never on an en
     `UPDATE sessions SET let_out = let_out || '{"paid": true}' WHERE id = $1`, [exit.session_id])), /sessions_let_out_is_a_record/);
   await assert.rejects(withTenant(g.tenant, (c) => c.query(
     `UPDATE sessions SET let_out = let_out - 'by' WHERE id = $1`, [exit.session_id])), /sessions_let_out_is_a_record/);
+});
+
+// --- A second case for the same stay; a person's end; the reader holding another car's fee (0045) ---
+
+/** A car in at `inMin` minutes ago; a case for it at `exitMin` minutes ago, on `device` (the exit lane's by default). */
+async function enterAndExit(g, { inMin = 90, exitMin = 0.5, device = g.exit, plate = plateNo() } = {}) {
+  const opened = await call(g.entry, 'POST', '/lane/sessions/open', {
+    event_id: randomUUID(), plate, entry_at: ago(inMin), entry_confirmation: 'confirmed',
+    plate_characters: { state: 'read', rule: RULE, pattern: plate },
+  });
+  assert.equal(opened.status, 201, await opened.clone().text());
+  return { plate, exit: await caseAt(g, plate, { exitMin, device }) };
+}
+
+async function caseAt(g, plate, { exitMin = 0.5, device = g.exit, eventId = randomUUID(), status = 201 } = {}) {
+  const res = await call(device, 'POST', '/lane/exits', { event_id: eventId, exit_at: ago(exitMin), plate_characters: { state: 'read', rule: RULE, pattern: plate } });
+  assert.equal(res.status, status, await res.clone().text());
+  return (await res.json()).exit;
+}
+
+const exitRow = (g, exitId) => withTenant(g.tenant, async (c) => (await c.query('SELECT * FROM exits WHERE id = $1', [exitId])).rows[0]);
+const supersededLines = (g, exitId) => withTenant(g.tenant, async (c) => (await c.query(
+  `SELECT actor_kind, actor_id, before, after FROM garage_changes WHERE tenant_id = $1 AND action = 'exit.superseded' AND subject_id = $2`,
+  [g.tenant, exitId])).rows);
+async function secondExitLane(g, name = 'Exit 2') {
+  const laneId = await withTenant(g.tenant, async (c) =>
+    (await c.query(`INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1, $2, $3, 'exit') RETURNING id`, [g.tenant, g.world.garage, name])).rows[0].id);
+  return { laneId, token: (await deviceToken(g.tenant, laneId, name)).token };
+}
+
+test('A SECOND CASE AFTER THE CARD PAID: the gate faulted and the car came back -- the new case is settled paid, on the fee it paid, and the paid stay opens', async () => {
+  const g = await garage('second-case-paid');
+  // At the barrier 35 minutes ago: one hour owed (250). It paid; the gate never opened.
+  const { plate, exit: first } = await enterAndExit(g, { inMin: 90, exitMin: 35 });
+  assert.equal(first.fee.fee_minor, 250);
+  const started = await pay(g, first.id);
+  stub.presentCard(started.payment.payment_intent_id);
+  assert.equal((await caseOf(g, first.id)).why, 'paid');
+
+  // Back now: two hours would be owed (500) on a fresh price. It owes nothing.
+  const second = await caseAt(g, plate);
+  assert.notEqual(second.id, first.id);
+  assert.deepEqual([second.settled, second.why, second.fee.fee_minor, second.paid_at_exit], [true, 'paid', 250, first.id], JSON.stringify(second));
+  assert.equal(second.payment.status, 'succeeded');
+  assert.equal(second.payment.payment_intent_id, started.payment.payment_intent_id, 'the one payment of the stay');
+  assert.equal(cancelCalls(started.payment.payment_intent_id).length, 0, 'a paid intent is never asked to cancel');
+  assert.equal([...stub.intents.values()].filter((i) => i.metadata.openparking_exit_id === second.id).length, 0, 'and no second payment is started');
+  const payAgain = await call(g.exit, 'POST', `/lane/exits/${second.id}/pay`);
+  assert.deepEqual([payAgain.status, (await payAgain.json()).code], [409, 'exit_settled']);
+
+  const old = await exitRow(g, first.id);
+  assert.ok(old.closed_at, 'the old case is closed');
+  assert.deepEqual([old.close_event_id, old.ended.why, old.ended.by_exit], [null, 'superseded', second.id]);
+  const polled = await (await call(g.exit, 'GET', `/lane/exits/${first.id}`)).json();
+  assert.deepEqual([polled.exit.closed, polled.exit.ended], [true, { why: 'superseded', superseded_by: second.id }]);
+  const lines = await supersededLines(g, first.id);
+  assert.equal(lines.length, 1);
+  assert.deepEqual([lines[0].actor_kind, lines[0].actor_id], ['computer', g.exitDeviceId]);
+  assert.deepEqual([lines[0].after.superseded_by, lines[0].after.stay_id, lines[0].after.payment, lines[0].after.paid_minor], [second.id, first.session_id, 'succeeded', 250]);
+  assert.ok(!JSON.stringify(lines).includes(plate), 'no plate in the change log');
+
+  const closed = await close(g, second.id);
+  assert.equal(closed.status, 200, await closed.clone().text());
+  const written = await stay(g, first.session_id);
+  assert.deepEqual([Number(written.fee_minor), written.let_out], [250, null], 'priced at what it paid, never let out unpaid');
+  const late = await close(g, first.id);
+  assert.deepEqual([late.status, (await late.json()).code], [409, 'exit_closed'], "the superseded case's close names it, and closes nothing");
+});
+
+test('A SECOND CASE WITH NOTHING PAID: the old intent is canceled at Stripe and cleared from the reader first, then the new one is sent; at the other exit lane too', async () => {
+  const g = await garage('second-case-unpaid');
+  const { plate, exit: first } = await enterAndExit(g);
+  const started = await pay(g, first.id);
+  const firstIntent = started.payment.payment_intent_id;
+  assert.equal(readerOf(g).action?.process_payment_intent?.payment_intent, firstIntent);
+
+  // The driver backed off to fetch a card and came back to the same lane.
+  const second = await caseAt(g, plate);
+  assert.deepEqual([second.settled, second.needs], [false, 'payment']);
+  assert.equal(intentOf(started).status, 'canceled', 'the old intent canceled at Stripe');
+  assert.equal(stub.cancels.filter((id) => id === firstIntent).length, 1);
+  assert.equal(readerOf(g).action, null, 'and cleared from the reader');
+  assert.equal((await recorded(g, first.id)).status, 'canceled');
+  assert.deepEqual((await events(g, 'exit_payment_canceled')).map((e) => e.detail.why), ['superseded']);
+  const paid = await pay(g, second.id);
+  const secondIntent = paid.payment.payment_intent_id;
+  assert.notEqual(secondIntent, firstIntent);
+  assert.equal(readerOf(g).action?.process_payment_intent?.payment_intent, secondIntent, "the new case's intent is on the reader");
+  assert.equal(stub.intents.get(secondIntent).amount, second.fee.fee_minor);
+  assert.deepEqual((await supersededLines(g, first.id)).map((l) => l.after.payment), ['canceled']);
+
+  // Then to the other exit lane: the case at lane 1 is superseded there.
+  const other = await secondExitLane(g);
+  const third = await caseAt(g, plate, { device: other.token });
+  assert.equal(third.needs, 'payment');
+  assert.equal(stub.intents.get(secondIntent).status, 'canceled');
+  assert.equal(readerOf(g).action, null, "lane 1's reader no longer holds the fee");
+  assert.equal((await exitRow(g, second.id)).ended.by_exit, third.id);
+  const lines = await supersededLines(g, second.id);
+  assert.deepEqual([lines[0].before.lane_id, lines[0].after.lane_id], [g.world.exitLane, other.laneId]);
+  // One open case for the stay, always.
+  const open = await withTenant(g.tenant, async (c) => (await c.query('SELECT id FROM exits WHERE session_id = $1 AND closed_at IS NULL', [first.session_id])).rows);
+  assert.deepEqual(open.map((r) => r.id), [third.id]);
+  // The resend of the newest case's event is that case, and supersedes nothing.
+  const resent = await call(other.token, 'POST', '/lane/exits', { event_id: third.event_id, exit_at: ago(0.5), plate_characters: { state: 'read', rule: RULE, pattern: plate } });
+  assert.deepEqual([resent.status, (await resent.json()).exit.id], [200, third.id]);
+});
+
+test('A SECOND CASE while the old payment cannot be settled now: 503 and nothing written; asked again, superseded with one cancel', async () => {
+  const g = await garage('second-case-unsettled');
+  const { plate, exit: first } = await enterAndExit(g);
+  const started = await pay(g, first.id);
+  const eventId = randomUUID();
+
+  // A card being authorised on the old intent: never cut off.
+  stub.behaviour.readerBusyNextClear = true;
+  const busy = await call(g.exit, 'POST', '/lane/exits', { event_id: eventId, exit_at: ago(0.5), plate_characters: { state: 'read', rule: RULE, pattern: plate } });
+  assert.deepEqual([busy.status, (await busy.json()).code], [503, 'payment_unsettled']);
+  assert.equal(intentOf(started).status, 'requires_payment_method');
+  assert.equal((await exitRow(g, first.id)).closed_at, null, 'the old case stays open');
+  // Stripe's answer lost: canceled there, not heard here.
+  stub.behaviour.dropNextCancel = true;
+  const lost = await call(g.exit, 'POST', '/lane/exits', { event_id: eventId, exit_at: ago(0.5), plate_characters: { state: 'read', rule: RULE, pattern: plate } });
+  assert.deepEqual([lost.status, (await lost.json()).code], [503, 'payment_unsettled']);
+  assert.equal((await withTenant(g.tenant, (c) => c.query('SELECT 1 FROM exits WHERE event_id = $1', [eventId]))).rowCount, 0, 'no case written');
+
+  const second = await caseAt(g, plate, { eventId });
+  assert.equal(second.needs, 'payment');
+  assert.equal(stub.cancels.filter((id) => id === started.payment.payment_intent_id).length, 1, 'one cancel at Stripe');
+  assert.equal((await recorded(g, first.id)).status, 'canceled');
+});
+
+test("A PERSON'S END WITH AN EXIT CASE OPEN works: the unpaid intent canceled at Stripe first, the case closed; after a let-out too", async () => {
+  const g = await garage('end-open-case');
+  const { exit } = await enterAndExit(g);
+  const started = await pay(g, exit.id);
+  const res = await call(g.op, 'POST', `/garages/${g.world.garage}/stays/${exit.session_id}/end`, { outcome: 'abandoned', reason: 'drove off through the entry' });
+  assert.equal(res.status, 200, await res.clone().text());
+  assert.equal(intentOf(started).status, 'canceled', 'no card can be taken for an ended stay');
+  assert.equal(readerOf(g).action, null);
+  const s = await stay(g, exit.session_id);
+  assert.deepEqual([s.ended.reason, s.ended.exit_cases, s.ended.paid], ['abandoned', [exit.id], undefined]);
+  const c = await exitRow(g, exit.id);
+  assert.deepEqual([Boolean(c.closed_at), c.close_event_id, c.ended.why], [true, null, 'stay_ended']);
+  assert.deepEqual((await events(g, 'exit_payment_canceled')).map((e) => e.detail.why), ['stay_ended']);
+  const line = await withTenant(g.tenant, async (cl) => (await cl.query(
+    `SELECT after FROM garage_changes WHERE tenant_id = $1 AND action = 'stay.end' AND subject_id = $2`, [g.tenant, exit.session_id])).rows);
+  assert.deepEqual(line.map((l) => l.after.exit_cases_closed), [[{ exit_id: exit.id, payment: 'canceled' }]]);
+  const pay2 = await call(g.exit, 'POST', `/lane/exits/${exit.id}/pay`);
+  assert.deepEqual([pay2.status, (await pay2.json()).code], [409, 'exit_closed']);
+
+  // Let out by an attendant, and the car never crossed: the stay still ends.
+  const { exit: lo } = await enterAndExit(g);
+  await pay(g, lo.id);
+  assert.equal((await call(g.op, 'POST', `/garages/${g.world.garage}/exits/${lo.id}/let-out`, { reason: 'reader broken' })).status, 200);
+  const ended = await call(g.op, 'POST', `/garages/${g.world.garage}/stays/${lo.session_id}/end`, { outcome: 'ended', reason: 'seen leaving' });
+  assert.equal(ended.status, 200, await ended.clone().text());
+  assert.equal((await exitRow(g, lo.id)).ended.why, 'stay_ended');
+});
+
+test("A PERSON'S END after the card paid: the payment is never canceled and stays paid, and the end says so; a card being authorised is 409 and nothing changes", async () => {
+  const g = await garage('end-paid-case');
+  const { exit } = await enterAndExit(g);
+  const started = await pay(g, exit.id);
+  stub.presentCard(started.payment.payment_intent_id);
+  const res = await call(g.op, 'POST', `/garages/${g.world.garage}/stays/${exit.session_id}/end`, { outcome: 'ended', reason: 'paid, gate stuck, lifted by hand' });
+  assert.equal(res.status, 200, await res.clone().text());
+  assert.equal(intentOf(started).status, 'succeeded');
+  assert.equal(cancelCalls(started.payment.payment_intent_id).length, 0, 'never asked to cancel');
+  assert.equal((await recorded(g, exit.id)).status, 'succeeded', 'recorded paid');
+  const s = await stay(g, exit.session_id);
+  assert.deepEqual(s.ended.paid, { exit_id: exit.id, amount_minor: exit.fee.fee_minor, currency: 'usd' });
+  const line = await withTenant(g.tenant, async (c) => (await c.query(
+    `SELECT after FROM garage_changes WHERE tenant_id = $1 AND action = 'stay.end' AND subject_id = $2`, [g.tenant, exit.session_id])).rows);
+  assert.deepEqual([line[0].after.exit_cases_closed, line[0].after.paid_minor], [[{ exit_id: exit.id, payment: 'succeeded' }], exit.fee.fee_minor]);
+
+  const { exit: busyCase } = await enterAndExit(g);
+  const sb = await pay(g, busyCase.id);
+  stub.behaviour.readerBusyNextClear = true;
+  const busy = await call(g.op, 'POST', `/garages/${g.world.garage}/stays/${busyCase.session_id}/end`, { outcome: 'abandoned', reason: 'x' });
+  assert.deepEqual([busy.status, (await busy.json()).code], [409, 'payment_in_progress']);
+  assert.equal(intentOf(sb).status, 'requires_payment_method');
+  assert.equal((await stay(g, busyCase.session_id)).exit_at, null, 'the stay stays open');
+  assert.equal((await exitRow(g, busyCase.id)).closed_at, null, 'and its case');
+});
+
+test("THE READER HOLDING ANOTHER CAR'S FEE: that intent is canceled at Stripe and cleared first, then this case's is sent -- the driver never pays another car's fee", async () => {
+  const g = await garage('reader-other-car');
+  const { exit: a } = await enterAndExit(g, { inMin: 30 });
+  const sa = await pay(g, a.id);
+  // A's close could not cancel its payment (the car is gone, its case open,
+  // its intent still on the reader). Car B pulls up.
+  const { exit: b } = await enterAndExit(g, { inMin: 150 });
+  assert.notEqual(b.fee.fee_minor, a.fee.fee_minor);
+  const res = await call(g.exit, 'POST', `/lane/exits/${b.id}/pay`);
+  assert.equal(res.status, 200, await res.clone().text());
+  const out = await res.json();
+  assert.equal(out.sent, true);
+  assert.equal(intentOf(sa).status, 'canceled', "A's intent canceled at Stripe");
+  assert.equal((await recorded(g, a.id)).status, 'canceled');
+  assert.deepEqual((await events(g, 'exit_payment_canceled')).map((e) => [e.detail.exit_id, e.detail.why]), [[a.id, 'reader_needed']]);
+  const onReader = readerOf(g).action?.process_payment_intent?.payment_intent;
+  assert.equal(onReader, out.exit.payment.payment_intent_id, "B's own intent is on the reader");
+  assert.equal(stub.intents.get(onReader).amount, b.fee.fee_minor, "at B's fee");
+
+  // Asked again while B's waits for its card: already there, sent, no second action.
+  const sends = stub.readerActions.filter((x) => x.intent === onReader).length;
+  const again = await call(g.exit, 'POST', `/lane/exits/${b.id}/pay`);
+  assert.deepEqual([again.status, (await again.json()).sent], [200, true]);
+  assert.equal(stub.readerActions.filter((x) => x.intent === onReader).length, sends, 'the reader is not handed it twice');
+});
+
+test("THE READER HOLDING ANOTHER CAR'S FEE THAT PAID in that instant: recorded paid, never canceled; an action this platform did not start is never touched", async () => {
+  const g = await garage('reader-other-paid');
+  const { exit: a } = await enterAndExit(g);
+  const sa = await pay(g, a.id);
+  const { exit: b } = await enterAndExit(g);
+  // The card on A's intent pays as the platform cancels it.
+  stub.behaviour.beforeCancel = (intent) => stub.presentCard(intent.id);
+  const res = await call(g.exit, 'POST', `/lane/exits/${b.id}/pay`);
+  assert.equal(res.status, 200, await res.clone().text());
+  assert.equal(intentOf(sa).status, 'succeeded', 'paid, never canceled');
+  assert.equal(stub.cancels.includes(sa.payment.payment_intent_id), false);
+  assert.equal((await recorded(g, a.id)).status, 'succeeded', 'and recorded paid');
+  assert.equal((await caseOf(g, a.id)).why, 'paid');
+  assert.equal(readerOf(g).action?.process_payment_intent?.payment_intent, (await res.json()).exit.payment.payment_intent_id);
+
+  // An action nobody here started: 409 reader_busy, nothing canceled or cleared.
+  const { exit: c } = await enterAndExit(g);
+  readerOf(g).action = { type: 'process_payment_intent', status: 'in_progress', process_payment_intent: { payment_intent: 'pi_stubnotours' } };
+  const clears = stub.requests.filter((r) => r.path === `/v1/terminal/readers/${g.readerId}/cancel_action`).length;
+  const foreign = await call(g.exit, 'POST', `/lane/exits/${c.id}/pay`);
+  assert.deepEqual([foreign.status, (await foreign.json()).code], [409, 'reader_busy']);
+  assert.equal(readerOf(g).action.process_payment_intent.payment_intent, 'pi_stubnotours');
+  assert.equal(stub.requests.filter((r) => r.path === `/v1/terminal/readers/${g.readerId}/cancel_action`).length, clears);
+});
+
+test('the stand-in refuses a new action while one is in progress, as Stripe does, and replaces a finished one', async () => {
+  const g = await garage('stub-busy');
+  const { exit: a } = await enterAndExit(g);
+  const sa = await pay(g, a.id);
+  const send = (intent) => fetch(`${stub.base}/v1/terminal/readers/${g.readerId}/process_payment_intent`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${KEY}`, 'stripe-account': g.account, 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ payment_intent: intent }).toString(),
+  });
+  const refused = await send(sa.payment.payment_intent_id);
+  assert.deepEqual([refused.status, (await refused.json()).error.code], [400, 'terminal_reader_busy']);
+  stub.presentCard(sa.payment.payment_intent_id, { decline: 'generic_decline' });
+  assert.equal(readerOf(g).action.status, 'failed');
+  assert.equal((await send(sa.payment.payment_intent_id)).status, 200, 'a finished action is replaced');
+});
+
+/** A stand-in for the text provider, on for `fn` only: it records each message. */
+async function withTexts(fn) {
+  const requests = [];
+  const srv = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      requests.push(Object.fromEntries(new URLSearchParams(raw)));
+      res.writeHead(201, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ sid: `SMstub${requests.length}` }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const dir = mkdtempSync(join(tmpdir(), 'text-receipt-'));
+  writeFileSync(join(dir, 'key'), 'text-key\n');
+  Object.assign(process.env, {
+    TEXT_PROVIDER: 'twilio', TEXT_ACCOUNT: 'ACstub0001', TEXT_KEY_FILE: join(dir, 'key'), TEXT_FROM: '+12025550100',
+    TEXT_API_BASE: `http://127.0.0.1:${srv.address().port}`,
+  });
+  try {
+    return await fn(requests);
+  } finally {
+    for (const k of ['TEXT_PROVIDER', 'TEXT_ACCOUNT', 'TEXT_KEY_FILE', 'TEXT_FROM', 'TEXT_API_BASE']) delete process.env[k];
+    await new Promise((r) => srv.close(r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("the receipt, the driver's word and the poll answer only at the case's own lane; a case paid at the case it superseded gets its receipt, once", async () => {
+  const g = await garage('own-lane');
+  const other = await secondExitLane(g);
+  const { plate, exit: first } = await enterAndExit(g);
+  const started = await pay(g, first.id);
+  stub.presentCard(started.payment.payment_intent_id);
+  await caseOf(g, first.id);
+  const second = await caseAt(g, plate);
+  assert.equal(second.why, 'paid');
+  const word = await unmatched(g);
+
+  await withTexts(async (texts) => {
+    for (const [method, path, body] of [
+      ['POST', `/lane/exits/${second.id}/receipt`, { phone: '+1 415 555 0100' }],
+      ['POST', `/lane/exits/${word.id}/word`, { entry_at: `${ago(30).slice(0, 19)}Z` }],
+      ['GET', `/lane/exits/${second.id}`],
+    ]) {
+      const res = await call(other.token, method, path, body);
+      assert.deepEqual([res.status, (await res.json()).code], [409, 'exit_on_another_lane'], `${method} ${path} from another lane of the garage`);
+    }
+    assert.equal(texts.length, 0, 'nothing sent from another lane');
+    assert.equal((await exitRow(g, word.id)).method, 'none', 'the word was not taken');
+
+    const sent = await call(g.exit, 'POST', `/lane/exits/${second.id}/receipt`, { phone: '+1 415 555 0100' });
+    assert.equal(sent.status, 200, await sent.clone().text());
+    assert.equal((await sent.json()).exit.payment.receipt_sent, true);
+    assert.equal(texts.length, 1);
+    assert.equal((await recorded(g, first.id)).receipt.to_last2, '00', 'kept on the one payment of the stay');
+    const twice = await call(g.exit, 'POST', `/lane/exits/${second.id}/receipt`, { phone: '+1 415 555 0100' });
+    assert.deepEqual([twice.status, (await twice.json()).code], [409, 'receipt_sent']);
+    assert.equal(texts.length, 1);
+  });
+});
+
+test('the database holds a case the platform closed: closed with no close event only with why, and why one of two', async () => {
+  const g = await garage('ended-db');
+  const { exit } = await enterAndExit(g);
+  const refused = (sql, params, constraint) => assert.rejects(withTenant(g.tenant, (c) => c.query(sql, params)), constraint);
+  await refused(`UPDATE exits SET closed_at = now() WHERE id = $1`, [exit.id], /exits_closed_is_complete/);
+  await refused(`UPDATE exits SET closed_at = now(), ended = $2 WHERE id = $1`, [exit.id, JSON.stringify({ why: 'tidied', at: new Date().toISOString(), by: 'key:x' })], /exits_ended_is_a_record/);
+  await refused(`UPDATE exits SET closed_at = now(), ended = $2 WHERE id = $1`, [exit.id, JSON.stringify({ why: 'superseded', at: new Date().toISOString() })], /exits_ended_is_a_record/);
+  await refused(`UPDATE exits SET closed_at = now(), close_event_id = 'x1', ended = $2 WHERE id = $1`, [exit.id, JSON.stringify({ why: 'stay_ended', at: new Date().toISOString(), by: 'key:x' })], /exits_closed_is_complete/);
+  assert.equal((await exitRow(g, exit.id)).closed_at, null);
 });

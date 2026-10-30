@@ -4,7 +4,8 @@
  * out (0042).
  *
  * Every property below is broken, one at a time, and
- * `test/exit-let-out.test.js` is REQUIRED to go red -- with at least one test
+ * `test/exit-let-out.test.js` with `test/stripe-test-mode-check.test.js` is
+ * REQUIRED to go red -- with at least one test
  * still green, so a break that stops the file running is not mistaken for one
  * the tests caught. A pass is the failure.
  *
@@ -31,6 +32,20 @@
  *   cancel_any_garage_or_lane    the cancel finds another garage's or lane's case
  *   word_any_garage              the driver's word lands on another garage's case
  *   close_any_garage             a close names another garage's case
+ *   second_case_not_superseding  a second case for the same stay leaves the open one open
+ *   superseded_payment_left_open a superseded case's open payment is not canceled at Stripe first
+ *   stay_payment_not_counted     a payment the stay made at a superseded case does not settle the new one
+ *   paid_fee_not_carried         a case superseding a paid one is priced afresh, not on the fee paid
+ *   superseding_unlogged         a superseding leaves no line in the change log
+ *   end_payment_left_open        a person's end leaves the stay's open payment uncanceled
+ *   other_car_intent_left        the reader holding another case's intent refuses this case's
+ *   reader_frees_blind           another case's intent on the reader is canceled without reading Stripe
+ *   own_intent_busy              this case's own intent waiting on the reader is a refusal
+ *   stub_replaces_action         the stand-in replaces an action in progress (not what Stripe does)
+ *   word_any_lane                the driver's word lands on another lane's case
+ *   receipt_any_lane             a receipt goes for another lane's case
+ *   poll_any_lane                the poll reads another lane's case
+ *   live_key_taken               the test-mode check takes a live key
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with one
  * statement of 0042 edited, so the property genuinely never existed there.
@@ -38,6 +53,8 @@
  *   let_out_with_fee             a let-out stay may carry a fee
  *   let_out_says_paid            a let-out record may say it was paid
  *   let_out_names_nobody         a let-out record may name nobody
+ *   case_closed_unexplained      a case may be closed with no close event and no why (0045)
+ *   ended_any_why                a case the platform closed may give any why (0045)
  */
 import { spawnSync } from 'node:child_process';
 import {
@@ -222,6 +239,95 @@ const SOURCE_BREAKS = [
   },
 ];
 
+SOURCE_BREAKS.push(
+  {
+    name: 'second_case_not_superseding',
+    why: 'a second case for the same stay leaves the open one open',
+    edits: [{ file: 'src/app.js', from: "          await exits.endCase(client, tenantId, prior.id, { why: 'superseded', by_exit: caseId });\n", to: '' }],
+  },
+  {
+    name: 'superseded_payment_left_open',
+    why: "a superseded case's open payment is not canceled at Stripe first",
+    edits: [{ file: 'src/app.js', from: '        if (sessionId) await settlePriorCase({ tenantId, garageId, sessionId, eventId });\n', to: '' }],
+  },
+  {
+    name: 'stay_payment_not_counted',
+    why: 'a payment the stay made at a superseded case does not settle the new one',
+    edits: [{ file: 'src/exits.js', from: "  if (row.stay_payment?.status === 'succeeded') return row.stay_payment;\n", to: '' }],
+  },
+  {
+    name: 'paid_fee_not_carried',
+    why: 'a case superseding a paid one is priced afresh, not on the fee paid',
+    edits: [{ file: 'src/app.js', from: '            if (paid) {\n              // PAID AT THE CASE IT SUPERSEDES', to: '            if (false) {\n              // PAID AT THE CASE IT SUPERSEDES' }],
+  },
+  {
+    name: 'superseding_unlogged',
+    why: 'a superseding leaves no line in the change log',
+    edits: [{ file: 'src/app.js', from: "    await changes.record(client, ctx, {\n      garageId,\n      action: 'exit.superseded',", to: "    await (async () => {})(client, ctx, {\n      garageId,\n      action: 'exit.superseded'," }],
+  },
+  {
+    name: 'end_payment_left_open',
+    why: "a person's end leaves the stay's open payment uncanceled",
+    edits: [{ file: 'src/app.js', from: '      await settleCasesBeforeEnd(req);\n', to: '' }],
+  },
+  {
+    name: 'other_car_intent_left',
+    why: "the reader holding another case's intent refuses this case's",
+    edits: [{ file: 'src/app.js', from: '    if (!held) throw busy(', to: '    if (true) throw busy(' }],
+  },
+  {
+    name: 'reader_frees_blind',
+    why: "another case's intent on the reader is canceled without reading Stripe",
+    edits: [{
+      file: 'src/app.js',
+      from: "        await cancelPayment(tenantId, garageId, held, { why: 'reader_needed' });",
+      to: "        await exitPayments.clearReader(config, payment.account_id, readerId).catch(() => {});\n        await exitPayments.cancelIntent(config, payment.account_id, held.payment.payment_intent_id).catch(() => {});",
+    }],
+  },
+  {
+    name: 'own_intent_busy',
+    why: "this case's own intent waiting on the reader is a refusal",
+    edits: [{ file: 'src/app.js', from: '    if (action.intent === payment.payment_intent_id) return true;\n', to: '' }],
+  },
+  {
+    name: 'stub_replaces_action',
+    why: 'the stand-in replaces an action in progress (not what Stripe does)',
+    edits: [{ file: 'test/stripe-stub.js', from: "          if (reader.action?.status === 'in_progress') {", to: '          if (false) {' }],
+  },
+  {
+    name: 'word_any_lane',
+    why: "the driver's word lands on another lane's case",
+    edits: [{
+      file: 'src/app.js',
+      from: "        // The case's own lane only: a driver's word is said where the car is.\n        if (row.lane_id !== laneId) throw conflict(",
+      to: "        // The case's own lane only: a driver's word is said where the car is.\n        if (false) throw conflict(",
+    }],
+  },
+  {
+    name: 'receipt_any_lane',
+    why: "a receipt goes for another lane's case",
+    edits: [{
+      file: 'src/app.js',
+      from: '        // The case\'s own lane only: the driver types the number where the car is.\n        if (row.lane_id !== laneId) throw conflict(',
+      to: '        // The case\'s own lane only: the driver types the number where the car is.\n        if (false) throw conflict(',
+    }],
+  },
+  {
+    name: 'live_key_taken',
+    why: 'the test-mode check takes a live key',
+    edits: [{ file: 'scripts/stripe-test-mode-check.js', from: '  if (!/^(sk|rk)_test_[A-Za-z0-9]+$/.test(key)) {', to: '  if (!/^(sk|rk)_[a-z]+_[A-Za-z0-9]+$/.test(key)) {' }],
+  },
+  {
+    name: 'poll_any_lane',
+    why: "the poll reads another lane's case",
+    edits: [{
+      file: 'src/app.js',
+      from: "      if (!row) throw new HttpError(404, 'exit case not found', 'exit_not_found');\n      if (row.lane_id !== laneId) throw conflict('exit_on_another_lane', 'this exit case is at another lane');\n      res.json({ exit: exits.present(await refreshPayment(",
+      to: "      if (!row) throw new HttpError(404, 'exit case not found', 'exit_not_found');\n      res.json({ exit: exits.present(await refreshPayment(",
+    }],
+  },
+);
+
 const ADDED_0042 = '0042_let_out_by_a_person.sql';
 
 const SCHEMA_BREAKS = [
@@ -246,7 +352,25 @@ const SCHEMA_BREAKS = [
   },
 ];
 
-const SUITE = ['--test', 'test/exit-let-out.test.js'];
+const ADDED_0045 = '0045_exit_case_ended.sql';
+SCHEMA_BREAKS.push(
+  {
+    name: 'case_closed_unexplained',
+    why: 'a case may be closed with no close event and no why',
+    edits: [{
+      file: ADDED_0045,
+      from: '  OR (closed_at IS NOT NULL AND close_event_id IS NULL AND ended IS NOT NULL)',
+      to: '  OR (closed_at IS NOT NULL AND close_event_id IS NULL)',
+    }],
+  },
+  {
+    name: 'ended_any_why',
+    why: 'a case the platform closed may give any why',
+    edits: [{ file: ADDED_0045, from: "        AND coalesce(ended->>'why', '') IN ('superseded', 'stay_ended')\n", to: '' }],
+  },
+);
+
+const SUITE = ['--test', 'test/exit-let-out.test.js', 'test/stripe-test-mode-check.test.js'];
 
 function stage() {
   const dir = mkdtempSync(join(tmpdir(), 'openparking-exit-let-out-control-'));

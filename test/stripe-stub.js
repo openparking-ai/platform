@@ -36,6 +36,14 @@ export async function startStripeStub() {
   const cancelByKey = new Map(); // idempotency key -> the first answer, replayed as Stripe does
   const cancels = []; // every cancel the stub carried out (not replays)
   let seq = 0;
+  /** The reader action working on this intent, ended as Stripe ends it: succeeded, or failed with a code. */
+  const finishAction = (intentId, outcome) => {
+    for (const t of terminal) {
+      if (t.action?.status === 'in_progress' && t.action.process_payment_intent?.payment_intent === intentId) {
+        t.action = { ...t.action, ...outcome };
+      }
+    }
+  };
   /**
    * What the next request meets. `failNext` fails the next request (or the
    * next whose path matches `failNext.path`). For a cancel: `beforeCancel`
@@ -164,6 +172,7 @@ export async function startStripeStub() {
             } else {
               intent.status = 'canceled';
               cancels.push(intent.id);
+              finishAction(intent.id, { status: 'failed', failure_code: 'payment_intent_canceled' });
               answer = { status: 200, body: { ...intent } };
             }
             if (key) cancelByKey.set(key, answer);
@@ -192,6 +201,13 @@ export async function startStripeStub() {
             }
             reader.action = null;
             return send(200, { id: reader.id, object: 'terminal.reader', action: null });
+          }
+          // As Stripe: a reader with an action still in progress -- a payment
+          // waiting for its card, or being authorised -- refuses a new one;
+          // it never replaces it. A finished action (succeeded, failed) is
+          // replaced.
+          if (reader.action?.status === 'in_progress') {
+            return send(400, { error: { type: 'invalid_request_error', code: 'terminal_reader_busy', message: 'Reader is currently busy processing another request.' } });
           }
           const intent = intents.get(form.payment_intent);
           if (!intent || intent.on !== on) return send(404, { error: { code: 'resource_missing', message: 'no such payment_intent' } });
@@ -270,9 +286,11 @@ export async function startStripeStub() {
       if (decline) {
         intent.status = 'requires_payment_method';
         intent.last_payment_error = { code: 'card_declined', decline_code: decline };
+        finishAction(intentId, { status: 'failed', failure_code: 'card_declined' });
       } else {
         intent.status = 'succeeded';
         intent.last_payment_error = null;
+        finishAction(intentId, { status: 'succeeded' });
       }
     },
     close: () => new Promise((resolve) => server.close(resolve)),

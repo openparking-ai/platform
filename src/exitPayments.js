@@ -100,6 +100,12 @@ export async function paymentOf(client, tenantId, exitId) {
   return rows[0] ?? null;
 }
 
+/** The payment recorded for a PaymentIntent, whichever case it is for; null for one this platform did not make. */
+export async function paymentByIntent(client, tenantId, intentId) {
+  const { rows } = await client.query('SELECT * FROM exit_payments WHERE tenant_id = $1 AND payment_intent_id = $2', [tenantId, intentId]);
+  return rows[0] ?? null;
+}
+
 export async function boundReader(client, tenantId, laneId) {
   const { rows } = await client.query(
     'SELECT * FROM lane_readers WHERE tenant_id = $1 AND lane_id = $2 AND unbound_at IS NULL', [tenantId, laneId]);
@@ -194,10 +200,22 @@ export function cancelIntent(config, accountId, intentId, idempotencyKey = undef
   return stripeCall({ method: 'POST', path: `/v1/payment_intents/${encodeURIComponent(intentId)}/cancel`, account: accountId, form: {}, idempotencyKey }, config);
 }
 
-/** The intent the reader is working on now, or null: another car's is never cleared. */
-export async function readerIntent(config, accountId, readerId) {
+/**
+ * What the reader is doing: `{type, status, intent}` -- `status` is Stripe's
+ * `in_progress`, `succeeded` or `failed`, `intent` the PaymentIntent of a
+ * `process_payment_intent` -- or null when it is doing nothing.
+ */
+export async function readerAction(config, accountId, readerId) {
   const reader = await stripeCall({ method: 'GET', path: `/v1/terminal/readers/${encodeURIComponent(readerId)}`, account: accountId }, config);
-  return reader?.action?.process_payment_intent?.payment_intent ?? null;
+  const a = reader?.action;
+  if (!a) return null;
+  return { type: a.type ?? null, status: a.status ?? null, intent: a.process_payment_intent?.payment_intent ?? null };
+}
+
+/** The intent the reader is working on now -- an action still in progress -- or null: another car's is never cleared. */
+export async function readerIntent(config, accountId, readerId) {
+  const a = await readerAction(config, accountId, readerId);
+  return a?.status === 'in_progress' ? a.intent : null;
 }
 
 /**

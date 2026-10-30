@@ -17,11 +17,20 @@ import { presentPayment } from './exitPayments.js';
  * SETTLED is the one thing the lane opens on: covered, a fee of zero, paid
  * (0038, src/exitPayments.js), or a person's decision. Anything else keeps
  * the barrier down and says what is missing.
+ *
+ * ONE OPEN CASE PER STAY (0037), and a new one SUPERSEDES it (0045): a lane
+ * drops its case when the car leaves the loop unsettled, and the car comes
+ * back -- to this lane or the other. The old case's open payment is
+ * canceled at Stripe first; if it had already paid, the new case carries
+ * the fee it paid and is settled paid: "I paid, the gate didn't open" -- the
+ * paid stay opens. A person ending the stay closes its open case the same
+ * way. Either is `ended` on the case, closed with no close event.
  */
 
 export const UNMATCHED_EVENT_KIND = 'exit_unmatched';
 export const DRIVER_WORD_EVENT_KIND = 'exit_driver_word';
 export const PERSON_EVENT_KIND = 'exit_let_out_by_person';
+export const SUPERSEDED_EVENT_KIND = 'exit_superseded';
 
 /** The longest stay a driver's stated entry may claim: the engine's own limit. */
 export const WORD_MAX_DAYS = 90;
@@ -90,7 +99,7 @@ export function letOutByField(value, exitId) {
  * opened from (`by`), with the authority the lane named.
  */
 export function letOutOf(row, { by, authority, at }) {
-  if (row.payment?.status === 'succeeded') return null;
+  if (paidFor(row)) return null;
   const q = row.quote;
   if (q?.outcome === 'covered') return null;
   if (q && !q.refusal && q.fee_minor === 0) return null;
@@ -146,16 +155,43 @@ export async function vehicleOf(client, tenantId, vehicleId) {
   return rows[0] ?? null;
 }
 
-/** A case with its payment (0038) beside it, as `payment`, or null. */
-const WITH_PAYMENT = `SELECT e.*, to_jsonb(p) AS payment
+/**
+ * The succeeded payment of the case's STAY taken at another of its cases, or
+ * null: the car paid at a case that was then superseded (0045) -- the gate
+ * faulted, the car backed off and came back, or went to the other exit lane.
+ * One live or paid payment per stay (0038), so at most one.
+ */
+const STAY_PAYMENT = `(SELECT to_jsonb(sp) FROM exit_payments sp
+                         WHERE sp.tenant_id = e.tenant_id AND sp.session_id = e.session_id
+                           AND sp.exit_id <> e.id AND sp.status = 'succeeded'
+                         LIMIT 1)`;
+
+/** A case with its payment (0038) beside it, as `payment`, and its stay's paid one, as `stay_payment`. */
+const WITH_PAYMENT = `SELECT e.*, to_jsonb(p) AS payment, ${STAY_PAYMENT} AS stay_payment
                         FROM exits e
                         LEFT JOIN exit_payments p ON p.tenant_id = e.tenant_id AND p.exit_id = e.id`;
 
-/** A row written with RETURNING, given its payment as a read would. */
+/** A row written with RETURNING, given its payments as a read would. */
 export async function withPayment(client, tenantId, row) {
   if (!row) return row;
-  const { rows } = await client.query('SELECT to_jsonb(p) AS payment FROM exit_payments p WHERE tenant_id = $1 AND exit_id = $2', [tenantId, row.id]);
-  return { ...row, payment: rows[0]?.payment ?? null };
+  const { rows } = await client.query(
+    `SELECT to_jsonb(p) AS payment, ${STAY_PAYMENT} AS stay_payment
+       FROM exits e LEFT JOIN exit_payments p ON p.tenant_id = e.tenant_id AND p.exit_id = e.id
+      WHERE e.tenant_id = $1 AND e.id = $2`,
+    [tenantId, row.id],
+  );
+  return { ...row, payment: rows[0]?.payment ?? null, stay_payment: rows[0]?.stay_payment ?? null };
+}
+
+/**
+ * The payment that paid this case's stay, or null: its own, succeeded; or
+ * one that succeeded at a case of the same stay it superseded. "I paid, the
+ * gate didn't open": the paid stay opens.
+ */
+export function paidFor(row) {
+  if (row.payment?.status === 'succeeded') return row.payment;
+  if (row.stay_payment?.status === 'succeeded') return row.stay_payment;
+  return null;
 }
 
 export async function caseByEvent(client, tenantId, eventId) {
@@ -171,21 +207,58 @@ export async function caseById(client, tenantId, garageId, exitId, { lock = fals
   return rows[0] ?? null;
 }
 
-/** A new case; a resend of the same lane event id returns the case already written. */
+/**
+ * A new case; a resend of the same lane event id returns the case already
+ * written. `c.caseId`, when given, is the new case's id: a case it
+ * supersedes names it before it is written.
+ */
 export async function insertCase(client, tenantId, c) {
   const { rows } = await client.query(
-    `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, plate_state, plate_rule, plate_pattern,
+    `INSERT INTO exits (id, tenant_id, garage_id, lane_id, event_id, exit_at, plate_state, plate_rule, plate_pattern,
                         colour_code, size, method, session_id, candidates, picker, quote)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+     VALUES (COALESCE($16::uuid, gen_random_uuid()), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
      ON CONFLICT (tenant_id, event_id) DO NOTHING
      RETURNING *`,
     [
       tenantId, c.garageId, c.laneId, c.eventId, c.exitAt, c.id.plate?.state ?? null, c.id.plate?.rule ?? null,
       c.id.plate?.pattern ?? null, c.id.colour_code, c.id.size, c.method, c.sessionId ?? null,
       JSON.stringify(c.candidates ?? []), c.picker ? JSON.stringify(c.picker) : null, c.quote ? JSON.stringify(c.quote) : null,
+      c.caseId ?? null,
     ],
   );
-  return { row: rows[0] ?? (await caseByEvent(client, tenantId, c.eventId)), created: rows.length === 1 };
+  const row = rows[0] ? await withPayment(client, tenantId, rows[0]) : await caseByEvent(client, tenantId, c.eventId);
+  return { row, created: rows.length === 1 };
+}
+
+/**
+ * The stay's open cases (0037 holds at most one), oldest first. `lock`
+ * takes each FOR UPDATE: a case is locked before its stay, everywhere (the
+ * close takes the case, then the stay), so two writers never wait on each
+ * other in opposite orders.
+ */
+export async function openCasesOfStay(client, tenantId, sessionId, { lock = false } = {}) {
+  const { rows } = await client.query(
+    `${WITH_PAYMENT} WHERE e.tenant_id = $1 AND e.session_id = $2 AND e.closed_at IS NULL
+      ORDER BY e.created_at, e.id${lock ? ' FOR UPDATE OF e' : ''}`,
+    [tenantId, sessionId],
+  );
+  return rows;
+}
+
+/**
+ * CLOSED BY THE PLATFORM (0045), not by a lane's close: `{why: "superseded",
+ * by_exit}` -- a new case for the same stay takes its place -- or `{why:
+ * "stay_ended", by}` -- a person ended the stay. Null when the case is not
+ * open. Its payment is settled at Stripe BEFORE this (canceled, or found
+ * paid): never closed with a card that can still be taken.
+ */
+export async function endCase(client, tenantId, exitId, ended) {
+  const { rows } = await client.query(
+    `UPDATE exits SET closed_at = now(), ended = $3
+      WHERE tenant_id = $1 AND id = $2 AND closed_at IS NULL RETURNING *`,
+    [tenantId, exitId, JSON.stringify({ ...ended, at: new Date().toISOString() })],
+  );
+  return withPayment(client, tenantId, rows[0] ?? null);
 }
 
 export async function recordWord(client, tenantId, exitId, { claimedEntryAt, quote }) {
@@ -237,7 +310,7 @@ export async function openCases(client, tenantId, garageId, limit = 100) {
  */
 export function settledOf(row) {
   if (row.person) return { settled: true, why: 'person' };
-  if (row.payment?.status === 'succeeded') return { settled: true, why: 'paid' };
+  if (paidFor(row)) return { settled: true, why: 'paid' };
   const q = row.quote;
   if (q?.outcome === 'covered') return { settled: true, why: 'covered' };
   if (q && !q.refusal && q.fee_minor === 0) return { settled: true, why: 'zero_fee' };
@@ -271,9 +344,15 @@ export function present(row) {
     entry_at: row.quote?.entry_at ?? row.claimed_entry_at ?? null,
     claimed_entry_at: row.claimed_entry_at,
     fee: presentFee(row.quote),
-    payment: presentPayment(row.payment ?? null),
+    // Its own payment; or, with none, the one that paid its stay at a case
+    // it superseded (`paid_at_exit` names that case).
+    payment: presentPayment(row.payment ?? paidFor(row)),
+    paid_at_exit: !row.payment && row.stay_payment?.status === 'succeeded' ? row.stay_payment.exit_id : null,
     ...settledOf(row),
     closed: row.closed_at !== null,
+    // Closed by the platform, not by a close (0045): why, and the case that
+    // took its place when it was superseded.
+    ended: row.ended ? { why: row.ended.why, superseded_by: row.ended.by_exit ?? null } : null,
   };
 }
 
@@ -285,6 +364,7 @@ export function presentForPerson(row) {
     candidates: row.candidates,
     picker: row.picker,
     person: row.person,
+    ended: row.ended ?? null,
     created_at: row.created_at,
   };
 }

@@ -132,8 +132,8 @@ const SOURCE_BREAKS = [
     name: 'open_payment_settles',
     why: 'a payment started, not paid, opens the gate',
     file: 'src/exits.js',
-    from: "  if (row.payment?.status === 'succeeded') return { settled: true, why: 'paid' };",
-    to: "  if (row.payment) return { settled: true, why: 'paid' };",
+    from: "  if (row.payment?.status === 'succeeded') return row.payment;",
+    to: '  if (row.payment) return row.payment;',
   },
   {
     name: 'other_lane_pays',
@@ -174,14 +174,14 @@ const SOURCE_BREAKS = [
     name: 'receipt_twice',
     why: 'a receipt is sent twice',
     file: 'src/app.js',
-    from: "        if (row.payment.receipt) throw conflict('receipt_sent', 'the receipt for this payment was already sent');",
+    from: "        if (paid.receipt) throw conflict('receipt_sent', 'the receipt for this payment was already sent');",
     to: '',
   },
   {
     name: 'receipt_unpaid',
     why: 'a receipt is sent for an exit not paid',
     file: 'src/app.js',
-    from: "        if (row.payment?.status !== 'succeeded') throw conflict('not_paid', 'a receipt is sent for a paid exit');",
+    from: "        if (!paid) throw conflict('not_paid', 'a receipt is sent for a paid exit');",
     to: '',
   },
   {
