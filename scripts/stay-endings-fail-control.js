@@ -28,7 +28,8 @@
  *   stuck_any_hours             any older_than_hours is taken
  *   end_without_reason          a stay is ended with no reason
  *   end_twice                   an ended stay is ended again
- *   end_at_an_exit              a stay is ended while a car is at an exit on it
+ *   end_refused_at_an_exit      a stay whose exit case was left open cannot be ended
+ *   end_leaves_case_open        a stay is ended and its exit case left open
  *   end_other_garage            a stay of another garage is ended
  *   abandoned_takes_left_at     an abandoned stay takes a time the car left
  *   left_before_entry           a car is said to have left before it came in
@@ -188,11 +189,18 @@ const SOURCE_BREAKS = [
     }],
   },
   {
-    name: 'end_at_an_exit',
-    why: 'a stay is ended while a car is at an exit on it',
+    name: 'end_refused_at_an_exit',
+    why: 'a stay whose exit case was left open cannot be ended',
     file: 'src/app.js',
-    from: '        if (await stuck.atAnExit(client, req.tenantId, stay.id)) {',
-    to: '        if (false) {',
+    from: '        const leftAt = ask.leftAt ? refuseFuture(ask.leftAt, \'left_at\', now) : now;',
+    to: '        if (atExit.length) throw conflict(\'stay_at_an_exit\', \'a car is at an exit lane on this stay\');\n        const leftAt = ask.leftAt ? refuseFuture(ask.leftAt, \'left_at\', now) : now;',
+  },
+  {
+    name: 'end_leaves_case_open',
+    why: 'a stay is ended and its exit case left open',
+    file: 'src/app.js',
+    from: "          await exits.endCase(client, req.tenantId, c.id, { why: 'stay_ended', by });",
+    to: '',
   },
   {
     name: 'end_other_garage',
