@@ -5,9 +5,10 @@
  * loop, and at the closing loop, each against the lane's event id of the entry
  * record it belongs to: a stay's open, a crossing no car made, a banned car
  * refused -- and, since 0036, the arming read's pictures of the stay's car.
- * They are removed `PICTURE_DAYS` (30) after the car left -- the stay's exit
- * -- or, when no stay holds them, 30 days after they were taken. A car still
- * inside keeps them, and so does a car on the list.
+ * They are removed `PICTURE_DAYS` (30) after they were taken, by the
+ * scheduled job (src/pictureRetention.js); a stay holds them while the car is
+ * inside and for 30 days after it left, and while its customer has paid
+ * picture storage (0041). A car on the list keeps them.
  *
  * THE LIST. With the garage's "ban tailgaters" on, a tailgater stay opened
  * there with a PLATE read is listed -- never a car nobody could read (0036);
@@ -26,9 +27,10 @@
 import sharp from 'sharp';
 
 /**
- * How long a picture is kept after the car left. The owner's answer
- * (2026-10-26): 30 days -- it was one week (2026-10-11). One number for every
- * garage; a longer keep for a garage that pays for storage is not built.
+ * How long a picture is kept after it was taken, and after the car left. The
+ * owner's answer (2026-10-26): 30 days -- it was one week (2026-10-11). One
+ * number for every garage; longer only while a stay's customer pays for
+ * storage (0041).
  */
 export const PICTURE_DAYS = 30;
 
@@ -215,9 +217,13 @@ export async function pictureOfBan(client, tenantId, garageId, banId, pictureId)
 }
 
 /**
- * Remove the pictures whose 30 days are over: 30 days after the stay that holds
- * them closed, or 30 days after they were taken when no stay holds them. A
- * stay still open keeps its pictures, and so does a stay on the list.
+ * Remove the pictures whose 30 days are over at `now` (the database's now
+ * when not given): 30 days after they were taken, and, for the pictures a
+ * stay holds, 30 days after it closed. A stay still open keeps its
+ * pictures, so does a stay whose customer has paid picture storage past
+ * `now` (0041), and so does a stay on the list. The 30th day over is gone:
+ * a picture taken exactly 30 days before `now` is removed. A day is 24
+ * hours, whatever the database's time zone and its clock changes.
  */
 export async function removeExpiredPictures(client, tenantId, { now = null } = {}) {
   const { rowCount } = await client.query(
@@ -226,14 +232,13 @@ export async function removeExpiredPictures(client, tenantId, { now = null } = {
         AND NOT EXISTS (
               SELECT 1 FROM banned_vehicles b JOIN sessions s ON s.id = b.session_id
                WHERE s.tenant_id = p.tenant_id AND s.open_event_id = p.event_id)
-        AND CASE
-              WHEN EXISTS (SELECT 1 FROM sessions s WHERE s.tenant_id = p.tenant_id AND s.open_event_id = p.event_id)
-              THEN EXISTS (SELECT 1 FROM sessions s
-                            WHERE s.tenant_id = p.tenant_id AND s.open_event_id = p.event_id
-                              AND s.exit_at IS NOT NULL
-                              AND s.exit_at < COALESCE($2::timestamptz, now()) - make_interval(days => $3))
-              ELSE p.taken_at < COALESCE($2::timestamptz, now()) - make_interval(days => $3)
-            END`,
+        AND p.taken_at <= COALESCE($2::timestamptz, now()) - make_interval(hours => 24 * $3)
+        AND NOT EXISTS (
+              SELECT 1 FROM sessions s
+               WHERE s.tenant_id = p.tenant_id AND s.open_event_id = p.event_id
+                 AND (s.exit_at IS NULL
+                      OR s.exit_at > COALESCE($2::timestamptz, now()) - make_interval(hours => 24 * $3)
+                      OR s.pictures_paid_until > COALESCE($2::timestamptz, now())))`,
     [tenantId, now, PICTURE_DAYS],
   );
   return rowCount;

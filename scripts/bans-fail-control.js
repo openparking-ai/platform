@@ -43,7 +43,7 @@ const BREAKS = [
     name: 'removed_while_inside',
     why: 'a stay still open loses its pictures with the 30 days',
     red: ['30 DAYS AFTER THE CAR LEFT'],
-    edits: [{ file: 'src/bans.js', from: '                              AND s.exit_at IS NOT NULL\n                              AND s.exit_at < ', to: '                              AND COALESCE(s.exit_at, s.entry_at) < ' }],
+    edits: [{ file: 'src/bans.js', from: '                 AND (s.exit_at IS NULL\n                      OR s.exit_at > ', to: '                 AND (false\n                      OR s.exit_at > ' }],
   },
   {
     name: 'tailgater_unmarked',

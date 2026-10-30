@@ -74,6 +74,13 @@
  *   abandoned_and_finished      a walk may be both abandoned and finished
  *   threshold_unbounded         a garage's walk threshold may be 0 or over 100
  *   walk_feeds_under_threshold  a finished walk may feed the stuck list under its threshold
+ *   blanking_takes_more         a closed walk's sighting may change more than its plate when blanked (0046)
+ *   lists_take_anything         a closed walk's lists may change in any way (0046)
+ *   blanked_with_plate          a sighting may be marked blanked with its plate still there (0046)
+ *   plate_missing_unblanked     a read sighting may lose its plate without being blanked (0046)
+ *
+ * The three breaks of 0040's freeze triggers edit 0046 too, which replaces
+ * those two functions: a property 0046 undid is not a property broken.
  */
 import { spawnSync } from 'node:child_process';
 import {
@@ -133,8 +140,8 @@ const SOURCE_BREAKS = [
     name: 'picture_kept_forever',
     why: "a walk's picture is kept past PICTURE_DAYS",
     file: 'src/walks.js',
-    from: "      WHERE tenant_id = $1 AND picture IS NOT NULL\n        AND taken_at <",
-    to: "      WHERE false AND tenant_id = $1 AND picture IS NOT NULL\n        AND taken_at <",
+    from: "      WHERE ws.tenant_id = $1 AND ws.picture IS NOT NULL\n        AND ws.taken_at <=",
+    to: "      WHERE false AND ws.tenant_id = $1 AND ws.picture IS NOT NULL\n        AND ws.taken_at <=",
   },
   {
     name: 'walk_any_garage',
@@ -483,15 +490,16 @@ const SOURCE_BREAKS = [
     name: 'walks_kept_forever',
     why: "a walk past the retention window is kept",
     file: 'src/retention.js',
-    from: "      `DELETE FROM walks\n        WHERE tenant_id = $1",
-    to: "      `DELETE FROM walks\n        WHERE false AND tenant_id = $1",
+    from: "      `DELETE FROM walks w\n        WHERE w.tenant_id = $1",
+    to: "      `DELETE FROM walks w\n        WHERE false AND w.tenant_id = $1",
   },
   {
     name: 'open_walk_kept_forever',
     why: "a walk never finished is kept past the window",
     file: 'src/retention.js',
-    from: "          AND COALESCE(finished_at, abandoned_at, started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,",
-    to: "          AND finished_at < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,",
+    // The DELETE's own line: the blanking below it reads the same window.
+    from: "          AND COALESCE(w.finished_at, w.abandoned_at, w.started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)\n          AND NOT EXISTS (",
+    to: "          AND w.finished_at < COALESCE($2::timestamptz, now()) - make_interval(days => $3)\n          AND NOT EXISTS (",
   },
   {
     name: 'walk_line_names_plate',
@@ -538,6 +546,7 @@ const SOURCE_BREAKS = [
 ];
 
 const ADDED_0040 = '0040_inventory_walks.sql';
+const ADDED_0046 = '0046_walk_plates_blanked.sql';
 
 const SCHEMA_BREAKS = [
   {
@@ -587,17 +596,26 @@ const SCHEMA_BREAKS = [
   {
     name: 'finished_walk_changes',
     why: "the app role may reopen or change a finished or abandoned walk",
-    edits: [{ file: ADDED_0040, from: "    IF OLD.finished_at IS NOT NULL OR OLD.abandoned_at IS NOT NULL THEN", to: "    IF false THEN" }],
+    edits: [
+      { file: ADDED_0040, from: "    IF OLD.finished_at IS NOT NULL OR OLD.abandoned_at IS NOT NULL THEN", to: "    IF false THEN" },
+      { file: ADDED_0046, from: "    IF OLD.finished_at IS NOT NULL OR OLD.abandoned_at IS NOT NULL THEN", to: "    IF false THEN" },
+    ],
   },
   {
     name: 'finished_sightings_change',
     why: "the app role may add to or change a closed walk's sightings",
-    edits: [{ file: ADDED_0040, from: "    IF NOT walk_closed(NEW.walk_id) THEN\n      RETURN NEW;", to: "    IF true THEN\n      RETURN NEW;" }],
+    edits: [
+      { file: ADDED_0040, from: "    IF NOT walk_closed(NEW.walk_id) THEN\n      RETURN NEW;", to: "    IF true THEN\n      RETURN NEW;" },
+      { file: ADDED_0046, from: "    IF NOT walk_closed(NEW.walk_id) THEN\n      RETURN NEW;", to: "    IF true THEN\n      RETURN NEW;" },
+    ],
   },
   {
     name: 'sighting_leaves_closed_walk',
     why: "the app role may move a sighting out of a closed walk into an open walk's share",
-    edits: [{ file: ADDED_0040, from: "    IF TG_OP = 'UPDATE' AND NEW.walk_id IS DISTINCT FROM OLD.walk_id THEN", to: "    IF false THEN" }],
+    edits: [
+      { file: ADDED_0040, from: "    IF TG_OP = 'UPDATE' AND NEW.walk_id IS DISTINCT FROM OLD.walk_id THEN", to: "    IF false THEN" },
+      { file: ADDED_0046, from: "    IF TG_OP = 'UPDATE' AND NEW.walk_id IS DISTINCT FROM OLD.walk_id THEN", to: "    IF false THEN" },
+    ],
   },
   {
     name: 'finished_walk_lists_more',
@@ -618,6 +636,34 @@ const SCHEMA_BREAKS = [
     name: 'two_open_walks_a_person',
     why: "a person may have two walks open at a garage",
     edits: [{ file: ADDED_0040, from: "CREATE UNIQUE INDEX walks_one_open_per_person", to: "CREATE INDEX walks_one_open_per_person" }],
+  },
+  {
+    name: 'blanking_takes_more',
+    why: "a closed walk's sighting may change more than its plate when blanked",
+    edits: [{
+      file: ADDED_0046,
+      from: "         AND NEW.readers = walk_readers_blanked(OLD.readers)\n         AND (to_jsonb(NEW) - ARRAY['plate', 'plate_state', 'plate_rule', 'plate_pattern', 'readers', 'plate_blanked_at'])\n             = (to_jsonb(OLD) - ARRAY['plate', 'plate_state', 'plate_rule', 'plate_pattern', 'readers', 'plate_blanked_at']) THEN",
+      to: '         THEN',
+    }],
+  },
+  {
+    name: 'lists_take_anything',
+    why: "a closed walk's lists may change in any way",
+    edits: [{ file: ADDED_0046, from: "    SELECT jsonb_typeof(o) = 'object' AND jsonb_typeof(n) = 'object'", to: "    SELECT true OR jsonb_typeof(o) = 'object' AND jsonb_typeof(n) = 'object'" }],
+  },
+  {
+    name: 'blanked_with_plate',
+    why: 'a sighting may be marked blanked with its plate still there',
+    edits: [{
+      file: ADDED_0046,
+      from: '  OR (plate IS NULL AND plate_state IS NULL AND plate_rule IS NULL AND plate_pattern IS NULL AND picture IS NULL)\n',
+      to: '  OR true\n',
+    }],
+  },
+  {
+    name: 'plate_missing_unblanked',
+    why: 'a read sighting may lose its plate without being blanked',
+    edits: [{ file: ADDED_0046, from: '  OR (read <> \'none\' AND why IS NULL AND (plate IS NOT NULL OR plate_blanked_at IS NOT NULL))', to: '  OR (read <> \'none\' AND why IS NULL)' }],
   },
   {
     name: 'abandoned_and_finished',

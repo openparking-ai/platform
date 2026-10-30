@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import { createApp } from '../src/app.js';
 import { redactExpiredVehicles } from '../src/retention.js';
+import { removeExpiredPictures } from '../src/pictureRetention.js';
 import { WALK_ABANDON_HOURS, SIGHTINGS_PER_MINUTE, WALK_COMPLETE_DEFAULT_PERCENT } from '../src/walks.js';
 import { SIGHTINGS_MAX } from '../src/walks.js';
 import { addressLimiter } from '../src/signIn.js';
@@ -898,8 +899,7 @@ test('A PICTURE HAS 30 DAYS: then it is forgotten and the sighting keeps what wa
   const old = await seen(g, walk, picture());
   const fresh = await seen(g, walk, picture());
   await withTenant(g.tenant, (c) => c.query("UPDATE walk_sightings SET taken_at = now() - interval '31 days' WHERE id = $1", [old.id]));
-  const result = await redactExpiredVehicles(g.tenant);
-  assert.equal(result.walkPictures, 1);
+  assert.deepEqual(await removeExpiredPictures(g.tenant), { lane: 0, walk: 1 });
   const path = (s) => `/garages/${g.id}/walks/${walk.id}/sightings/${s.id}/picture`;
   assert.equal((await call(g.op, 'GET', path(old))).status, 404);
   assert.equal((await call(g.op, 'GET', path(fresh))).status, 200);
@@ -907,4 +907,46 @@ test('A PICTURE HAS 30 DAYS: then it is forgotten and the sighting keeps what wa
   const byId = new Map(shown.sightings.map((s) => [s.id, s]));
   assert.deepEqual([byId.get(old.id).has_picture, byId.get(old.id).read, byId.get(old.id).why], [false, 'none', 'reader_off']);
   assert.equal(byId.get(fresh.id).has_picture, true);
+});
+
+test('A CLOSED WALK TAKES EXACTLY THE BLANKING OF PLATES (0046), and nothing else: a sighting whose picture is gone, once, and plates in its lists set to null', async () => {
+  readerOff();
+  const g = await garage('wk-blank');
+  const walk = await startWalk(g);
+  const a = await seen(g, walk, typed('BLA1111'));
+  const b = await seen(g, walk, typed('BLA2222'));
+  const withPicture = await seen(g, walk, picture());
+  await finish(g, walk);
+  const as = (sql, params) => withTenant(g.tenant, (c) => c.query(sql, params));
+  const BLANK = `plate = NULL, plate_state = NULL, plate_rule = NULL, plate_pattern = NULL,
+                 readers = walk_readers_blanked(readers), plate_blanked_at = now()`;
+
+  await as(`UPDATE walk_sightings SET ${BLANK} WHERE id = $1`, [a.id]);
+  const blanked = (await as('SELECT plate, plate_pattern, plate_blanked_at FROM walk_sightings WHERE id = $1', [a.id])).rows[0];
+  assert.deepEqual([blanked.plate, blanked.plate_pattern, Boolean(blanked.plate_blanked_at)], [null, null, true]);
+  await assert.rejects(as(`UPDATE walk_sightings SET ${BLANK}, added_by = 'someone else' WHERE id = $1`, [b.id]), /walk_sightings_frozen/,
+    'nothing else changes with it');
+  await assert.rejects(as(`UPDATE walk_sightings SET ${BLANK}, read = 'unsure' WHERE id = $1`, [b.id]), /walk_sightings_frozen/);
+  await assert.rejects(as(`UPDATE walk_sightings SET ${BLANK} WHERE id = $1`, [withPicture.id]), /walk_sightings_frozen|walk_sightings_blanked_whole/,
+    'not while its picture is kept');
+  await assert.rejects(as(`UPDATE walk_sightings SET plate = 'BLA1111' WHERE id = $1`, [a.id]), /walk_sightings_frozen/, 'never back');
+  await assert.rejects(as(`UPDATE walk_sightings SET plate_blanked_at = now() - interval '1 day' WHERE id = $1`, [a.id]), /walk_sightings_frozen/, 'once');
+
+  await as(`UPDATE walks SET lists = walk_lists_blanked(lists, '{}') WHERE id = $1`, [walk.id]);
+  const lists = (await as('SELECT lists FROM walks WHERE id = $1', [walk.id])).rows[0].lists;
+  assert.ok(!JSON.stringify(lists).includes('BLA2222'), 'the plates in its lists set to null');
+  assert.equal(lists.seen_without_stay.length, 2, 'every row kept');
+  await assert.rejects(as(`UPDATE walks SET lists = jsonb_set(lists, '{seen_without_stay,0,plate}', '"ZZZ9999"') WHERE id = $1`, [walk.id]), /walks_frozen/,
+    'a plate is set to null, never to another');
+  await assert.rejects(as(`UPDATE walks SET lists = jsonb_set(lists, '{seen_without_stay,0,sighting}', to_jsonb(gen_random_uuid()::text)) WHERE id = $1`, [walk.id]), /walks_frozen/);
+  await assert.rejects(as(`UPDATE walks SET lists = lists || '{"extra": 1}' WHERE id = $1`, [walk.id]), /walks_frozen/);
+  await assert.rejects(as(`UPDATE walks SET lists = jsonb_set(lists, '{seen_without_stay}', (lists->'seen_without_stay') - 0) WHERE id = $1`, [walk.id]), /walks_frozen/, 'no row goes');
+  await assert.rejects(as(`UPDATE walks SET finished_by = 'someone else', lists = walk_lists_blanked(lists, '{}') WHERE id = $1`, [walk.id]), /walks_frozen/);
+
+  // The shape, on any walk: blanked whole, and a plate missing only once blanked.
+  const open = await startWalk(g);
+  const c = await seen(g, open, typed('BLA3333'));
+  await assert.rejects(as('UPDATE walk_sightings SET plate_blanked_at = now() WHERE id = $1', [c.id]), /walk_sightings_blanked_whole/);
+  await assert.rejects(as('UPDATE walk_sightings SET plate = NULL, plate_state = NULL, plate_rule = NULL, plate_pattern = NULL WHERE id = $1', [c.id]),
+    /walk_sightings_read_shape/);
 });

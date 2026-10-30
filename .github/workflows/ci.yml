@@ -153,6 +153,12 @@ jobs:
       - name: Retention purge runs clean on a fresh database
         run: npm run purge
 
+      - name: Picture job runs clean and says counts only
+        run: |
+          line="$(npm run -s purge-pictures)"
+          echo "$line"
+          echo "$line" | grep -Eqx 'pictures: [0-9]+ tenant\(s\); removed [0-9]+ lane picture\(s\) and [0-9]+ walk picture\(s\)\.'
+
       - name: RLS fail-control
         # Proves the isolation suite actually measures isolation, by requiring
         # it to FAIL against a scratch database with RLS stripped out.
@@ -392,6 +398,16 @@ jobs:
         # pictures and its vehicle), and no route that lists a car by hand --
         # and requires test/bans.test.js to go red in the test that names it.
         run: npm run bans-fail-control
+
+      - name: Picture-retention fail-control
+        # 0041 and the picture job. Each break removes one property -- the
+        # 30 days (29, 31, exactly 30, a day of 24 hours across a clock
+        # change), an open stay keeping its lane and walk pictures, the 30
+        # days after the car left, a picture a typed plate answered, paid
+        # storage and its end, the job reaching every tenant and saying
+        # counts only, a walk kept while a picture of it is -- and requires
+        # test/picture-retention.test.js to go red in the test that names it.
+        run: npm run picture-retention-fail-control
 
       - name: Rates-and-open fail-control
         # U7g. Each break removes one property -- the try priced by the
