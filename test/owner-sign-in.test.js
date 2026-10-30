@@ -625,7 +625,7 @@ test('A GET never changes anything: every operator GET, cookie-authenticated fro
 test('NO CREDENTIAL IN A URL: no auth route has a path parameter, and the auth code reads no query', async () => {
   const auth = routeTable(main.app).filter((r) => r.base === '/api/v1/auth');
   // Sign-in's four, the four doors behind an emailed link (0032, test/account-links.test.js),
-  // and the passkeys' seven (0035, test/passkeys.test.js).
+  // and the passkeys' seven (0047, test/passkeys.test.js).
   assert.deepEqual(auth.map((r) => `${r.method} ${r.path}`).sort(), [
     'GET /me', 'GET /passkeys', 'POST /forgot', 'POST /invite/accept', 'POST /invite/status',
     'POST /passkey/options', 'POST /passkey/sign-in', 'POST /passkeys', 'POST /passkeys/options', 'POST /passkeys/remove', 'POST /passkeys/rename',

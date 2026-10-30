@@ -13,8 +13,9 @@
  *     "passkeys": { "<credential id>": { "person", "tenant", "public_key",
  *                   "counter", "transports" } } }
  * `mode` holds for every verb, or only for those listed in `only` when that is
- * given. `answer_tenant` makes the door answer with another tenant than the
- * one it was asked about, as a module gone wrong would. Every call is appended
+ * given. `answer_tenant` (`answer_person`) makes the door answer with another
+ * tenant (person) than the one it was asked about, as a module gone wrong
+ * would. `delay_ms` makes every answer wait that long first, as a slow module. Every call is appended
  * to ACCOUNTS_STANDIN_LOG as one JSON line {argv, stdin}, so a test can see
  * what arrived where.
  */
@@ -40,6 +41,7 @@ const args = {};
 for (let i = 0; i < rest.length; i += 2) args[rest[i]] = rest[i + 1];
 
 const mode = !state.only || state.only.includes(verb) ? state.mode ?? 'normal' : 'normal';
+if (Number.isSafeInteger(state.delay_ms) && state.delay_ms > 0) await new Promise((r) => setTimeout(r, state.delay_ms));
 if (mode === 'exit2') {
   process.stderr.write('the database refused: SQLSTATE 57P01: terminating connection\n');
   process.exit(2);
@@ -54,7 +56,7 @@ const people = state.people ?? [];
 const answer = (p) => {
   if (mode === 'not_a_person') return { person: p.person, tenant: p.tenant, email: p.email };
   return {
-    person: p.person, tenant: p.answer_tenant ?? p.tenant, email: p.email, name: p.name ?? null, language: p.language ?? 'en',
+    person: p.answer_person ?? p.person, tenant: p.answer_tenant ?? p.tenant, email: p.email, name: p.name ?? null, language: p.language ?? 'en',
     garages: p.garages, permissions: p.permissions, version: p.version,
   };
 };

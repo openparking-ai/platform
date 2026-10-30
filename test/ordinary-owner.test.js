@@ -37,8 +37,8 @@ const OPENS_THE_LOOKUP = [
 // The FORCED tables a definer reads across accounts, each with 0031's policy.
 const LOOKUP_TABLES = ['tenants', 'garages', 'lanes', 'operator_invites', 'operator_password_resets'];
 const READS_NO_FORCED_TABLE = [
-  'resolve_linked_session', // linked_sessions (0035)
-  'resolve_operator_passkey', // operator_passkeys, operator_users (0035)
+  'resolve_linked_session', // linked_sessions (0047)
+  'resolve_operator_passkey', // operator_passkeys, operator_users (0047)
   'resolve_operator_session', // operator_tokens, operator_users
   'resolve_operator_token', // operator_tokens
   'resolve_operator_user', // operator_users

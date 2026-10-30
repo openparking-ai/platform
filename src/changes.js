@@ -43,12 +43,21 @@ import { LINE_WORDS } from './alerts.js';
 
 /** The subjects a line can be about, as the table allows them. */
 export const SUBJECTS = Object.freeze([
-  'garage', 'lane', 'computer', 'reader', 'payment_account', 'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'passkey', 'unknown',
+  'garage', 'lane', 'computer', 'reader', 'payment_account', 'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'unknown',
 ]);
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const LINES_PAGE = 50;
 const LINES_MAX_PAGE = 200;
+
+/**
+ * Every subject the table allows, as 0047 rebuilds its CHECK in one list: the
+ * ones above, those of the migrations beside 0047 -- main's exit (0037) and
+ * stay (0039), the inventory walk's walk (0040) -- and 0047's passkey. A line
+ * may be about any of them; test/migration-order.test.js holds this list equal
+ * to the table's.
+ */
+export const LINE_SUBJECTS = Object.freeze([...new Set([...SUBJECTS, 'exit', 'stay', 'walk', 'passkey'])]);
 
 /**
  * A credential this platform hands out, wherever it sits in a string. Every
@@ -177,7 +186,7 @@ export const internals = {
  */
 export async function record(client, ctx, { garageId = null, action, subject, before = null, after = null }) {
   if (!ctx) throw new Error('a change was made with no change context');
-  if (!SUBJECTS.includes(subject?.kind)) throw new Error(`a change line names an unknown subject ${JSON.stringify(subject?.kind)}`);
+  if (!LINE_SUBJECTS.includes(subject?.kind)) throw new Error(`a change line names an unknown subject ${JSON.stringify(subject?.kind)}`);
   assertNoCredential({ action, subject, before, after }, ctx.secrets);
   // The subject's id is a uuid, never typed: its digits are not a number.
   assertNoContactDetail({ action, subject: { kind: subject.kind, name: subject.name }, before, after }, ctx.private ?? []);
@@ -290,22 +299,26 @@ export async function refused(req, err, { action, request: said, credential, cre
 }
 
 /**
- * The garage's lines of one outcome, newest first: its own and the account's
- * (garage_id NULL). Changes made ('done') and refused attempts ('refused')
- * are read apart, so refused attempts can never push a change off a page.
- * Paged by line: `after` is the id of the last line of the page before, and
- * `next` the id of this page's last line, or null. Null when `after` names no
- * line of this garage's log of that outcome.
+ * The garage's lines of one outcome, newest first: its own and -- for a
+ * reader over the whole account (`accountWide`) -- the account's (garage_id
+ * NULL). An account's lines name its passkeys, its keys, its admin's email:
+ * a reader at some garages sees only theirs. Changes made ('done') and
+ * refused attempts ('refused') are read apart, so refused attempts can never
+ * push a change off a page. Paged by line: `after` is the id of the last line
+ * of the page before, and `next` the id of this page's last line, or null.
+ * Null when `after` names no line of this garage's log of that outcome, as
+ * this reader reads it.
  */
-export async function linesForGarage(client, tenantId, garageId, { outcome = 'done', after = null, limit = LINES_PAGE } = {}) {
+export async function linesForGarage(client, tenantId, garageId, { outcome = 'done', after = null, limit = LINES_PAGE, accountWide = true } = {}) {
   if (outcome !== 'done' && outcome !== 'refused') throw new Error(`no outcome ${JSON.stringify(outcome)}`);
   const size = Math.min(Math.max(Number.isInteger(limit) ? limit : LINES_PAGE, 1), LINES_MAX_PAGE);
   const values = [tenantId, garageId, size + 1, outcome];
+  const whose = accountWide ? '(gc.garage_id = $2 OR gc.garage_id IS NULL)' : 'gc.garage_id = $2';
   let older = '';
   if (after) {
     const { rows } = await client.query(
-      'SELECT at, id FROM garage_changes WHERE tenant_id = $1 AND id = $2 AND (garage_id = $3 OR garage_id IS NULL) AND outcome = $4',
-      [tenantId, after, garageId, outcome],
+      `SELECT gc.at, gc.id FROM garage_changes gc WHERE gc.tenant_id = $1 AND gc.id = $3 AND ${whose} AND gc.outcome = $4`,
+      [tenantId, garageId, after, outcome],
     );
     if (!rows[0]) return null;
     values.push(rows[0].at, rows[0].id);
@@ -320,7 +333,7 @@ export async function linesForGarage(client, tenantId, garageId, { outcome = 'do
        FROM garage_changes gc
        LEFT JOIN alert_contacts ac
          ON gc.subject_kind = 'alert_contact' AND ac.tenant_id = gc.tenant_id AND ac.id = gc.subject_id
-      WHERE gc.tenant_id = $1 AND (gc.garage_id = $2 OR gc.garage_id IS NULL) AND gc.outcome = $4 ${older}
+      WHERE gc.tenant_id = $1 AND ${whose} AND gc.outcome = $4 ${older}
       ORDER BY gc.at DESC, gc.id DESC
       LIMIT $3`,
     values,
@@ -329,12 +342,12 @@ export async function linesForGarage(client, tenantId, garageId, { outcome = 'do
   return { lines: page, next: rows.length > size && page.length ? page[page.length - 1].id : null };
 }
 
-/** How many refused attempts the garage's log holds: lines, and the attempts they count. */
-export async function refusedCount(client, tenantId, garageId) {
+/** How many refused attempts the garage's log holds, as this reader reads it: lines, and the attempts they count. */
+export async function refusedCount(client, tenantId, garageId, { accountWide = true } = {}) {
   const { rows } = await client.query(
     `SELECT count(*)::int AS lines, coalesce(sum(attempts), 0)::int AS attempts
        FROM garage_changes
-      WHERE tenant_id = $1 AND (garage_id = $2 OR garage_id IS NULL) AND outcome = 'refused'`,
+      WHERE tenant_id = $1 AND ${accountWide ? '(garage_id = $2 OR garage_id IS NULL)' : 'garage_id = $2'} AND outcome = 'refused'`,
     [tenantId, garageId],
   );
   return rows[0];

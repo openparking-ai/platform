@@ -414,8 +414,11 @@ export const TABLES_WITHOUT_TENANT_ID = {
     "refused attempts that name no account's garage and come with no account's credential (0026): nobody's, so " +
     'no tenant; the application holds no grant on it and writes it only through record_refused_change()',
   linked_sign_in_locks:
-    'wrong passwords for an email a linked accounts module keeps (0035): counted before anything says whose the email ' +
+    'wrong passwords for an email a linked accounts module keeps (0047): counted before anything says whose the email ' +
     'is, and the module refuses without saying either, so no tenant; it holds a hash of the email and an address only',
+  passkey_challenges:
+    "passkey challenges (0047): a sign-in's is made before anything says who is signing in, so no tenant; an adding's " +
+    'names its admin and session only by a SHA-256 of them. Each holds a random challenge and the caller address, for five minutes',
 };
 
 /**
@@ -430,7 +433,7 @@ export const TABLES_WITHOUT_TENANT_ID = {
  * operator_tokens, 0024 for operator_users (an email is presented and its
  * tenant is what the lookup finds), and rls-coverage.test.js for the assertion
  * that these are the ONLY ones. 0024's other table, operator_sign_in_locks, is
- * read only once the tenant is known, and is FORCED like any other. 0035 adds
+ * read only once the tenant is known, and is FORCED like any other. 0047 adds
  * operator_passkeys (a passkey is presented; its tenant is what the lookup
  * finds) and linked_sessions (a session token, as operator_tokens).
  */

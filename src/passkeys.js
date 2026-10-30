@@ -1,5 +1,5 @@
 /**
- * Passkeys (0035; README, "Passkeys for the admin"). A maintained WebAuthn
+ * Passkeys (0047; README, "Passkeys for the admin"). A maintained WebAuthn
  * library does the cryptography (@simplewebauthn/server); this file keeps the
  * rows and the rules.
  *
@@ -8,22 +8,34 @@
  * start otherwise. One passkey then works on every site of the deployment
  * under that domain. Unset, passkeys are off: `409 passkeys_not_configured`.
  *
- * A CHALLENGE WORKS ONCE, for five minutes, for its own purpose, and adding a
- * passkey is the signed-in admin's own: the challenge names them. Challenges
- * are held in this process.
+ * THE PERSON IS VERIFIED, NOT ONLY PRESENT. Adding a passkey and signing in
+ * with one ask the authenticator for user verification (`required`: Face ID, a
+ * fingerprint, the device's PIN), and a response without it is refused: a key
+ * anyone holding it can press is not an admin's sign-in.
+ *
+ * A CHALLENGE WORKS ONCE, for five minutes, for its own purpose. It is kept
+ * in the database (passkey_challenges), so every process of a deployment and a
+ * restart see the same ones, and taken with one DELETE, so two uses at once
+ * find it once. Adding a passkey's challenge names the admin and the session
+ * that asked (a SHA-256 of them). One caller address holds at most
+ * CHALLENGES_PER_ADDRESS at once; ended ones are purged as new ones are made.
  *
  * A SIGN-IN finds the passkey by its credential id -- the admin's here, or a
- * linked person's through the accounts door -- checks the signature against
- * the public key kept when it was added, and refuses a counter that did not go
- * up (a copied key) unless the authenticator keeps none. Every refusal is the
- * same answer: nothing tells an unknown passkey from a bad signature or a
- * copied key.
+ * linked person's through the accounts door -- and checks the signature
+ * against the public key kept when it was added. Only then is the counter
+ * read: one that did not go up (but for an authenticator that keeps none)
+ * means a copy of the key is in use, so the sign-in is refused and the
+ * admin's passkey is TURNED OFF, in the transaction that read it, and logged.
+ * Every refusal is the same answer: nothing tells an unknown passkey from a
+ * bad signature or a copied key.
  *
- * The password stays: a passkey is a second way in. A password reset keeps
- * the admin's passkeys; removing the admin removes them (ON DELETE CASCADE).
- * Neither a public key nor a response is ever logged.
+ * The password stays: a passkey is a second way in. A password reset removes
+ * the admin's passkeys (src/invites.js, src/adminAccount.js), and a passkey
+ * added before the password last changed is not found in any case; removing
+ * the admin removes them (ON DELETE CASCADE). Neither a public key nor a
+ * response is ever logged.
  */
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import * as swa from '@simplewebauthn/server';
 import { query, withTenant } from './db.js';
 import { generateDeviceToken, hashToken } from './auth.js';
@@ -32,7 +44,8 @@ import * as accountsDoor from './accountsDoor.js';
 
 export const MAX_PASSKEYS = 10;
 export const CHALLENGE_SECONDS = 300;
-const MAX_CHALLENGES = 10_000;
+//: How many live challenges one caller address may hold at once.
+export const CHALLENGES_PER_ADDRESS = 20;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CONTROL = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 const DOMAIN = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
@@ -84,31 +97,50 @@ export function readPasskeySettings(env, adminOrigin) {
 }
 
 // ---------------------------------------------------------------------------
-// Challenges, once each, in this process.
+// Challenges, once each, in the database.
 // ---------------------------------------------------------------------------
 
-const challenges = new Map();
+/** Who an adding challenge is for: the admin and the session, hashed; null for a sign-in's. */
+const ownerOf = (owner) => (owner
+  ? createHash('sha256').update(`openparking-passkey-challenge:${owner.tenantId}:${owner.userId}:${owner.sessionId}`, 'utf8').digest('hex')
+  : null);
 
-function newChallenge(purpose, challenge, owner = null) {
-  if (challenges.size >= MAX_CHALLENGES) {
-    const now = Date.now();
-    for (const [id, c] of challenges) if (c.expiresAt <= now) challenges.delete(id);
-    if (challenges.size >= MAX_CHALLENGES) throw new PasskeyRefused(503, 'passkeys_busy', 'Passkeys are busy. Try again in a moment.');
-  }
-  const id = randomUUID();
-  challenges.set(id, { challenge, purpose, tenantId: owner?.tenantId ?? null, userId: owner?.userId ?? null, expiresAt: Date.now() + CHALLENGE_SECONDS * 1000 });
-  return id;
-}
+const busy = () => new PasskeyRefused(429, 'passkeys_busy', 'Too many passkey requests from here. Try again in a few minutes.');
 
-/** The challenge `id` names, used up now; null when it is not one, has ended, or is someone else's. */
-function useChallenge(id, purpose, owner = null) {
-  if (typeof id !== 'string' || !UUID.test(id)) return null;
-  const c = challenges.get(id);
-  if (!c) return null;
-  challenges.delete(id);
-  const mine = c.purpose === purpose && c.tenantId === (owner?.tenantId ?? null) && c.userId === (owner?.userId ?? null);
-  return mine && c.expiresAt > Date.now() ? c.challenge : null;
-}
+// On an object so a test can reach in; nothing else replaces them. Each is
+// one statement through query(), which tries once more on a lost connection:
+// a second insert leaves one unused challenge to end, and a second take finds
+// none and refuses -- neither lets anyone in.
+export const challenges = {
+  /** A new challenge's id; `passkeys_busy` when this address holds its share already. */
+  async make(purpose, challenge, address, owner = null) {
+    const { rows } = await query(
+      `WITH purged AS (
+         DELETE FROM passkey_challenges WHERE expires_at <= now()
+       ), held AS (
+         SELECT count(*)::int AS n FROM passkey_challenges WHERE address = $4 AND expires_at > now()
+       )
+       INSERT INTO passkey_challenges (purpose, challenge, owner, address, expires_at)
+       SELECT $1, $2, $3, $4, now() + make_interval(secs => $5) FROM held WHERE held.n < $6
+       RETURNING id`,
+      [purpose, challenge, ownerOf(owner), String(address ?? 'unknown').slice(0, 64), CHALLENGE_SECONDS, CHALLENGES_PER_ADDRESS],
+    );
+    if (!rows[0]) throw busy();
+    return rows[0].id;
+  },
+
+  /** The challenge `id` names, used up now; null when it is not one, has ended, or is someone else's. */
+  async use(id, purpose, owner = null) {
+    if (typeof id !== 'string' || !UUID.test(id)) return null;
+    const c = (await query(
+      'DELETE FROM passkey_challenges WHERE id = $1 RETURNING challenge, purpose, owner, expires_at > now() AS live',
+      [id],
+    )).rows[0];
+    if (!c) return null;
+    const mine = c.purpose === purpose && c.owner === ownerOf(owner);
+    return mine && c.live ? c.challenge : null;
+  },
+};
 
 const challengeText = () => randomBytes(32).toString('base64url');
 
@@ -124,9 +156,9 @@ function passkeyName(raw) {
   return name;
 }
 
-const view = (p) => ({ id: p.id, name: p.name, created_at: p.created_at, last_used_at: p.last_used_at });
+const view = (p) => ({ id: p.id, name: p.name, created_at: p.created_at, last_used_at: p.last_used_at, disabled_at: p.disabled_at ?? null });
 
-export async function registrationOptions(passkeys, admin) {
+export async function registrationOptions(passkeys, admin, address) {
   if (!passkeys) throw off();
   const existing = await withTenant(admin.tenantId, async (c) =>
     (await c.query('SELECT credential_id, transports FROM operator_passkeys WHERE user_id = $1', [admin.userId])).rows);
@@ -139,10 +171,10 @@ export async function registrationOptions(passkeys, admin) {
     challenge: challengeText(),
     attestationType: 'none',
     excludeCredentials: existing.map((p) => ({ id: p.credential_id, transports: p.transports })),
-    authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
+    authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
     timeout: CHALLENGE_SECONDS * 1000,
   });
-  return { challenge_id: newChallenge('register', options.challenge, admin), options };
+  return { challenge_id: await challenges.make('register', options.challenge, address, admin), options };
 }
 
 export async function addPasskey(passkeys, admin, body, ctx) {
@@ -152,12 +184,12 @@ export async function addPasskey(passkeys, admin, body, ctx) {
   if (!b.response || typeof b.response !== 'object' || Array.isArray(b.response)) {
     throw new PasskeyRefused(400, 'passkey_unreadable', 'The passkey request could not be read.');
   }
-  const expectedChallenge = useChallenge(b.challenge_id, 'register', admin);
+  const expectedChallenge = await challenges.use(b.challenge_id, 'register', admin);
   if (!expectedChallenge) throw new PasskeyRefused(409, 'passkey_challenge_ended', 'That took too long, or was already used. Start again.');
   let out;
   try {
     out = await swa.verifyRegistrationResponse({
-      response: b.response, expectedChallenge, expectedOrigin: passkeys.origins, expectedRPID: passkeys.rpId, requireUserVerification: false,
+      response: b.response, expectedChallenge, expectedOrigin: passkeys.origins, expectedRPID: passkeys.rpId, requireUserVerification: true,
     });
   } catch {
     out = null;
@@ -172,7 +204,7 @@ export async function addPasskey(passkeys, admin, body, ctx) {
     try {
       row = (await c.query(
         `INSERT INTO operator_passkeys (tenant_id, user_id, credential_id, public_key, counter, transports, name)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, name, created_at, last_used_at`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, name, created_at, last_used_at, disabled_at`,
         [admin.tenantId, admin.userId, credential.id, Buffer.from(credential.publicKey), credential.counter ?? 0,
           (credential.transports ?? []).filter((t) => typeof t === 'string' && /^[a-z-]{1,20}$/.test(t)).slice(0, 8), name],
       )).rows[0];
@@ -191,7 +223,7 @@ export async function addPasskey(passkeys, admin, body, ctx) {
 
 export async function listPasskeys(admin) {
   return withTenant(admin.tenantId, async (c) =>
-    (await c.query('SELECT id, name, created_at, last_used_at FROM operator_passkeys WHERE user_id = $1 ORDER BY created_at, id', [admin.userId])).rows.map(view));
+    (await c.query('SELECT id, name, created_at, last_used_at, disabled_at FROM operator_passkeys WHERE user_id = $1 ORDER BY created_at, id', [admin.userId])).rows.map(view));
 }
 
 export async function renamePasskey(admin, body, ctx) {
@@ -203,7 +235,7 @@ export async function renamePasskey(admin, body, ctx) {
   return withTenant(admin.tenantId, async (c) => {
     const was = (await c.query('SELECT name FROM operator_passkeys WHERE id = $1 AND user_id = $2 FOR UPDATE', [id, admin.userId])).rows[0];
     if (!was) throw notFound();
-    const row = (await c.query('UPDATE operator_passkeys SET name = $3 WHERE id = $1 AND user_id = $2 RETURNING id, name, created_at, last_used_at', [id, admin.userId, name])).rows[0];
+    const row = (await c.query('UPDATE operator_passkeys SET name = $3 WHERE id = $1 AND user_id = $2 RETURNING id, name, created_at, last_used_at, disabled_at', [id, admin.userId, name])).rows[0];
     await changes.record(c, ctx, {
       garageId: null, action: 'passkey.rename', subject: { kind: 'passkey', id, name }, before: { name: was.name }, after: { name },
     });
@@ -228,26 +260,67 @@ export async function removePasskey(admin, body, ctx) {
 // Signing in with one.
 // ---------------------------------------------------------------------------
 
-export async function signInOptions(passkeys) {
+export async function signInOptions(passkeys, address) {
   if (!passkeys) throw off();
   const options = await swa.generateAuthenticationOptions({
-    rpID: passkeys.rpId, userVerification: 'preferred', challenge: challengeText(), timeout: CHALLENGE_SECONDS * 1000,
+    rpID: passkeys.rpId, userVerification: 'required', challenge: challengeText(), timeout: CHALLENGE_SECONDS * 1000,
   });
-  return { challenge_id: newChallenge('sign_in', options.challenge), options };
+  return { challenge_id: await challenges.make('sign_in', options.challenge, address), options };
 }
 
 // On an object so a test can reach in; nothing else replaces them.
 export const internals = {
+  /**
+   * The signature, the origin, the relying party, the challenge and user
+   * verification -- not the counter: the library is handed 0, so it never
+   * refuses one before the signature is known to hold. The counter is this
+   * file's to judge, after (checkSignIn).
+   */
   async verify(passkeys, response, expectedChallenge, credential) {
     try {
       return await swa.verifyAuthenticationResponse({
-        response, expectedChallenge, expectedOrigin: passkeys.origins, expectedRPID: passkeys.rpId, requireUserVerification: false, credential,
+        response, expectedChallenge, expectedOrigin: passkeys.origins, expectedRPID: passkeys.rpId, requireUserVerification: true,
+        credential: { ...credential, counter: 0 },
       });
     } catch {
       return null;
     }
   },
+
+  /**
+   * The admin's passkey used with counter `next`, in one transaction holding
+   * its row: moved on when it went up (or both are 0: an authenticator that
+   * keeps none), or else TURNED OFF, with its line in the change log. Two
+   * sign-ins at once with one counter: one moves it, the other finds it moved
+   * and turns the passkey off. Answers 'used', 'turned_off', or 'gone' when
+   * there is no live passkey to judge.
+   */
+  async useAdminPasskey(tenantId, passkeyId, next) {
+    return withTenant(tenantId, async (c) => {
+      // Held from this read to the commit: a second sign-in at the same moment
+      // reads the counter this one leaves.
+      const row = (await c.query(
+        'SELECT id, name, (counter < $2 OR (counter = 0 AND $2 = 0)) AS went_up FROM operator_passkeys WHERE id = $1 AND disabled_at IS NULL FOR UPDATE',
+        [passkeyId, next],
+      )).rows[0];
+      if (!row) return 'gone';
+      if (row.went_up) {
+        await c.query('UPDATE operator_passkeys SET counter = $2, last_used_at = now() WHERE id = $1', [passkeyId, next]);
+        return 'used';
+      }
+      await c.query('UPDATE operator_passkeys SET disabled_at = now() WHERE id = $1', [passkeyId]);
+      // Its line, in the same transaction: the platform turned it off, nobody signed in.
+      await changes.record(c, { tenantId, actor: { kind: 'nobody', id: null }, count: 0, unchanged: false, secrets: [], private: [] }, {
+        garageId: null, action: 'passkey.turn_off', subject: { kind: 'passkey', id: row.id, name: row.name },
+        before: { turned_off: false }, after: { turned_off: true, why: 'counter_not_up' },
+      });
+      return 'turned_off';
+    });
+  },
 };
+
+/** A copied key, said in a log line: which passkey, never its key, counter or response. */
+const logCopied = (where, ids) => console.error(`[auth] passkey sign-in refused: the counter did not go up (a copy of the key?); ${where} ${ids}`);
 
 /**
  * Who a sign-in response proves: `{kind: 'admin', userId, tenantId}` or
@@ -259,7 +332,7 @@ export async function checkSignIn(passkeys, body) {
   const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
   const response = b.response && typeof b.response === 'object' && !Array.isArray(b.response) ? b.response : null;
   const credentialId = response && typeof response.id === 'string' && accountsDoor.CREDENTIAL.test(response.id) ? response.id : null;
-  const expectedChallenge = useChallenge(b.challenge_id, 'sign_in');
+  const expectedChallenge = await challenges.use(b.challenge_id, 'sign_in');
   if (!expectedChallenge || !credentialId) throw refused();
 
   const admin = (await query('SELECT * FROM resolve_operator_passkey($1)', [credentialId])).rows[0] ?? null;
@@ -276,17 +349,21 @@ export async function checkSignIn(passkeys, body) {
   const next = out.authenticationInfo.newCounter;
 
   if (admin) {
-    // Two sign-ins with one response at once: only one moves the counter (or
-    // both stay at 0 on an authenticator that keeps none).
-    const moved = await withTenant(admin.tenant_id, async (c) => (await c.query(
-      'UPDATE operator_passkeys SET counter = $2, last_used_at = now() WHERE id = $1 AND (counter < $2 OR (counter = 0 AND $2 = 0)) RETURNING id',
-      [admin.passkey_id, next])).rowCount);
-    if (!moved) throw refused();
+    const used = await internals.useAdminPasskey(admin.tenant_id, admin.passkey_id, next);
+    if (used === 'turned_off') logCopied('the admin\'s passkey is turned off:', `passkey ${admin.passkey_id}, tenant ${admin.tenant_id}`);
+    if (used !== 'used') throw refused();
     return { kind: 'admin', userId: admin.user_id, tenantId: admin.tenant_id };
+  }
+  // A linked person's passkey is the module's to turn off; it is told the
+  // counter, and refuses one that did not go up. Refused here first, too.
+  if ((next > 0 || stored > 0) && next <= stored) {
+    logCopied('a linked person\'s passkey, for the module to judge:', `person ${linked.person}, tenant ${linked.tenant}`);
+    throw refused();
   }
   if (!(await accountsDoor.passkeyUsed(credentialId, next))) throw refused();
   const person = await accountsDoor.who(linked.tenant, linked.person);
-  if (!person) throw refused();
+  // The module's answer must be the person the passkey named, in that tenant.
+  if (!person || person.tenant !== linked.tenant || person.person !== linked.person) throw refused();
   return { kind: 'linked', person };
 }
 

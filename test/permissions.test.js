@@ -252,3 +252,54 @@ test('DONE BY: a key may name who acts through it; the name is kept beside the l
   assert.equal((await copy('key')).rowCount, 1);
   for (const kind of ['owner', 'linked']) await assert.rejects(copy(kind), /garage_changes_done_by_shape/, kind);
 });
+
+test('THROUGH A LANE COMPUTER, TOO: a computer of a garage outside the list answers as one that does not exist, and is not cancelled', async () => {
+  const a = await account('pm-device');
+  const device = async (lane) => (await su.query(
+    `INSERT INTO lane_devices (tenant_id, lane_id, name, token_hash)
+     VALUES ($1, $2, 'Gate computer', md5(gen_random_uuid()::text) || md5(gen_random_uuid()::text)) RETURNING id`,
+    [a.tenant, lane],
+  )).rows[0].id;
+  const outsideDevice = await device(a.two.entryLane);
+  const ownDevice = await device(a.one.entryLane);
+  const p = await linked(a, { garages: [a.one.garage], permissions: ['lanes:change'] });
+  const outside = await call(`/api/v1/devices/${outsideDevice}/revoke`, { cookie: p.token, method: 'POST', body: {} });
+  const nothing = await call('/api/v1/devices/00000000-0000-4000-8000-000000000000/revoke', { cookie: p.token, method: 'POST', body: {} });
+  assert.equal(outside.status, 404, outside.text);
+  assert.equal(outside.text, nothing.text, 'a computer outside the list says more than one that does not exist');
+  assert.equal((await su.query('SELECT revoked_at FROM lane_devices WHERE id = $1', [outsideDevice])).rows[0].revoked_at, null, 'the computer outside the list was cancelled');
+  // The control: a computer of their own garage is cancelled.
+  const own = await call(`/api/v1/devices/${ownDevice}/revoke`, { cookie: p.token, method: 'POST', body: {} });
+  assert.equal(own.status, 200, own.text);
+  assert.ok((await su.query('SELECT revoked_at FROM lane_devices WHERE id = $1', [ownDevice])).rows[0].revoked_at);
+});
+
+test('THE ACCOUNT\'S OWN LINES ARE FOR THE WHOLE ACCOUNT: a reader at some garages sees their garage\'s lines and refused attempts, never the account\'s', async () => {
+  const a = await account('pm-log');
+  // An account-wide line (the admin's language) and a refused one, and a line of garage one.
+  const cookie = tokenOf(await call('/api/v1/auth/sign-in', { method: 'POST', body: { email: a.email, password: PASSWORD } }));
+  assert.equal((await call('/api/v1/auth/language', { cookie, method: 'PUT', body: { language: 'es' } })).status, 200);
+  assert.equal((await call('/api/v1/auth/language', { cookie, method: 'PUT', body: { language: 'fr' } })).status, 400);
+  assert.equal((await call(`/api/v1/lanes/${a.one.entryLane}`, { key: a.key, method: 'PATCH', body: { name: 'Front lane' } })).status, 200);
+  const accountLine = (await su.query("SELECT id FROM garage_changes WHERE tenant_id = $1 AND garage_id IS NULL AND outcome = 'done' LIMIT 1", [a.tenant])).rows[0].id;
+
+  const some = await linked(a, { garages: [a.one.garage], permissions: ['log:read'] });
+  const every = await linked(a, { garages: 'all', permissions: ['log:read'] });
+  const read = async (who, path) => (await call(`/api/v1/garages/${a.one.garage}/${path}`, { cookie: who.token })).json;
+  const someDone = await read(some, 'changes');
+  const everyDone = await read(every, 'changes');
+  assert.ok(someDone.changes.some((c) => c.action === 'lane.rename'), 'the garage\'s own line is missing');
+  assert.equal(someDone.changes.some((c) => c.garage_id === null), false, 'a reader at some garages sees the account\'s lines');
+  assert.ok(everyDone.changes.some((c) => c.action === 'language.change' && c.garage_id === null), 'a reader over the whole account misses the account\'s lines');
+  // Paging from an account line: not a line of this reader's log.
+  assert.equal((await call(`/api/v1/garages/${a.one.garage}/changes/${accountLine}`, { cookie: some.token })).status, 404);
+  assert.equal((await call(`/api/v1/garages/${a.one.garage}/changes/${accountLine}`, { cookie: every.token })).status, 200);
+  // Refused attempts and their count, the same way.
+  const someRefused = await read(some, 'refused-attempts');
+  const everyRefused = await read(every, 'refused-attempts');
+  assert.equal(someRefused.refused.some((c) => c.garage_id === null), false);
+  assert.ok(everyRefused.refused.some((c) => c.garage_id === null));
+  assert.ok(someRefused.count.lines < everyRefused.count.lines, 'the count includes the account\'s refused attempts');
+  // The admin and a key read the whole account, as before.
+  assert.ok((await call(`/api/v1/garages/${a.one.garage}/changes`, { key: a.key })).json.changes.some((c) => c.garage_id === null));
+});

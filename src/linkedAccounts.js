@@ -1,5 +1,5 @@
 /**
- * People from a linked accounts module (0035; README, "Linked accounts:
+ * People from a linked accounts module (0047; README, "Linked accounts:
  * people beside the admin"): their sessions, and sign-in's lock for them.
  *
  * A SESSION KEEPS THE ANSWER IT WAS MADE FROM -- who, the tenant, the garages,

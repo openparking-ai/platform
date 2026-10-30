@@ -32,8 +32,8 @@
  */
 import express from 'express';
 import { hashPassword, passwordRuleBroken } from './passwords.js';
-import { sendEmail, EmailNotSent } from './email.js';
-import { acceptedNotice, resetEmail } from './emailText.js';
+import { notify, sendEmail, EmailNotSent } from './email.js';
+import { acceptedNotice, passkeysRemovedEmail, resetEmail } from './emailText.js';
 import { verifyUtf8 } from './utf8Body.js';
 import { DatabaseUnavailable, unavailableAnswer } from './db.js';
 import {
@@ -246,7 +246,12 @@ export function mountAccountDoors(router, { settings, email, line, answer, signI
       if (!passwordHash) return await answer(req, res, 503, LINK_BUSY);
       const done = await completeReset(found.reset, { passwordHash });
       if (done.status) return await answer(req, res, 409, { error: RESET_SENTENCES[done.status], code: `reset_${done.status}` });
-      return await answer(req, res, 200, { email: done.email, message: RESET_DONE });
+      await answer(req, res, 200, { email: done.email, message: RESET_DONE });
+      // After the answer: the reset removed the account's passkeys, and its holder is told.
+      if (done.passkeysRemoved > 0) {
+        notify(email, { to: done.email, ...passkeysRemovedEmail(done.language, { count: done.passkeysRemoved, at: new Date() }) }, 'passkeys-removed notice');
+      }
+      return undefined;
     } catch (err) {
       return failed(req, res, 'reset', err);
     }

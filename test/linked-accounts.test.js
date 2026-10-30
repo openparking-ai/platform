@@ -1,5 +1,5 @@
 /**
- * People from a linked accounts module (0035; README, "Linked accounts: people
+ * People from a linked accounts module (0047; README, "Linked accounts: people
  * beside the admin"), against the door's stand-in (test/fixtures/accounts-door).
  *
  * Unset is only the admin; set, an email that is not the admin's is the
@@ -94,7 +94,7 @@ const age = (token) => su.query(
 before(async () => {
   su = superuserClient();
   await su.connect();
-  main = await serve({ ADMIN_ORIGIN, SIGN_IN_REFUSAL_FLOOR_MS: '200', SIGN_IN_ATTEMPTS_PER_ADDRESS: '1000', ACCOUNTS_RECHECK_SECONDS: '10' });
+  main = await serve({ ADMIN_ORIGIN, SIGN_IN_REFUSAL_FLOOR_MS: '200', ACCOUNTS_SIGN_IN_FLOOR_MS: '200', SIGN_IN_ATTEMPTS_PER_ADDRESS: '1000', ACCOUNTS_RECHECK_SECONDS: '10' });
 });
 
 after(async () => {
@@ -346,4 +346,49 @@ test('ANOTHER TENANT\'S PERSON never reaches this tenant: its garage is not foun
   assert.equal((await call(`/api/v1/garages/${a.world.garage}`, { cookie: token })).status, 404);
   const list = await call('/api/v1/garages', { cookie: token });
   assert.deepEqual(list.json.garages.map((g) => g.id), [b.world.garage]);
+});
+
+test('ONE TIME ON THE WIRE: with a door named, a wrong admin password and an email asked of a slow module both wait for ACCOUNTS_SIGN_IN_FLOOR_MS; a module slower than it is logged', async () => {
+  const FLOOR = 1500;
+  const slow = await serve({ ADMIN_ORIGIN, SIGN_IN_REFUSAL_FLOOR_MS: '200', ACCOUNTS_SIGN_IN_FLOOR_MS: String(FLOOR), SIGN_IN_ATTEMPTS_PER_ADDRESS: '1000' });
+  const a = await account('la-floor');
+  const timed = async (email, password) => {
+    const started = performance.now();
+    const r = await signInAs(email, password, { base: slow.base });
+    return { ...r, ms: performance.now() - started };
+  };
+  door.edit((s) => { s.delay_ms = 700; });
+  try {
+    // The admin's road: one hash here. Another email's road: the module, 700 ms.
+    const admin = await timed(a.email, WRONG);
+    const other = await timed(`nobody-${Math.random().toString(36).slice(2, 8)}@example.com`, WRONG);
+    for (const [what, r] of [['a wrong admin password', admin], ['an email asked of the module', other]]) {
+      assert.equal(r.status, 401, what);
+      assert.ok(r.ms >= FLOOR - 5, `${what} answered in ${Math.round(r.ms)} ms, before the floor of ${FLOOR}`);
+      assert.ok(r.ms < FLOOR + 1000, `${what} answered in ${Math.round(r.ms)} ms, long after the floor`);
+    }
+    assert.equal(admin.text, other.text);
+    // A module slower than the floor is said in the log, so the floor is raised.
+    door.edit((s) => { s.delay_ms = FLOOR + 300; });
+    const said = [];
+    const error = console.error;
+    console.error = (...args) => { said.push(args.join(' ')); };
+    try {
+      assert.equal((await timed(`slow-${Math.random().toString(36).slice(2, 8)}@example.com`, WRONG)).status, 401);
+    } finally {
+      console.error = error;
+    }
+    assert.ok(said.some((l) => /the accounts door took \d+ ms to answer a sign-in, more than ACCOUNTS_SIGN_IN_FLOOR_MS \(1500\)/.test(l)), said.join('\n'));
+  } finally {
+    door.edit((s) => { delete s.delay_ms; });
+  }
+  // With no door named the admin's refusal keeps sign-in's own floor: the larger one is the door's.
+  door.name(false);
+  try {
+    const plain = await timed(a.email, WRONG);
+    assert.equal(plain.status, 401);
+    assert.ok(plain.ms < FLOOR - 300, `with no door the admin waited ${Math.round(plain.ms)} ms`);
+  } finally {
+    door.name(true);
+  }
 });

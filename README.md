@@ -582,10 +582,10 @@ account-links-fail-control` breaks each one in turn.
 
 **A passkey is optional**, and the password stays: a passkey is a second way in,
 never the only one. The admin adds, names, lists and removes their own, behind
-their session (WebAuthn, through `@simplewebauthn/server`; migration 0035):
+their session (WebAuthn, through `@simplewebauthn/server`; migration 0047):
 
-    POST   /api/v1/auth/passkeys/options     ->  200 {challenge_id, options}  (the creation options)
-    POST   /api/v1/auth/passkeys             {challenge_id, name, response}  ->  201 {passkey: {id, name, created_at, last_used_at}}
+    POST   /api/v1/auth/passkeys/options     [{password}]  ->  200 {challenge_id, options}  (the creation options)
+    POST   /api/v1/auth/passkeys             {challenge_id, name, response}  ->  201 {passkey: {id, name, created_at, last_used_at, disabled_at}}
     GET    /api/v1/auth/passkeys             ->  200 {passkeys: [...]}
     POST   /api/v1/auth/passkeys/rename      {id, name}        ->  200 {passkey}
     POST   /api/v1/auth/passkeys/remove      {id}              ->  204
@@ -603,17 +603,51 @@ comma-separated list of origins, `ADMIN_ORIGIN` when unset. With no
 `PASSKEY_RP_ID`, passkeys are off and every passkey route answers `409
 passkeys_not_configured`.
 
-**A challenge works once**, for five minutes, held in this process: a deployment
-of more than one process must send a passkey's two steps to the same one, or the
-second is refused as if the challenge had ended. **A passkey's counter must go
-up** with every use (or stay 0 on an authenticator that keeps none): one that
-does not is a copied key and is refused, `401 passkey_refused`, and the
-passkey's own counter is not moved. A passkey sign-in keeps sign-in's floor, its
-per-address attempt limit and its `Origin` rule. Its refusals are one: an
-unknown passkey, a signature that does not check and a copied key answer the
-same. A password reset keeps the admin's passkeys; a passkey whose admin is
-removed goes with them. Adding and removing one is a line in the change log
-(`passkey.add`, `passkey.remove`), with its name, never its key.
+**The person is verified, not only present.** Adding a passkey and signing in
+with one ask for user verification (`userVerification: "required"`: Face ID, a
+fingerprint, the device's PIN), and a response without it is refused: a security
+key with no PIN, which anyone holding it can press, is neither added nor let in.
+
+**Adding one is proved again.** The cookie alone does not add a passkey: the
+session must have signed in with the password within the last five minutes, or
+`/passkeys/options` must carry the password, `{"password"}`. Otherwise it answers
+`403 password_required` ("Enter your password to add a passkey."). A session that
+signed in with a passkey has proved no password. The password is checked as
+sign-in checks it: a place in the hash line, the address's lock, and a wrong one
+counted toward that lock; a wrong password and a locked address are one answer,
+`403 password_not_accepted`, at sign-in's floor. **The account holder is told by
+email** that a passkey was added, its name and when, after the answer; with no
+email configured, the log says the notice was not sent (never to whom), and the
+change log has the line either way.
+
+**A challenge works once**, for five minutes, for its own purpose. Challenges are
+kept in the database (`passkey_challenges`), so every process of a deployment and
+a restart see the same ones, and each is taken with one `DELETE`, so two uses at
+once find it once. Adding a passkey's challenge is bound to the admin and the
+session that asked, by a SHA-256 of them. One caller address holds at most 20 at
+once (`429 passkeys_busy` past that); ended ones are purged as new ones are made.
+
+**A passkey's counter must go up** with every use (or stay 0 on an authenticator
+that keeps none). It is read only after the signature has checked: one that did
+not go up means a copy of the key is in use, so the sign-in is refused, `401
+passkey_refused`, and the admin's passkey is **turned off** (`disabled_at`, listed
+with it) in the same transaction, with a line in the change log
+(`passkey.turn_off`, by nobody, its name and never its key) and one in the log
+(which passkey and tenant, never a key, a counter or a response). A passkey that
+is turned off is never found again; the admin removes it and adds another. Two
+sign-ins at once with one counter: one is let in, the other turns the key off. A
+linked person's passkey is the module's to turn off: a counter that did not go up
+is refused here before the module is told, and logged.
+
+A passkey sign-in keeps sign-in's floor, its per-address attempt limit and its
+`Origin` rule. Its refusals are one: an unknown passkey, a signature that does not
+check, a response without user verification and a copied key answer the same.
+**A password reset removes every passkey of the admin** -- by the emailed link
+and by `reset-admin-password` -- in the reset's own transaction, and the admin is
+told by email how many went; a passkey added before the password last changed is
+not found in any case, whatever changed it. A passkey whose admin is removed goes
+with them. Adding, renaming and removing one is a line in the change log
+(`passkey.add`, `passkey.rename`, `passkey.remove`), with its name, never its key.
 
 ### Linked accounts: people beside the admin
 
@@ -650,7 +684,13 @@ moment."), and **nobody is let in**.
 
 **Sign-in asks the admin first.** An email that is not the admin's, with the door
 named, goes to the door; the door's refusal is the same `401 sign_in_refused`,
-byte for byte, held to the same floor. **The per-address lock covers door
+byte for byte. **And in the same time**: the admin's password is checked here and
+anyone else's by the module, a slower road, so with the door named every sign-in
+refusal -- the admin's too -- waits for `ACCOUNTS_SIGN_IN_FLOOR_MS` (default 2000,
+200 to 15000) or sign-in's own floor, whichever is larger. Set it above the
+module's own time: a door sign-in that takes longer is logged ("the accounts door
+took N ms ... raise it"), since its road would then be on the wire. A module that
+cannot decide (`503`) is answered at the same floor. **The per-address lock covers door
 sign-ins**: ten refusals for one email from one address lock that address out of
 that email for 30 minutes, kept by a hash of the email (`linked_sign_in_locks`),
 and a locked address does not reach the door. A permission the door names that
@@ -696,7 +736,10 @@ nothing an admin or a key does today changes. A linked person holds what the
 module says. **A route about a garage** — its id in the path, or a lane or a
 computer of it — **also checks that garage is in the session's list**, and one
 that is not answers what an id naming nothing answers (`404`), so a list never
-says what lies outside it. `GET /api/v1/garages` lists only the session's
+says what lies outside it. **The account's own change-log lines** -- those of no
+one garage: its passkeys, its keys, its admin's language -- **are read only by a
+session over every garage**; a person at some garages reads their garages' lines
+and refused attempts, and the count of them, without the account's. `GET /api/v1/garages` lists only the session's
 garages; making a garage needs `garages:change` and every garage. A test walks
 every route the operator router has and fails if one names no permission, or
 one that is not in the list.

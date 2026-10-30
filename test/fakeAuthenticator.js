@@ -5,7 +5,9 @@
  * verification (@simplewebauthn/server) runs on them unchanged.
  *
  * Every field a test may want wrong is an option: another origin, another
- * relying party, a counter that goes back, a signature over something else.
+ * relying party, a counter that goes back, a signature over something else,
+ * a key that sees the person present but does not verify them (`uv: false`:
+ * a security key with no PIN).
  */
 import { createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import { isoCBOR } from '@simplewebauthn/server/helpers';
@@ -17,7 +19,7 @@ const FLAG_UP = 0x01;
 const FLAG_UV = 0x04;
 const FLAG_AT = 0x40;
 
-export function fakeAuthenticator({ origin, rpId, counter = 0, step = 1 } = {}) {
+export function fakeAuthenticator({ origin, rpId, counter = 0, step = 1, uv = true } = {}) {
   const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
   const jwk = publicKey.export({ format: 'jwk' });
   const credentialId = randomBytes(32);
@@ -44,7 +46,7 @@ export function fakeAuthenticator({ origin, rpId, counter = 0, step = 1 } = {}) 
       const idLength = Buffer.alloc(2);
       idLength.writeUInt16BE(credentialId.length);
       const authData = Buffer.concat([
-        sha256(as.rpId ?? rpId ?? options.rp.id), Buffer.from([FLAG_UP | FLAG_UV | FLAG_AT]), count,
+        sha256(as.rpId ?? rpId ?? options.rp.id), Buffer.from([FLAG_UP | ((as.uv ?? uv) ? FLAG_UV : 0) | FLAG_AT]), count,
         Buffer.alloc(16), idLength, credentialId, cose,
       ]);
       const attestationObject = isoCBOR.encode(new Map([['fmt', 'none'], ['attStmt', new Map()], ['authData', authData]]));
@@ -63,7 +65,7 @@ export function fakeAuthenticator({ origin, rpId, counter = 0, step = 1 } = {}) 
       }));
       const count = Buffer.alloc(4);
       count.writeUInt32BE(self.counter);
-      const authData = Buffer.concat([sha256(as.rpId ?? rpId ?? options.rpId), Buffer.from([FLAG_UP | FLAG_UV]), count]);
+      const authData = Buffer.concat([sha256(as.rpId ?? rpId ?? options.rpId), Buffer.from([FLAG_UP | ((as.uv ?? uv) ? FLAG_UV : 0)]), count]);
       const signed = Buffer.concat([authData, sha256(clientData)]);
       const signature = sign('sha256', as.tamper ? Buffer.concat([signed, Buffer.from([0])]) : signed, privateKey);
       return {

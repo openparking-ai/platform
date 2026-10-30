@@ -2919,9 +2919,11 @@ export function createApp() {
       const out = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
-        const page = await changes.linesForGarage(client, req.tenantId, garage.id, { outcome, after: req.params.changeId ?? null });
+        // The account's own lines (its passkeys, keys, admin) only for a reader over the whole account.
+        const accountWide = req.access.garages === 'all';
+        const page = await changes.linesForGarage(client, req.tenantId, garage.id, { outcome, after: req.params.changeId ?? null, accountWide });
         if (!page) throw new HttpError(404, 'change not found');
-        return { page, count: outcome === 'refused' ? await changes.refusedCount(client, req.tenantId, garage.id) : null };
+        return { page, count: outcome === 'refused' ? await changes.refusedCount(client, req.tenantId, garage.id, { accountWide }) : null };
       });
       if (outcome === 'done') res.json({ changes: out.page.lines.map(presentChange), next: out.page.next });
       else res.json({ refused: out.page.lines.map(presentChange), next: out.page.next, count: out.count });
