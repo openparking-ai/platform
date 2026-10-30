@@ -3811,7 +3811,9 @@ export function createApp() {
    * A stay that ENDED owes what its exit would have charged at `left_at`
    * (0043), kept on `ended.owed` and answered as `owed_minor`. Nothing is
    * charged here, whatever card the car has: the garage collects it its
-   * own way. An abandoned stay owes nothing.
+   * own way. An abandoned stay owes nothing. A stay that paid at an exit
+   * (`ended.paid`) is answered owing the rest: the price less what was
+   * paid, never below 0.
    */
   operator.post('/garages/:garageId/stays/:stayId/end', async (req, res, next) => {
     try {
@@ -3860,7 +3862,8 @@ export function createApp() {
           },
         });
         if (!row) throw conflict('stay_not_open', 'this stay is not open: it has already been closed or ended');
-        const owedMinor = owed ? owed.fee_minor : null;
+        // What it still owes, as shown: the price less what was paid on the stay, never below 0.
+        const owedMinor = owed ? stuck.owedAfterPaid(owed.fee_minor, paid, row.currency) : null;
         await repo.appendEvents(client, req.tenantId, [{
           garageId: garage.id,
           laneId: null,

@@ -212,6 +212,21 @@ export function owedOf(quote) {
   };
 }
 
+/**
+ * WHAT A STAY STILL OWES, AS SHOWN: what it owes (`ended.owed.fee_minor`, or
+ * a let-out's `owed_minor`) less what was paid on the stay at an exit (0045,
+ * `ended.paid`), never below 0. Null stays null: a price the rates refused is
+ * not a price of nothing. Stripe writes a currency in small letters and the
+ * stay in capitals; a payment in another currency is not taken off (an exit
+ * charges the stay's own). The stay keeps both figures, whole, as recorded.
+ */
+export function owedAfterPaid(owedMinor, paid, currency) {
+  if (owedMinor === null || owedMinor === undefined) return null;
+  const owed = Number(owedMinor);
+  if (!paid || String(paid.currency).toUpperCase() !== String(currency).toUpperCase()) return owed;
+  return Math.max(0, owed - Number(paid.amount_minor));
+}
+
 /** An ended stay, as the person who ended it reads it back: what it owes, when the car left. */
 export function presentEnded(s) {
   const owed = s.ended?.owed ?? null;
@@ -220,7 +235,7 @@ export function presentEnded(s) {
     entered_at: s.entry_at,
     exit_at: s.exit_at,
     ended: s.ended,
-    owed_minor: owed ? owed.fee_minor : null,
+    owed_minor: owed ? owedAfterPaid(owed.fee_minor, s.ended.paid, s.currency) : null,
     // True when the garage links a pass and had no exit lane to ask it at:
     // what is owed was priced without it. Null on a stay that owes nothing.
     pass_unasked: owed ? owed.pass_unasked === true : null,

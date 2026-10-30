@@ -153,7 +153,7 @@ const SOURCE_BREAKS = [
     name: 'past_owed_missing',
     why: 'the past stays do not say what an ended stay owes',
     file: 'src/pastStays.js',
-    from: '    owed_minor: row.owed_minor === null || row.owed_minor === undefined ? null : Number(row.owed_minor),',
+    from: '    owed_minor: owedAfterPaid(row.owed_minor, row.paid, row.currency),',
     to: '    owed_minor: null,',
   },
   {

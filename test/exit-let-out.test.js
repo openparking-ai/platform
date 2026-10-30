@@ -30,7 +30,9 @@
  *     the change log by the lane computer, with no plate;
  *   * A PERSON'S END with a case open closes the case -- the unpaid intent
  *     canceled at Stripe first, a paid one never canceled and named on the
- *     end -- and a card being authorised is 409 with nothing changed;
+ *     end -- and a card being authorised is 409 with nothing changed; a
+ *     stay that paid is shown owing its price less what was paid, never
+ *     below 0, in the answer, the event, the change log and the past stays;
  *   * THE READER HOLDING ANOTHER CAR'S FEE: that intent is canceled at
  *     Stripe and cleared before this case's is sent; one that paid in the
  *     instant is recorded paid, never canceled; an action this platform did
@@ -759,6 +761,48 @@ test("A PERSON'S END after the card paid: the payment is never canceled and stay
   assert.equal(intentOf(sb).status, 'requires_payment_method');
   assert.equal((await stay(g, busyCase.session_id)).exit_at, null, 'the stay stays open');
   assert.equal((await exitRow(g, busyCase.id)).closed_at, null, 'and its case');
+});
+
+test("A PERSON'S END of a stay that paid at an exit: what it owes is the price less what was paid, never below 0 -- in the answer, the event, the change log and the past stays", async () => {
+  const g = await garage('end-paid-owed');
+  const endPaid = async ({ inMin, exitMin, leftAt }) => {
+    const { exit } = await enterAndExit(g, { inMin, exitMin });
+    const started = await pay(g, exit.id);
+    stub.presentCard(started.payment.payment_intent_id);
+    const res = await call(g.op, 'POST', `/garages/${g.world.garage}/stays/${exit.session_id}/end`,
+      { outcome: 'ended', reason: 'paid at the exit, then stayed on', ...(leftAt ? { left_at: leftAt } : {}) });
+    assert.equal(res.status, 200, await res.clone().text());
+    const answer = (await res.json()).stay;
+    const line = (await withTenant(g.tenant, async (c) => (await c.query(
+      `SELECT after FROM garage_changes WHERE tenant_id = $1 AND action = 'stay.end' AND subject_id = $2`, [g.tenant, exit.session_id])).rows))[0];
+    const event = (await events(g, 'stay_ended')).find((e) => e.detail.session_id === exit.session_id);
+    return { exit, answer, line, event, row: await stay(g, exit.session_id) };
+  };
+  const past = async (row) => {
+    const res = await call(g.op, 'GET', `/garages/${g.world.garage}/stays/closed?from=${encodeURIComponent(ago(300))}&to=${encodeURIComponent(ago(-1))}`);
+    assert.equal(res.status, 200, await res.clone().text());
+    return (await res.json()).stays.filter((x) => new Date(x.exit_at).getTime() === new Date(row.exit_at).getTime());
+  };
+
+  // In 90 minutes ago, paid at an exit 70 minutes ago (20 minutes: one hour),
+  // and left now (90 minutes: two hours). It owes the second hour.
+  const less = await endPaid({ inMin: 90, exitMin: 70 });
+  assert.deepEqual([less.exit.fee.fee_minor, less.row.ended.paid.amount_minor, less.row.ended.owed.fee_minor], [250, 250, 500],
+    'the stay keeps the whole price and what was paid');
+  assert.deepEqual([less.answer.owed_minor, less.answer.currency], [250, 'USD'], 'the answer: 500 less the 250 paid');
+  assert.deepEqual([less.line.after.owed_minor, less.line.after.paid_minor, less.line.after.currency], [250, 250, 'USD'], 'the change-log line');
+  assert.equal(less.event.detail.owed_minor, 250, 'the event');
+  assert.deepEqual((await past(less.row)).map((x) => [x.ended, x.fee_minor, x.owed_minor]), [['ended', null, 250]], 'the past stays');
+
+  // In 150 minutes ago, paid three hours at the exit now, and said to have
+  // left 100 minutes ago (50 minutes: one hour). It paid more than that: it
+  // owes nothing, never a negative figure.
+  const more = await endPaid({ inMin: 150, exitMin: 0.5, leftAt: ago(100) });
+  assert.deepEqual([more.row.ended.paid.amount_minor, more.row.ended.owed.fee_minor], [750, 250]);
+  assert.equal(more.answer.owed_minor, 0, 'the answer: 250 less 750 is nothing owed, not -500');
+  assert.equal(more.line.after.owed_minor, 0, 'the change-log line');
+  assert.equal(more.event.detail.owed_minor, 0, 'the event');
+  assert.deepEqual((await past(more.row)).map((x) => x.owed_minor), [0], 'the past stays');
 });
 
 test("THE READER HOLDING ANOTHER CAR'S FEE: that intent is canceled at Stripe and cleared first, then this case's is sent -- the driver never pays another car's fee", async () => {

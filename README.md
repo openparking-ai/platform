@@ -1890,11 +1890,16 @@ at, by, why}` when a person decided.
   breakdown, plan_version, covered_by, refused, pass_unasked, entitlement}`;
   `entitlement` is what each module was asked and said, and the retention
   purge takes it out with the vehicle) and answered as `owed_minor`: 0 when
-  covered, null when the rates refused to price it. **Nothing is charged**,
-  whatever card the car has: the stay stays unpriced (`fee_minor` is what a
-  stay paid at its exit), and the garage collects what it owes its own way.
-  An abandoned stay owes nothing. Pricing needs the rate engine: with it
-  down, `ended` is refused as the exit is, and `abandoned` still works.
+  covered, null when the rates refused to price it. **A stay that paid at an
+  exit** before a person ended it owes the rest: `owed_minor` -- in the
+  end's answer, its event, its change-log line and the past stays -- is
+  `ended.owed.fee_minor` less `ended.paid.amount_minor`, never below 0;
+  `ended.owed` keeps the exit's whole quote and `ended.paid` what was paid.
+  **Nothing is charged**, whatever card the car has: the stay stays
+  unpriced (`fee_minor` is what a stay paid at its exit), and the garage
+  collects what it owes its own way. An abandoned stay owes nothing.
+  Pricing needs the rate engine: with it down, `ended` is refused as the
+  exit is, and `abandoned` still works.
 
 The past stays (`GET /garages/:garageId/stays/closed`) carry `ended`, the
 reason, on a stay that was ended, and `owed_minor` beside a null `fee_minor`
