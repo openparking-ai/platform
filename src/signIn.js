@@ -238,23 +238,36 @@ export function callerAddress(req, settings) {
   return address.slice(0, 64);
 }
 
-/** Attempts per address in a fixed window, held in this process. */
+/**
+ * Attempts per address in a fixed window, held in this process.
+ *
+ * `attempt(address)` counts one and answers `{allowed, resetAt,
+ * retryAfterSeconds}`: when this address's window ends, and the whole
+ * seconds until then, at least 1 -- what a refusal's `Retry-After` says.
+ * `take(address)` is the same count answering `allowed` alone.
+ */
 export function addressLimiter({ max, windowSeconds, now = () => Date.now() }) {
   const seen = new Map();
+  const attempt = (address) => {
+    const at = now();
+    if (seen.size > 10_000) {
+      for (const [key, entry] of seen) if (entry.resetAt <= at) seen.delete(key);
+    }
+    let entry = seen.get(address);
+    if (!entry || entry.resetAt <= at) {
+      entry = { count: 0, resetAt: at + windowSeconds * 1000 };
+      seen.set(address, entry);
+    }
+    entry.count += 1;
+    return {
+      allowed: entry.count <= max,
+      resetAt: entry.resetAt,
+      retryAfterSeconds: Math.max(1, Math.ceil((entry.resetAt - at) / 1000)),
+    };
+  };
   return {
-    take(address) {
-      const at = now();
-      if (seen.size > 10_000) {
-        for (const [key, entry] of seen) if (entry.resetAt <= at) seen.delete(key);
-      }
-      let entry = seen.get(address);
-      if (!entry || entry.resetAt <= at) {
-        entry = { count: 0, resetAt: at + windowSeconds * 1000 };
-        seen.set(address, entry);
-      }
-      entry.count += 1;
-      return entry.count <= max;
-    },
+    attempt,
+    take: (address) => attempt(address).allowed,
   };
 }
 

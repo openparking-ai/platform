@@ -43,9 +43,15 @@
  * plate is. Both are nulled on every session of every vehicle this run
  * redacts, and on no other: the session keeps its times and its fee, exactly
  * as before.
+ *
+ * An INVENTORY WALK (0040) holds plates a person photographed or typed: it
+ * is deleted, with its sightings and the stays it listed, once it finished,
+ * was abandoned, or (neither) started longer ago than the window. A
+ * sighting's picture goes sooner, once its PICTURE_DAYS (30) are over.
  */
 import { withTenant } from './db.js';
 import * as repo from './repository.js';
+import * as walksModule from './walks.js';
 
 export async function redactExpiredVehicles(tenantId, { now = null, dryRun = false } = {}) {
   return withTenant(tenantId, async (client) => {
@@ -161,7 +167,14 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
           AND COALESCE(closed_at, exit_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,
       [tenantId, now, days],
     );
-    return { tenantId, retentionDays: days, redacted: rows.length, wouldRedact: rows.length };
+    const { rowCount: walks } = await client.query(
+      `DELETE FROM walks
+        WHERE tenant_id = $1
+          AND COALESCE(finished_at, abandoned_at, started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,
+      [tenantId, now, days],
+    );
+    const walkPictures = await walksModule.removeExpiredPictures(client, tenantId, { now });
+    return { tenantId, retentionDays: days, redacted: rows.length, wouldRedact: rows.length, walksDeleted: walks, walkPictures };
   });
 }
 

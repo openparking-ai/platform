@@ -51,7 +51,7 @@ if (only && tables.length === 0) {
 }
 
 for (const spec of tables) {
-  const { table, insert, appendOnly, noDelete, singleton } = spec;
+  const { table, insert, appendOnly, noDelete, writeOnce, singleton } = spec;
 
   // A singleton table holds one row per tenant by construction (tenant_settings
   // is keyed on tenant_id), so its "second row" is another tenant's, and the
@@ -97,15 +97,27 @@ for (const spec of tables) {
     );
   });
 
-  if (!appendOnly) {
-    test(`${table}: a tenant cannot update another tenant's row`, async () => {
-      const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
-      const count = await withTenant(A, async (c) => {
-        const res = await c.query(`UPDATE ${table} SET tenant_id = tenant_id WHERE ${key} = $1`, [idB]);
-        return res.rowCount;
-      });
-      assert.equal(count, 0, `${table} let tenant A update tenant B's row`);
+  if (writeOnce) {
+    // Written once and deleted with what owns it: with no UPDATE grant there
+    // is no policy to measure, so the missing grant is what is asserted.
+    test(`${table}: a row, once written, is never changed by the app role`, async () => {
+      const own = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
+      const change = (c) => c.query(`UPDATE ${table} SET tenant_id = tenant_id WHERE ${key} = $1`, [own]);
+      await assert.rejects(withTenant(B, change), /permission denied/i, `${table} took an UPDATE from its own tenant`);
     });
+  }
+
+  if (!appendOnly) {
+    if (!writeOnce) {
+      test(`${table}: a tenant cannot update another tenant's row`, async () => {
+        const idB = (await withTenant(B, (c) => insert(c, B, worldB))).rows[0].id;
+        const count = await withTenant(A, async (c) => {
+          const res = await c.query(`UPDATE ${table} SET tenant_id = tenant_id WHERE ${key} = $1`, [idB]);
+          return res.rowCount;
+        });
+        assert.equal(count, 0, `${table} let tenant A update tenant B's row`);
+      });
+    }
 
     if (noDelete) {
       // Updatable but never deletable: the app role has no DELETE grant, so
