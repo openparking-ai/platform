@@ -26,6 +26,11 @@
  *   job_first_tenant_only       the job goes through the first tenant it is given only
  *   job_line_names_tenants      the job's line names the tenants
  *   walk_deleted_with_picture   the retention window deletes a walk whose picture a stay still keeps
+ *   other_sightings_keep_plates a walk kept for one picture keeps the plates of sightings whose picture is gone
+ *   list_plates_kept            a walk kept for one picture keeps every plate in its lists
+ *   kept_stay_plate_blanked     the stay whose picture keeps the walk loses its plate in the lists
+ *   young_sightings_blanked     a walk inside the window has its sightings' plates blanked
+ *   young_lists_blanked         a walk inside the window has the plates in its lists blanked
  *
  * ONE TENANT AT A TIME has no source break: each pass runs under the
  * tenant's row security as the app role (NOBYPASSRLS), so no edit to the
@@ -47,6 +52,11 @@ const OPEN = 'AN OPEN STAY KEEPS ITS PICTURES';
 const PAID = 'PAID STORAGE KEEPS THEM';
 const TENANTS = 'TWO TENANTS';
 const WAITS = 'A WALK WAITS FOR ITS PICTURES';
+const PLATES = "A 400-DAY WALK KEPT FOR ONE CAR'S PICTURE";
+const YOUNG = 'A WALK INSIDE THE WINDOW';
+const BLANK_WHERE = "          AND (ws.plate IS NOT NULL OR ws.plate_pattern IS NOT NULL OR ws.readers <> walk_readers_blanked(ws.readers))\n";
+const SIGHTING_WINDOW = '          AND COALESCE(w.finished_at, w.abandoned_at, w.started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,\n      [tenantId, now, days],\n    );\n    const { rowCount: listsBlanked }';
+const LIST_WINDOW = "          WHERE w.tenant_id = $1 AND jsonb_typeof(w.lists) = 'object'\n            AND COALESCE(w.finished_at, w.abandoned_at, w.started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)\n";
 
 const LANE_TAKEN = '        AND p.taken_at <= COALESCE($2::timestamptz, now()) - make_interval(hours => 24 * $3)\n';
 const WALK_TAKEN = '        AND ws.taken_at <= COALESCE($2::timestamptz, now()) - make_interval(hours => 24 * $3)\n';
@@ -191,6 +201,44 @@ const BREAKS = [
       from: '          AND NOT EXISTS (\n                SELECT 1 FROM walk_sightings ws\n                 WHERE ws.tenant_id = w.tenant_id AND ws.walk_id = w.id AND ws.picture IS NOT NULL)`,',
       to: '`,',
     }],
+  },
+  {
+    name: 'other_sightings_keep_plates',
+    why: 'a walk kept for one picture keeps the plates of sightings whose picture is gone',
+    red: [PLATES],
+    edits: [{ file: 'src/retention.js', from: '          AND ws.picture IS NULL AND ws.plate_blanked_at IS NULL\n', to: '          AND false\n' }],
+  },
+  {
+    name: 'list_plates_kept',
+    why: 'a walk kept for one picture keeps every plate in its lists',
+    red: [PLATES],
+    edits: [{
+      file: 'src/retention.js',
+      from: '        WHERE w.tenant_id = $1 AND w.id = d.id AND w.lists IS DISTINCT FROM walk_lists_blanked(d.lists, d.keep)`,',
+      to: '        WHERE false`,',
+    }],
+  },
+  {
+    name: 'kept_stay_plate_blanked',
+    why: 'the stay whose picture keeps the walk loses its plate in the lists',
+    red: [PLATES],
+    edits: [{
+      file: 'src/retention.js',
+      from: '       UPDATE walks w SET lists = walk_lists_blanked(d.lists, d.keep)',
+      to: "       UPDATE walks w SET lists = walk_lists_blanked(d.lists, '{}'::uuid[])",
+    }],
+  },
+  {
+    name: 'young_sightings_blanked',
+    why: 'a walk inside the window has its sightings\' plates blanked',
+    red: [YOUNG],
+    edits: [{ file: 'src/retention.js', from: BLANK_WHERE + SIGHTING_WINDOW, to: BLANK_WHERE.trimEnd() + '`,\n      [tenantId, now, days],\n    );\n    const { rowCount: listsBlanked }' }],
+  },
+  {
+    name: 'young_lists_blanked',
+    why: 'a walk inside the window has the plates in its lists blanked',
+    red: [YOUNG],
+    edits: [{ file: 'src/retention.js', from: LIST_WINDOW, to: "          WHERE w.tenant_id = $1 AND jsonb_typeof(w.lists) = 'object'\n" }],
   },
 ];
 

@@ -48,7 +48,10 @@
  * is deleted, with its sightings and the stays it listed, once it finished,
  * was abandoned, or (neither) started longer ago than the window, and none
  * of its pictures is still kept. Its pictures, and the lane's, go by their
- * own rule, in the picture job (src/pictureRetention.js).
+ * own rule, in the picture job (src/pictureRetention.js). One kept picture
+ * keeps the walk, but not the other cars' plates (0046): past the window,
+ * the plate of every sighting whose picture is gone is blanked, and every
+ * plate in its lists but the row of the stay that keeps the picture.
  */
 import { withTenant } from './db.js';
 import * as repo from './repository.js';
@@ -178,7 +181,48 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
                  WHERE ws.tenant_id = w.tenant_id AND ws.walk_id = w.id AND ws.picture IS NOT NULL)`,
       [tenantId, now, days],
     );
-    return { tenantId, retentionDays: days, redacted: rows.length, wouldRedact: rows.length, walksDeleted: walks };
+    // A walk still there past the window waits for a picture a stay keeps
+    // (0046): every other car's plate goes. A sighting whose picture is gone
+    // -- or that never had one -- has its plate, its characters and the
+    // readers' plates blanked, once; the plates in its lists are set to null
+    // but in the `seen_with_stay` rows that hold a kept picture. Again on a
+    // later run, as more pictures go.
+    const { rowCount: sightingsBlanked } = await client.query(
+      `UPDATE walk_sightings ws
+          SET plate = NULL, plate_state = NULL, plate_rule = NULL, plate_pattern = NULL,
+              readers = walk_readers_blanked(ws.readers), plate_blanked_at = COALESCE($2::timestamptz, now())
+         FROM walks w
+        WHERE ws.tenant_id = $1 AND w.tenant_id = ws.tenant_id AND w.id = ws.walk_id
+          AND ws.picture IS NULL AND ws.plate_blanked_at IS NULL
+          AND (ws.plate IS NOT NULL OR ws.plate_pattern IS NOT NULL OR ws.readers <> walk_readers_blanked(ws.readers))
+          AND COALESCE(w.finished_at, w.abandoned_at, w.started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,
+      [tenantId, now, days],
+    );
+    const { rowCount: listsBlanked } = await client.query(
+      `WITH due AS (
+         SELECT w.id, w.lists,
+                ARRAY(SELECT (e.row->>'stay')::uuid
+                        FROM jsonb_array_elements(w.lists->'seen_with_stay') AS e(row)
+                       WHERE EXISTS (
+                               SELECT 1 FROM walk_sightings ws
+                                WHERE ws.tenant_id = w.tenant_id AND ws.walk_id = w.id AND ws.picture IS NOT NULL
+                                  AND (e.row->'sightings' ? ws.id::text
+                                       OR EXISTS (SELECT 1 FROM walk_sightings a
+                                                   WHERE a.tenant_id = ws.tenant_id AND a.walk_id = ws.walk_id AND a.confirms = ws.id
+                                                     AND e.row->'sightings' ? a.id::text)))) AS keep
+           FROM walks w
+          WHERE w.tenant_id = $1 AND jsonb_typeof(w.lists) = 'object'
+            AND COALESCE(w.finished_at, w.abandoned_at, w.started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)
+       )
+       UPDATE walks w SET lists = walk_lists_blanked(d.lists, d.keep)
+         FROM due d
+        WHERE w.tenant_id = $1 AND w.id = d.id AND w.lists IS DISTINCT FROM walk_lists_blanked(d.lists, d.keep)`,
+      [tenantId, now, days],
+    );
+    return {
+      tenantId, retentionDays: days, redacted: rows.length, wouldRedact: rows.length, walksDeleted: walks,
+      walkSightingsBlanked: sightingsBlanked, walkListsBlanked: listsBlanked,
+    };
   });
 }
 

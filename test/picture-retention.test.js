@@ -110,11 +110,12 @@ async function walkWith(g, sightings) {
       const typed = Boolean(s.plate);
       const { rows } = await c.query(
         `INSERT INTO walk_sightings (tenant_id, walk_id, read, plate, why, plate_state, plate_rule, plate_pattern,
-                                     confirms, taken_at, added_by, picture, picture_type)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'key:test', $11, $12) RETURNING id`,
+                                     confirms, taken_at, added_by, picture, picture_type, readers)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'key:test', $11, $12, $13) RETURNING id`,
         [g.tenant, walk.id, typed ? 'typed' : 'none', s.plate ?? null, typed ? null : 'reader_off',
           typed ? 'read' : null, typed ? RULE : null, typed ? [...s.plate].map(fold).join('') : null,
-          s.answers === undefined ? null : ids[s.answers], s.takenAt, s.picture ? JPEG : null, s.picture ? 'image/jpeg' : null],
+          s.answers === undefined ? null : ids[s.answers], s.takenAt, s.picture ? JPEG : null, s.picture ? 'image/jpeg' : null,
+          JSON.stringify(s.readers ?? [])],
       );
       ids.push(rows[0].id);
     }
@@ -288,4 +289,74 @@ test('A WALK WAITS FOR ITS PICTURES: past the retention window it is kept while 
   assert.deepEqual(await removeExpiredPictures(g.tenant, { now: after_(left, 30) }), { lane: 0, walk: 1 });
   await redactExpiredVehicles(g.tenant);
   assert.equal(await walkThere(), 0, 'its picture gone, the walk goes with the window');
+});
+
+test("A 400-DAY WALK KEPT FOR ONE CAR'S PICTURE holds no other car's plate: sightings whose picture is gone and every list row but the kept stay's are blanked", async () => {
+  const g = await garage('pic-walk-plates');
+  const inside = await openStay(g, { entryAt: ago(60) });
+  const notSeen = await openStay(g, { entryAt: ago(60) });
+  const { walk, ids: [keptId, typedId, goneId, noneId] } = await walkWith(g, [
+    { plate: inside.plate, picture: true, takenAt: ago(45) },
+    { plate: 'OTHERCAR1', takenAt: ago(45) },
+    { plate: 'GONEPIC22', picture: true, takenAt: ago(45), readers: [{ reader: 'fast-alpr', plate: 'GONEPIC22', confidence: 0.97 }] },
+    { takenAt: ago(45) },
+  ]);
+  const plates = [inside.plate, notSeen.plate, 'OTHERCAR1', 'GONEPIC22'];
+  assert.ok(plates.every((p) => JSON.stringify(walk.lists).includes(p)), 'every plate is in the lists at the finish');
+  // The car still inside keeps its picture; the one no stay keeps goes after its 30 days.
+  assert.deepEqual(await removeExpiredPictures(g.tenant), { lane: 0, walk: 1 });
+  await ageWalks([walk.id], 400);
+
+  const result = await redactExpiredVehicles(g.tenant);
+  assert.deepEqual([result.walksDeleted, result.walkSightingsBlanked, result.walkListsBlanked], [0, 2, 1]);
+  const rows = await withTenant(g.tenant, async (c) => (await c.query(
+    `SELECT id, read, plate, plate_state, plate_rule, plate_pattern, readers, plate_blanked_at, picture IS NOT NULL AS has_picture
+       FROM walk_sightings WHERE walk_id = $1`, [walk.id])).rows);
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const kept = byId.get(keptId);
+  assert.deepEqual([kept.plate, kept.has_picture, kept.plate_blanked_at], [inside.plate, true, null], "the kept picture's car keeps its own");
+  for (const id of [typedId, goneId]) {
+    const r = byId.get(id);
+    assert.deepEqual([r.plate, r.plate_state, r.plate_rule, r.plate_pattern, r.has_picture], [null, null, null, null, false], `sighting ${id} blanked`);
+    assert.ok(r.plate_blanked_at, 'and says when');
+    assert.equal(r.read, 'typed', 'what was read is kept: only the plate goes');
+  }
+  assert.deepEqual(byId.get(goneId).readers, [{ reader: 'fast-alpr', plate: null, confidence: 0.97 }], "the reader's plate goes; who read it and how sure stay");
+  assert.deepEqual([byId.get(noneId).read, byId.get(noneId).plate_blanked_at], ['none', null], 'a sighting with no plate has nothing to blank');
+
+  const lists = (await withTenant(g.tenant, (c) => c.query('SELECT lists FROM walks WHERE id = $1', [walk.id]))).rows[0].lists;
+  const text = JSON.stringify(lists);
+  for (const p of [notSeen.plate, 'OTHERCAR1', 'GONEPIC22']) assert.ok(!text.includes(p), `${p} is not in the lists`);
+  assert.deepEqual(lists.seen_with_stay.map((r) => [r.stay, r.plate]), [[inside.id, inside.plate]], 'the kept stay keeps its plate');
+  assert.deepEqual(lists.stay_not_seen.map((r) => [r.stay, r.plate]), [[notSeen.id, null]], 'a stay the walk did not see: its id, no plate');
+  assert.equal(lists.seen_without_stay.length, 2, 'every row is kept, only its plate goes');
+  assert.ok(lists.seen_without_stay.every((r) => r.plate === null));
+  const all = [...rows.map((r) => r.plate), text].join(' ');
+  for (const p of [notSeen.plate, 'OTHERCAR1', 'GONEPIC22']) assert.ok(!all.includes(p), `${p} nowhere in the walk`);
+
+  // Again: nothing more to do, and nothing refused.
+  const again = await redactExpiredVehicles(g.tenant);
+  assert.deepEqual([again.walkSightingsBlanked, again.walkListsBlanked], [0, 0]);
+
+  // The car leaves; once its picture is gone, the walk goes whole.
+  const left = ago(0.5);
+  await closeAt(g, inside, left);
+  assert.deepEqual(await removeExpiredPictures(g.tenant, { now: after_(left, 30) }), { lane: 0, walk: 1 });
+  assert.equal((await redactExpiredVehicles(g.tenant)).walksDeleted, 1);
+});
+
+test('A WALK INSIDE THE WINDOW keeps every plate, kept picture or not', async () => {
+  const g = await garage('pic-walk-young');
+  const inside = await openStay(g, { entryAt: ago(60) });
+  const { walk, ids: [, typedId] } = await walkWith(g, [
+    { plate: inside.plate, picture: true, takenAt: ago(1) },
+    { plate: 'YOUNGCAR1', takenAt: ago(1) },
+  ]);
+  await ageWalks([walk.id], 5);
+  const result = await redactExpiredVehicles(g.tenant);
+  assert.deepEqual([result.walkSightingsBlanked, result.walkListsBlanked], [0, 0]);
+  const r = (await withTenant(g.tenant, (c) => c.query('SELECT plate FROM walk_sightings WHERE id = $1', [typedId]))).rows[0];
+  assert.equal(r.plate, 'YOUNGCAR1');
+  const lists = (await withTenant(g.tenant, (c) => c.query('SELECT lists FROM walks WHERE id = $1', [walk.id]))).rows[0].lists;
+  assert.ok(JSON.stringify(lists).includes('YOUNGCAR1'));
 });

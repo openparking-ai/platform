@@ -157,7 +157,11 @@ week.
 **A stay keeps the pictures it holds** -- the lane's of its entry, and the walk's a finished walk listed as seeing
 it -- while the car is inside, then for 30 days after it left (by the exit or a person's ending), and while its
 customer has paid picture storage (`sessions.pictures_paid_until`, 0041; nothing writes it yet). A walk past the
-retention window is kept while one of its pictures is.
+retention window is kept while one of its pictures is -- but **not the other cars' plates** (0046): past the window
+the purge blanks the plate, the positioned characters and the readers' plates of every sighting whose picture is
+gone (or that never had one), and every plate in the walk's four lists but the `seen_with_stay` row of the stay
+whose picture keeps the walk. What was read, who read it, the rows and the stay ids stay; again on each run, as more
+pictures go. The freeze triggers on a closed walk allow exactly that blanking and nothing else.
 
 The job is `npm run purge-pictures` (`npm run purge` runs it first), one tenant at a time under that tenant's row
 security; it prints counts only. `test/picture-retention.test.js` holds each rule, and

@@ -1983,7 +1983,13 @@ sightings once it finished or was abandoned -- or, neither, started --
 longer ago than the tenant's retention window (`retention_days`), in the
 same purge as the vehicles -- and not while one of its pictures is still
 kept: deleting the walk would take the picture with it. Its pictures go by
-the picture job (*Picture retention*).
+the picture job (*Picture retention*). One car's kept picture does not keep
+the others' plates (0046): past the window, a sighting whose picture is gone
+has its plate, its characters and the readers' plates blanked
+(`plate_blanked_at`), and the lists keep a plate only on the
+`seen_with_stay` row of the stay that keeps the picture; rows, stay ids and
+what was read stay. The freeze triggers allow exactly that blanking on a
+closed walk, and nothing else.
 
 ### Picture retention
 
