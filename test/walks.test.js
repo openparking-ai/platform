@@ -15,7 +15,8 @@ import { randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import { createApp } from '../src/app.js';
 import { redactExpiredVehicles } from '../src/retention.js';
-import { WALK_ABANDON_HOURS, SIGHTINGS_PER_MINUTE, SIGHTINGS_MAX, WALK_COMPLETE_DEFAULT_PERCENT } from '../src/walks.js';
+import { WALK_ABANDON_HOURS, SIGHTINGS_PER_MINUTE, WALK_COMPLETE_DEFAULT_PERCENT } from '../src/walks.js';
+import { SIGHTINGS_MAX } from '../src/walks.js';
 import { addressLimiter } from '../src/signIn.js';
 import { fold } from '../src/exitMatch.js';
 import {
