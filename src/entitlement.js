@@ -9,7 +9,7 @@
  * none of their data, and reads what they print.
  *
  *   garage-pass access-in-store --tenant T --garage G --vehicle V --lane L
- *                               --direction exit --at EXIT
+ *                               --direction exit --at EXIT --entered-at ENTRY
  *       exit 0 covered · 1 not covered · anything else: could not decide
  *       (2: refused to answer / configuration; 3: the request was refused,
  *       e.g. a garage it does not know). Prints a JSON answer on 0/1/3.
@@ -21,6 +21,19 @@
  * identity, a garage, a lane and instants, and the answers carry access
  * facts. Their own tests hold their side (garage-pass G3/G21, monthly-billing
  * G6); the argv is kept on the record so this side can be checked too.
+ *
+ * EACH VISIT IS A SESSION OF THE PASS (the owner's rule, 2026-10-31; 0048):
+ * a monthly or a pass holder's every in and out is a stay of its own, asked
+ * about at its own exit with its own entry (`--entered-at`, to both
+ * modules), so the pass's own rules -- its days, its hours, a car replaced on
+ * it -- are judged per session, and nothing carries from one session to the
+ * next. The pass a session belonged to is kept on it (`passSessionOf`).
+ *
+ * A STAY A REGISTRATION QR LET IN (0048) is asked about by the plate the QR
+ * was made for (`passIdentity`, the stay's `entry_qr.qr_plate`), to
+ * garage-pass only: the QR is its credential, and a car let in on one
+ * difference or with nothing read is the pass's car. Monthly billing is
+ * asked by the plate as read, or not at all when none was.
  *
  * COULD-NOT-DECIDE IS NOT NOT-COVERED. A module that cannot answer -- no DSN,
  * a database down, a garage it does not know, the script missing -- raises
@@ -119,6 +132,7 @@ async function ask(module, link, { identity, laneId, entryAt, exitAt }, options)
       ? [
           'access-in-store', '--tenant', link.tenant_id, '--garage', link.garage_id,
           '--vehicle', identity, '--lane', laneId, '--direction', 'exit', '--at', at,
+          '--entered-at', entryAt.toISOString(),
         ]
       : [
           'covered-in-store', '--tenant', link.tenant_id, '--garage', link.garage_id,
@@ -154,7 +168,7 @@ async function ask(module, link, { identity, laneId, entryAt, exitAt }, options)
  * TRANSIENT otherwise. Returns `{ outcome, covered_by, record }`; `record`
  * is what goes on the row.
  */
-export async function consult({ garage, identity, laneId, exitLaneIds = null, entryAt, exitAt }, options = {}) {
+export async function consult({ garage, identity, passIdentity = null, qr = null, laneId, exitLaneIds = null, entryAt, exitAt }, options = {}) {
   const record = { identity, asked_at: exitAt.toISOString() };
   const coveredBy = [];
   for (const module of Object.keys(MODULES)) {
@@ -163,6 +177,15 @@ export async function consult({ garage, identity, laneId, exitLaneIds = null, en
       record[module] = { consulted: false, reason: 'not linked: the garage names no garage in this module' };
       continue;
     }
+    // Who is asked about: the QR's plate, to garage-pass, for a stay a QR let
+    // in; the plate or ticket as read otherwise.
+    const asked = module === 'garage_pass' && passIdentity ? passIdentity : identity;
+    if (!asked) {
+      record[module] = { consulted: false, reason: 'no plate was read at the entry: this module cannot be asked about this car' };
+      continue;
+    }
+    const byQr = module === 'garage_pass' && Boolean(passIdentity);
+    const asQr = (r) => (byQr ? { ...r, asked_as: 'qr_plate', qr } : r);
     if (module === 'garage_pass' && laneId === null) {
       // A STAY A PERSON ENDED (0043): no lane was crossed, and a pass answers
       // for a lane. It is asked at each of the garage's exit lanes
@@ -177,16 +200,16 @@ export async function consult({ garage, identity, laneId, exitLaneIds = null, en
       const atLanes = [];
       let answer = null;
       for (const lane of lanes) {
-        answer = await ask(module, link, { identity, laneId: lane, entryAt, exitAt }, options);
+        answer = await ask(module, link, { identity: asked, laneId: lane, entryAt, exitAt }, options);
         atLanes.push({ lane_id: lane, covered: answer.covered });
         if (answer.covered) break;
       }
-      record[module] = { ...answer, asked_at_lanes: atLanes };
+      record[module] = asQr({ ...answer, asked_at_lanes: atLanes });
       if (atLanes.some((a) => a.covered)) coveredBy.push('garage_pass');
       continue;
     }
-    const answer = await ask(module, link, { identity, laneId, entryAt, exitAt }, options);
-    record[module] = answer;
+    const answer = await ask(module, link, { identity: asked, laneId, entryAt, exitAt }, options);
+    record[module] = asQr(answer);
     if (answer.covered) coveredBy.push(module);
   }
   return {
@@ -194,6 +217,34 @@ export async function consult({ garage, identity, laneId, exitLaneIds = null, en
     covered_by: coveredBy,
     record: { ...record, covered_by: coveredBy },
   };
+}
+
+/**
+ * THE PASS A STAY WAS A SESSION OF (0048), from what its exit was told: the
+ * garage-pass answer that named a pass -- covered or not, its reason kept --
+ * or else the monthly agreement that covered it. Null when no module named
+ * one. Each session of a pass is its own stay with its own answer; nothing
+ * carries from one to the next.
+ */
+export function passSessionOf(record, qr = null) {
+  const gp = record?.garage_pass;
+  if (gp?.consulted && gp.answer?.pass_id) {
+    return {
+      module: 'garage_pass',
+      pass_id: String(gp.answer.pass_id),
+      covered: Boolean(gp.covered),
+      reason: gp.covered ? null : gp.answer.reason ?? null,
+      covering_term: gp.covered ? gp.answer.covering_term ?? null : null,
+      ...(qr?.enrolment ? { enrolment: qr.enrolment } : {}),
+      ...(qr?.passed_by ? { passed_by: qr.passed_by } : {}),
+    };
+  }
+  const mb = record?.monthly_billing;
+  const agreement = mb?.consulted && mb.covered
+    ? mb.answer?.lines?.find((l) => l.includes('under agreement'))?.trim() ?? null
+    : null;
+  if (agreement) return { module: 'monthly_billing', agreement, covered: true };
+  return null;
 }
 
 export const REGISTER_VERB = 'show-garage-register';

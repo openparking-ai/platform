@@ -119,6 +119,13 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
             AND vehicle_id = ANY($2::uuid[])`,
         [tenantId, rows.map((r) => r.id)],
       );
+      // The plate a registration QR was made for (0048): a plate, so it goes
+      // with the vehicle; the QR's id and how it passed stay on the stay.
+      await client.query(
+        `UPDATE sessions SET entry_qr = NULLIF(entry_qr - 'qr_plate', '{}'::jsonb)
+          WHERE tenant_id = $1 AND entry_qr ? 'qr_plate' AND vehicle_id = ANY($2::uuid[])`,
+        [tenantId, rows.map((r) => r.id)],
+      );
       // What was read of an unread car's plate below the lane's confidence
       // (0036): a plate's text, so it goes with the descriptors.
       await client.query(

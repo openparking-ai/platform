@@ -125,6 +125,12 @@ export async function openSession(
   tenantId,
   {
     garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation, entryDescriptor = null, tailgater = false,
+    // A stay a registration QR let in (0048): `{enrolment, passed_by, qr_plate}`.
+    entryQr = null,
+    // Called, inside this transaction and before the old stay is ended, with
+    // the car's open stay a later entry supersedes and the new stay's id:
+    // the route closes that stay's open exit case there (0048).
+    onSupersede = null,
     noOpenCommand = false, entryUnsurePlate = null, entryUnsurePlateConfidence = null, entryId = null,
   },
 ) {
@@ -157,8 +163,14 @@ export async function openSession(
   // had ended by the later entry: it is ended as superseded and the new
   // visit gets its own stay. Never folded into the old one, which would bill
   // the new visit from the old entry.
+  //
+  // A RETURN AFTER AN EXIT IS A NEW STAY (the owner's rule, 2026-10-31):
+  // "when the car leaves, it's gone; when it comes back new time starts". A
+  // car whose stay reached an exit lane before this entry has been out: it
+  // is never folded back, however soon it came in again. The fold is for an
+  // entry re-approach only.
   const existing = await findOpenSession(client, tenantId, garageId, vehicleId);
-  if (existing && Math.abs(entryAt - existing.entry_at) <= reapproachMinutes() * 60_000) {
+  if (existing && (await foldsInto(client, tenantId, existing, entryAt))) {
     return { session: existing, created: false, superseded: [] };
   }
   const id = randomUUID();
@@ -175,8 +187,12 @@ export async function openSession(
   // the old stay is ended, so a race undoes that too.
   await client.query('SAVEPOINT open_session');
   try {
-    const superseded = existing && existing.entry_at < entryAt
-      ? [await endStay(client, tenantId, existing.id, { reason: 'superseded', exitAt: entryAt, record: { by_session: id } })].filter(Boolean)
+    const superseding = Boolean(existing && existing.entry_at < entryAt);
+    const supersededRecord = superseding && onSupersede ? await onSupersede(existing, id) : null;
+    const superseded = superseding
+      ? [await endStay(client, tenantId, existing.id, {
+        reason: 'superseded', exitAt: entryAt, record: { by_session: id, ...(supersededRecord ?? {}) },
+      })].filter(Boolean)
       : [];
     // Counted at the car's own entry, not when its open arrived: a lane
     // that delivers late counts the cars that were in when this one came in.
@@ -187,15 +203,16 @@ export async function openSession(
                              open_event_id, entry_confirmation, entry_descriptor, tailgater,
                              occupancy_at_entry_bp, no_open_command, entry_unsure_plate,
                              entry_unsure_plate_confidence, entry_plate_state, entry_plate_rule,
-                             entry_plate_pattern, entry_colour_code, entry_size, exit_at, ended)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+                             entry_plate_pattern, entry_colour_code, entry_size, exit_at, ended, entry_qr)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
        RETURNING *`,
       [id, tenantId, garageId, vehicleId, laneId, entryAt, currency, openEventId, entryConfirmation,
        entryDescriptor, tailgater, occupancyAtEntryBp,
        noOpenCommand, entryUnsurePlate, entryUnsurePlateConfidence,
        entryId?.plate?.state ?? null, entryId?.plate?.rule ?? null, entryId?.plate?.pattern ?? null,
        entryId?.colour_code ?? null, entryId?.size ?? null,
-       endedBy ? endedBy.entry_at : null, ended === null ? null : JSON.stringify(ended)],
+       endedBy ? endedBy.entry_at : null, ended === null ? null : JSON.stringify(ended),
+       entryQr === null ? null : JSON.stringify(entryQr)],
     );
     await client.query('RELEASE SAVEPOINT open_session');
     return { session: rows[0], created: true, superseded };
@@ -211,6 +228,32 @@ export async function openSession(
     if (!raced) throw err;
     return { session: raced, created: false, superseded: [] };
   }
+}
+
+/**
+ * Whether an entry of the car at `entryAt` is the same arrival as its open
+ * stay `existing` -- a re-approach at the entry -- and answers that stay:
+ * within REAPPROACH_MINUTES of its entry, and that stay never reached an
+ * exit lane by then (no case at or before this entry). A car that reached
+ * an exit had been out: its entry is a new stay, however soon.
+ */
+export async function foldsInto(client, tenantId, existing, entryAt) {
+  const reapproach = Math.abs(entryAt - existing.entry_at) <= reapproachMinutes() * 60_000;
+  return reapproach && !(await reachedAnExit(client, tenantId, existing.id, entryAt));
+}
+
+/** Whether an entry at `entryAt` ends the car's open stay `existing` as superseded: a later entry that is not the same arrival. */
+export async function supersedes(client, tenantId, existing, entryAt) {
+  return existing.entry_at < entryAt && !(await foldsInto(client, tenantId, existing, entryAt));
+}
+
+/** The stay had a car at an exit lane at or before `at`: some exit case names it. */
+export async function reachedAnExit(client, tenantId, sessionId, at) {
+  const { rows } = await client.query(
+    'SELECT 1 FROM exits WHERE tenant_id = $1 AND session_id = $2 AND exit_at <= $3 LIMIT 1',
+    [tenantId, sessionId, at],
+  );
+  return rows.length > 0;
 }
 
 /** The car's first stay here that came in after `at`, open or closed, or null. */
@@ -371,6 +414,8 @@ export async function closeSession(
     validation = null,
     // LET OUT WITH NOTHING PAID (0042): the record, and then no fee.
     letOut = null,
+    // THE PASS THIS STAY WAS A SESSION OF (0048), or null.
+    passSession = null,
   },
 ) {
   const priced = pricing.outcome !== 'covered' && pricing.refusal === undefined && letOut === null;
@@ -384,7 +429,7 @@ export async function closeSession(
             fee_minor = $8, plan_version = $9, breakdown = $10, space_class = $11,
             pricing_refusal = $12, exit_outcome = $13, entitlement = $14,
             decided_by = $15, decision_inputs = $16, validation = $17,
-            subtotal_minor = $18, let_out = $19, ended = NULL
+            subtotal_minor = $18, let_out = $19, ended = NULL, pass_session = $20
       WHERE tenant_id = $1 AND id = $2 AND (exit_at IS NULL OR ended IS NOT NULL)
       RETURNING *`,
     [tenantId, sessionId, exitAt, laneId, closeEventId, exitConfirmation, exitDescriptor,
@@ -399,7 +444,8 @@ export async function closeSession(
      decisionInputs === null || decisionInputs === undefined ? null : JSON.stringify(decisionInputs),
      validation === null || validation === undefined ? null : JSON.stringify(validation),
      subtotal,
-     letOut === null ? null : JSON.stringify(letOut)],
+     letOut === null ? null : JSON.stringify(letOut),
+     passSession === null ? null : JSON.stringify(passSession)],
   );
   return rows[0] ?? null;
 }

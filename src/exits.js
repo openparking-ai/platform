@@ -21,16 +21,27 @@ import { presentPayment } from './exitPayments.js';
  * ONE OPEN CASE PER STAY (0037), and a new one SUPERSEDES it (0045): a lane
  * drops its case when the car leaves the loop unsettled, and the car comes
  * back -- to this lane or the other. The old case's open payment is
- * canceled at Stripe first; if it had already paid, the new case carries
- * the fee it paid and is settled paid: "I paid, the gate didn't open" -- the
- * paid stay opens. A person ending the stay closes its open case the same
- * way. Either is `ended` on the case, closed with no close event.
+ * canceled at Stripe first. A person ending the stay closes its open case
+ * the same way. Either is `ended` on the case, closed with no close event.
+ *
+ * PAID AND LEFT (the owner's rule, 2026-10-30; 0048): a stay is finished
+ * when the car crosses the closing loop after the gate. A car that paid and
+ * backed out before it is the same stay, with no time limit: its next case
+ * prices the WHOLE stay again, CREDITS what the stay already paid at its
+ * other cases, and asks only the difference -- nothing when the price is not
+ * higher (`withCredit`). The quote keeps the whole stay's figures, which the
+ * close writes; `due_minor` is what this exit asks for and what is paid.
  */
 
 export const UNMATCHED_EVENT_KIND = 'exit_unmatched';
 export const DRIVER_WORD_EVENT_KIND = 'exit_driver_word';
 export const PERSON_EVENT_KIND = 'exit_let_out_by_person';
 export const SUPERSEDED_EVENT_KIND = 'exit_superseded';
+/** A case closed because the car came in again: its stay is over (0048). */
+export const REENTERED_EVENT_KIND = 'exit_stay_reentered';
+/** The lane's reader refused a case's payment (0048): what an exception reads as the reader's errors. */
+export const READER_REFUSED_EVENT_KIND = 'exit_reader_refused';
+export const READER_REFUSALS = Object.freeze(['reader_offline', 'reader_busy', 'no_reader_bound']);
 
 /** The longest stay a driver's stated entry may claim: the engine's own limit. */
 export const WORD_MAX_DAYS = 90;
@@ -99,20 +110,36 @@ export function letOutByField(value, exitId) {
  * opened from (`by`), with the authority the lane named.
  */
 export function letOutOf(row, { by, authority, at }) {
-  if (paidFor(row)) return null;
+  if (!owesAtExit(row)) return null;
   const q = row.quote;
-  if (q?.outcome === 'covered') return null;
-  if (q && !q.refusal && q.fee_minor === 0) return null;
   return {
     paid: false,
     by: row.person?.by ?? by,
     reason: row.person?.reason ?? authority ?? null,
     exit_id: row.id,
-    owed_minor: q && !q.refusal ? q.fee_minor : null,
+    // What it still owed: the whole stay less what the stay paid at its
+    // earlier cases (`due_minor`); null when it could not be priced.
+    owed_minor: dueOf(q),
+    // What the stay had paid at those cases, kept beside it: a car let out
+    // owing the difference had paid the rest.
+    paid_minor: creditOf(q),
     currency: q?.currency ?? null,
     payment: row.payment?.status ?? null,
     at: at.toISOString(),
   };
+}
+
+/**
+ * Whether the car at this case still owed when it was let out: not paid,
+ * not covered, not a fee of zero. A person letting such a car out is a car
+ * let out unpaid (0042, 0048).
+ */
+export function owesAtExit(row) {
+  if (paidFor(row)) return false;
+  const q = row.quote;
+  if (q?.outcome === 'covered') return false;
+  if (q && !q.refusal && dueOf(q) === 0) return false;
+  return true;
 }
 
 export function uuidField(value, label) {
@@ -156,14 +183,16 @@ export async function vehicleOf(client, tenantId, vehicleId) {
 }
 
 /**
- * The succeeded payment of the case's STAY taken at another of its cases, or
- * null: the car paid at a case that was then superseded (0045) -- the gate
- * faulted, the car backed off and came back, or went to the other exit lane.
- * One live or paid payment per stay (0038), so at most one.
+ * The latest succeeded payment of the case's STAY taken at another of its
+ * cases, or null: the car paid at a case that was then superseded (0045) --
+ * the gate faulted, the car backed off and came back, or went to the other
+ * exit lane. It settles this case only when the stay's credit covers the
+ * whole stay priced again (`paidFor`): never on its own.
  */
 const STAY_PAYMENT = `(SELECT to_jsonb(sp) FROM exit_payments sp
                          WHERE sp.tenant_id = e.tenant_id AND sp.session_id = e.session_id
                            AND sp.exit_id <> e.id AND sp.status = 'succeeded'
+                         ORDER BY sp.succeeded_at DESC, sp.id DESC
                          LIMIT 1)`;
 
 /** A case with its payment (0038) beside it, as `payment`, and its stay's paid one, as `stay_payment`. */
@@ -184,14 +213,102 @@ export async function withPayment(client, tenantId, row) {
 }
 
 /**
- * The payment that paid this case's stay, or null: its own, succeeded; or
- * one that succeeded at a case of the same stay it superseded. "I paid, the
- * gate didn't open": the paid stay opens.
+ * The payment that paid this case, or null: its own, succeeded; or, when what
+ * the stay paid at its earlier cases covers the whole stay priced again
+ * (`creditCovers`), the latest of those. "I paid, the gate didn't open": the
+ * paid stay opens -- at the price it paid, and no further.
  */
 export function paidFor(row) {
   if (row.payment?.status === 'succeeded') return row.payment;
-  if (row.stay_payment?.status === 'succeeded') return row.stay_payment;
+  if (creditCovers(row.quote) && row.stay_payment?.status === 'succeeded') return row.stay_payment;
   return null;
+}
+
+/** What the stay paid at its other cases, credited on this case's quote (0048); 0 with none. */
+export function creditOf(q) {
+  return q?.credit?.paid_minor ?? 0;
+}
+
+/**
+ * WHAT THIS EXIT ASKS FOR: the whole stay less what it already paid
+ * (`due_minor`), or the fee on a case with no credit; 0 when covered; null
+ * when it could not be priced. A case written before 0048 that carried a
+ * paid fee over (`paid_at_exit`) asks nothing.
+ */
+export function dueOf(q) {
+  if (!q) return null;
+  if (q.outcome === 'covered') return 0;
+  if (q.refusal) return null;
+  if (q.due_minor !== undefined && q.due_minor !== null) return q.due_minor;
+  if (q.paid_at_exit && q.credit === undefined) return 0;
+  return q.fee_minor;
+}
+
+/** The stay paid at its earlier cases at least the whole stay priced again: nothing more is asked. */
+export function creditCovers(q) {
+  if (!q || q.refusal) return false;
+  if (q.paid_at_exit && q.credit === undefined) return true;
+  return creditOf(q) > 0 && dueOf(q) === 0;
+}
+
+/**
+ * Every succeeded payment of the stay taken at a case other than `exitId`,
+ * oldest first, with the quote of the case it paid: what a new case
+ * credits. Read under the stay's lock, after the old case's open payment was
+ * settled at Stripe, so none of them can still move.
+ */
+export async function stayPayments(client, tenantId, sessionId, exitId = null) {
+  const { rows } = await client.query(
+    `SELECT p.id, p.exit_id, p.amount_minor, p.currency, p.succeeded_at, e.quote
+       FROM exit_payments p
+       JOIN exits e ON e.tenant_id = p.tenant_id AND e.id = p.exit_id
+      WHERE p.tenant_id = $1 AND p.session_id = $2 AND p.status = 'succeeded'
+        AND ($3::uuid IS NULL OR p.exit_id <> $3)
+      ORDER BY p.succeeded_at, p.id`,
+    [tenantId, sessionId, exitId],
+  );
+  return rows;
+}
+
+/**
+ * THE CREDIT (the owner's rule, 2026-10-30): a new case's quote, given what
+ * the stay already paid at its other cases.
+ *
+ *   nothing paid        the quote as priced; it asks its fee.
+ *   priced higher       the whole stay as priced, the credit beside it, and
+ *                       `due_minor` the difference: what is paid now.
+ *   not higher          (or covered now) nothing more is asked: the stay
+ *                       keeps the figures of the case whose payment paid it
+ *                       last -- what the stay paid in all, since each case's
+ *                       payment was its whole fee less its own credit -- and
+ *                       the new price is kept beside them (`repriced`).
+ *   not priced          the refusal, the credit beside it: a person decides.
+ *
+ * Never a negative figure, and never a payment the stay already made: the
+ * credit is every succeeded payment of the stay.
+ */
+export function withCredit(priced, payments) {
+  if (!payments.length) return priced;
+  const currency = String(priced.currency).toLowerCase();
+  if (payments.some((p) => String(p.currency).toLowerCase() !== currency)) {
+    throw new Error("a stay's payments are in another currency than its price");
+  }
+  const paidMinor = payments.reduce((sum, p) => sum + Number(p.amount_minor), 0);
+  const credit = {
+    paid_minor: paidMinor,
+    payments: payments.map((p) => ({ id: p.id, exit_id: p.exit_id, amount_minor: Number(p.amount_minor) })),
+  };
+  if (priced.refusal) return { ...priced, credit, due_minor: null };
+  if (priced.outcome !== 'covered' && priced.fee_minor > paidMinor) {
+    return { ...priced, credit, due_minor: priced.fee_minor - paidMinor };
+  }
+  const last = payments[payments.length - 1].quote;
+  return {
+    ...last,
+    credit,
+    due_minor: 0,
+    repriced: { outcome: priced.outcome, fee_minor: priced.fee_minor, exit_at: priced.exit_at, covered_by: priced.covered_by },
+  };
 }
 
 export async function caseByEvent(client, tenantId, eventId) {
@@ -310,22 +427,30 @@ export async function openCases(client, tenantId, garageId, limit = 100) {
  */
 export function settledOf(row) {
   if (row.person) return { settled: true, why: 'person' };
-  if (paidFor(row)) return { settled: true, why: 'paid' };
+  if (paidFor(row) || creditCovers(row.quote)) return { settled: true, why: 'paid' };
   const q = row.quote;
   if (q?.outcome === 'covered') return { settled: true, why: 'covered' };
-  if (q && !q.refusal && q.fee_minor === 0) return { settled: true, why: 'zero_fee' };
+  if (q && !q.refusal && dueOf(q) === 0) return { settled: true, why: 'zero_fee' };
   if (row.method === 'none') return { settled: false, needs: 'driver_word' };
   if (!q || q.refusal) return { settled: false, needs: 'person' };
   return { settled: false, needs: 'payment' };
 }
 
-/** The fee as shown, without the pricing internals the close keeps. */
+/**
+ * The fee as shown, without the pricing internals the close keeps.
+ * `fee_minor` is what this exit asks for -- the whole stay less what it
+ * already paid at its earlier cases (0048) -- so a screen that shows it shows
+ * what the card is charged. `stay_fee_minor` is the whole stay, which the
+ * breakdown and the subtotal describe; `credit_minor` what it had paid.
+ */
 function presentFee(q) {
   if (!q) return null;
   return {
     outcome: q.outcome,
     covered_by: q.covered_by,
-    fee_minor: q.fee_minor,
+    fee_minor: dueOf(q),
+    stay_fee_minor: q.refusal ? null : q.fee_minor,
+    credit_minor: creditOf(q),
     subtotal_minor: q.subtotal_minor,
     currency: q.currency,
     breakdown: q.breakdown,
@@ -345,9 +470,10 @@ export function present(row) {
     claimed_entry_at: row.claimed_entry_at,
     fee: presentFee(row.quote),
     // Its own payment; or, with none, the one that paid its stay at a case
-    // it superseded (`paid_at_exit` names that case).
+    // it superseded when the credit covers the whole stay (`paid_at_exit`
+    // names that case).
     payment: presentPayment(row.payment ?? paidFor(row)),
-    paid_at_exit: !row.payment && row.stay_payment?.status === 'succeeded' ? row.stay_payment.exit_id : null,
+    paid_at_exit: !row.payment && paidFor(row) ? paidFor(row).exit_id : null,
     ...settledOf(row),
     closed: row.closed_at !== null,
     // Closed by the platform, not by a close (0045): why, and the case that

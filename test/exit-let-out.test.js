@@ -24,10 +24,11 @@
  *   * every route here answers only its own account, garage and lane;
  *   * A SECOND CASE FOR THE SAME STAY (0045) supersedes the open one, never
  *     a 500: the old intent canceled at Stripe and cleared from the reader
- *     first; if it had paid, the new case is settled paid on the fee it
- *     paid and the stay closes priced -- the paid stay opens; Stripe unable
- *     to settle now is a 503 with nothing written; the superseding is in
- *     the change log by the lane computer, with no plate;
+ *     first; if it had paid, the new case prices the whole stay again,
+ *     credits what it paid and asks only the difference (0048) -- nothing
+ *     when not priced higher, and the paid stay opens; Stripe unable to
+ *     settle now is a 503 with nothing written; the superseding is in the
+ *     change log by the lane computer, with no plate;
  *   * A PERSON'S END with a case open closes the case -- the unpaid intent
  *     canceled at Stripe first, a paid one never canceled and named on the
  *     end -- and a card being authorised is 409 with nothing changed; a
@@ -336,7 +337,7 @@ test("a person's close naming the case cancels its payment and writes the stay l
   assert.equal(out.session.exit_outcome, 'transient');
   assert.deepEqual(
     { ...out.session.let_out, at: undefined },
-    { paid: false, by: `lane_device:${g.exitDeviceId}`, reason: 'human_open_now', exit_id: exit.id, owed_minor: exit.fee.fee_minor, currency: 'USD', payment: 'canceled', at: undefined },
+    { paid: false, by: `lane_device:${g.exitDeviceId}`, reason: 'human_open_now', exit_id: exit.id, owed_minor: exit.fee.fee_minor, paid_minor: 0, currency: 'USD', payment: 'canceled', at: undefined },
   );
   assert.equal((await recorded(g, exit.id)).status, 'canceled');
   const told = await events(g, 'exit_payment_canceled');
@@ -607,25 +608,25 @@ async function secondExitLane(g, name = 'Exit 2') {
   return { laneId, token: (await deviceToken(g.tenant, laneId, name)).token };
 }
 
-test('A SECOND CASE AFTER THE CARD PAID: the gate faulted and the car came back -- the new case is settled paid, on the fee it paid, and the paid stay opens', async () => {
+test('A SECOND CASE AFTER THE CARD PAID, PRICED HIGHER: the whole stay priced again, what it paid credited, only the difference asked -- and the stay closes at its whole price, each part charged once', async () => {
   const g = await garage('second-case-paid');
-  // At the barrier 35 minutes ago: one hour owed (250). It paid; the gate never opened.
+  // At the barrier 35 minutes ago: one hour owed (250). It paid; it backed
+  // out before the closing loop: the same stay (the owner's rule, 2026-10-30).
   const { plate, exit: first } = await enterAndExit(g, { inMin: 90, exitMin: 35 });
   assert.equal(first.fee.fee_minor, 250);
   const started = await pay(g, first.id);
   stub.presentCard(started.payment.payment_intent_id);
   assert.equal((await caseOf(g, first.id)).why, 'paid');
 
-  // Back now: two hours would be owed (500) on a fresh price. It owes nothing.
+  // Back now: two hours (500) on the whole stay. 250 was paid: 250 is asked.
   const second = await caseAt(g, plate);
   assert.notEqual(second.id, first.id);
-  assert.deepEqual([second.settled, second.why, second.fee.fee_minor, second.paid_at_exit], [true, 'paid', 250, first.id], JSON.stringify(second));
-  assert.equal(second.payment.status, 'succeeded');
-  assert.equal(second.payment.payment_intent_id, started.payment.payment_intent_id, 'the one payment of the stay');
+  assert.deepEqual(
+    [second.settled, second.needs, second.fee.fee_minor, second.fee.stay_fee_minor, second.fee.credit_minor, second.paid_at_exit, second.payment],
+    [false, 'payment', 250, 500, 250, null, null], JSON.stringify(second));
   assert.equal(cancelCalls(started.payment.payment_intent_id).length, 0, 'a paid intent is never asked to cancel');
-  assert.equal([...stub.intents.values()].filter((i) => i.metadata.openparking_exit_id === second.id).length, 0, 'and no second payment is started');
-  const payAgain = await call(g.exit, 'POST', `/lane/exits/${second.id}/pay`);
-  assert.deepEqual([payAgain.status, (await payAgain.json()).code], [409, 'exit_settled']);
+  const quote = (await exitRow(g, second.id)).quote;
+  assert.deepEqual([quote.fee_minor, quote.due_minor, quote.credit.paid_minor, quote.credit.payments.map((p) => p.exit_id)], [500, 250, 250, [first.id]]);
 
   const old = await exitRow(g, first.id);
   assert.ok(old.closed_at, 'the old case is closed');
@@ -638,12 +639,44 @@ test('A SECOND CASE AFTER THE CARD PAID: the gate faulted and the car came back 
   assert.deepEqual([lines[0].after.superseded_by, lines[0].after.stay_id, lines[0].after.payment, lines[0].after.paid_minor], [second.id, first.session_id, 'succeeded', 250]);
   assert.ok(!JSON.stringify(lines).includes(plate), 'no plate in the change log');
 
+  // The difference, on an intent of its own: 250, never the 500 again.
+  const diff = await pay(g, second.id);
+  assert.notEqual(diff.payment.payment_intent_id, started.payment.payment_intent_id);
+  assert.equal(stub.intents.get(diff.payment.payment_intent_id).amount, 250, 'the card is asked the difference only');
+  stub.presentCard(diff.payment.payment_intent_id);
+  const paidNow = await caseOf(g, second.id);
+  assert.deepEqual([paidNow.settled, paidNow.why], [true, 'paid']);
+
   const closed = await close(g, second.id);
   assert.equal(closed.status, 200, await closed.clone().text());
   const written = await stay(g, first.session_id);
-  assert.deepEqual([Number(written.fee_minor), written.let_out], [250, null], 'priced at what it paid, never let out unpaid');
+  assert.deepEqual([Number(written.fee_minor), written.let_out], [500, null], 'the stay at its whole price, never let out unpaid');
+  const taken = await withTenant(g.tenant, async (c) => (await c.query(
+    `SELECT amount_minor, status FROM exit_payments WHERE session_id = $1 ORDER BY created_at`, [first.session_id])).rows);
+  assert.deepEqual(taken.map((p) => [Number(p.amount_minor), p.status]), [[250, 'succeeded'], [250, 'succeeded']], 'paid 250 and 250: 500, once');
   const late = await close(g, first.id);
   assert.deepEqual([late.status, (await late.json()).code], [409, 'exit_closed'], "the superseded case's close names it, and closes nothing");
+});
+
+test('A SECOND CASE AFTER THE CARD PAID, NOT PRICED HIGHER: "I paid, the gate didn\'t open" -- nothing more is asked and the paid stay opens on what it paid', async () => {
+  const g = await garage('second-case-paid-same');
+  const { plate, exit: first } = await enterAndExit(g, { inMin: 90, exitMin: 1 });
+  assert.equal(first.fee.fee_minor, 500);
+  const started = await pay(g, first.id);
+  stub.presentCard(started.payment.payment_intent_id);
+  await caseOf(g, first.id);
+
+  const second = await caseAt(g, plate);
+  assert.deepEqual([second.settled, second.why, second.fee.fee_minor, second.fee.stay_fee_minor, second.fee.credit_minor, second.paid_at_exit],
+    [true, 'paid', 0, 500, 500, first.id], JSON.stringify(second));
+  assert.equal(second.payment.payment_intent_id, started.payment.payment_intent_id, 'the payment that paid it');
+  assert.equal([...stub.intents.values()].filter((i) => i.metadata.openparking_exit_id === second.id).length, 0, 'and no second payment is started');
+  const payAgain = await call(g.exit, 'POST', `/lane/exits/${second.id}/pay`);
+  assert.deepEqual([payAgain.status, (await payAgain.json()).code], [409, 'exit_settled']);
+  const closed = await close(g, second.id);
+  assert.equal(closed.status, 200, await closed.clone().text());
+  const written = await stay(g, first.session_id);
+  assert.deepEqual([Number(written.fee_minor), written.let_out], [500, null], 'priced at what it paid');
 });
 
 test('A SECOND CASE WITH NOTHING PAID: the old intent is canceled at Stripe and cleared from the reader first, then the new one is sent; at the other exit lane too', async () => {

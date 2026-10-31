@@ -294,6 +294,9 @@ const NAMES_A_LANE = {
   'shadow_searches.exit_lane_id': 'history',
   // A car at an exit, and how it was let out (0037): never deleted.
   'exits.lane_id': 'history',
+  // A car a person let out (0048): always about an exit case at that same
+  // lane (its trigger), so the case keeps the lane; never deleted.
+  'exceptions.lane_id': 'history',
   'board_message_lanes.lane_id': 'board',
   // A picture kept with an entry (0033). A lane that took one has the entry's
   // stay or event too, which keep the lane; a picture alone goes with it.
@@ -345,6 +348,12 @@ test('F1 check 3. THE SWEEP: every column that names a lane is listed, and remov
     'exits.lane_id': (c, lane) => c.query(
       `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
        VALUES ($1,$2,$3,'f1x' || replace(gen_random_uuid()::text, '-', ''),now(),'none')`, [a.tenant, g.id, lane]),
+    'exceptions.lane_id': (c, lane) => c.query(
+      `WITH e AS (INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+                  VALUES ($1,$2,$3,'f1e' || replace(gen_random_uuid()::text, '-', ''),now(),'none') RETURNING id)
+       INSERT INTO exceptions (tenant_id, garage_id, lane_id, exit_id, kind, source, done_by, let_out_at, case_opened_at, window_from, window_to, story)
+       SELECT $1,$2,$3,e.id,'let_out_unpaid','attendant','test',now(),now(),now() - interval '15 minutes',now() + interval '15 minutes','{}' FROM e`,
+      [a.tenant, g.id, lane]),
   };
   const helper = await newLane(base, a, g.id, 'Helper', 'entry');
   for (const [col, fate] of Object.entries(NAMES_A_LANE)) {

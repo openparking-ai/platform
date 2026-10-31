@@ -19,7 +19,7 @@ import * as terminal from './terminal.js';
 import * as signIn from './signIn.js';
 import { startSetting } from './startSettings.js';
 import { HttpError } from './errors.js';
-import { GarageTimeInvalid, localToInstant } from './garageTime.js';
+import { GarageTimeInvalid, instantToLocal, localToInstant } from './garageTime.js';
 import * as changes from './changes.js';
 import * as lanes from './lanes.js';
 import * as board from './board.js';
@@ -35,6 +35,7 @@ import * as exitPayments from './exitPayments.js';
 import * as textReceipt from './textReceipt.js';
 import * as stuck from './stuckStays.js';
 import * as walks from './walks.js';
+import * as exceptionsRecord from './exceptions.js';
 import { connectConfig, StripeError, StripeUnreachable } from './stripe.js';
 import { garageCurrency, garageName, garageSpaces, garageTimezone } from './garageFields.js';
 import { verifyUtf8 } from './utf8Body.js';
@@ -110,6 +111,7 @@ export const ID_PARAMS = Object.freeze({
     stayId: () => new HttpError(404, 'stay not found', 'stay_not_found'),
     walkId: () => new HttpError(404, 'walk not found', 'walk_not_found'),
     sightingId: () => new HttpError(404, 'sighting not found', 'sighting_not_found'),
+    exceptionId: () => new HttpError(404, 'exception not found', 'exception_not_found'),
   }),
   lane: Object.freeze({
     sessionId: () => conflict('stay_not_open', STAY_NOT_OPEN),
@@ -448,6 +450,42 @@ const PHONE_MAX = 32;
  * whether it IS a number the module can match is the module's question, and a
  * number it cannot read is a not-validated answer, not a refusal.
  */
+/** How the pass module's rule passed a registration QR (garage-pass `similar_enough`). */
+export const QR_PASSED_BY = Object.freeze(['same_plate', 'look_alike', 'one_difference', 'nothing_read']);
+
+/**
+ * THE QR THAT LET A CAR IN (0048): the lane's `qr` on an open,
+ * `{enrolment, passed_by, qr_plate}`, each only when the pass module answered
+ * it. What is sent is checked to the shape the stay keeps; a key this build
+ * does not know is left on the lane (a newer lane is not refused for it).
+ * Null when absent, or when it carries none of the three.
+ */
+function qrField(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw bad('qr must be an object: {enrolment, passed_by, qr_plate}, each when the pass module answered it');
+  }
+  const out = {};
+  const { enrolment = null, passed_by: passedBy = null, qr_plate: qrPlate = null } = value;
+  if (enrolment !== null) {
+    if (typeof enrolment !== 'string' || !/^[!-~]{1,128}$/.test(enrolment)) {
+      throw bad("qr.enrolment must be the QR's id: 1 to 128 printable characters with no space");
+    }
+    out.enrolment = enrolment;
+  }
+  if (passedBy !== null) {
+    if (!QR_PASSED_BY.includes(passedBy)) throw bad(`qr.passed_by must be one of ${QR_PASSED_BY.join(', ')}`);
+    out.passed_by = passedBy;
+  }
+  if (qrPlate !== null) {
+    if (typeof qrPlate !== 'string' || !/^[^\s\p{Cc}]{1,32}$/u.test(qrPlate)) {
+      throw bad("qr.qr_plate must be the QR's plate in the pass module's form: 1 to 32 characters, no space");
+    }
+    out.qr_plate = qrPlate;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 function phoneField(value) {
   if (value === undefined || value === null) return null;
   if (typeof value !== 'string' || !/^[0-9 +().-]+$/.test(value) || value.length > PHONE_MAX || !/[0-9]/.test(value)) {
@@ -2078,7 +2116,7 @@ export function createApp() {
    */
   lane.post('/sessions/open', async (req, res, next) => {
     try {
-      const { tenantId, garageId, laneId, direction } = req.device;
+      const { tenantId, garageId, laneId, direction, deviceId } = req.device;
       if (direction !== 'entry') {
         throw conflict('wrong_lane_direction', 'this device is not on an entry lane');
       }
@@ -2121,6 +2159,12 @@ export function createApp() {
       // characters, the colour code, the size. Each optional; an older lane
       // sends none and its stays are found by their plate.
       const entryId = exits.idFields(req.body);
+      // A REGISTRATION QR let this car in (lane-controller #54, 0048): the
+      // QR's id, how the pass module's rule passed it, and the plate the QR
+      // was made for. Kept on the stay; its exit asks garage-pass by that
+      // plate, so a car let in on one difference or with nothing read is
+      // the pass's car there too.
+      const entryQr = qrField(req.body?.qr);
       // Required, not optional. Without it there is no key to be idempotent on
       // and the only thing left to check is state -- which is exactly how a
       // replay arriving after the car has left opens a second, phantom session.
@@ -2137,7 +2181,37 @@ export function createApp() {
         tenantId, garageId, laneId, laneEventId: String(openEventId), action: 'open', at: entryAt,
       });
 
-      const result = await withTenant(tenantId, async (client) => {
+      // A RETURN IS A NEW STAY (the owner's rule, 2026-10-31; 0048): when
+      // this entry ends the car's earlier stay, that stay is closed
+      // completely -- its open exit case closed with it, the case's unpaid
+      // payment canceled at Stripe first, outside any transaction; a paid
+      // one stays paid on the old stay. A card being authorised on it, or
+      // Stripe out of reach: 503 and nothing written; the lane sends the
+      // open again.
+      let result = null;
+      for (let attempt = 1; !result; attempt += 1) {
+        await settleBeforeReentry({ tenantId, garageId, plate, ticketRef, entryAt });
+        result = await withTenant(tenantId, (client) => openStay(client)).catch((err) => {
+          if (!(err instanceof PriorCaseMoved)) throw err;
+          if (attempt >= PRIOR_CASE_ATTEMPTS) throw reentryUnsettled();
+          return null;
+        });
+      }
+
+      // The row that was written, echoed whole -- `entry_confirmation` and
+      // `entry_descriptor` with it.
+      // A LANE DEPENDS ON THAT FIELD BEING HERE: a platform that predates the
+      // column answers this call exactly as successfully and hands back a
+      // session without it, so the lane treats an open that does not come back
+      // carrying the value it sent as not delivered, and says so. Dropping the
+      // field from this response would be indistinguishable, to a lane, from
+      // deploying against a platform that cannot record it.
+      res.status(result.created ? 201 : 200).json({
+        session: presentSession(result.session),
+        created: result.created,
+      });
+
+      async function openStay(client) {
         const vehicle = await repo.upsertVehicle(client, tenantId, {
           plate,
           ticketRef,
@@ -2156,6 +2230,8 @@ export function createApp() {
           entryConfirmation,
           entryDescriptor,
           tailgater,
+          entryQr,
+          onSupersede: (old, newId) => closeStayOnReentry(client, { tenantId, garageId, deviceId, old, newId, at: entryAt }),
           noOpenCommand,
           entryUnsurePlate: unsure.plate,
           entryUnsurePlateConfidence: unsure.confidence,
@@ -2176,20 +2252,7 @@ export function createApp() {
           })));
         }
         return opened;
-      });
-
-      // The row that was written, echoed whole -- `entry_confirmation` and
-      // `entry_descriptor` with it.
-      // A LANE DEPENDS ON THAT FIELD BEING HERE: a platform that predates the
-      // column answers this call exactly as successfully and hands back a
-      // session without it, so the lane treats an open that does not come back
-      // carrying the value it sent as not delivered, and says so. Dropping the
-      // field from this response would be indistinguishable, to a lane, from
-      // deploying against a platform that cannot record it.
-      res.status(result.created ? 201 : 200).json({
-        session: presentSession(result.session),
-        created: result.created,
-      });
+      }
     } catch (err) {
       if (err.code === 'EVENT_ID_VEHICLE_CONFLICT') {
         return next(conflict('event_id_reused', 'event_id already used for a different vehicle'));
@@ -2476,15 +2539,14 @@ export function createApp() {
             const [now = null] = await exits.openCasesOfStay(client, tenantId, sessionId);
             if (now?.id !== prior?.id) throw new PriorCaseMoved();
             if (prior?.payment?.status === 'open') throw new PriorCaseMoved();
-            const paid = prior ? exits.paidFor(prior) : null;
-            if (paid) {
-              // PAID AT THE CASE IT SUPERSEDES: "I paid, the gate didn't
-              // open" -- the paid stay opens, on the fee it paid.
-              quote = { ...prior.quote, paid_at_exit: prior.id };
-            } else {
-              const vehicle = await exits.vehicleOf(client, tenantId, open.vehicle_id);
-              quote = await quoteStay(client, { tenantId, garage, laneId, session: open, vehicle, exitAt });
-            }
+            // PAID AND LEFT (the owner's rule, 2026-10-30): a car that paid
+            // and backed out before the closing loop is the same stay. The
+            // WHOLE stay is priced again, what it paid at its other cases is
+            // credited, and only the difference is asked -- nothing when the
+            // price is not higher. No time limit.
+            const vehicle = await exits.vehicleOf(client, tenantId, open.vehicle_id);
+            const priced = await quoteStay(client, { tenantId, garage, laneId, session: open, vehicle, exitAt });
+            quote = exits.withCredit(priced, await exits.stayPayments(client, tenantId, sessionId));
           } else {
             method = 'none';
             sessionId = null;
@@ -2657,9 +2719,12 @@ export function createApp() {
     let payment = staged.existing;
     if (!payment) {
       const q = staged.row.quote;
+      // What this exit asks for: the whole stay less what the stay already
+      // paid at its earlier cases (0048) -- never what it paid again.
+      const amountMinor = exits.dueOf(q);
       try {
         intent = await exitPayments.createIntent(config, staged.accountId,
-          exitPayments.intentBody({ amountMinor: q.fee_minor, currency: q.currency, exitId, garageId }), exitId);
+          exitPayments.intentBody({ amountMinor, currency: q.currency, exitId, garageId }), exitId);
       } catch (err) {
         if (err instanceof StripeError && err.code === 'amount_too_small') {
           throw conflict('fee_below_card_minimum', 'the fee is below the least a card can be charged; a person decides');
@@ -2674,8 +2739,15 @@ export function createApp() {
         if (fresh.closed_at) return { closedMeanwhile: true };
         const w = await exitPayments.insertPayment(client, tenantId, {
           garageId, exitId, sessionId: staged.row.session_id, channel, readerId: staged.reader?.reader_id ?? null,
-          accountId: staged.accountId, intentId: intent.id, amountMinor: q.fee_minor,
+          accountId: staged.accountId, intentId: intent.id, amountMinor,
           currency: String(q.currency).toLowerCase(), stripeStatus: String(intent.status).slice(0, 40), startedBy: actor,
+        }).catch(async (err) => {
+          // Refused here (another case's payment open, or the stay paid
+          // already): the intent just made is never left for a card.
+          if (err instanceof stripeAccount.ConnectRefusal) {
+            await exitPayments.cancelIntent(config, staged.accountId, intent.id, exitPayments.cancelKey(intent)).catch(() => {});
+          }
+          throw err;
         });
         if (w.created) {
           await repo.appendEvents(client, tenantId, [{
@@ -2898,6 +2970,96 @@ export function createApp() {
     }
   }
 
+  /** The open's 503 when the car's earlier stay has a payment Stripe could not settle now: the lane sends the open again. */
+  const reentryUnsettled = () => new HttpError(503,
+    "this car's earlier stay has an exit payment that could not be settled with Stripe now; send the open again", 'payment_unsettled');
+
+  /**
+   * BEFORE AN ENTRY ENDS THE CAR'S EARLIER STAY (0048): that stay's open
+   * exit case's open payment is canceled at Stripe, or found paid -- never a
+   * card left that can still be taken for a stay that is over. Asked only
+   * when this entry will supersede the stay (a later entry, not the same
+   * arrival); a car nobody could read never supersedes. A card being
+   * authorised, or Stripe out of reach: 503, nothing written. Stripe having
+   * taken another amount: a person decides (409).
+   */
+  async function settleBeforeReentry({ tenantId, garageId, plate, ticketRef, entryAt }) {
+    if (!plate && !ticketRef) return;
+    const found = await withTenant(tenantId, async (client) => {
+      const old = await repo.findOpenSessionByIdentity(client, tenantId, garageId, { plate, ticketRef });
+      if (!old || !(await repo.supersedes(client, tenantId, old, entryAt))) return [];
+      return exits.openCasesOfStay(client, tenantId, old.id);
+    });
+    for (const c of found) {
+      if (c.payment?.status !== 'open') continue;
+      try {
+        await cancelPayment(tenantId, garageId, c, { why: 'stay_reentered' });
+      } catch (err) {
+        if (err.code === 'payment_amount_mismatch') {
+          throw conflict('prior_payment_amount_mismatch',
+            "Stripe took another amount than the fee at this car's earlier exit case: a person decides");
+        }
+        if (notSettledNow(err)) throw reentryUnsettled();
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * THE OLD STAY, CLOSED COMPLETELY AT THE CAR'S RETURN (0048), inside the
+   * open's transaction and before the stay is ended: each open exit case of
+   * it -- locked first, as everywhere -- is closed `{why: "stay_ended", by,
+   * by_session}` with an `exit_stay_reentered` event and an
+   * `exit.closed_on_return` line by the entry lane's computer. A payment
+   * still open on it (started since `settleBeforeReentry`) is asked about
+   * again. A paid one stays paid on the old stay, and the stay's `ended`
+   * says what it paid; a car a person let out keeps its exception on the old
+   * stay. Answers what goes on the old stay's `ended`.
+   */
+  async function closeStayOnReentry(client, { tenantId, garageId, deviceId, old, newId, at }) {
+    const atExit = await exits.openCasesOfStay(client, tenantId, old.id, { lock: true });
+    if (atExit.some((c) => c.payment?.status === 'open')) throw new PriorCaseMoved();
+    const by = `lane_device:${deviceId}`;
+    if (atExit.length) {
+      const { rows } = await client.query('SELECT name FROM lane_devices WHERE tenant_id = $1 AND id = $2', [tenantId, deviceId]);
+      const ctx = { tenantId, actor: { kind: 'computer', id: deviceId, name: rows[0]?.name ?? null }, count: 0, secrets: [], private: [] };
+      for (const c of atExit) {
+        await exits.endCase(client, tenantId, c.id, { why: 'stay_ended', by, by_session: newId });
+        const paid = exits.paidFor(c);
+        await changes.record(client, ctx, {
+          garageId,
+          action: 'exit.closed_on_return',
+          subject: { kind: 'exit', id: c.id, name: null },
+          before: { open: true, lane_id: c.lane_id },
+          after: {
+            open: false, stay_id: old.id, by_stay: newId,
+            payment: paid ? 'succeeded' : c.payment?.status ?? null,
+            let_out_by_person: Boolean(c.person),
+          },
+        });
+        await repo.appendEvents(client, tenantId, [{
+          garageId,
+          laneId: c.lane_id,
+          eventId: `${exits.REENTERED_EVENT_KIND}:${c.id}`,
+          kind: exits.REENTERED_EVENT_KIND,
+          occurredAt: at,
+          detail: { actor: by, exit_id: c.id, stay_id: old.id, by_session: newId, payment: paid ? 'succeeded' : c.payment?.status ?? null },
+        }]);
+      }
+    }
+    const payments = await exits.stayPayments(client, tenantId, old.id);
+    return {
+      ...(atExit.length ? { exit_cases: atExit.map((c) => c.id) } : {}),
+      ...(payments.length ? {
+        paid: {
+          exit_id: payments[payments.length - 1].exit_id,
+          amount_minor: payments.reduce((sum, p) => sum + Number(p.amount_minor), 0),
+          currency: payments[0].currency,
+        },
+      } : {}),
+    };
+  }
+
   /**
    * THE SUPERSEDING, IN THE CHANGE LOG: by the lane computer whose case took
    * the old one's place, naming both cases, the stay and how the old
@@ -2949,6 +3111,47 @@ export function createApp() {
       }
       throw err;
     }
+  }
+
+  /** The lane computer, as an exception names who pressed it: its id and its name. */
+  async function laneDeviceName(client, tenantId, deviceId) {
+    const { rows } = await client.query('SELECT name FROM lane_devices WHERE tenant_id = $1 AND id = $2', [tenantId, deviceId]);
+    return `lane_device:${deviceId}${rows[0]?.name ? ` (${rows[0].name})` : ''}`.slice(0, 300);
+  }
+
+  /**
+   * WRITE AN EXCEPTION (0048) inside the let-out's transaction, under a
+   * savepoint: a record that cannot be written is logged by its case and
+   * never takes the let-out back with it -- `npm run complete-exceptions`
+   * writes it later from what is on record. Answers the new row, or null
+   * (already written, or not written).
+   */
+  async function recordException(client, tenantId, args) {
+    await client.query('SAVEPOINT exception_record');
+    try {
+      const out = await exceptionsRecord.recordLetOut(client, tenantId, args);
+      await client.query('RELEASE SAVEPOINT exception_record');
+      return out.created ? out.row : null;
+    } catch (err) {
+      await client.query('ROLLBACK TO SAVEPOINT exception_record');
+      console.error(`[exceptions] the exception for exit case ${args.exitCase.id} was not written: ${err.message ?? err}`);
+      return null;
+    }
+  }
+
+  /**
+   * AFTER AN EXCEPTION'S LET-OUT COMMITTED: the payment as it then stood,
+   * and the gate agent's messages and calls for the lane so far, appended.
+   * Never throws: the car is out whatever happens here.
+   */
+  async function afterException(tenantId, exception, { payment = null }) {
+    const write = (fn) => withTenant(tenantId, fn);
+    try {
+      if (payment) await write((client) => exceptionsRecord.recordPaymentAfter(client, tenantId, exception, payment));
+    } catch (err) {
+      console.error(`[exceptions] the payment after the let-out was not written for exception ${exception.id}: ${err.message ?? err}`);
+    }
+    await exceptionsRecord.copyGateAgent(write, tenantId, exception);
   }
 
   /**
@@ -3009,10 +3212,27 @@ export function createApp() {
   lane.post('/exits/:exitId/pay', connectRoute(async (req, res) => {
     const { tenantId, garageId, laneId, direction } = req.device;
     if (direction !== 'exit') throw conflict('wrong_lane_direction', 'this device is not on an exit lane');
-    const { row, sent } = await payCase({
-      tenantId, garageId, exitId: req.params.exitId, channel: 'lane_reader', laneId, actor: `lane_device:${req.device.deviceId}`,
-    });
-    res.json({ exit: exits.present(row), sent });
+    const actor = `lane_device:${req.device.deviceId}`;
+    let paid;
+    try {
+      paid = await payCase({ tenantId, garageId, exitId: req.params.exitId, channel: 'lane_reader', laneId, actor });
+    } catch (err) {
+      // THE READER'S REFUSALS ARE KEPT (0048), as an event at the lane: an
+      // exception about this car reads them back as the reader's errors
+      // around its let-out. Kept or not, the refusal is answered as it was.
+      if (err instanceof stripeAccount.ConnectRefusal && exits.READER_REFUSALS.includes(err.code)) {
+        await withTenant(tenantId, (client) => repo.appendEvents(client, tenantId, [{
+          garageId,
+          laneId,
+          eventId: `${exits.READER_REFUSED_EVENT_KIND}:${randomUUID()}`,
+          kind: exits.READER_REFUSED_EVENT_KIND,
+          occurredAt: new Date(),
+          detail: { actor, exit_id: req.params.exitId, code: err.code },
+        }])).catch(() => {});
+      }
+      throw err;
+    }
+    res.json({ exit: exits.present(paid.row), sent: paid.sent });
   }));
 
   /**
@@ -3150,7 +3370,9 @@ export function createApp() {
       });
       if (exitId) await settleBeforeClose(tenantId, garageId, exitId);
 
+      let exception = null;
       const out = await withTenant(tenantId, async (client) => {
+        exception = null;
         // Keyed on the event first, so a replay returns the very session this
         // exact exit closed -- not "the most recent closed one", which is a
         // guess that goes wrong the moment a vehicle visits twice.
@@ -3174,6 +3396,16 @@ export function createApp() {
           if (exitCase.payment?.status === 'open') throw paymentUnsettled();
           letOut = exits.letOutOf(exitCase, { by: `lane_device:${deviceId}`, authority: letOutBy, at: exitAt });
           await recordLetOutAtLane(client, { tenantId, garageId, deviceId, exitCase, letOut, letOutBy });
+          // THE EXCEPTION (0048): a person at the lane opened for this car,
+          // or it left owing with nobody's decision on the case. A case an
+          // attendant let out has its exception already.
+          if (!exitCase.person && (letOutBy || letOut)) {
+            const garageRow = await repo.getGarage(client, tenantId, garageId);
+            exception = await recordException(client, tenantId, {
+              exitCase, source: 'lane', by: await laneDeviceName(client, tenantId, deviceId), authority: letOutBy, at: exitAt,
+              garageCurrency: garageRow.currency,
+            });
+          }
           if (!exitCase.session_id) {
             // The driver's word, or no stay found and a person let the car
             // out: the case is the whole record of this exit.
@@ -3348,6 +3580,10 @@ export function createApp() {
           asked = await entitlement.consult({
             garage,
             identity,
+            // A stay a registration QR let in: garage-pass is asked by the
+            // QR's plate (0048).
+            passIdentity: open.entry_qr?.qr_plate ?? null,
+            qr: open.entry_qr ?? null,
             laneId,
             entryAt: open.entry_at,
             exitAt,
@@ -3420,6 +3656,9 @@ export function createApp() {
           decisionInputs,
           validation: validated.record,
           letOut,
+          // THE PASS THIS STAY WAS A SESSION OF (0048), as its own exit was
+          // told: each visit of a pass is its own session.
+          passSession: passSessionFor(asked, localDecision, open.entry_qr ?? null),
         });
         if (wasEnded || clocksApart) {
           await repo.appendEvents(client, tenantId, [
@@ -3521,6 +3760,10 @@ export function createApp() {
           : null;
         return { session: closed, exitCase: closedCase, closed: true, replay: false, releaseAfter: validated.releaseAfter };
       });
+
+      // The gate agent's records for the exception the close wrote, after it
+      // committed: bounded, and never holding the close up.
+      if (exception && !out.replay) await afterException(tenantId, exception, {});
 
       // The release the close decided on, asked AFTER the close committed
       // (A2.3). A door that cannot answer now leaves `releasing` for the
@@ -3688,6 +3931,14 @@ export function createApp() {
   // another account's garage, or a person of another garage, is not found.
   // -------------------------------------------------------------------------
 
+  /** The stay a person ends: this garage's, and open -- or refused by name. Read before Stripe is asked, and again in the write. */
+  const stayToEnd = async (client, req, garage) => {
+    const stay = await repo.getSession(client, req.tenantId, req.params.stayId);
+    if (!stay || stay.garage_id !== garage.id) throw new HttpError(404, 'stay not found', 'stay_not_found');
+    if (stay.exit_at) throw conflict('stay_not_open', 'this stay is not open: it has already been closed or ended');
+    return stay;
+  };
+
   /** The garage, or a 404: read on the write's own transaction. */
   const ownGarage = async (client, req) => {
     const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
@@ -3714,17 +3965,67 @@ export function createApp() {
   });
 
   /**
+   * THE EXCEPTIONS OF A DAY (0048): every car a person let out, and every
+   * barrier a person opened, at this garage on `day` -- the garage's own
+   * local day, `YYYY-MM-DD`, today when unnamed -- oldest first, with who,
+   * when, why, what it owed and paid, and how many records were appended.
+   * Read through the garage: another account's or garage's is 404. No plate.
+   */
+  operator.get('/garages/:garageId/exceptions', async (req, res, next) => {
+    try {
+      const out = await withTenant(req.tenantId, async (client) => {
+        const garage = await ownGarage(client, req);
+        const { day, from, to } = garageDay(req.query.day, garage.timezone);
+        return { day, from, to, rows: await exceptionsRecord.forGarage(client, req.tenantId, garage.id, { from, to }) };
+      });
+      res.json({
+        garage_id: req.params.garageId,
+        day: out.day,
+        from: out.from.toISOString(),
+        to: out.to.toISOString(),
+        count: out.rows.length,
+        let_out_unpaid: out.rows.filter((x) => x.kind === exceptionsRecord.KINDS.LET_OUT_UNPAID).length,
+        exceptions: out.rows.map(exceptionsRecord.presentSummary),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * ONE EXCEPTION'S WHOLE STORY (0048): what happened as it stood at the
+   * let-out -- the case, the stay, every payment, the lane's events -- and
+   * everything appended after it: the payment once canceled, the lane's
+   * events to the window's end, and each copy of the gate agent's messages
+   * and calls, with their own ids, or why it could not be made.
+   */
+  operator.get('/garages/:garageId/exceptions/:exceptionId', async (req, res, next) => {
+    try {
+      const x = await withTenant(req.tenantId, async (client) => {
+        const garage = await ownGarage(client, req);
+        return exceptionsRecord.one(client, req.tenantId, garage.id, req.params.exceptionId);
+      });
+      if (!x) throw new HttpError(404, 'exception not found', 'exception_not_found');
+      res.json({ exception: exceptionsRecord.presentWhole(x) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
    * A PERSON LETS THE CAR OUT, `{reason}`: the case is settled whatever it
    * owed, with who and why on the case, an event beside it, and a line in
    * the change log. Once per case, and only while the car is at the lane.
    */
   operator.post('/garages/:garageId/exits/:exitId/let-out', async (req, res, next) => {
     try {
+      let exception = null;
       const reason = req.body?.reason;
       if (typeof reason !== 'string' || reason.trim().length === 0 || reason.length > 500) {
         throw bad('reason is required: why the car is let out, at most 500 characters');
       }
       const row = await changeTx(req, async (client) => {
+        exception = null;
         const garage = await ownGarage(client, req);
         const found = await exits.caseById(client, req.tenantId, garage.id, req.params.exitId, { lock: true });
         if (!found) throw new HttpError(404, 'exit case not found', 'exit_not_found');
@@ -3733,6 +4034,12 @@ export function createApp() {
         const actor = await changes.who(client, req.change);
         const person = { by: `${actor.kind}:${actor.name ?? actor.id ?? ''}`.slice(0, 300), reason: reason.trim(), at: new Date().toISOString() };
         const updated = await exits.recordPerson(client, req.tenantId, found.id, person);
+        // THE EXCEPTION (0048), in the same transaction as the decision: who,
+        // when, why, what it owed and paid, the case and its payments as they
+        // stood, the lane's events before it.
+        exception = await recordException(client, req.tenantId, {
+          exitCase: found, source: 'attendant', by: person.by, reason: person.reason, at: new Date(person.at), garageCurrency: garage.currency,
+        });
         await repo.appendEvents(client, req.tenantId, [{
           garageId: garage.id,
           laneId: found.lane_id,
@@ -3750,7 +4057,12 @@ export function createApp() {
         });
         return updated;
       });
-      res.json({ exit: exits.presentForPerson(await cancelForPerson(req.tenantId, row.garage_id, row)) });
+      const settled = await cancelForPerson(req.tenantId, row.garage_id, row);
+      // What is learned after the decision, appended to its exception: the
+      // payment as the let-out left it, and the gate agent's records so far.
+      // Neither ever holds the let-out up.
+      if (exception) await afterException(req.tenantId, exception, { payment: row.payment ? settled.payment : null });
+      res.json({ exit: exits.presentForPerson(settled) });
     } catch (err) {
       next(err);
     }
@@ -3812,22 +4124,36 @@ export function createApp() {
    * (0043), kept on `ended.owed` and answered as `owed_minor`. Nothing is
    * charged here, whatever card the car has: the garage collects it its
    * own way. An abandoned stay owes nothing. A stay that paid at an exit
-   * (`ended.paid`) is answered owing the rest: the price less what was
-   * paid, never below 0.
+   * (`ended.paid`, every payment of the stay summed) is answered owing the
+   * rest: the price less what was paid, never below 0.
+   *
+   * READS FIRST, THEN STRIPE, THEN THE WRITE: `left_at` is checked and the
+   * stay priced before any payment is canceled at Stripe, so a refused
+   * `left_at` or a rate engine that cannot answer fails the request with
+   * every payment as it was.
    */
   operator.post('/garages/:garageId/stays/:stayId/end', async (req, res, next) => {
     try {
       const ask = stuck.endRequest(req.body, parseTime);
+      const now = new Date();
+      // THE READS FIRST: the stay, when the car left, and what it owes then.
+      // Nothing at Stripe has been touched yet.
+      const staged = await withTenant(req.tenantId, async (client) => {
+        const garage = await ownGarage(client, req);
+        const stay = await stayToEnd(client, req, garage);
+        const leftAt = ask.leftAt ? refuseFuture(ask.leftAt, 'left_at', now) : now;
+        if (leftAt < stay.entry_at) throw new HttpError(400, 'left_at is before the stay came in', 'left_at_before_entry');
+        const owed = ask.outcome === 'ended' ? await owedForEnded(client, { tenantId: req.tenantId, garage, stay, leftAt }) : null;
+        return { garageId: garage.id, leftAt, owed, cases: await exits.openCasesOfStay(client, req.tenantId, stay.id) };
+      });
       // AN EXIT CASE OPEN ON THE STAY (0045) never blocks the end: the car
       // left the lane without its close, a let-out included. Its open
-      // payment is canceled at Stripe first, outside any transaction; one
+      // payment is canceled at Stripe now, outside any transaction; one
       // that succeeded stays paid, and the end says so.
-      await settleCasesBeforeEnd(req);
+      await settleCasesBeforeEnd(req, staged);
       const ended = await changeTx(req, async (client) => {
         const garage = await ownGarage(client, req);
-        const stay = await repo.getSession(client, req.tenantId, req.params.stayId);
-        if (!stay || stay.garage_id !== garage.id) throw new HttpError(404, 'stay not found', 'stay_not_found');
-        if (stay.exit_at) throw conflict('stay_not_open', 'this stay is not open: it has already been closed or ended');
+        const stay = await stayToEnd(client, req, garage);
         // The stay's open cases, then the stay: the close's order.
         // A stay closed meanwhile is refused below, where `endStay` finds it not open.
         const atExit = await exits.openCasesOfStay(client, req.tenantId, stay.id, { lock: true });
@@ -3836,20 +4162,24 @@ export function createApp() {
         if (nowAtExit.map((c) => c.id).join() !== atExit.map((c) => c.id).join() || atExit.some((c) => c.payment?.status === 'open')) {
           throw conflict('stay_payment_moving', 'a car reached an exit or started paying on this stay just now: ask again');
         }
-        const now = new Date();
-        const leftAt = ask.leftAt ? refuseFuture(ask.leftAt, 'left_at', now) : now;
-        if (leftAt < stay.entry_at) throw new HttpError(400, 'left_at is before the stay came in', 'left_at_before_entry');
+        const { leftAt, owed } = staged;
         const actor = await changes.who(client, req.change);
         const by = `${actor.kind}:${actor.name ?? actor.id ?? ''}`.slice(0, 300);
-        const owed = ask.outcome === 'ended' ? await owedForEnded(client, { tenantId: req.tenantId, garage, stay, leftAt }) : null;
         const closedCases = [];
-        let paid = null;
         for (const c of atExit) {
           await exits.endCase(client, req.tenantId, c.id, { why: 'stay_ended', by });
           const p = exits.paidFor(c);
-          paid ??= p ? { exit_id: p.exit_id, amount_minor: p.amount_minor, currency: p.currency } : null;
           closedCases.push({ exit_id: c.id, payment: p ? 'succeeded' : c.payment?.status ?? null });
         }
+        // WHAT THE STAY PAID: every succeeded payment at any of its cases --
+        // a car that paid, backed out and paid the difference paid both
+        // (0048). The latest names the case.
+        const payments = await exits.stayPayments(client, req.tenantId, stay.id);
+        const paid = payments.length ? {
+          exit_id: payments[payments.length - 1].exit_id,
+          amount_minor: payments.reduce((sum, p) => sum + Number(p.amount_minor), 0),
+          currency: payments[0].currency,
+        } : null;
         const row = await repo.endStay(client, req.tenantId, stay.id, {
           reason: ask.outcome,
           exitAt: leftAt,
@@ -3893,19 +4223,13 @@ export function createApp() {
   });
 
   /**
-   * BEFORE A PERSON ENDS A STAY: its open exit case's open payment is
-   * canceled at Stripe, or found paid. A card being authorised: 409, ask
-   * again. Stripe out of reach: 503, nothing written. Another account's or
-   * garage's stay: nothing asked here; the end answers 404.
+   * BEFORE A PERSON ENDS A STAY, after its reads: its open exit case's open
+   * payment is canceled at Stripe, or found paid. A card being authorised:
+   * 409, ask again. Stripe out of reach: 503, nothing written. Another
+   * account's or garage's stay never reaches here: the reads answered 404.
    */
-  async function settleCasesBeforeEnd(req) {
-    const found = await withTenant(req.tenantId, async (client) => {
-      const garage = await ownGarage(client, req);
-      const stay = await repo.getSession(client, req.tenantId, req.params.stayId);
-      if (!stay || stay.garage_id !== garage.id || stay.exit_at) return null;
-      return { garageId: garage.id, cases: await exits.openCasesOfStay(client, req.tenantId, stay.id) };
-    });
-    for (const c of found?.cases ?? []) {
+  async function settleCasesBeforeEnd(req, found) {
+    for (const c of found.cases) {
       if (c.payment?.status !== 'open') continue;
       try {
         await cancelPayment(req.tenantId, found.garageId, c, { why: 'stay_ended' });
@@ -4602,6 +4926,20 @@ async function tryOne(client, tenantId, garage, documents, stay) {
   };
 }
 
+/**
+ * The pass a closing stay was a session of (0048): what a module named at
+ * its exit (`entitlement.passSessionOf`), or the pass a lane's covered
+ * decision matched. Null when none was named.
+ */
+function passSessionFor(asked, localDecision, qr) {
+  const named = entitlement.passSessionOf(asked.record, qr);
+  if (named) return named;
+  const lanePass = asked.record?.decided_by === 'lane' && asked.outcome === entitlement.EXIT_OUTCOMES.COVERED
+    ? localDecision?.matched?.find((m) => m.pass)?.pass ?? null
+    : null;
+  return lanePass ? { module: 'garage_pass', pass_id: String(lanePass), covered: true, decided_by: 'lane' } : null;
+}
+
 /** The event a close that could not be priced leaves beside the row. */
 const CLOSE_UNPRICED_EVENT_KIND = 'close_unpriced';
 
@@ -4663,8 +5001,12 @@ async function priceStay({ garage, plans, session, exitAt }) {
  */
 async function quoteStay(client, { tenantId, garage, laneId, exitLaneIds = null, session, vehicle, exitAt }) {
   const identity = vehicle?.plate ?? vehicle?.ticket_ref ?? null;
-  const asked = identity
-    ? await entitlement.consult({ garage, identity, laneId, exitLaneIds, entryAt: session.entry_at, exitAt })
+  // A stay a registration QR let in is asked about by the QR's plate (0048).
+  const passIdentity = session.entry_qr?.qr_plate ?? null;
+  const asked = identity || passIdentity
+    ? await entitlement.consult({
+      garage, identity, passIdentity, qr: session.entry_qr ?? null, laneId, exitLaneIds, entryAt: new Date(session.entry_at), exitAt,
+    })
     : {
         outcome: entitlement.EXIT_OUTCOMES.TRANSIENT,
         covered_by: [],
@@ -4987,6 +5329,28 @@ export { pool, LANE_EVENT_KINDS, CLOSE_UNPRICED_EVENT_KIND };
  * wants "everything"; clamping gives them the most this will do and says so by
  * echoing the value back in the report.
  */
+/**
+ * A garage's own local day, `YYYY-MM-DD` (today in its zone when absent), as
+ * the instants it runs between. A day that is not a real date is refused.
+ */
+function garageDay(raw, timezone) {
+  const day = raw === undefined ? instantToLocal(Date.now(), timezone).slice(0, 10) : raw;
+  if (typeof day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day) {
+    throw new HttpError(400, 'day is a date in the garage\'s own time, written YYYY-MM-DD', 'day_invalid');
+  }
+  const next = new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
+  // Midnight a zone skips (clocks forward at 00:00) is the day's first real minute.
+  const start = (d) => {
+    try {
+      return localToInstant(`${d}T00:00`, timezone, 'day');
+    } catch (err) {
+      if (!(err instanceof GarageTimeInvalid)) throw err;
+      return localToInstant(`${d}T01:00`, timezone, 'day');
+    }
+  };
+  return { day, from: start(day), to: start(next) };
+}
+
 function clampWindow(raw, fallback) {
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) return fallback;
