@@ -57,6 +57,9 @@ const LANE_DETAIL_KEYS = Object.freeze([
 const PLATFORM_KINDS = new Set([
   'exit_unmatched', 'exit_driver_word', 'exit_let_out_by_person', 'exit_superseded', 'exit_stay_reentered',
   'exit_payment_started', 'exit_paid', 'exit_payment_canceled', 'exit_covered', 'close_unpriced', 'exit_reader_refused',
+  // A QR shown at the lane (#80): its detail is a closed set with no token
+  // and no plate, held so where the platform writes it and where a lane does.
+  'qr_presented',
 ]);
 
 function cutDetail(kind, detail) {
