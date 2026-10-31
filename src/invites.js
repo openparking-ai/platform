@@ -267,8 +267,9 @@ export async function requestReset(email, nobody) {
 
 /**
  * Use a ready reset: the new hash, every session ended, every lock cleared,
- * the reset marked used -- one transaction holding the reset. Answers
- * `{ email, sessionsRevoked }`, or `{ status }` when it was no longer ready.
+ * every passkey removed (0047), the reset marked used -- one transaction
+ * holding the reset. Answers `{ email, language, sessionsRevoked,
+ * passkeysRemoved }`, or `{ status }` when it was no longer ready.
  */
 export async function completeReset(reset, { passwordHash }) {
   return withTenant(reset.tenant_id, async (c) => {
@@ -279,16 +280,18 @@ export async function completeReset(reset, { passwordHash }) {
     )).rows[0] ?? null;
     const status = linkStatus(held);
     if (status !== 'ready') return { status };
-    const email = (await c.query(
-      'UPDATE operator_users SET password_hash = $2, password_changed_at = now() WHERE id = $1 RETURNING email',
+    const { email, language } = (await c.query(
+      'UPDATE operator_users SET password_hash = $2, password_changed_at = now() WHERE id = $1 RETURNING email, language',
       [held.user_id, passwordHash],
-    )).rows[0].email;
+    )).rows[0];
+    // A passkey is a second way in: whoever reset the password must not find one left behind.
+    const removed = await c.query('DELETE FROM operator_passkeys WHERE user_id = $1', [held.user_id]);
     const revoked = await c.query(
       `UPDATE operator_tokens SET revoked_at = now() WHERE user_id = $1 AND kind = 'session' AND revoked_at IS NULL`,
       [held.user_id],
     );
     await c.query('DELETE FROM operator_sign_in_locks WHERE user_id = $1', [held.user_id]);
     await c.query('UPDATE operator_password_resets SET used_at = now() WHERE id = $1', [held.id]);
-    return { email, sessionsRevoked: revoked.rowCount };
+    return { email, language, sessionsRevoked: revoked.rowCount, passkeysRemoved: removed.rowCount };
   });
 }

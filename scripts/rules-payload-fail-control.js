@@ -154,8 +154,8 @@ const SOURCE_BREAKS = [
     name: 'rates_accepts_again',
     why: 'the retired route answers 201',
     file: 'src/app.js',
-    from: "  operator.post('/garages/:garageId/rates', (_req, _res, next) => {\n    next(",
-    to: "  operator.post('/garages/:garageId/rates', (_req, res, next) => {\n    if (res) return res.status(201).json({ rate: {} });\n    next(",
+    from: "  operator.post('/garages/:garageId/rates', may('rates:change'), (_req, _res, next) => {\n    next(",
+    to: "  operator.post('/garages/:garageId/rates', may('rates:change'), (_req, res, next) => {\n    if (res) return res.status(201).json({ rate: {} });\n    next(",
   },
   {
     name: 'since_unchecked',

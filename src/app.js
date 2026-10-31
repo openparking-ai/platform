@@ -40,6 +40,10 @@ import * as exceptionsRecord from './exceptions.js';
 import { connectConfig, StripeError, StripeUnreachable } from './stripe.js';
 import { garageCurrency, garageName, garageSpaces, garageTimezone } from './garageFields.js';
 import { verifyUtf8 } from './utf8Body.js';
+import { EVERYTHING, permit, reaches } from './permissions.js';
+import * as linkedAccounts from './linkedAccounts.js';
+import { AccountsUndecided } from './accountsDoor.js';
+import { readDoneBy } from './doneBy.js';
 
 /**
  * The stay's open exit case changed, or took a payment, between the cancel
@@ -913,6 +917,11 @@ export function createApp() {
   // -------------------------------------------------------------------------
   const operator = express.Router();
 
+  // Each operator route's one permission (src/permissions.js): an id outside
+  // the session's garages answers what an id naming nothing answers there.
+  const may = (permission, options = {}) =>
+    permit(permission, { notFound: (which, route) => ID_PARAMS.operator[which](route), ...options });
+
   /**
    * Authenticated by an operator token, and the tenant comes FROM the token.
    *
@@ -945,6 +954,8 @@ export function createApp() {
         req.tenantId = rows[0].tenant_id;
         req.operatorTokenId = rows[0].token_id;
         req.actor = { kind: 'key', id: rows[0].token_id };
+        req.access = EVERYTHING;
+        req.doneBy = readDoneBy(req);
         req.change = changes.context(req, [token]);
         pool.query('SELECT touch_operator_token($1)', [req.operatorTokenId]).catch(() => {});
         return next();
@@ -956,13 +967,34 @@ export function createApp() {
         throw new HttpError(403, signIn.ORIGIN_REFUSED.error, signIn.ORIGIN_REFUSED.code);
       }
       const found = await signIn.resolveSession(session, authSettings);
-      if (!found) {
+      if (found) {
+        req.tenantId = found.tenant_id;
+        req.operatorTokenId = found.token_id;
+        req.actor = { kind: 'owner', id: found.user_id, name: found.email };
+        req.access = EVERYTHING;
+        req.change = changes.context(req, [session]);
+        return next();
+      }
+      // A person from a linked accounts module (src/linkedAccounts.js): only
+      // while the deployment names one, asked again when the answer is old.
+      let linked;
+      try {
+        linked = await linkedAccounts.resolve(session, authSettings);
+      } catch (err) {
+        if (err instanceof AccountsUndecided) {
+          console.error(`[auth] ${err.message}`);
+          throw new HttpError(503, linkedAccounts.ACCOUNTS_UNDECIDED.error, linkedAccounts.ACCOUNTS_UNDECIDED.code);
+        }
+        throw err;
+      }
+      if (!linked) {
         signIn.clearCookie(res, authSettings);
         throw new HttpError(401, signIn.SESSION_ENDED.error, signIn.SESSION_ENDED.code);
       }
-      req.tenantId = found.tenant_id;
-      req.operatorTokenId = found.token_id;
-      req.actor = { kind: 'owner', id: found.user_id, name: found.email };
+      req.tenantId = linked.tenant_id;
+      req.operatorTokenId = linked.session_id;
+      req.actor = { kind: 'linked', id: linked.person, name: linked.email };
+      req.access = linkedAccounts.access(linked);
       req.change = changes.context(req, [session]);
       next();
     } catch (err) {
@@ -1001,7 +1033,7 @@ export function createApp() {
    */
   const recorder = (req) => (client, line) => changes.record(client, req.change, line);
 
-  operator.post('/garages', async (req, res, next) => {
+  operator.post('/garages', may('garages:change', { everyGarage: true }), async (req, res, next) => {
     try {
       const raw = req.body ?? {};
       if (!raw.name || !raw.timezone || !raw.currency) throw bad('name, timezone and currency are required');
@@ -1074,16 +1106,16 @@ export function createApp() {
    * session or key, as every operator route; another tenant's garage is NOT
    * FOUND. Reads only: nothing here writes.
    */
-  operator.get('/garages', async (req, res, next) => {
+  operator.get('/garages', may('garages:read'), async (req, res, next) => {
     try {
       const rows = await withTenant(req.tenantId, (client) => repo.garagesForTenant(client, req.tenantId));
-      res.json({ garages: rows.map(repo.presentGarage) });
+      res.json({ garages: rows.filter((g) => reaches(req.access, g.id)).map(repo.presentGarage) });
     } catch (err) {
       next(err);
     }
   });
 
-  operator.get('/garages/:garageId', async (req, res, next) => {
+  operator.get('/garages/:garageId', may('garages:read'), async (req, res, next) => {
     try {
       const garage = await withTenant(req.tenantId, (client) => repo.getGarage(client, req.tenantId, req.params.garageId));
       if (!garage) throw new HttpError(404, 'garage not found');
@@ -1093,7 +1125,7 @@ export function createApp() {
     }
   });
 
-  operator.get('/garages/:garageId/lanes', async (req, res, next) => {
+  operator.get('/garages/:garageId/lanes', may('lanes:read'), async (req, res, next) => {
     try {
       const lanes = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
@@ -1110,7 +1142,7 @@ export function createApp() {
     }
   });
 
-  operator.patch('/garages/:garageId', async (req, res, next) => {
+  operator.patch('/garages/:garageId', may('garages:change'), async (req, res, next) => {
     try {
       const action = defaultAction(req.body?.default_action, { required: false });
       const transient = transientField(req.body?.transient_available, { required: false });
@@ -1194,7 +1226,7 @@ export function createApp() {
    * condition with whether it holds and why not. The operator's readout
    * before -- and after -- asking to activate.
    */
-  operator.get('/garages/:garageId/activation', async (req, res, next) => {
+  operator.get('/garages/:garageId/activation', may('garages:read'), async (req, res, next) => {
     try {
       const state = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
@@ -1214,7 +1246,7 @@ export function createApp() {
    * `details.unmet` by its step key -- the setup read's `not_done`, from the
    * same function (src/setup.js `openingSteps`). Idempotent.
    */
-  operator.post('/garages/:garageId/activate', async (req, res, next) => {
+  operator.post('/garages/:garageId/activate', may('garages:change'), async (req, res, next) => {
     try {
       const out = await changeTx(req, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
@@ -1250,7 +1282,7 @@ export function createApp() {
    * is refused by name. Restatable; every statement is recorded with what
    * changed and what the probes saw.
    */
-  operator.put('/garages/:garageId/entitlement-links', async (req, res, next) => {
+  operator.put('/garages/:garageId/entitlement-links', may('garages:change'), async (req, res, next) => {
     try {
       const body = req.body ?? {};
       for (const key of Object.keys(body)) {
@@ -1295,7 +1327,7 @@ export function createApp() {
    * (`VALIDATIONS_DOOR` unset) refuses a link by name, 409
    * `validations_not_configured`, and runs nothing; unlinking needs no door.
    */
-  operator.put('/garages/:garageId/validations-link', async (req, res, next) => {
+  operator.put('/garages/:garageId/validations-link', may('garages:change'), async (req, res, next) => {
     try {
       const body = req.body ?? {};
       for (const key of Object.keys(body)) {
@@ -1345,7 +1377,7 @@ export function createApp() {
   };
 
   /** Create the garage's account, or answer the one it has. Never a second. Body: {country}. */
-  operator.post('/garages/:garageId/stripe-account', connectRoute(async (req, res) => {
+  operator.post('/garages/:garageId/stripe-account', may('payments:change'), connectRoute(async (req, res) => {
     const { account, created } = await stripeAccount.createAccount(req.tenantId, req.params.garageId, {
       actor: `operator_token:${req.operatorTokenId}`,
       country: req.body?.country,
@@ -1355,20 +1387,20 @@ export function createApp() {
   }));
 
   /** What this platform last read, without asking Stripe. */
-  operator.get('/garages/:garageId/stripe-account', connectRoute(async (req, res) => {
+  operator.get('/garages/:garageId/stripe-account', may('payments:read'), connectRoute(async (req, res) => {
     const row = await stripeAccount.getAccount(req.tenantId, req.params.garageId);
     res.json({ stripe_account: stripeAccount.presentAccount(row) });
   }));
 
   /** Stripe's onboarding link, for the operator to open. */
-  operator.post('/garages/:garageId/stripe-account/onboarding-link', connectRoute(async (req, res) => {
+  operator.post('/garages/:garageId/stripe-account/onboarding-link', may('payments:change'), connectRoute(async (req, res) => {
     const link = await stripeAccount.onboardingLink(req.tenantId, req.params.garageId);
     // Nothing of this platform's is changed: Stripe made a link. So no line.
     res.status(201).json({ onboarding_link: link });
   }));
 
   /** Ask Stripe now, and keep the answer with when it was read. */
-  operator.post('/garages/:garageId/stripe-account/refresh', connectRoute(async (req, res) => {
+  operator.post('/garages/:garageId/stripe-account/refresh', may('payments:change'), connectRoute(async (req, res) => {
     const row = await stripeAccount.refreshAccount(req.tenantId, req.params.garageId, {
       actor: `operator_token:${req.operatorTokenId}`,
       record: recorder(req),
@@ -1380,7 +1412,7 @@ export function createApp() {
    * The garage's Location, on its own account: where its readers are grouped.
    * Refused while the account cannot take a card.
    */
-  operator.post('/garages/:garageId/stripe-account/location', connectRoute(async (req, res) => {
+  operator.post('/garages/:garageId/stripe-account/location', may('payments:change'), connectRoute(async (req, res) => {
     const { location, created } = await terminal.createLocation(req.tenantId, req.params.garageId, req.body ?? {}, {
       actor: `operator_token:${req.operatorTokenId}`,
       record: recorder(req),
@@ -1389,19 +1421,19 @@ export function createApp() {
   }));
 
   /** The garage's Location as this platform recorded it, or null. Asks Stripe nothing. */
-  operator.get('/garages/:garageId/stripe-account/location', connectRoute(async (req, res) => {
+  operator.get('/garages/:garageId/stripe-account/location', may('payments:read'), connectRoute(async (req, res) => {
     const row = await terminal.readLocation(req.tenantId, req.params.garageId);
     res.json({ location: terminal.presentLocation(row) });
   }));
 
   /** Every reader binding the garage's lanes have had, current ones first. */
-  operator.get('/garages/:garageId/readers', connectRoute(async (req, res) => {
+  operator.get('/garages/:garageId/readers', may('payments:read'), connectRoute(async (req, res) => {
     const rows = await terminal.listReaders(req.tenantId, req.params.garageId);
     res.json({ readers: rows.map(terminal.presentReader) });
   }));
 
   /** Register a reader on the garage's account and bind it to this lane. */
-  operator.post('/lanes/:laneId/reader', connectRoute(async (req, res) => {
+  operator.post('/lanes/:laneId/reader', may('payments:change'), connectRoute(async (req, res) => {
     const row = await terminal.bindReader(req.tenantId, req.params.laneId, req.body ?? {}, {
       actor: `operator_token:${req.operatorTokenId}`,
       record: recorder(req),
@@ -1410,7 +1442,7 @@ export function createApp() {
   }));
 
   /** End the lane's binding. Recorded; the binding's row stays. */
-  operator.post('/lanes/:laneId/reader/unbind', connectRoute(async (req, res) => {
+  operator.post('/lanes/:laneId/reader/unbind', may('payments:change'), connectRoute(async (req, res) => {
     const row = await terminal.unbindReader(req.tenantId, req.params.laneId, {
       actor: `operator_token:${req.operatorTokenId}`,
       record: recorder(req),
@@ -1418,7 +1450,7 @@ export function createApp() {
     res.json({ reader: terminal.presentReader(row) });
   }));
 
-  operator.post('/garages/:garageId/lanes', async (req, res, next) => {
+  operator.post('/garages/:garageId/lanes', may('lanes:change'), async (req, res, next) => {
     try {
       const { name, direction } = req.body ?? {};
       if (!name || !['entry', 'exit'].includes(direction)) {
@@ -1455,7 +1487,7 @@ export function createApp() {
    * and nothing writes it any more. Always refused, so its one change-log
    * line is the refused-attempt line (src/changes.js).
    */
-  operator.post('/garages/:garageId/rates', (_req, _res, next) => {
+  operator.post('/garages/:garageId/rates', may('rates:change'), (_req, _res, next) => {
     next(
       new HttpError(
         RATES_RETIRED_STATUS,
@@ -1489,7 +1521,7 @@ export function createApp() {
    * other plan stored since is `409 rates_changed_since_check`. Nothing is
    * stored on either.
    */
-  operator.post('/garages/:garageId/rate-plans', async (req, res, next) => {
+  operator.post('/garages/:garageId/rate-plans', may('rates:change'), async (req, res, next) => {
     try {
       // The owner's confirmation first (U7g): nothing reaches the engine, let
       // alone the store, until somebody has said they checked the prices.
@@ -1541,7 +1573,7 @@ export function createApp() {
    * store knows about each: no selection, no "current plan" -- the engine
    * chooses by entry time, and a second chooser here is the copy that drifts.
    */
-  operator.get('/garages/:garageId/rate-plans', async (req, res, next) => {
+  operator.get('/garages/:garageId/rate-plans', may('rates:read'), async (req, res, next) => {
     try {
       const out = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
@@ -1576,7 +1608,7 @@ export function createApp() {
    * store would refuse for this garage is the store's own refusal. At most 20
    * tries a minute for each signed-in owner (or key).
    */
-  operator.post('/garages/:garageId/rate-plans/try', async (req, res, next) => {
+  operator.post('/garages/:garageId/rate-plans/try', may('rates:read'), async (req, res, next) => {
     try {
       if (!tryLimiter.take(`${req.actor.kind}:${req.actor.id}`)) {
         throw new HttpError(429, `at most ${TRY_PER_MINUTE} tries a minute; wait a minute and try again`, 'too_many_tries');
@@ -1633,7 +1665,7 @@ export function createApp() {
     }
   });
 
-  operator.post('/lanes/:laneId/devices', async (req, res, next) => {
+  operator.post('/lanes/:laneId/devices', may('lanes:change'), async (req, res, next) => {
     try {
       const { name } = req.body ?? {};
       if (!name) throw bad('name is required');
@@ -1688,7 +1720,7 @@ export function createApp() {
    * device is issued again, not un-revoked, so a mistake costs an issuance and
    * never quietly restores a credential somebody else may be holding.
    */
-  operator.post('/devices/:deviceId/revoke', async (req, res, next) => {
+  operator.post('/devices/:deviceId/revoke', may('lanes:change'), async (req, res, next) => {
     try {
       const device = await changeTx(req, async (client) => {
         const { rows: was } = await client.query(
@@ -1746,7 +1778,7 @@ export function createApp() {
    * `token_hash` is not in the RETURNING list. Revoking a credential is not an
    * occasion to hand it back out.
    */
-  operator.post('/operator-tokens/:tokenId/revoke', async (req, res, next) => {
+  operator.post('/operator-tokens/:tokenId/revoke', may('account:change', { everyGarage: true }), async (req, res, next) => {
     try {
       const tokenRow = await changeTx(req, async (client) => {
         const { rows: was } = await client.query(
@@ -1800,7 +1832,7 @@ export function createApp() {
    * which is what row-level security makes it, and it is the convention every
    * other garage-scoped route here already follows.
    */
-  operator.get('/garages/:garageId/devices', async (req, res, next) => {
+  operator.get('/garages/:garageId/devices', may('lanes:read'), async (req, res, next) => {
     try {
       const devices = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
@@ -1827,7 +1859,7 @@ export function createApp() {
    * `unconfirmable_count` and `open_count` are returned beside it, so a
    * consumer can see the whole of what is open and what is behind each part.
    */
-  operator.get('/garages/:garageId/sessions/open', async (req, res, next) => {
+  operator.get('/garages/:garageId/sessions/open', may('stays:read'), async (req, res, next) => {
     try {
       const sessions = await withTenant(req.tenantId, (client) =>
         repo.openSessionsForGarage(client, req.tenantId, req.params.garageId),
@@ -1851,7 +1883,7 @@ export function createApp() {
    * reconciler on a money record destroys the evidence of the thing it was
    * meant to detect.
    */
-  operator.get('/garages/:garageId/reconciliation', async (req, res, next) => {
+  operator.get('/garages/:garageId/reconciliation', may('money:read'), async (req, res, next) => {
     try {
       const hours = clampWindow(req.query.hours, 24);
       const maxHours = statedWindow(req.query.max_stay_hours, 'max_stay_hours');
@@ -1869,7 +1901,7 @@ export function createApp() {
    * A garage's past stays (src/pastStays.js): the stays that closed in a
    * stated range, paged, with no vehicle identity. Read-only.
    */
-  operator.get('/garages/:garageId/stays/closed', async (req, res, next) => {
+  operator.get('/garages/:garageId/stays/closed', may('stays:read'), async (req, res, next) => {
     try {
       const asked = pastStays.readQuery(req.query);
       const page = await withTenant(req.tenantId, async (client) => {
@@ -3982,7 +4014,7 @@ export function createApp() {
    * Nothing here computes a percentage; the close takes its tax lines from
    * the engine (0023).
    */
-  operator.post('/garages/:garageId/tax-sets', async (req, res, next) => {
+  operator.post('/garages/:garageId/tax-sets', may('rates:change'), async (req, res, next) => {
     try {
       const set = await taxes.judgeTaxSet(req.body?.tax_set);
       taxes.assertStorable(set);
@@ -4013,7 +4045,7 @@ export function createApp() {
    * "current set": the engine picks the one in force by instant, and the
    * activation readout says which one that is today.
    */
-  operator.get('/garages/:garageId/tax-sets', async (req, res, next) => {
+  operator.get('/garages/:garageId/tax-sets', may('rates:read'), async (req, res, next) => {
     try {
       const sets = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
@@ -4035,7 +4067,7 @@ export function createApp() {
    * in order, done or not, with the facts it was decided on (src/setup.js).
    * A read: nothing here writes.
    */
-  operator.get('/garages/:garageId/setup', async (req, res, next) => {
+  operator.get('/garages/:garageId/setup', may('garages:read'), async (req, res, next) => {
     try {
       const out = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
@@ -4049,7 +4081,7 @@ export function createApp() {
   });
 
   /** Rename a lane. Body: {name}. */
-  operator.patch('/lanes/:laneId', async (req, res, next) => {
+  operator.patch('/lanes/:laneId', may('lanes:change'), async (req, res, next) => {
     try {
       const lane = await changeTx(req, (client) => lanes.rename(client, req.tenantId, req.params.laneId, req.body ?? {}, req.change));
       res.json({ lane: { id: lane.id, garage_id: lane.garage_id, name: lane.name, direction: lane.direction } });
@@ -4063,7 +4095,7 @@ export function createApp() {
    * no recorded event. Anything else is refused by name, `lane_has_history`,
    * with what it has in `details`, and nothing is changed.
    */
-  operator.delete('/lanes/:laneId', async (req, res, next) => {
+  operator.delete('/lanes/:laneId', may('lanes:change'), async (req, res, next) => {
     try {
       await changeTx(req, (client) => lanes.remove(client, req.tenantId, req.params.laneId, req.change));
       res.status(204).end();
@@ -4077,7 +4109,7 @@ export function createApp() {
    * The last open lane of a direction is refused, `last_open_lane`, unless
    * `override` is true. Closing a closed lane changes its reason and message.
    */
-  operator.post('/lanes/:laneId/close', async (req, res, next) => {
+  operator.post('/lanes/:laneId/close', may('lanes:change'), async (req, res, next) => {
     try {
       const closed = await changeTx(req, (client) => lanes.close(client, req.tenantId, req.params.laneId, req.body ?? {}, req.change));
       res.json({ lane: { id: req.params.laneId, closed: { reason: closed.closed_reason, message: closed.closed_message, at: closed.closed_at } } });
@@ -4087,7 +4119,7 @@ export function createApp() {
   });
 
   /** Open a closed lane again. Refused by name when it is open. */
-  operator.post('/lanes/:laneId/reopen', async (req, res, next) => {
+  operator.post('/lanes/:laneId/reopen', may('lanes:change'), async (req, res, next) => {
     try {
       const opened = await changeTx(req, (client) => lanes.reopen(client, req.tenantId, req.params.laneId, req.body, req.change));
       res.json({ lane: { id: req.params.laneId, closed: null, reopened_at: opened.reopened_at } });
@@ -4123,7 +4155,7 @@ export function createApp() {
    * the driver's word, a person, a payment -- and, for a case the picker
    * was asked about, what it was shown and answered.
    */
-  operator.get('/garages/:garageId/exits', async (req, res, next) => {
+  operator.get('/garages/:garageId/exits', may('stays:read'), async (req, res, next) => {
     try {
       const open = await withTenant(req.tenantId, async (client) => {
         await ownGarage(client, req);
@@ -4165,9 +4197,9 @@ export function createApp() {
       next(err);
     }
   };
-  operator.get('/garages/:garageId/exceptions', (req, res, next) => exceptionsOfDay(req, res, next, req.query.day));
+  operator.get('/garages/:garageId/exceptions', may('stays:read'), (req, res, next) => exceptionsOfDay(req, res, next, req.query.day));
   /** The same day, named in the path: `/exceptions/day/YYYY-MM-DD`, the garage's own date. */
-  operator.get('/garages/:garageId/exceptions/day/:day', (req, res, next) => exceptionsOfDay(req, res, next, req.params.day));
+  operator.get('/garages/:garageId/exceptions/day/:day', may('stays:read'), (req, res, next) => exceptionsOfDay(req, res, next, req.params.day));
 
   /**
    * ONE EXCEPTION'S WHOLE STORY (0048): what happened as it stood at the
@@ -4176,7 +4208,7 @@ export function createApp() {
    * events to the window's end, and each copy of the gate agent's messages
    * and calls, with their own ids, or why it could not be made.
    */
-  operator.get('/garages/:garageId/exceptions/:exceptionId', async (req, res, next) => {
+  operator.get('/garages/:garageId/exceptions/:exceptionId', may('stays:read'), async (req, res, next) => {
     try {
       const x = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4196,7 +4228,7 @@ export function createApp() {
    * no other. Through the garage, `private, no-store`; a picture the
    * retention job has deleted is 404, as at every picture route.
    */
-  operator.get('/garages/:garageId/exceptions/:exceptionId/pictures/:pictureId', async (req, res, next) => {
+  operator.get('/garages/:garageId/exceptions/:exceptionId/pictures/:pictureId', may('stays:read'), async (req, res, next) => {
     try {
       const picture = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4215,7 +4247,7 @@ export function createApp() {
    * owed, with who and why on the case, an event beside it, and a line in
    * the change log. Once per case, and only while the car is at the lane.
    */
-  operator.post('/garages/:garageId/exits/:exitId/let-out', async (req, res, next) => {
+  operator.post('/garages/:garageId/exits/:exitId/let-out', may('stays:change'), async (req, res, next) => {
     try {
       let exception = null;
       const reason = req.body?.reason;
@@ -4272,7 +4304,7 @@ export function createApp() {
    * unless asked), and those the latest finished walk did not see (0040),
    * oldest first, each with its entry pictures, for a person to end. A read.
    */
-  operator.get('/garages/:garageId/stays/stuck', async (req, res, next) => {
+  operator.get('/garages/:garageId/stays/stuck', may('stays:read'), async (req, res, next) => {
     try {
       const { hours, garageHours, stays, facts, pictures } = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4296,7 +4328,7 @@ export function createApp() {
   });
 
   /** One entry picture of a stay of this garage (0033), as the image itself. */
-  operator.get('/garages/:garageId/stays/:stayId/pictures/:pictureId', async (req, res, next) => {
+  operator.get('/garages/:garageId/stays/:stayId/pictures/:pictureId', may('stays:read'), async (req, res, next) => {
     try {
       const picture = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4330,7 +4362,7 @@ export function createApp() {
    * `left_at` or a rate engine that cannot answer fails the request with
    * every payment as it was.
    */
-  operator.post('/garages/:garageId/stays/:stayId/end', async (req, res, next) => {
+  operator.post('/garages/:garageId/stays/:stayId/end', may('stays:change'), async (req, res, next) => {
     try {
       const ask = stuck.endRequest(req.body, parseTime);
       const now = new Date();
@@ -4471,7 +4503,7 @@ export function createApp() {
     return null;
   };
 
-  operator.post('/garages/:garageId/walks', async (req, res, next) => {
+  operator.post('/garages/:garageId/walks', may('inventory:change'), async (req, res, next) => {
     try {
       const { walk, created } = await changeTx(req, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4507,7 +4539,7 @@ export function createApp() {
     (ask.clientRef ? await walks.sightingByRef(client, req.tenantId, walk.id, ask.clientRef) : null)
       ?? (digest ? await walks.sightingByPicture(client, req.tenantId, walk.id, digest) : null);
 
-  operator.post('/garages/:garageId/walks/:walkId/sightings', readPicture, async (req, res, next) => {
+  operator.post('/garages/:garageId/walks/:walkId/sightings', may('inventory:change'), readPicture, async (req, res, next) => {
     try {
       // The phone waits the `Retry-After` it is sent and keeps the picture
       // until it is saved: whole seconds until this key's minute ends.
@@ -4603,7 +4635,7 @@ export function createApp() {
     }
   });
 
-  operator.post('/garages/:garageId/walks/:walkId/sightings/:sightingId/pick', async (req, res, next) => {
+  operator.post('/garages/:garageId/walks/:walkId/sightings/:sightingId/pick', may('inventory:change'), async (req, res, next) => {
     try {
       const stayId = req.body?.stay;
       const { sighting, stays } = await changeTx(req, async (client) => {
@@ -4628,7 +4660,7 @@ export function createApp() {
     }
   });
 
-  operator.post('/garages/:garageId/walks/:walkId/finish', async (req, res, next) => {
+  operator.post('/garages/:garageId/walks/:walkId/finish', may('inventory:change'), async (req, res, next) => {
     try {
       const walk = await changeTx(req, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4666,7 +4698,7 @@ export function createApp() {
     }
   });
 
-  operator.get('/garages/:garageId/walks/:walkId/sightings/:sightingId/picture', async (req, res, next) => {
+  operator.get('/garages/:garageId/walks/:walkId/sightings/:sightingId/picture', may('inventory:read'), async (req, res, next) => {
     try {
       const picture = await withTenant(req.tenantId, async (client) => {
         await ownGarage(client, req);
@@ -4681,7 +4713,7 @@ export function createApp() {
     }
   });
 
-  operator.get('/garages/:garageId/walks/:walkId', async (req, res, next) => {
+  operator.get('/garages/:garageId/walks/:walkId', may('inventory:read'), async (req, res, next) => {
     try {
       const out = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4702,7 +4734,7 @@ export function createApp() {
    * then presents the card to it. The case is settled when Stripe says the
    * intent succeeded -- the lane's poll, or this route asked again, reads it.
    */
-  operator.post('/garages/:garageId/exits/:exitId/pay', connectRoute(async (req, res) => {
+  operator.post('/garages/:garageId/exits/:exitId/pay', may('stays:change'), connectRoute(async (req, res) => {
     const garage = await withTenant(req.tenantId, (client) => ownGarage(client, req));
     const { row, clientSecret } = await payCase({
       tenantId: req.tenantId, garageId: garage.id, exitId: req.params.exitId, channel: 'phone_reader',
@@ -4718,7 +4750,7 @@ export function createApp() {
    * whose ban reaches it -- listed here, or at a garage of the account that
    * bans across all its garages -- each with its pictures. A read.
    */
-  operator.get('/garages/:garageId/banned', async (req, res, next) => {
+  operator.get('/garages/:garageId/banned', may('garages:read'), async (req, res, next) => {
     try {
       const out = await withTenant(req.tenantId, async (client) => {
         await ownGarage(client, req);
@@ -4735,7 +4767,7 @@ export function createApp() {
    * listed only as a tailgater, where the garage bans them. Its stay and its
    * pictures then age out by the normal rules.
    */
-  operator.post('/garages/:garageId/banned/:banId/remove', async (req, res, next) => {
+  operator.post('/garages/:garageId/banned/:banId/remove', may('garages:change'), async (req, res, next) => {
     try {
       await changeTx(req, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4759,7 +4791,7 @@ export function createApp() {
   });
 
   /** One picture of a banned car whose ban reaches this garage, as the image itself. */
-  operator.get('/garages/:garageId/banned/:banId/pictures/:pictureId', async (req, res, next) => {
+  operator.get('/garages/:garageId/banned/:banId/pictures/:pictureId', may('garages:read'), async (req, res, next) => {
     try {
       const picture = await withTenant(req.tenantId, async (client) => {
         await ownGarage(client, req);
@@ -4774,7 +4806,7 @@ export function createApp() {
   });
 
   /** The alerts, in order, and the garage's people with what each gets. A read. */
-  operator.get('/garages/:garageId/alerts', async (req, res, next) => {
+  operator.get('/garages/:garageId/alerts', may('garages:read'), async (req, res, next) => {
     try {
       const out = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4787,7 +4819,7 @@ export function createApp() {
   });
 
   /** Add a person. Body: {name, phone?, email?, language?}: a phone, an email, or both. */
-  operator.post('/garages/:garageId/alert-contacts', async (req, res, next) => {
+  operator.post('/garages/:garageId/alert-contacts', may('garages:change'), async (req, res, next) => {
     try {
       const out = await changeTx(req, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4800,7 +4832,7 @@ export function createApp() {
   });
 
   /** Change a person: any of {name, phone, email, language}; null takes a phone or email away. */
-  operator.patch('/garages/:garageId/alert-contacts/:contactId', async (req, res, next) => {
+  operator.patch('/garages/:garageId/alert-contacts/:contactId', may('garages:change'), async (req, res, next) => {
     try {
       const out = await changeTx(req, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4813,7 +4845,7 @@ export function createApp() {
   });
 
   /** Remove a person, and every choice of theirs with them. */
-  operator.delete('/garages/:garageId/alert-contacts/:contactId', async (req, res, next) => {
+  operator.delete('/garages/:garageId/alert-contacts/:contactId', may('garages:change'), async (req, res, next) => {
     try {
       await changeTx(req, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4826,7 +4858,7 @@ export function createApp() {
   });
 
   /** Which alerts a person gets: {by_text: [alert], by_email: [alert]}, the whole of both. */
-  operator.put('/garages/:garageId/alert-contacts/:contactId/choices', async (req, res, next) => {
+  operator.put('/garages/:garageId/alert-contacts/:contactId/choices', may('garages:change'), async (req, res, next) => {
     try {
       const out = await changeTx(req, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4845,7 +4877,7 @@ export function createApp() {
   // -------------------------------------------------------------------------
 
   /** The garage's board: its messages and each lane's price switch. A read. */
-  operator.get('/garages/:garageId/board', async (req, res, next) => {
+  operator.get('/garages/:garageId/board', may('garages:read'), async (req, res, next) => {
     try {
       const out = await withTenant(req.tenantId, async (client) => board.read(client, req.tenantId, await ownGarage(client, req)));
       res.json({ ...out, screen: { characters: SCREEN_CHARACTERS, message_max: MESSAGE_MAX } });
@@ -4855,7 +4887,7 @@ export function createApp() {
   });
 
   /** Add a message. Body: {text, lanes: [laneId], starts?, ends?}, times in the garage's own time as YYYY-MM-DDTHH:MM. */
-  operator.post('/garages/:garageId/board-messages', async (req, res, next) => {
+  operator.post('/garages/:garageId/board-messages', may('garages:change'), async (req, res, next) => {
     try {
       const out = await changeTx(req, async (client) => board.add(client, req.tenantId, await ownGarage(client, req), req.body ?? {}, req.change));
       res.status(201).json(out);
@@ -4865,7 +4897,7 @@ export function createApp() {
   });
 
   /** Change a message: any of {text, lanes, starts, ends}; null takes a start or an end away. */
-  operator.patch('/garages/:garageId/board-messages/:messageId', async (req, res, next) => {
+  operator.patch('/garages/:garageId/board-messages/:messageId', may('garages:change'), async (req, res, next) => {
     try {
       const out = await changeTx(req, async (client) => board.change(client, req.tenantId, await ownGarage(client, req), req.params.messageId, req.body ?? {}, req.change));
       res.json(out);
@@ -4875,7 +4907,7 @@ export function createApp() {
   });
 
   /** Remove a message from every lane it shows on. */
-  operator.delete('/garages/:garageId/board-messages/:messageId', async (req, res, next) => {
+  operator.delete('/garages/:garageId/board-messages/:messageId', may('garages:change'), async (req, res, next) => {
     try {
       await changeTx(req, async (client) => board.remove(client, req.tenantId, await ownGarage(client, req), req.params.messageId, req.change));
       res.status(204).end();
@@ -4885,7 +4917,7 @@ export function createApp() {
   });
 
   /** This lane shows the price on its board, or not. Body: {show: true | false}. */
-  operator.put('/lanes/:laneId/board-prices', async (req, res, next) => {
+  operator.put('/lanes/:laneId/board-prices', may('rates:change'), async (req, res, next) => {
     try {
       const out = await changeTx(req, (client) => board.setPrices(client, req.tenantId, req.params.laneId, req.body ?? {}, req.change));
       res.json(out);
@@ -4909,9 +4941,11 @@ export function createApp() {
       const out = await withTenant(req.tenantId, async (client) => {
         const garage = await repo.getGarage(client, req.tenantId, req.params.garageId);
         if (!garage) throw new HttpError(404, 'garage not found');
-        const page = await changes.linesForGarage(client, req.tenantId, garage.id, { outcome, after: req.params.changeId ?? null });
+        // The account's own lines (its passkeys, keys, admin) only for a reader over the whole account.
+        const accountWide = req.access.garages === 'all';
+        const page = await changes.linesForGarage(client, req.tenantId, garage.id, { outcome, after: req.params.changeId ?? null, accountWide });
         if (!page) throw new HttpError(404, 'change not found');
-        return { page, count: outcome === 'refused' ? await changes.refusedCount(client, req.tenantId, garage.id) : null };
+        return { page, count: outcome === 'refused' ? await changes.refusedCount(client, req.tenantId, garage.id, { accountWide }) : null };
       });
       if (outcome === 'done') res.json({ changes: out.page.lines.map(presentChange), next: out.page.next });
       else res.json({ refused: out.page.lines.map(presentChange), next: out.page.next, count: out.count });
@@ -4919,10 +4953,10 @@ export function createApp() {
       next(err);
     }
   };
-  operator.get('/garages/:garageId/changes', logRead('done'));
-  operator.get('/garages/:garageId/changes/:changeId', logRead('done'));
-  operator.get('/garages/:garageId/refused-attempts', logRead('refused'));
-  operator.get('/garages/:garageId/refused-attempts/:changeId', logRead('refused'));
+  operator.get('/garages/:garageId/changes', may('log:read'), logRead('done'));
+  operator.get('/garages/:garageId/changes/:changeId', may('log:read'), logRead('done'));
+  operator.get('/garages/:garageId/refused-attempts', may('log:read'), logRead('refused'));
+  operator.get('/garages/:garageId/refused-attempts/:changeId', may('log:read'), logRead('refused'));
 
   /**
    * A refused write is a line in the change log (src/changes.js): in the log
@@ -5435,6 +5469,9 @@ function presentChange(line) {
     at: line.at,
     outcome: line.outcome,
     who: { kind: line.actor_kind, name: line.actor_name },
+    // Who acted through an operator key, in the words the key's caller gave
+    // (src/doneBy.js); null on every other line.
+    done_by: line.done_by ?? null,
     action: line.action,
     // A person to tell is named as they are now, or not at all when they
     // have been removed (src/changes.js): the line itself never holds a name.

@@ -154,20 +154,29 @@ export async function createAdmin({ tenantId, email, password }) {
   }
 }
 
-/** A new password for the admin `email` names; every session revoked, every lock cleared. */
+/**
+ * A new password for the admin `email` names; every session revoked, every
+ * lock cleared, every passkey removed (0047). Answers what it did, and the
+ * admin's language for the notice that their passkeys went.
+ */
 export async function resetAdminPassword({ email, password }) {
   const normal = normalEmail(email);
   const user = (await query('SELECT user_id, tenant_id FROM resolve_operator_user($1)', [normal])).rows[0];
   if (!user) throw new AdminCommandRefused('no admin has that email');
   const hash = await hashPassword(password);
   return withTenant(user.tenant_id, async (c) => {
-    await c.query('UPDATE operator_users SET password_hash = $2, password_changed_at = now() WHERE id = $1', [user.user_id, hash]);
+    const { language } = (await c.query(
+      'UPDATE operator_users SET password_hash = $2, password_changed_at = now() WHERE id = $1 RETURNING language', [user.user_id, hash],
+    )).rows[0];
+    const removed = await c.query('DELETE FROM operator_passkeys WHERE user_id = $1', [user.user_id]);
     const revoked = await c.query(
       `UPDATE operator_tokens SET revoked_at = now() WHERE user_id = $1 AND kind = 'session' AND revoked_at IS NULL`,
       [user.user_id],
     );
     const cleared = await c.query('DELETE FROM operator_sign_in_locks WHERE user_id = $1', [user.user_id]);
-    return { tenant_id: user.tenant_id, email: normal, sessions_revoked: revoked.rowCount, locks_cleared: cleared.rowCount };
+    return {
+      tenant_id: user.tenant_id, email: normal, language, sessions_revoked: revoked.rowCount, locks_cleared: cleared.rowCount, passkeys_removed: removed.rowCount,
+    };
   });
 }
 

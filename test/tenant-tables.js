@@ -307,6 +307,33 @@ export const TENANT_TABLES = [
       ),
   },
   {
+    table: 'operator_passkeys',
+    // A passkey belongs to the tenant's one admin, made here if it is not.
+    insert: (c, t) =>
+      c.query(
+        `WITH u AS (
+           INSERT INTO operator_users (tenant_id, email, password_hash)
+           VALUES ($1, 'iso-' || gen_random_uuid()::text || '@example.com', 'scrypt$row')
+           ON CONFLICT (tenant_id) DO UPDATE SET password_changed_at = now() RETURNING id, tenant_id
+         )
+         INSERT INTO operator_passkeys (tenant_id, user_id, credential_id, public_key, name)
+         SELECT tenant_id, id, replace(gen_random_uuid()::text, '-', ''), '\\x000102030405060708090a0b0c0d0e0f'::bytea, 'Row'
+           FROM u RETURNING id`,
+        [t],
+      ),
+  },
+  {
+    table: 'linked_sessions',
+    insert: (c, t) =>
+      c.query(
+        `INSERT INTO linked_sessions (tenant_id, token_hash, person, email, all_garages, permissions, version, expires_at)
+         VALUES ($1, md5(gen_random_uuid()::text) || md5(gen_random_uuid()::text), gen_random_uuid(),
+                 'iso-' || gen_random_uuid()::text || '@example.com', true, '{}', 'v1', now() + interval '1 hour')
+         RETURNING id`,
+        [t],
+      ),
+  },
+  {
     table: 'operator_invites',
     // Every row here is an invite already used, so the one-live-per-tenant
     // and one-live-per-email indexes (0032) never meet a policy test.
@@ -503,12 +530,18 @@ export const TABLES_WITHOUT_TENANT_ID = {
   platform_security_log:
     "refused attempts that name no account's garage and come with no account's credential (0026): nobody's, so " +
     'no tenant; the application holds no grant on it and writes it only through record_refused_change()',
+  linked_sign_in_locks:
+    'wrong passwords for an email a linked accounts module keeps (0047): counted before anything says whose the email ' +
+    'is, and the module refuses without saying either, so no tenant; it holds a hash of the email and an address only',
+  passkey_challenges:
+    "passkey challenges (0047): a sign-in's is made before anything says who is signing in, so no tenant; an adding's " +
+    'names its admin and session only by a SHA-256 of them. Each holds a random challenge and the caller address, for five minutes',
 };
 
 /**
  * Tables that are ENABLE ROW LEVEL SECURITY but deliberately NOT FORCE.
  *
- * ALL THREE are credential-resolution tables, and they are on this list for the one
+ * ALL FIVE are credential-resolution tables, and they are on this list for the one
  * reason the RLS template cannot express: a credential is presented and the
  * tenant that owns it is precisely what the lookup exists to discover, so no
  * tenant policy can gate it. Nothing else may join this list without the same
@@ -517,6 +550,8 @@ export const TABLES_WITHOUT_TENANT_ID = {
  * operator_tokens, 0024 for operator_users (an email is presented and its
  * tenant is what the lookup finds), and rls-coverage.test.js for the assertion
  * that these are the ONLY ones. 0024's other table, operator_sign_in_locks, is
- * read only once the tenant is known, and is FORCED like any other.
+ * read only once the tenant is known, and is FORCED like any other. 0047 adds
+ * operator_passkeys (a passkey is presented; its tenant is what the lookup
+ * finds) and linked_sessions (a session token, as operator_tokens).
  */
-export const NOT_FORCED_BY_DESIGN = ['lane_devices', 'operator_tokens', 'operator_users'];
+export const NOT_FORCED_BY_DESIGN = ['lane_devices', 'linked_sessions', 'operator_passkeys', 'operator_tokens', 'operator_users'];

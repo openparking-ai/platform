@@ -68,8 +68,13 @@ import * as changes from './changes.js';
 import { generateDeviceToken, hashToken } from './auth.js';
 import { dummyHash, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
 import { mountAccountDoors } from './accountDoors.js';
-import { readEmailSettings } from './email.js';
+import { notify, readEmailSettings } from './email.js';
+import { passkeyAddedEmail } from './emailText.js';
 import { verifyUtf8 } from './utf8Body.js';
+import * as accountsDoor from './accountsDoor.js';
+import * as linkedAccounts from './linkedAccounts.js';
+import * as passkeys from './passkeys.js';
+import { ALL as ALL_PERMISSIONS } from './permissions.js';
 
 export const COOKIE = 'op_session';
 export const MAX_FAILED = 10;
@@ -86,6 +91,8 @@ export const SESSION_ENDED = Object.freeze({ error: 'The session has ended. Sign
 export const SIGN_IN_REQUIRED = Object.freeze({ error: 'Sign in first.', code: 'sign_in_required' });
 //: The hash line is full. Decided before the email is read, so the same for every email.
 export const BUSY = Object.freeze({ error: 'Sign-in is busy. Try again in a moment.', code: 'sign_in_busy' });
+//: A linked accounts module could not decide (src/accountsDoor.js): nobody is let in.
+export const UNDECIDED = Object.freeze({ error: 'Sign-in could not be checked just now. Try again in a moment.', code: 'sign_in_undecided' });
 //: Anything but {"language": "en" | "es"}, sent as JSON: one refusal, whatever was wrong with it.
 export const LANGUAGE_REFUSED = Object.freeze({ error: 'The language must be "en" or "es", sent as JSON: {"language"}.', code: 'language_refused' });
 
@@ -119,7 +126,21 @@ export const NUMBER_SETTINGS = Object.freeze({
   // The doors behind an emailed link (0032), each counted on its own.
   ACCOUNT_LINK_ATTEMPTS_PER_ADDRESS: { min: 1, max: 1000, fallback: 10 },
   ACCOUNT_LINK_ATTEMPTS_WINDOW_MINUTES: { min: 1, max: 1440, fallback: 60 },
+  // How old a linked session's answer may be before the module is asked again (0047).
+  ACCOUNTS_RECHECK_SECONDS: { min: 10, max: 900, fallback: 60 },
+  // With a linked accounts module named, the floor of EVERY sign-in refusal --
+  // the admin's, checked here, and everyone else's, asked of the module -- set
+  // above the module's own time, so the two are one time on the wire (0047).
+  ACCOUNTS_SIGN_IN_FLOOR_MS: { min: 200, max: 15000, fallback: 2000 },
 });
+
+//: Adding a passkey needs the password proved this recently: signed in with it, or typed again.
+export const PASSWORD_RECENT_SECONDS = 300;
+
+//: Adding a passkey on a session that has not proved the password in five minutes.
+export const PASSWORD_REQUIRED = Object.freeze({ error: 'Enter your password to add a passkey.', code: 'password_required' });
+//: The password typed to add a passkey is not the admin's (or the address is locked): one answer for both.
+export const PASSWORD_NOT_ACCEPTED = Object.freeze({ error: 'That password was not accepted.', code: 'password_not_accepted' });
 
 //: The most proxy hops TRUST_PROXY may name.
 export const MAX_PROXY_HOPS = 5;
@@ -211,6 +232,9 @@ export function readAuthSettings(env = process.env) {
     hashLinePerAddress,
     linkAttemptsPerAddress: whole(env, 'ACCOUNT_LINK_ATTEMPTS_PER_ADDRESS'),
     linkAttemptsWindowSeconds: whole(env, 'ACCOUNT_LINK_ATTEMPTS_WINDOW_MINUTES') * 60,
+    accountsRecheckSeconds: whole(env, 'ACCOUNTS_RECHECK_SECONDS'),
+    accountsFloorMs: whole(env, 'ACCOUNTS_SIGN_IN_FLOOR_MS'),
+    passkeys: passkeys.readPasskeySettings(env, adminOrigin),
   };
 }
 
@@ -424,15 +448,38 @@ export const internals = {
            AND (revoked_at IS NOT NULL OR expires_at <= now() OR last_seen_at <= now() - make_interval(secs => $2))`,
         [user.user_id, settings.idleSeconds],
       );
+      // The password was just proved: `password_at` (0047), which adding a passkey reads.
       const session = (await c.query(
-        `INSERT INTO operator_tokens (tenant_id, name, token_hash, kind, user_id, expires_at, last_seen_at)
-         VALUES ($1, 'sign-in', $2, 'session', $3, now() + make_interval(secs => $4), now())
+        `INSERT INTO operator_tokens (tenant_id, name, token_hash, kind, user_id, expires_at, last_seen_at, password_at)
+         VALUES ($1, 'sign-in', $2, 'session', $3, now() + make_interval(secs => $4), now(), now())
          RETURNING id, expires_at, last_seen_at + make_interval(secs => $5) AS idle_ends_at`,
         [user.tenant_id, hashToken(token), user.user_id, settings.maxSeconds, settings.idleSeconds],
       )).rows[0];
       return { ...session, language: still.rows[0].language };
     });
     return row ? { token, row } : null;
+  },
+
+  /** Whether the session proved the password within PASSWORD_RECENT_SECONDS. */
+  async passwordRecent(session) {
+    return withTenant(session.tenant_id, async (c) => (await c.query(
+      `SELECT 1 FROM operator_tokens WHERE id = $1 AND user_id = $2 AND kind = 'session'
+          AND password_at > now() - make_interval(secs => $3)`,
+      [session.token_id, session.user_id, PASSWORD_RECENT_SECONDS],
+    )).rowCount === 1);
+  },
+
+  /** The admin a session names, as sign-in checks a password against: its user, tenant and hash. */
+  async adminOf(session) {
+    return withTenant(session.tenant_id, async (c) => (await c.query(
+      'SELECT id AS user_id, tenant_id, password_hash FROM operator_users WHERE id = $1 AND tenant_id = $2',
+      [session.user_id, session.tenant_id],
+    )).rows[0] ?? null);
+  },
+
+  /** The session proved the password now. */
+  async passwordProved(session) {
+    await withTenant(session.tenant_id, (c) => c.query('UPDATE operator_tokens SET password_at = now() WHERE id = $1 AND user_id = $2', [session.token_id, session.user_id]));
   },
 
   /** The language of the admin a session names, read in that session's tenant. */
@@ -512,11 +559,64 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
   dummyHash().catch(() => {});
 
   /** Every sign-in answer but a sign-in: never sooner than the floor after the request arrived. */
-  const refuse = async (req, res, status, body) => {
-    const wait = settings.refusalFloorMs - (performance.now() - req.arrivedAt);
+  const refuse = async (req, res, status, body, floorMs = settings.refusalFloorMs) => {
+    const wait = floorMs - (performance.now() - req.arrivedAt);
     if (wait > 0) await sleep(wait);
     if (status === 503) res.set('Retry-After', '2');
     return res.status(status).json(body);
+  };
+
+  /**
+   * A sign-in's refusal -- by password or by passkey. With a linked accounts
+   * module named, an email that is not the admin's is asked of the module, a
+   * slower road than the admin's own hash: so every refusal then waits for the
+   * larger of the two floors, the admin's included, and the road is not on the
+   * wire. Read at each refusal, as the door is (src/accountsDoor.js).
+   */
+  const signInFloor = () => (accountsDoor.doorConfigured() ? Math.max(settings.refusalFloorMs, settings.accountsFloorMs) : settings.refusalFloorMs);
+  const refuseSignIn = (req, res, status, body) => refuse(req, res, status, body, signInFloor());
+
+  /**
+   * A sign-in for an email that is not the admin's, on a deployment that
+   * names a linked accounts module: its lock, then its door, then a session
+   * of the module's answer. Refused exactly as an admin is refused; a module
+   * that could not decide lets nobody in. `leave` gives the line's place back.
+   */
+  const linkedSignIn = async (req, res, body, address, leave) => {
+    try {
+      const hash = linkedAccounts.emailHash(body.email);
+      const locked = linkedAccounts.isLocked(await linkedAccounts.internals.lockOf(hash, address));
+      let person = null;
+      const asked = performance.now();
+      try {
+        if (!locked) person = await linkedAccounts.internals.door.signIn(body.email, body.password);
+      } finally {
+        leave();
+      }
+      // A module slower than the floor puts its road on the wire: said, so the floor is raised.
+      const took = performance.now() - asked;
+      if (took > settings.accountsFloorMs) {
+        console.error(`[auth] the accounts door took ${Math.round(took)} ms to answer a sign-in, more than ACCOUNTS_SIGN_IN_FLOOR_MS (${settings.accountsFloorMs}): raise it, or an admin's email can be told from another by the time a refusal takes`);
+      }
+      if (!person) {
+        // A wrong password counts; so does an attempt during the lock, which re-arms it.
+        await linkedAccounts.internals.recordFailure(hash, address);
+        return await refuseSignIn(req, res, 401, REFUSED);
+      }
+      const { token, row } = await linkedAccounts.mint(person, settings);
+      await linkedAccounts.internals.clearLock(hash, address);
+      setCookie(res, settings, token);
+      return res.status(200).json({
+        email: person.email,
+        tenant_id: person.tenant,
+        session_ends_at: endsAt({ expires_at: row.expires_at, idle_ends_at: row.idle_ends_at }).toISOString(),
+        language: row.language,
+      });
+    } catch (err) {
+      if (!(err instanceof accountsDoor.AccountsUndecided)) throw err;
+      console.error(`[auth] sign-in: ${err.message}`);
+      return refuseSignIn(req, res, 503, UNDECIDED);
+    }
   };
 
   router.use((req, _res, next) => {
@@ -540,6 +640,7 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
       if (!leave) return await refuse(req, res, 503, BUSY);
 
       const found = (await query('SELECT * FROM resolve_operator_user($1)', [body.email])).rows[0] ?? null;
+      if (!found && accountsDoor.doorConfigured()) return await linkedSignIn(req, res, body, address, leave);
       const user = found ?? NOBODY;
       const lock = await internals.lockOf(user, address);
       const locked = Boolean(lock?.locked_until && new Date(lock.locked_until) > new Date());
@@ -550,7 +651,7 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
       if (!found || !matches || locked) {
         // The same write for every refusal; it counts only a wrong password of a real user.
         await internals.recordFailure(user, address, Boolean(found) && !matches);
-        return await refuse(req, res, 401, REFUSED);
+        return await refuseSignIn(req, res, 401, REFUSED);
       }
 
       const minted = await internals.mintSession(found, address, settings);
@@ -558,7 +659,7 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
         // The password changed while this one was being checked: refused like
         // any refusal, through the same failure write, which counts nothing.
         await internals.recordFailure(user, address, false);
-        return await refuse(req, res, 401, REFUSED);
+        return await refuseSignIn(req, res, 401, REFUSED);
       }
       const { token, row } = minted;
       setCookie(res, settings, token);
@@ -612,25 +713,43 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
         return res.status(403).json(ORIGIN_REFUSED);
       }
       const found = await resolveSession(token, settings);
-      if (!found) {
+      if (found) {
+        req.session = found;
+        req.tenantId = found.tenant_id;
+        req.actor = { kind: 'owner', id: found.user_id, name: found.email };
+        req.change = changes.context(req, [token]);
+        return next();
+      }
+      const linked = await linkedAccounts.resolve(token, settings);
+      if (!linked) {
         await refusedLanguage(req, 401, SESSION_ENDED);
         clearCookie(res, settings);
         return res.status(401).json(SESSION_ENDED);
       }
-      req.session = found;
-      req.tenantId = found.tenant_id;
-      req.actor = { kind: 'owner', id: found.user_id, name: found.email };
+      req.linked = linked;
+      req.tenantId = linked.tenant_id;
+      req.actor = { kind: 'linked', id: linked.person, name: linked.email };
       req.change = changes.context(req, [token]);
-      next();
+      return next();
     } catch (err) {
-      next(err);
+      if (err instanceof accountsDoor.AccountsUndecided) {
+        console.error(`[auth] ${err.message}`);
+        return res.status(503).set('Retry-After', '2').json(linkedAccounts.ACCOUNTS_UNDECIDED);
+      }
+      return next(err);
     }
   };
 
+  /** The admin's own routes: a linked person's passkeys are the module's. */
+  const adminOnly = (req, res, next) => (req.linked ? res.status(409).json(passkeys.ELSEWHERE) : next());
+
   router.post('/sign-out', session, async (req, res, next) => {
     try {
-      await withTenant(req.session.tenant_id, (c) =>
-        c.query('UPDATE operator_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL', [req.session.token_id]));
+      if (req.linked) await linkedAccounts.signOut(req.linked);
+      else {
+        await withTenant(req.session.tenant_id, (c) =>
+          c.query('UPDATE operator_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL', [req.session.token_id]));
+      }
       clearCookie(res, settings);
       res.status(204).end();
     } catch (err) {
@@ -638,10 +757,22 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
     }
   });
 
+  // Who is signed in, and what they may do (README, "Permissions"): the admin
+  // holds every permission at every garage; a linked person what the module said.
   router.get('/me', session, async (req, res, next) => {
     try {
+      if (req.linked) {
+        const l = req.linked;
+        return res.json({
+          kind: 'linked', email: l.email, name: l.name, tenant_id: l.tenant_id, session_ends_at: endsAt(l).toISOString(),
+          language: l.language, permissions: l.permissions, garages: l.all_garages ? 'all' : l.garages,
+        });
+      }
       const language = await internals.languageOf(req.session);
-      res.json({ email: req.session.email, tenant_id: req.session.tenant_id, session_ends_at: endsAt(req.session).toISOString(), language });
+      res.json({
+        kind: 'admin', email: req.session.email, name: null, tenant_id: req.session.tenant_id,
+        session_ends_at: endsAt(req.session).toISOString(), language, permissions: ALL_PERMISSIONS, garages: 'all',
+      });
     } catch (err) {
       next(err);
     }
@@ -665,11 +796,177 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
         await refusedLanguage(req, 400, LANGUAGE_REFUSED);
         return res.status(400).json(LANGUAGE_REFUSED);
       }
+      // A linked person's language is the module's: this changes it for this session only.
+      if (req.linked) {
+        if ((await linkedAccounts.setLanguage(req.linked, language)) !== 1) throw new Error('the linked session has no row to change');
+        return res.status(200).json({ language });
+      }
       const changed = await internals.setLanguage(req.session, language, req.change);
       if (changed !== 1) throw new Error('the signed-in admin has no row to change');
       return res.status(200).json({ language });
     } catch (err) {
       return next(err);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Passkeys (src/passkeys.js): the admin's own behind the session, and a
+  // sign-in with one held to sign-in's floor, limit and Origin rule.
+  // -------------------------------------------------------------------------
+  const passkeyJson = express.json({ limit: '64kb', strict: true, verify: verifyUtf8 });
+  const readPasskeyBody = (req, res, next) => {
+    if (!req.is('application/json')) return next(Object.assign(new Error('not JSON'), { passkeyUnreadable: true }));
+    return passkeyJson(req, res, (err) => next(err ? Object.assign(new Error('the passkey body could not be read', { cause: err }), { passkeyUnreadable: true }) : undefined));
+  };
+  const answerPasskey = (res, err, next) => (err instanceof passkeys.PasskeyRefused
+    ? res.status(err.status).json({ error: err.message, code: err.code })
+    : next(err));
+  const adminOf = (req) => ({ tenantId: req.session.tenant_id, userId: req.session.user_id, sessionId: req.session.token_id, email: req.session.email });
+  const passkeysOn = (_req, res, next) => (settings.passkeys ? next() : res.status(409).json(passkeys.NOT_CONFIGURED));
+
+  /** Adding a passkey's first step reads nothing, or JSON: {"password"}. */
+  const readOptionsBody = (req, res, next) => {
+    const length = req.get('content-length');
+    if (!req.is('application/json') && (length === undefined || length === '0') && req.get('transfer-encoding') === undefined) {
+      req.body = {};
+      return next();
+    }
+    return readPasskeyBody(req, res, next);
+  };
+
+  /**
+   * ADDING A PASSKEY IS PROVED AGAIN: the session signed in with the password
+   * within PASSWORD_RECENT_SECONDS, or the password comes in the body. A
+   * session signed in with a passkey has proved no password. The password is
+   * checked as sign-in checks one -- a place in the hash line, this address's
+   * lock, a wrong one counted toward it -- and a wrong one and a locked
+   * address are one answer, at the floor. A right one counts as proved now.
+   */
+  const passwordAgain = async (req, res, next) => {
+    try {
+      const b = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : null;
+      if (!b || Object.keys(b).some((k) => k !== 'password')) return next(Object.assign(new Error('not a passkey body'), { passkeyUnreadable: true }));
+      if (b.password === undefined) {
+        if (await internals.passwordRecent(req.session)) return next();
+        return res.status(403).json(PASSWORD_REQUIRED);
+      }
+      if (typeof b.password !== 'string' || b.password.length === 0 || b.password.length > MAX_PASSWORD_LENGTH * 4) {
+        return await refuse(req, res, 403, PASSWORD_NOT_ACCEPTED);
+      }
+      const address = callerAddress(req, settings);
+      const leave = line.enter(address);
+      if (!leave) return await refuse(req, res, 503, BUSY);
+      let user;
+      let locked;
+      let matches;
+      try {
+        // The session found its admin a moment ago; gone since, it is nobody's password.
+        user = (await internals.adminOf(req.session)) ?? { ...NOBODY, password_hash: null };
+        const held = await internals.lockOf(user, address);
+        locked = Boolean(held?.locked_until && new Date(held.locked_until) > new Date());
+        matches = await internals.verifyPassword(b.password, user.password_hash ?? await dummyHash());
+      } finally {
+        leave();
+      }
+      if (!matches || locked || user.user_id === NOBODY.user_id) {
+        await internals.recordFailure(user, address, !matches);
+        return await refuse(req, res, 403, PASSWORD_NOT_ACCEPTED);
+      }
+      await internals.passwordProved(req.session);
+      return next();
+    } catch (err) {
+      return next(err);
+    }
+  };
+
+  /** The account holder is told a passkey was added, after the answer: by email, or in the log when there is none. */
+  const tellPasskeyAdded = async (req, passkey) => {
+    try {
+      const language = (await internals.languageOf(req.session)) ?? 'en';
+      notify(email, { to: req.session.email, ...passkeyAddedEmail(language, { name: passkey.name, at: new Date(passkey.created_at) }) }, 'passkey-added notice');
+    } catch (err) {
+      logFailure('passkey-added notice', err);
+    }
+  };
+
+  router.post('/passkeys/options', session, adminOnly, passkeysOn, readOptionsBody, passwordAgain, async (req, res, next) => {
+    try {
+      return res.json(await passkeys.registrationOptions(settings.passkeys, adminOf(req), callerAddress(req, settings)));
+    } catch (err) {
+      return answerPasskey(res, err, next);
+    }
+  });
+  router.post('/passkeys', session, adminOnly, readPasskeyBody, async (req, res, next) => {
+    try {
+      const passkey = await passkeys.addPasskey(settings.passkeys, adminOf(req), req.body, req.change);
+      res.status(201).json({ passkey });
+      return tellPasskeyAdded(req, passkey);
+    } catch (err) {
+      return answerPasskey(res, err, next);
+    }
+  });
+  router.get('/passkeys', session, adminOnly, async (req, res, next) => {
+    try {
+      return res.json({ passkeys: await passkeys.listPasskeys(adminOf(req)) });
+    } catch (err) {
+      return next(err);
+    }
+  });
+  // The id rides in the body: no route under /auth has a path parameter.
+  router.post('/passkeys/rename', session, adminOnly, readPasskeyBody, async (req, res, next) => {
+    try {
+      return res.json({ passkey: await passkeys.renamePasskey(adminOf(req), req.body, req.change) });
+    } catch (err) {
+      return answerPasskey(res, err, next);
+    }
+  });
+  router.post('/passkeys/remove', session, adminOnly, readPasskeyBody, async (req, res, next) => {
+    try {
+      await passkeys.removePasskey(adminOf(req), req.body, req.change);
+      return res.status(204).end();
+    } catch (err) {
+      return answerPasskey(res, err, next);
+    }
+  });
+
+  /** The checks every passkey sign-in step makes before it reads anything: as sign-in's. */
+  const passkeyDoor = async (req, res) => {
+    if (settings.adminOrigin === null) return refuse(req, res, 409, NOT_CONFIGURED);
+    const origin = req.get('origin');
+    if (origin !== undefined && origin !== settings.adminOrigin) return refuse(req, res, 403, ORIGIN_REFUSED);
+    if (!limiter.take(callerAddress(req, settings))) return refuse(req, res, 429, RATE_LIMITED);
+    if (!settings.passkeys) return refuse(req, res, 409, passkeys.NOT_CONFIGURED);
+    return null;
+  };
+
+  router.post('/passkey/options', async (req, res, next) => {
+    try {
+      if (await passkeyDoor(req, res)) return undefined;
+      return res.json(await passkeys.signInOptions(settings.passkeys, callerAddress(req, settings)));
+    } catch (err) {
+      return answerPasskey(res, err, next);
+    }
+  });
+  router.post('/passkey/sign-in', readPasskeyBody, async (req, res, next) => {
+    try {
+      if (await passkeyDoor(req, res)) return undefined;
+      const proved = await passkeys.checkSignIn(settings.passkeys, req.body);
+      if (proved.kind === 'linked') {
+        const { token, row } = await linkedAccounts.mint(proved.person, settings);
+        setCookie(res, settings, token);
+        return res.json({ email: proved.person.email, tenant_id: proved.person.tenant, session_ends_at: endsAt(row).toISOString(), language: row.language });
+      }
+      const minted = await passkeys.mintAdminSession(proved, settings);
+      if (!minted) return await refuseSignIn(req, res, 401, passkeys.REFUSED);
+      setCookie(res, settings, minted.token);
+      return res.json({ email: minted.row.email, tenant_id: proved.tenantId, session_ends_at: endsAt(minted.row).toISOString(), language: minted.row.language });
+    } catch (err) {
+      if (err instanceof passkeys.PasskeyRefused && err.status === 401) return refuseSignIn(req, res, 401, passkeys.REFUSED);
+      if (err instanceof accountsDoor.AccountsUndecided) {
+        console.error(`[auth] passkey sign-in: ${err.message}`);
+        return refuseSignIn(req, res, 503, UNDECIDED);
+      }
+      return answerPasskey(res, err, next);
     }
   });
 
@@ -692,6 +989,10 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
       return res.status(503).set('Retry-After', '2').json(unavailableAnswer(err, req.method));
     }
     if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);
+    if (err?.passkeyUnreadable) {
+      const body = { error: 'The passkey request could not be read. Send JSON.', code: 'passkey_unreadable' };
+      return req.path === '/passkey/sign-in' ? refuse(req, res, 400, body) : res.status(400).json(body);
+    }
     // A stored hash this code does not know is named here, PasswordHashUnrecognised.
     logFailure(req.path.replace(/^\//, ''), err);
     if (onSignIn) return refuse(req, res, 500, { error: 'internal error' });

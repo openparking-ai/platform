@@ -617,6 +617,191 @@ link.
 each of these, against a stand-in for the email service; `npm run
 account-links-fail-control` breaks each one in turn.
 
+### Passkeys for the admin
+
+**A passkey is optional**, and the password stays: a passkey is a second way in,
+never the only one. The admin adds, names, lists and removes their own, behind
+their session (WebAuthn, through `@simplewebauthn/server`; migration 0047):
+
+    POST   /api/v1/auth/passkeys/options     [{password}]  ->  200 {challenge_id, options}  (the creation options)
+    POST   /api/v1/auth/passkeys             {challenge_id, name, response}  ->  201 {passkey: {id, name, created_at, last_used_at, disabled_at}}
+    GET    /api/v1/auth/passkeys             ->  200 {passkeys: [...]}
+    POST   /api/v1/auth/passkeys/rename      {id, name}        ->  200 {passkey}
+    POST   /api/v1/auth/passkeys/remove      {id}              ->  204
+    POST   /api/v1/auth/passkey/options      ->  200 {challenge_id, options}  (no session needed)
+    POST   /api/v1/auth/passkey/sign-in      {challenge_id, response}  ->  200 as sign-in answers, and the cookie
+
+`options` is the WebAuthn options JSON, binary fields base64url; `response` is the
+browser's answer in the same form (`PublicKeyCredential.toJSON()`).
+
+**One relying party.** `PASSKEY_RP_ID` is a domain, and it must be the host of
+every origin in `PASSKEY_ORIGINS` or a domain above it (`example.com` for
+`https://admin.example.com`); `serve` refuses any other. So one passkey works on
+every site of the deployment that shares that domain. `PASSKEY_ORIGINS` is a
+comma-separated list of origins, `ADMIN_ORIGIN` when unset. With no
+`PASSKEY_RP_ID`, passkeys are off and every passkey route answers `409
+passkeys_not_configured`.
+
+**The person is verified, not only present.** Adding a passkey and signing in
+with one ask for user verification (`userVerification: "required"`: Face ID, a
+fingerprint, the device's PIN), and a response without it is refused: a security
+key with no PIN, which anyone holding it can press, is neither added nor let in.
+
+**Adding one is proved again.** The cookie alone does not add a passkey: the
+session must have signed in with the password within the last five minutes, or
+`/passkeys/options` must carry the password, `{"password"}`. Otherwise it answers
+`403 password_required` ("Enter your password to add a passkey."). A session that
+signed in with a passkey has proved no password. The password is checked as
+sign-in checks it: a place in the hash line, the address's lock, and a wrong one
+counted toward that lock; a wrong password and a locked address are one answer,
+`403 password_not_accepted`, at sign-in's floor. **The account holder is told by
+email** that a passkey was added, its name and when, after the answer; with no
+email configured, the log says the notice was not sent (never to whom), and the
+change log has the line either way.
+
+**A challenge works once**, for five minutes, for its own purpose. Challenges are
+kept in the database (`passkey_challenges`), so every process of a deployment and
+a restart see the same ones, and each is taken with one `DELETE`, so two uses at
+once find it once. Adding a passkey's challenge is bound to the admin and the
+session that asked, by a SHA-256 of them. One caller address holds at most 20 at
+once (`429 passkeys_busy` past that); ended ones are purged as new ones are made.
+
+**A passkey's counter must go up** with every use (or stay 0 on an authenticator
+that keeps none). It is read only after the signature has checked: one that did
+not go up means a copy of the key is in use, so the sign-in is refused, `401
+passkey_refused`, and the admin's passkey is **turned off** (`disabled_at`, listed
+with it) in the same transaction, with a line in the change log
+(`passkey.turn_off`, by nobody, its name and never its key) and one in the log
+(which passkey and tenant, never a key, a counter or a response). A passkey that
+is turned off is never found again; the admin removes it and adds another. Two
+sign-ins at once with one counter: one is let in, the other turns the key off. A
+linked person's passkey is the module's to turn off: a counter that did not go up
+is refused here before the module is told, and logged.
+
+A passkey sign-in keeps sign-in's floor, its per-address attempt limit and its
+`Origin` rule. Its refusals are one: an unknown passkey, a signature that does not
+check, a response without user verification and a copied key answer the same.
+**A password reset removes every passkey of the admin** -- by the emailed link
+and by `reset-admin-password` -- in the reset's own transaction, and the admin is
+told by email how many went; a passkey added before the password last changed is
+not found in any case, whatever changed it. A passkey whose admin is removed goes
+with them. Adding, renaming and removing one is a line in the change log
+(`passkey.add`, `passkey.rename`, `passkey.remove`), with its name, never its key.
+
+### Linked accounts: people beside the admin
+
+The admin is the only account this repository keeps. **A deployment may link a
+module that keeps other people** — managers, people who look after the money,
+people who look after one garage — and this platform asks it who they are,
+exactly as it asks a validations module about a validation: through a door the
+deployment names, never by importing anything of it.
+
+**`ACCOUNTS_DOOR` names it**, a bare command name found in `ENTITLEMENT_BIN_DIR`
+or on the PATH, and **there is no default. Unset means only the one admin**,
+exactly as before: no door is ever run, and a sign-in for any other email is
+refused as an unknown email is. The module's own database address is the
+module's, in the environment it is given; a password goes to it on **stdin,
+never argv**. It answers JSON on stdout, and **its exit status is the answer**:
+
+    <door> sign-in                              < {"email", "password"}
+        0  {"person", "tenant", "email", "name", "language", "garages": "all" | [ids],
+            "permissions": [...], "version"}
+        1  {"refused": true}      no such person, a wrong password, or nobody the dashboard is for
+    <door> who --tenant T --person P
+        0  the same as sign-in    1  {"gone": true}
+    <door> passkey --credential C
+        0  {"person", "tenant", "public_key", "counter", "transports"}    1  {"unknown": true}
+    <door> passkey-used --credential C --counter N
+        0  {"counter": N}         1  {"refused": true}   (the counter did not go up)
+    2  could not decide: words on stderr, nothing to read on stdout
+
+`version` changes whenever the person's garages, permissions or password change.
+Anything but these shapes, a door that cannot be run or does not answer within
+15 seconds, and exit 2 are all **could not decide**: the sign-in is refused, `503
+sign_in_undecided` ("Sign-in could not be checked just now. Try again in a
+moment."), and **nobody is let in**.
+
+**Sign-in asks the admin first.** An email that is not the admin's, with the door
+named, goes to the door; the door's refusal is the same `401 sign_in_refused`,
+byte for byte. **And in the same time**: the admin's password is checked here and
+anyone else's by the module, a slower road, so with the door named every sign-in
+refusal -- the admin's too -- waits for `ACCOUNTS_SIGN_IN_FLOOR_MS` (default 2000,
+200 to 15000) or sign-in's own floor, whichever is larger. Set it above the
+module's own time: a door sign-in that takes longer is logged ("the accounts door
+took N ms ... raise it"), since its road would then be on the wire. A module that
+cannot decide (`503`) is answered at the same floor. **The per-address lock covers door
+sign-ins**: ten refusals for one email from one address lock that address out of
+that email for 30 minutes, kept by a hash of the email (`linked_sign_in_locks`),
+and a locked address does not reach the door. A permission the door names that
+is not in the list below, a garage that is not an id, or a tenant this platform
+does not have, is could-not-decide, never a smaller session.
+
+**The session keeps** who, the tenant, the garages, the permissions and the
+version (`linked_sessions`; only the token's SHA-256), under sign-in's own idle
+and absolute ends and the same cookie. **It asks `who` again** when the last
+answer is older than `ACCOUNTS_RECHECK_SECONDS` (default 60, 10 to 900): a new
+version takes the new garages and permissions; `gone`, or another tenant, ends
+the session (`401 session_ended`); could-not-decide refuses the request, `503
+accounts_undecided`, and runs nothing, until the door answers again. A linked
+person's passkey is the module's: the passkey sign-in above asks `passkey` for an
+id this platform does not keep, checks the signature here, and records the use
+through `passkey-used` before it asks `who` and signs in.
+
+A linked person's change-log lines name them by the email the module gave
+(`actor_kind` `linked`). Their language comes from the module; `PUT
+/api/v1/auth/language` changes it for that session only.
+
+### Permissions: one on every operator route
+
+**Every operator route names exactly one permission**, and a request whose
+session does not hold it is refused `403 permission_refused` before the route
+runs. The list is this platform's own, each a `read` or a `change` (`change`
+includes `read`):
+
+    garages   the garages, their setup, alerts, the board, banned cars
+    rates     rate plans, taxes, the board's prices
+    lanes     lanes, their computers, closing and reopening
+    payments  the garage's own Stripe account, its location and card readers
+    money     takings and the reconciliation
+    refunds   giving money back
+    payouts   the payouts view
+    account   the account itself, its keys
+    inventory walks through a garage and what they saw
+    stays     open and past stays, the stuck list, ending a stuck one; the cars at an
+              exit, letting one out, paying at a phone reader; the exceptions
+    log       the change log and refused attempts
+
+**The admin and every operator key hold all of them**, at every garage, so
+nothing an admin or a key does today changes. A linked person holds what the
+module says. **A route about a garage** — its id in the path, or a lane or a
+computer of it — **also checks that garage is in the session's list**, and one
+that is not answers what an id naming nothing answers (`404`), so a list never
+says what lies outside it. **The account's own change-log lines** -- those of no
+one garage: its passkeys, its keys, its admin's language -- **are read only by a
+session over every garage**; a person at some garages reads their garages' lines
+and refused attempts, and the count of them, without the account's. `GET /api/v1/garages` lists only the session's
+garages; making a garage needs `garages:change` and every garage. A test walks
+every route the operator router has and fails if one names no permission, or
+one that is not in the list.
+
+`GET /api/v1/auth/me` says who: `{kind: "admin" | "linked", email, name,
+tenant_id, session_ends_at, language, permissions, garages: "all" | [ids]}`.
+
+### Done by
+
+**An operator key may say who, in plain words, is acting through it**: an
+`X-Done-By` header, the person's name percent-encoded as UTF-8, 1 to 80
+characters after it is decoded, with no control characters (`400 done_by_refused`
+otherwise). It is kept on the change-log line of what the request changes, and
+read back with it (`done_by`). **It is never trusted for anything else**: the
+key's permissions are the key's, whatever name is given, and on a session the
+header is not read: the line names the person signed in.
+
+`test/linked-accounts.test.js`, `test/passkeys.test.js` and
+`test/permissions.test.js` hold each of these, against a stand-in for the door
+(`test/fixtures/accounts-door`); `npm run linked-accounts-fail-control` breaks
+each one in turn.
+
 ### The owner's reads
 
 What the owner's screens read, behind the session or a key, tenant-scoped in

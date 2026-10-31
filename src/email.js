@@ -138,3 +138,20 @@ export async function sendEmail(settings, { to, subject, text }) {
   await res.arrayBuffer().catch(() => {});
   if (!res.ok) throw new EmailNotSent(`the email service answered ${res.status}`);
 }
+
+/**
+ * A notice to the account holder, sent after the answer it follows, never
+ * failing it: resolves true when the service took it, false otherwise. With
+ * no email configured, the log says it was not sent -- what, never to whom.
+ * A failure is said by what failed (EmailNotSent's words), never the address.
+ */
+export function notify(settings, message, what) {
+  if (!settings?.configured) {
+    console.log(`[email] the ${what} was not sent: no email is configured here`);
+    return Promise.resolve(false);
+  }
+  return sendEmail(settings, message).then(() => true, (err) => {
+    console.error(`[email] the ${what} was not sent: ${err instanceof EmailNotSent ? err.message : err?.constructor?.name ?? 'Error'}`);
+    return false;
+  });
+}
