@@ -81,6 +81,8 @@
  *
  * The three breaks of 0040's freeze triggers edit 0046 too, which replaces
  * those two functions: a property 0046 undid is not a property broken.
+ * walk_subject_refused edits 0047 too, which writes the change log's subject
+ * list again (adding 'passkey'): a list 0047 puts back is not a list broken.
  */
 import { spawnSync } from 'node:child_process';
 import {
@@ -547,6 +549,7 @@ const SOURCE_BREAKS = [
 
 const ADDED_0040 = '0040_inventory_walks.sql';
 const ADDED_0046 = '0046_walk_plates_blanked.sql';
+const ADDED_0047 = '0047_linked_accounts_and_passkeys.sql';
 
 const SCHEMA_BREAKS = [
   {
@@ -586,7 +589,10 @@ const SCHEMA_BREAKS = [
   {
     name: 'walk_subject_refused',
     why: "the change log does not take a walk as its subject",
-    edits: [{ file: ADDED_0040, from: "'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'exit', 'stay', 'walk',", to: "'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'exit', 'stay'," }],
+    edits: [
+      { file: ADDED_0040, from: "'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'exit', 'stay', 'walk',", to: "'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'exit', 'stay'," },
+      { file: ADDED_0047, from: "'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'exit', 'stay', 'walk',", to: "'rate_plan', 'tax_set', 'key', 'language', 'alert_contact', 'board_message', 'exit', 'stay'," },
+    ],
   },
   {
     name: 'walk_line_may_name',
