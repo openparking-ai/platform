@@ -5537,8 +5537,10 @@ export { pool, LANE_EVENT_KINDS, CLOSE_UNPRICED_EVENT_KIND };
  */
 function garageDay(raw, timezone) {
   const day = raw === undefined ? instantToLocal(Date.now(), timezone).slice(0, 10) : raw;
-  if (typeof day !== 'string' || !PARAM_SHAPES.day.test(day) || Number.isNaN(Date.parse(`${day}T00:00:00Z`))
-    || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day) {
+  // A real date from 1970 to 9999: year 0000 and the like are no garage's day
+  // (the time zone database cannot place them), and refused, not a 500.
+  if (typeof day !== 'string' || !PARAM_SHAPES.day.test(day) || Number(day.slice(0, 4)) < 1970
+    || Number.isNaN(Date.parse(`${day}T00:00:00Z`)) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day) {
     throw DAY_INVALID();
   }
   const next = new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
@@ -5548,7 +5550,12 @@ function garageDay(raw, timezone) {
       return localToInstant(`${d}T00:00`, timezone, 'day');
     } catch (err) {
       if (!(err instanceof GarageTimeInvalid)) throw err;
+    }
+    try {
       return localToInstant(`${d}T01:00`, timezone, 'day');
+    } catch (err) {
+      if (err instanceof GarageTimeInvalid) throw DAY_INVALID();
+      throw err;
     }
   };
   return { day, from: start(day), to: start(next) };

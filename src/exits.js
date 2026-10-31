@@ -315,11 +315,19 @@ export function withCredit(priced, payments, { refundsUnread = [] } = {}) {
     return { ...priced, credit, due_minor: priced.fee_minor - paidMinor };
   }
   const last = payments[payments.length - 1].quote;
+  // PRICED LOWER THAN PAID (the owner, 2026-10-31: "the only reason we have
+  // this is because the person paid and backed out. Stayed longer. There
+  // shouldn't be any reason the fee will be lower"): nothing is refunded and
+  // nothing goes negative, and the case says so for a manager -- only a rate
+  // change between the payment and this exit, or a pass covering it now,
+  // can do it.
+  const repricedMinor = priced.outcome === 'covered' ? 0 : priced.fee_minor;
   return {
     ...last,
     credit,
     due_minor: 0,
     repriced: { outcome: priced.outcome, fee_minor: priced.fee_minor, exit_at: priced.exit_at, covered_by: priced.covered_by },
+    ...(repricedMinor < paidMinor ? { repriced_lower: { paid_minor: paidMinor, repriced_minor: repricedMinor, outcome: priced.outcome } } : {}),
   };
 }
 
@@ -503,6 +511,8 @@ export function presentForPerson(row) {
     picker: row.picker,
     person: row.person,
     ended: row.ended ?? null,
+    // Priced again lower than the stay paid (0048): for a person to see.
+    repriced_lower: row.quote?.repriced_lower ?? null,
     created_at: row.created_at,
   };
 }

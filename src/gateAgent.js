@@ -190,7 +190,13 @@ async function page(t, spec, params) {
   return { list, more: body.more === true, cursor: body.cursor, gap: body.gap === true };
 }
 
-/** A call-back number keyed by a person is kept as its last two digits, nowhere whole. */
+/**
+ * A call-back number keyed by a person is kept as its last two digits,
+ * nowhere whole. The gate agent no longer offers the call-back (the owner,
+ * 2026-10-31: "no need for option 6"), so `keyed` no longer arrives; this
+ * stays for the records a gate agent kept from before, which a copy can
+ * still carry.
+ */
 function reduceKeyed(o) {
   if (!o || typeof o !== 'object' || !Object.hasOwn(o, 'keyed')) return o;
   const { keyed, ...rest } = o;

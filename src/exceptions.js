@@ -167,6 +167,14 @@ function caseOf(row) {
       currency: q.currency,
       refused: Boolean(q.refusal),
       covered_by: q.covered_by ?? [],
+      // What the stay had paid at its earlier cases, each payment less its
+      // refunds as Stripe last said, and the ones Stripe could not be asked
+      // about at this exit (`refunds_unread`).
+      credit: q.credit
+        ? { paid_minor: q.credit.paid_minor, payments: q.credit.payments ?? [], refunds_unread: q.credit.refunds_unread ?? [] }
+        : null,
+      // Priced again lower than it had paid: nothing refunded, for a manager to see.
+      repriced_lower: q.repriced_lower ?? null,
     } : null,
     settled_before: exits.settledOf({ ...row, person: null }),
     person: row.person ?? null,

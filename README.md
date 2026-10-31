@@ -2008,7 +2008,13 @@ difference is asked -- nothing when the price is not higher, never a
 negative figure. The case's quote keeps the whole stay's figures (what the
 close writes) with `credit: {paid_minor, payments}` and `due_minor` beside
 them; a quote not priced higher keeps the figures of the case whose payment
-paid it, and the new price as `repriced`. The lane reads `fee.fee_minor` as
+paid it, and the new price as `repriced`; and when that price is LOWER than
+the stay paid -- only a rate change between the payment and the exit, or a
+pass covering it now, can do it: the owner, "there shouldn't be any reason
+the fee will be lower" -- nothing is refunded and nothing goes negative, and
+the case is marked `repriced_lower: {paid_minor, repriced_minor, outcome}`
+(on the attendant's list of open cases, and in an exception's story) for a
+manager to see. The lane reads `fee.fee_minor` as
 what to pay (the difference), `fee.stay_fee_minor` and `fee.credit_minor`
 beside it. A car let out owing the difference is let out unpaid owing it,
 with what it had paid (`let_out.paid_minor`). **A refund is not paid**:
@@ -2085,7 +2091,10 @@ gate agent's messages and calls for the lane** over [case opened - 15 min,
 let-out + 15 min], copied with their own ids and revisions -- who was paged,
 on which sink, when, what each answered; who called, who was rung, who
 answered. A call's keyed call-back number is kept as its last two digits
-(`keyed_last2`), as a text receipt keeps its number. **Nothing here waits on
+(`keyed_last2`), as a text receipt keeps its number -- for the records from
+before the gate agent dropped its call-back option; `keyed` no longer
+arrives. The story's case carries its fee's `credit` (`paid_minor`, each
+payment with its `refunded_minor`, and `refunds_unread`) and `repriced_lower`. **Nothing here waits on
 the gate agent**: the exception is written with the let-out, the answer goes,
 and the copy runs after it; a let-out whose exception cannot be written
 stands, the failure is logged by its case, and the sweep writes it from the
@@ -2104,7 +2113,7 @@ says how many, nothing else; the exception and the rest stay.
   `not_reachable` or `not_configured`, the worse of the two sources'.
   `GET /api/v1/garages/:garageId/exceptions/day/:day` is the same list, the
   day (`YYYY-MM-DD`, the garage's own date) in the path; a day that is not a
-  date is `400 day_invalid`. `GET /api/v1/garages/:garageId/exceptions/:exceptionId`
+  date from 1970 on is `400 day_invalid`. `GET /api/v1/garages/:garageId/exceptions/:exceptionId`
   -- one record's whole story, `payment_after_let_out`, `lane_events_after`,
   each copy of the gate agent's records under `gate_agent: {messages,
   calls}`, copied or saying why not, and its pictures by id: `pictures:
