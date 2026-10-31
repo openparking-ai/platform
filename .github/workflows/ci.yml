@@ -521,6 +521,20 @@ jobs:
         # statements never created -- and the suite must go red.
         run: npm run exit-outcomes-fail-control
 
+      - name: Lane QR fail-control
+        # A QR shown at a lane is asked of garage-pass through its own door.
+        # Each property is broken in turn -- the gate opening on anything but
+        # covered, a valid QR kept shut when nothing was read or on a
+        # look-alike or one-difference read, a refused QR shutting a covered
+        # car, could-not-answer relayed as an answer, the token, the plate or
+        # the QR's plate written into the event, the event without passed_by
+        # or the enrolment id, the plate in a log line, the door's error
+        # quoting the argv, no event, no rate limit or one limit for every
+        # lane, a stale presentation taken, the direction taken from the body,
+        # a lane's qr_presented taken with any detail, a control character
+        # reaching the module -- and the file must go red.
+        run: npm run lane-qr-fail-control
+
       - name: Validations fail-control
         # A validation at the exit (0019, amendment A1): the claim made at the
         # reader on the fee the close will write and held on the open stay;

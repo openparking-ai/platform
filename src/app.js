@@ -11,6 +11,7 @@ import * as ratePlans from './ratePlans.js';
 import * as activation from './activation.js';
 import * as taxes from './taxes.js';
 import * as entitlement from './entitlement.js';
+import * as enrolments from './enrolments.js';
 import * as validations from './validations.js';
 import { reconcile } from './reconcile.js';
 import * as pastStays from './pastStays.js';
@@ -267,9 +268,22 @@ const LANE_EVENT_KINDS = [
   'exit_unconfirmable',
   'fallback_needs_human',
   'frames_captured',
+  // A QR shown at the lane. Recorded by THIS platform when it asked
+  // garage-pass (`POST /lane/redeem-enrolment`, src/enrolments.js); posted by
+  // the LANE only for a QR it could not present -- offline, or the platform
+  // could not answer -- with `answered: false`. Its detail never carries the
+  // token or a plate (`QR_PRESENTED_DETAIL_KEYS` holds the lane's to that).
+  'qr_presented',
   'vehicle_identified',
   'vended',
 ];
+
+/**
+ * What a lane may say about a QR it could not present. A closed set, because
+ * `events` is append-only and nothing purges a detail: a lane that put the
+ * token or the plate here would make a credential or an identity permanent.
+ */
+const QR_PRESENTED_DETAIL_KEYS = Object.freeze(['answered', 'reason', 'direction', 'read_identity']);
 
 /**
  * What a session open or close SAYS saw the car, and it is required — never
@@ -2025,6 +2039,13 @@ export function createApp() {
       const events = incoming.map((e) => {
         if (!e.event_id) throw bad('every event needs an event_id');
         if (!e.kind) throw bad('every event needs a kind');
+        if (e.kind === enrolments.QR_PRESENTED_EVENT_KIND) {
+          const detail = e.detail ?? {};
+          const extra = Object.keys(detail).filter((k) => !QR_PRESENTED_DETAIL_KEYS.includes(k));
+          if (extra.length || detail.answered !== false) {
+            throw bad(`a lane's qr_presented is a QR it could not present: answered false, and only ${QR_PRESENTED_DETAIL_KEYS.join(', ')} -- never the token or a plate`);
+          }
+        }
         return {
           garageId,
           laneId,
@@ -2041,6 +2062,73 @@ export function createApp() {
       });
       const result = await withTenant(tenantId, (client) => repo.appendEvents(client, tenantId, events));
       res.status(202).json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * A QR SHOWN AT THIS LANE (src/enrolments.js): `{ token, vehicle,
+   * presented_at }` -- what the scanner read, the identity the camera
+   * measured (null when it read none) and when. The lane's direction is the
+   * device's, never the body's. garage-pass is asked through its own door and
+   * its two answers come back verbatim beside `open`, which is true for a
+   * covered movement and nothing else.
+   *
+   *   200  the module answered: open or shut, and why
+   *   409  the garage names no garage-pass garage (`qr_not_linked`), or the
+   *        presentation is older than the car at the barrier (`qr_stale`)
+   *   429  this device has presented too many QRs this minute
+   *   503  garage-pass could not answer -- the lane's offline case
+   *
+   * Rate-limited per device, because the token space is what a scanner
+   * guesses at: a stolen device token is a lane, and a lane is the one caller
+   * that can try QRs. The token and the plate are kept nowhere (the header of
+   * src/enrolments.js); the event records what happened to the QR and the gate.
+   */
+  lane.post('/redeem-enrolment', async (req, res, next) => {
+    try {
+      const { tenantId, garageId, laneId, direction, deviceId } = req.device;
+      if (!qrLimiter.take(deviceId)) {
+        res.set('Retry-After', '60');
+        throw new HttpError(429, `this lane has presented ${QR_PER_MINUTE} QRs this minute; the next is taken in a minute`);
+      }
+      let token;
+      let vehicle;
+      try {
+        token = enrolments.tokenField(req.body?.token);
+        vehicle = enrolments.vehicleField(req.body?.vehicle);
+      } catch (err) {
+        if (err instanceof TypeError) throw bad(err.message);
+        throw err;
+      }
+      const at = refuseFuture(parseTime(req.body?.presented_at, 'presented_at'), 'presented_at');
+      if ((Date.now() - at.getTime()) / 1000 > enrolments.PRESENTED_MAX_AGE_SECONDS) {
+        throw conflict('qr_stale', `presented_at is more than ${enrolments.PRESENTED_MAX_AGE_SECONDS}s ago: a QR is checked while the car is at the barrier, and an answer for a car no longer there opens nothing`);
+      }
+      const garage = await withTenant(tenantId, (client) => repo.getGarage(client, tenantId, garageId));
+      const link = garage?.garage_pass_link;
+      if (!link) {
+        throw conflict('qr_not_linked', 'this garage names no garage-pass garage, so a QR cannot be checked here');
+      }
+      const record = (detail) => withTenant(tenantId, (client) => repo.appendEvents(client, tenantId, [{
+        garageId,
+        laneId,
+        eventId: `qr:${randomUUID()}`,
+        kind: enrolments.QR_PRESENTED_EVENT_KIND,
+        occurredAt: at,
+        detail,
+      }]));
+      let result;
+      try {
+        result = await enrolments.redeem({ link, token, vehicle, laneId, direction, at });
+      } catch (err) {
+        if (!(err instanceof entitlement.EntitlementUnavailable)) throw err;
+        await record(enrolments.presentedDetail({ laneId, direction, vehicle, unavailable: true }));
+        throw new HttpError(503, `${err.message}; the QR could not be checked`, 'qr_unanswered');
+      }
+      await record(enrolments.presentedDetail({ laneId, direction, vehicle, result }));
+      res.json({ open: result.open, outcome: result.outcome, enrolment: result.enrolment, answer: result.answer });
     } catch (err) {
       next(err);
     }
@@ -4537,6 +4625,10 @@ export const TRY_MAX_STAYS = 100;
 export const TRY_PER_MINUTE = 20;
 const tryLimiter = signIn.addressLimiter({ max: TRY_PER_MINUTE, windowSeconds: 60 });
 const sightingLimiter = signIn.addressLimiter({ max: walks.SIGHTINGS_PER_MINUTE, windowSeconds: 60 });
+
+/** How many QRs one lane device may present a minute: a car a scan, with room for a driver's retries. */
+export const QR_PER_MINUTE = 10;
+const qrLimiter = signIn.addressLimiter({ max: QR_PER_MINUTE, windowSeconds: 60 });
 
 /** One `{ entry, exit }` of a try, read in the garage's time and refused by name. */
 function tryStay(raw, i, timezone) {
