@@ -26,6 +26,7 @@
  *   refunds_never_read           the stay's payments are credited without asking Stripe for refunds
  *   refunds_unread_unsaid        a payment Stripe could not be asked about is credited and nothing says so
  *   refund_read_waits_30s        a returning car waits on a silent Stripe for 30 s, not 3
+ *   repriced_lower_unmarked      a stay priced again lower than it paid is not marked
  *
  * A return is a new stay (test/exit-rules.test.js):
  *   return_folded_into_old_stay  a car back in soon after an exit is folded into its old stay
@@ -82,6 +83,9 @@
  *   copy_state_always_complete   the list says every copy is complete
  *   day_path_missing             the day cannot be named in the path
  *   day_in_path_ignored          a day named in the path is not the day answered
+ *   day_year_unchecked           a day before 1970 is taken
+ *   story_credit_dropped         the exception's story drops the case's credit and its refunds unread
+ *   repriced_lower_not_in_story  the exception's story does not show a price lower than paid
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with one
  * statement of 0048 edited, so the property genuinely never existed there.
@@ -208,6 +212,13 @@ const SOURCE_BREAKS = [
     suite: RULES,
     catches: 'A SILENT STRIPE NEVER KEEPS A RETURNING CAR WAITING',
     edits: [{ file: 'src/exitPayments.js', from: 'export const REFUND_READ_TIMEOUT_MS = 3000;', to: 'export const REFUND_READ_TIMEOUT_MS = 30_000;' }],
+  },
+  {
+    name: 'repriced_lower_unmarked',
+    why: 'a stay priced again lower than it paid is not marked',
+    suite: RULES,
+    catches: 'NEVER NEGATIVE',
+    edits: [{ file: 'src/exits.js', from: '    ...(repricedMinor < paidMinor ? { repriced_lower:', to: '    ...(false ? { repriced_lower:' }],
   },
   {
     name: 'end_counts_open_case_only',
@@ -559,6 +570,27 @@ const SOURCE_BREAKS = [
     suite: EXCEPTIONS,
     catches: "THE DAY'S LIST SAYS THE GATE AGENT IN SHORT",
     edits: [{ file: 'src/app.js', from: "exceptionsOfDay(req, res, next, req.params.day));", to: 'exceptionsOfDay(req, res, next, req.query.day));' }],
+  },
+  {
+    name: 'day_year_unchecked',
+    why: 'a day before 1970 is taken',
+    suite: EXCEPTIONS,
+    catches: "THE DAY'S LIST SAYS THE GATE AGENT IN SHORT",
+    edits: [{ file: 'src/app.js', from: " || Number(day.slice(0, 4)) < 1970\n", to: '\n' }],
+  },
+  {
+    name: 'story_credit_dropped',
+    why: "the exception's story drops the case's credit and its refunds unread",
+    suite: EXCEPTIONS,
+    catches: 'THE STORY KEEPS THE CREDIT',
+    edits: [{ file: 'src/exceptions.js', from: '      credit: q.credit\n        ? { paid_minor', to: '      credit: null && q.credit\n        ? { paid_minor' }],
+  },
+  {
+    name: 'repriced_lower_not_in_story',
+    why: "the exception's story does not show a price lower than paid",
+    suite: EXCEPTIONS,
+    catches: 'THE STORY KEEPS THE CREDIT',
+    edits: [{ file: 'src/exceptions.js', from: '      repriced_lower: q.repriced_lower ?? null,', to: '      repriced_lower: null,' }],
   },
   {
     name: 'reconcile_uncounted',

@@ -650,7 +650,7 @@ jobs:
         run: npm run db-restart-fail-control
 
       - name: Exit-rules fail-control
-        # The owner's exit rules and the exceptions (0048). Breaks 61
+        # The owner's exit rules and the exceptions (0048). Breaks 65
         # properties -- the whole stay priced again with every payment
         # credited and only the difference asked, never negative, never the
         # whole again; a return after an exit a new stay with the old one's

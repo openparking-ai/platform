@@ -90,7 +90,14 @@ test('NEVER NEGATIVE: a stay priced again at less than it paid asks nothing, and
   assert.deepEqual([second.settled, second.why, second.fee.fee_minor, second.fee.stay_fee_minor, second.fee.credit_minor], [true, 'paid', 0, 750, 750]);
   const q = (await row(g, 'exits', second.id)).quote;
   assert.deepEqual([q.fee_minor, q.due_minor, q.repriced.fee_minor, q.credit.paid_minor], [750, 0, 500, 750], 'the price asked again is kept beside what was paid');
-  const closed = await close(h, g, second.id);
+  assert.deepEqual(q.repriced_lower, { paid_minor: 750, repriced_minor: 500, outcome: 'transient' }, 'priced lower than paid: marked for a manager');
+  const listed = await (await h.call(g.op, 'GET', `/garages/${g.world.garage}/exits`)).json();
+  assert.deepEqual(listed.exits.find((e) => e.id === second.id).repriced_lower, { paid_minor: 750, repriced_minor: 500, outcome: 'transient' });
+  // Priced again at what it paid: nothing lower, nothing marked.
+  const third = await caseAt(h, g, plate, { exitMin: 0.3 });
+  assert.equal((await row(g, 'exits', third.id)).quote.repriced_lower, undefined);
+  const closedAt = third.id;
+  const closed = await close(h, g, closedAt);
   assert.equal(closed.status, 200, await closed.clone().text());
   assert.equal(Number((await row(g, 'sessions', first.session_id)).fee_minor), 750, 'the stay at what it paid');
 });

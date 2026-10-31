@@ -566,10 +566,44 @@ test("THE DAY'S LIST SAYS THE GATE AGENT IN SHORT: messages, failed deliveries, 
   assert.equal(byPath.status, 200, await byPath.clone().text());
   const pathList = await byPath.json();
   assert.deepEqual([pathList.day, pathList.count, pathList.from, pathList.to], [today, list.count, list.from, list.to]);
-  for (const bad of ['2026-02-30', '2026-13-01', '31-10-2026', 'today']) {
+  for (const bad of ['2026-02-30', '2026-13-01', '31-10-2026', 'today', '0000-01-01', '1969-12-31']) {
     const res = await h.call(g.op, 'GET', `/garages/${g.world.garage}/exceptions/day/${bad}`);
     assert.deepEqual([res.status, (await res.json()).code], [400, 'day_invalid'], bad);
   }
+  for (const bad of ['0000-01-01', '9999-12-31']) {
+    const res = await h.call(g.op, 'GET', `/garages/${g.world.garage}/exceptions?day=${bad}`);
+    assert.deepEqual([res.status, (await res.json()).code], [400, 'day_invalid'], `?day=${bad}`);
+  }
   const other = await cardGarage(h, 'exc-summary-other');
   assert.equal((await h.call(other.op, 'GET', `/garages/${g.world.garage}/exceptions/day/${today}`)).status, 404, "another account's garage");
+});
+
+test("THE STORY KEEPS THE CREDIT: each payment less its refunds, the ones Stripe could not be asked about, and a price lower than paid marked for a manager", async () => {
+  const g = await cardGarage(h, 'exc-credit');
+  delete process.env.GATE_AGENTS_FILE;
+  // Paid three hours; then, at another lane's clock behind, priced at two --
+  // with Stripe silent on refunds.
+  const { plate } = await enter(h, g, { inMin: 150 });
+  const first = await caseAt(h, g, plate, { exitMin: 0.5 });
+  await payAndPresent(h, g, first.id);
+  h.stub.behaviour.failNext = { status: 500, type: 'api_error', code: 'api_error', message: 'down', path: /latest_charge/ };
+  const lower = await caseAt(h, g, plate, { exitMin: 50 });
+  await letOut(g, lower.id, 'priced lower, opened by hand');
+  let fee = (await oneOf(g, (await exceptionOfCase(g, lower.id)).id)).story.case.fee;
+  const paymentId = (await rows(g, 'SELECT id FROM exit_payments WHERE exit_id = $1', [first.id]))[0].id;
+  assert.deepEqual(fee.credit.refunds_unread, [paymentId], 'Stripe silent: said so');
+  assert.deepEqual(fee.repriced_lower, { paid_minor: 750, repriced_minor: 500, outcome: 'transient' });
+
+  // Paid 500, 200 of it refunded at Stripe, read at the next exit.
+  const { plate: other } = await enter(h, g, { inMin: 90 });
+  const paid = await caseAt(h, g, other, { exitMin: 1 });
+  const started = await payAndPresent(h, g, paid.id);
+  h.stub.refund(started.payment.payment_intent_id, 200);
+  const back = await caseAt(h, g, other);
+  await letOut(g, back.id);
+  const whole = await oneOf(g, (await exceptionOfCase(g, back.id)).id);
+  fee = whole.story.case.fee;
+  assert.deepEqual([fee.credit_minor, fee.credit.paid_minor, fee.credit.payments.map((p) => [p.amount_minor, p.refunded_minor]), fee.credit.refunds_unread, fee.repriced_lower],
+    [300, 300, [[500, 200]], [], null]);
+  assert.deepEqual(whole.story.payments.filter((p) => p.exit_id === paid.id).map((p) => p.refunded_minor), [200], "the payment's refund, in the story's payments too");
 });
