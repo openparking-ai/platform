@@ -188,8 +188,12 @@ purge. What they copy from the gate agent names people's addresses as the
 gate agent keeps them -- the email addresses a message went to, the SIP
 addresses a call rang and was answered from -- because who received is the
 question the record answers; a call-back number a person keyed, a driver's
-phone, is kept as its last two digits only. **Recorded as kept, with no
-window yet.**
+phone, is kept as its last two digits only. Those copies are **blanked**
+once older than the account's `tenant_settings.exception_copy_retention_days`
+-- 400 days by default, the gate agent's own, 1 to 3650 -- by the retention
+purge (`npm run purge`), counts only: `records` emptied, `purged_at` set, the
+only change an appended record takes. The exception row stays, with the
+change log's rules.
 
 ## What is never redacted
 

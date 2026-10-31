@@ -636,7 +636,7 @@ jobs:
         run: npm run db-restart-fail-control
 
       - name: Exit-rules fail-control
-        # The owner's exit rules and the exceptions (0048). Breaks 40
+        # The owner's exit rules and the exceptions (0048). Breaks 51
         # properties -- the whole stay priced again with every payment
         # credited and only the difference asked, never negative, never the
         # whole again; a return after an exit a new stay with the old one's
@@ -647,7 +647,10 @@ jobs:
         # written with the let-out, with no plate, its payments and the
         # lane's events, the gate agent's messages and calls copied with
         # their ids, by the token from its file, never following a redirect,
-        # the let-out never held up -- and ten of 0048's guards. Each break
+        # the let-out never held up nor kept waiting, a failed write never
+        # taking it back; a close after the car came back in still that
+        # stay's exit; a refund never counted as paid; a copy blanked past
+        # its window -- and twelve of 0048's guards. Each break
         # must turn the named test red, the rest of its file still green.
         run: npm run exit-rules-fail-control
 

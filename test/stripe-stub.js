@@ -154,7 +154,14 @@ export async function startStripeStub() {
         if (pi) {
           const intent = intents.get(decodeURIComponent(pi[1]));
           if (!intent || intent.on !== on) return send(404, { error: { code: 'resource_missing', message: 'no such payment_intent' } });
-          if (req.method === 'GET' && !pi[2]) return send(200, intent);
+          if (req.method === 'GET' && !pi[2]) {
+            // `expand[]=latest_charge`: the charge, with what was refunded of it.
+            if (!url.searchParams.getAll('expand[]').includes('latest_charge')) return send(200, intent);
+            const charge = intent.status === 'succeeded'
+              ? { id: `ch_${intent.id.slice(3)}`, object: 'charge', amount: intent.amount, amount_refunded: intent.refunded ?? 0 }
+              : null;
+            return send(200, { ...intent, latest_charge: charge });
+          }
           if (req.method === 'POST' && pi[2]) {
             const key = req.headers['idempotency-key'];
             if (key && cancelByKey.has(key)) {
@@ -292,6 +299,11 @@ export async function startStripeStub() {
         intent.last_payment_error = null;
         finishAction(intentId, { status: 'succeeded' });
       }
+    },
+    /** A refund made at Stripe's dashboard: this platform is told nothing. */
+    refund(intentId, amountMinor) {
+      const intent = intents.get(intentId);
+      intent.refunded = (intent.refunded ?? 0) + amountMinor;
     },
     close: () => new Promise((resolve) => server.close(resolve)),
   };

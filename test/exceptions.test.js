@@ -36,7 +36,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { pool, withTenant } from './helpers.js';
+import { pool, withTenant, superuserClient } from './helpers.js';
 import * as exceptions from '../src/exceptions.js';
 import { startGateAgentStub, message, callRecord } from './gate-agent-stub.js';
 import {
@@ -77,10 +77,18 @@ function configureGate(g, { url = gate.url, lanes = { [g.world.exitLane]: { moni
   process.env.GATE_AGENTS_FILE = file;
 }
 
+/** An attendant's let-out, answered; then the gate agent's copy it started after the answer, finished. */
 const letOut = async (g, exitId, reason = 'reader broken, driver had cash') => {
   const res = await h.call(g.op, 'POST', `/garages/${g.world.garage}/exits/${exitId}/let-out`, { reason });
   assert.equal(res.status, 200, await res.clone().text());
+  await exceptions.copiesSettled();
   return (await res.json()).exit;
+};
+/** A lane's close, answered; then its copy finished. */
+const closeThen = async (g, exitId, extra) => {
+  const res = await close(h, g, exitId, extra);
+  await exceptions.copiesSettled();
+  return res;
 };
 const listOf = async (g, query = '') => {
   const res = await h.call(g.op, 'GET', `/garages/${g.world.garage}/exceptions${query}`);
@@ -217,7 +225,7 @@ test('A PERSON AT THE LANE is an exception from the lane, by the lane computer, 
   const g = await cardGarage(h, 'exc-lane');
   configureGate(g);
   const owing = await caseAt(h, g, (await enter(h, g)).plate);
-  const res = await close(h, g, owing.id, { let_out_by: 'human_open_and_flag' });
+  const res = await closeThen(g, owing.id, { let_out_by: 'human_open_and_flag' });
   assert.equal(res.status, 200, await res.clone().text());
   const x = await exceptionOfCase(g, owing.id);
   assert.deepEqual([x.kind, x.source, x.done_by, x.authority, x.owed_minor], ['let_out_unpaid', 'lane', `lane_device:${g.exitDeviceId} (Exit 1 computer)`, 'human_open_and_flag', 500]);
@@ -227,7 +235,7 @@ test('A PERSON AT THE LANE is an exception from the lane, by the lane computer, 
   // Paid, then a person opened anyway: a barrier opened, owing nothing.
   const paid = await caseAt(h, g, (await enter(h, g)).plate);
   await payAndPresent(h, g, paid.id);
-  assert.equal((await close(h, g, paid.id, { let_out_by: 'human_open_now' })).status, 200);
+  assert.equal((await closeThen(g, paid.id, { let_out_by: 'human_open_now' })).status, 200);
   const opened = await exceptionOfCase(g, paid.id);
   assert.deepEqual([opened.kind, opened.owed_minor, opened.paid_minor], ['barrier_opened', 0, 500]);
 
@@ -356,7 +364,8 @@ test('THE DATABASE HOLDS THE RECORD: never updated or deleted by the application
   const refused = (sql, params, re) => assert.rejects(withTenant(g.tenant, (c) => c.query(sql, params)), re);
   await refused('UPDATE exceptions SET reason = $2 WHERE id = $1', [x.id, 'changed'], /permission denied/);
   await refused('DELETE FROM exceptions WHERE id = $1', [x.id], /permission denied/);
-  await refused('UPDATE exception_records SET state = state WHERE exception_id = $1', [x.id], /permission denied/);
+  await refused('UPDATE exception_records SET state = state WHERE exception_id = $1', [x.id], /never edited/);
+  await refused(`UPDATE exception_records SET records = '[{"x":1}]', purged_at = now() WHERE exception_id = $1`, [x.id], /never edited|exception_records_purged_copies_only/);
   await refused('DELETE FROM exception_records WHERE exception_id = $1', [x.id], /permission denied/);
   const insert = (over) => {
     const v = {
@@ -376,4 +385,98 @@ test('THE DATABASE HOLDS THE RECORD: never updated or deleted by the application
   await assert.rejects(withTenant(g.tenant, (c) => c.query(
     `INSERT INTO exception_records (tenant_id, exception_id, source, state) VALUES ($1, $2, 'gate_agent_calls', 'not_reachable')`,
     [g.tenant, x.id])), /exception_records_copied_or_why/);
+});
+
+test('A SLOW GATE AGENT NEVER HOLDS THE LET-OUT OR THE CLOSE: both are answered at once, the exception already written; the copy lands after, saying what it met', async () => {
+  const g = await cardGarage(h, 'exc-slow');
+  configureGate(g);
+  gate.behaviour.delayMs = 5000;
+  try {
+    const a = await caseAt(h, g, (await enter(h, g)).plate);
+    let t0 = Date.now();
+    const res = await h.call(g.op, 'POST', `/garages/${g.world.garage}/exits/${a.id}/let-out`, { reason: 'reader broken' });
+    const attendantMs = Date.now() - t0;
+    assert.equal(res.status, 200, await res.clone().text());
+    assert.ok(attendantMs < 1500, `the let-out is answered at once, not after the gate agent (${attendantMs} ms)`);
+    assert.ok(await exceptionOfCase(g, a.id), 'the exception is written before the answer');
+
+    const b = await caseAt(h, g, (await enter(h, g)).plate);
+    t0 = Date.now();
+    const closed = await close(h, g, b.id, { let_out_by: 'human_open_now' });
+    const laneMs = Date.now() - t0;
+    assert.equal(closed.status, 200, await closed.clone().text());
+    assert.ok(laneMs < 1500, `the lane's close is answered at once (${laneMs} ms)`);
+    assert.ok(await exceptionOfCase(g, b.id));
+
+    await exceptions.copiesSettled();
+    const whole = await oneOf(g, (await exceptionOfCase(g, a.id)).id);
+    assert.deepEqual(whole.gate_agent.messages.map((r) => [r.state, r.detail]), [['not_reachable', 'gate agent not reachable: no answer within 3000 ms']]);
+  } finally {
+    gate.behaviour.delayMs = 0;
+  }
+});
+
+test("THE EXCEPTION'S OWN WRITE FAILING NEVER TAKES THE LET-OUT BACK: the car stays let out, the failure is logged, and the sweep writes the exception from the record", async () => {
+  const g = await cardGarage(h, 'exc-write-fails');
+  delete process.env.GATE_AGENTS_FILE;
+  const su = superuserClient();
+  await su.connect();
+  const name = `test_refuse_exception_${g.tenant.replace(/-/g, '').slice(0, 12)}`;
+  // The database refuses this account's exceptions, as an outage or a defect would.
+  await su.query(`CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN IF NEW.tenant_id = '${g.tenant}' THEN RAISE EXCEPTION 'exceptions refused for this test'; END IF; RETURN NEW; END $$`);
+  await su.query(`CREATE TRIGGER ${name} BEFORE INSERT ON exceptions FOR EACH ROW EXECUTE FUNCTION ${name}()`);
+  let attendant;
+  let lane;
+  try {
+    attendant = await caseAt(h, g, (await enter(h, g)).plate);
+    const res = await h.call(g.op, 'POST', `/garages/${g.world.garage}/exits/${attendant.id}/let-out`, { reason: 'barrier stuck' });
+    assert.equal(res.status, 200, await res.clone().text());
+    assert.equal((await rows(g, 'SELECT person FROM exits WHERE id = $1', [attendant.id]))[0].person.reason, 'barrier stuck', 'the let-out stands');
+    lane = await caseAt(h, g, (await enter(h, g)).plate);
+    const closed = await close(h, g, lane.id, { let_out_by: 'human_open_now' });
+    assert.equal(closed.status, 200, await closed.clone().text());
+    assert.equal((await closed.json()).session.let_out.owed_minor, 500, 'the stay is let out, owing');
+    assert.equal(await exceptionOfCase(g, attendant.id), undefined);
+    assert.equal(await exceptionOfCase(g, lane.id), undefined);
+  } finally {
+    await su.query(`DROP TRIGGER IF EXISTS ${name} ON exceptions`);
+    await su.query(`DROP FUNCTION IF EXISTS ${name}()`);
+    await su.end();
+  }
+  const out = spawnSync(process.execPath, [resolve(import.meta.dirname, '..', 'scripts', 'complete-exceptions.js')], { env: process.env, encoding: 'utf8' });
+  assert.equal(out.status, 0, out.stderr);
+  const a = await exceptionOfCase(g, attendant.id);
+  const b = await exceptionOfCase(g, lane.id);
+  assert.deepEqual([a.source, a.reason, a.story.recovered], ['attendant', 'barrier stuck', true]);
+  assert.deepEqual([b.source, b.authority, b.owed_minor, b.story.recovered], ['lane', 'human_open_now', 500, true]);
+});
+
+test("A COPY OF THE GATE AGENT'S RECORDS IS BLANKED PAST THE ACCOUNT'S WINDOW -- 400 days unless it sets another; the exception and the rest stay", async () => {
+  const g = await cardGarage(h, 'exc-retention');
+  configureGate(g);
+  gate.store.messages.push(message({ lane: 'lane-1', at: ago(1), revision: 900 }));
+  const exit = await caseAt(h, g, (await enter(h, g)).plate);
+  await pay(h, g, exit.id);
+  await letOut(g, exit.id);
+  const x = await exceptionOfCase(g, exit.id);
+  const blank = (days) => withTenant(g.tenant, (c) => exceptions.blankExpiredCopies(c, g.tenant, new Date(Date.now() + days * 86_400_000)));
+  assert.equal(await blank(399), 0, 'inside the 400 days: kept');
+  assert.equal(await blank(401), 2, 'past them: the messages and the calls');
+  const whole = await oneOf(g, x.id);
+  for (const r of [...whole.gate_agent.messages, ...whole.gate_agent.calls]) {
+    assert.deepEqual([r.records, Boolean(r.purged_at), r.state], [[], true, 'copied']);
+  }
+  assert.equal(whole.payment_after_let_out.exit_id, exit.id, 'what else was appended stays');
+  assert.equal(whole.story.case.id, exit.id, 'the exception stays');
+  assert.equal(await blank(800), 0, 'blanked once');
+
+  // An account that keeps them a day.
+  await withTenant(g.tenant, (c) => c.query(
+    `INSERT INTO tenant_settings (tenant_id, exception_copy_retention_days) VALUES ($1, 1)
+     ON CONFLICT (tenant_id) DO UPDATE SET exception_copy_retention_days = 1`, [g.tenant]));
+  const other = await caseAt(h, g, (await enter(h, g)).plate);
+  await letOut(g, other.id);
+  assert.equal(await blank(2), 2);
+  await assert.rejects(withTenant(g.tenant, (c) => c.query(`UPDATE tenant_settings SET exception_copy_retention_days = 0 WHERE tenant_id = $1`, [g.tenant])), /check constraint/);
 });

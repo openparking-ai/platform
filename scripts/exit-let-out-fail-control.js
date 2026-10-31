@@ -263,7 +263,7 @@ SOURCE_BREAKS.push(
   {
     name: 'paid_not_credited',
     why: 'a case superseding a paid one asks the whole price again, not the difference (0048)',
-    edits: [{ file: 'src/app.js', from: '            quote = exits.withCredit(priced, await exits.stayPayments(client, tenantId, sessionId));', to: '            quote = priced;' }],
+    edits: [{ file: 'src/app.js', from: '            quote = exits.withCredit(priced, await exits.stayPayments(client, tenantId, sessionId), { refundsUnread });', to: '            quote = priced;' }],
   },
   {
     name: 'superseding_unlogged',

@@ -5,9 +5,10 @@
  *   node scripts/purge-vehicles.js            redact everything eligible
  *   node scripts/purge-vehicles.js --dry-run  report what would go, change nothing
  */
-import { pool } from '../src/db.js';
+import { pool, withTenant } from '../src/db.js';
 import { listTenantIds, redactExpiredVehicles } from '../src/retention.js';
 import { runPictureRetention, summary } from '../src/pictureRetention.js';
+import { blankExpiredCopies } from '../src/exceptions.js';
 
 const dryRun = process.argv.includes('--dry-run');
 const tenants = await listTenantIds(pool);
@@ -31,4 +32,12 @@ for (const tenantId of tenants) {
 }
 console.log(`${tenants.length} tenant(s); ${dryRun ? 'would redact' : 'redacted'} ${total} vehicle(s).`);
 if (pictures) console.log(summary(pictures));
+
+// The gate agent's records copied onto exceptions (0048), past each account's
+// window: blanked, counts only. Never in a dry run.
+if (!dryRun) {
+  let blanked = 0;
+  for (const tenantId of tenants) blanked += await withTenant(tenantId, (client) => blankExpiredCopies(client, tenantId));
+  console.log(`exceptions: ${tenants.length} tenant(s); blanked ${blanked} gate-agent copy(ies) past their window.`);
+}
 await pool.end();

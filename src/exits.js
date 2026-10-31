@@ -259,7 +259,8 @@ export function creditCovers(q) {
  */
 export async function stayPayments(client, tenantId, sessionId, exitId = null) {
   const { rows } = await client.query(
-    `SELECT p.id, p.exit_id, p.amount_minor, p.currency, p.succeeded_at, e.quote
+    `SELECT p.id, p.exit_id, p.amount_minor, p.refunded_minor, p.refunds_read_at, p.currency, p.succeeded_at, p.account_id,
+            p.payment_intent_id, e.quote
        FROM exit_payments p
        JOIN exits e ON e.tenant_id = p.tenant_id AND e.id = p.exit_id
       WHERE p.tenant_id = $1 AND p.session_id = $2 AND p.status = 'succeeded'
@@ -268,6 +269,11 @@ export async function stayPayments(client, tenantId, sessionId, exitId = null) {
     [tenantId, sessionId, exitId],
   );
   return rows;
+}
+
+/** What a stay's payments kept: each one's amount less what was refunded of it (0048). */
+export function keptOf(payments) {
+  return payments.reduce((sum, p) => sum + Number(p.amount_minor) - Number(p.refunded_minor ?? 0), 0);
 }
 
 /**
@@ -287,16 +293,22 @@ export async function stayPayments(client, tenantId, sessionId, exitId = null) {
  * Never a negative figure, and never a payment the stay already made: the
  * credit is every succeeded payment of the stay.
  */
-export function withCredit(priced, payments) {
+export function withCredit(priced, payments, { refundsUnread = [] } = {}) {
   if (!payments.length) return priced;
   const currency = String(priced.currency).toLowerCase();
   if (payments.some((p) => String(p.currency).toLowerCase() !== currency)) {
     throw new Error("a stay's payments are in another currency than its price");
   }
-  const paidMinor = payments.reduce((sum, p) => sum + Number(p.amount_minor), 0);
+  // A REFUND IS NOT PAID (decided 2026-10-31): each payment counts for what
+  // it kept, as Stripe last said (`refunded_minor`).
+  const paidMinor = keptOf(payments);
   const credit = {
     paid_minor: paidMinor,
-    payments: payments.map((p) => ({ id: p.id, exit_id: p.exit_id, amount_minor: Number(p.amount_minor) })),
+    payments: payments.map((p) => ({
+      id: p.id, exit_id: p.exit_id, amount_minor: Number(p.amount_minor), refunded_minor: Number(p.refunded_minor ?? 0),
+    })),
+    // Payments Stripe could not be asked about now: credited as last read.
+    ...(refundsUnread.length ? { refunds_unread: refundsUnread } : {}),
   };
   if (priced.refusal) return { ...priced, credit, due_minor: null };
   if (priced.outcome !== 'covered' && priced.fee_minor > paidMinor) {

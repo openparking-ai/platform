@@ -107,6 +107,7 @@ function presentPayment(p) {
     stripe_status: p.stripe_status,
     last_failure: p.last_failure,
     amount_minor: Number(p.amount_minor),
+    refunded_minor: Number(p.refunded_minor ?? 0),
     currency: p.currency,
     payment_intent_id: p.payment_intent_id,
     started_by: p.started_by,
@@ -298,6 +299,28 @@ export async function copyGateAgent(write, tenantId, exception, { now = new Date
   }
 }
 
+/** The copies started after a let-out was answered, still running. */
+const inFlight = new Set();
+
+/**
+ * COPY THE GATE AGENT'S RECORDS AFTER THE ANSWER: started, never awaited by
+ * the request that let the car out -- a slow gate agent never holds a let-out
+ * or a lane's close. Its outcome is appended like any copy; one that never
+ * finishes is the sweep's.
+ */
+export function copyLater(write, tenantId, exception, options = {}) {
+  const running = copyGateAgent(write, tenantId, exception, options)
+    .catch((err) => console.error(`[exceptions] the gate agent's copy for exception ${exception.id} failed: ${err.message ?? err}`))
+    .finally(() => inFlight.delete(running));
+  inFlight.add(running);
+  return running;
+}
+
+/** Every copy started after an answer, finished: what a test or a shutdown waits on. */
+export async function copiesSettled() {
+  while (inFlight.size) await Promise.allSettled([...inFlight]);
+}
+
 /**
  * The exceptions whose record is still to be finished, for the sweep: the
  * window has passed and a gate-agent source has no complete copy -- one that
@@ -354,6 +377,35 @@ export async function finish(write, tenantId, exception, { now = new Date(), env
   if (!sources.length || late) return { copied: false };
   await copyGateAgent(write, tenantId, exception, { now, env, sources });
   return { copied: true };
+}
+
+/**
+ * How long this account keeps a copy of the gate agent's records
+ * (`tenant_settings.exception_copy_retention_days`): 400 days -- the gate
+ * agent's own default -- for an account with no settings row, mirroring the
+ * column as vehicle retention does.
+ */
+export async function copyRetentionDays(client, tenantId) {
+  const { rows } = await client.query('SELECT exception_copy_retention_days FROM tenant_settings WHERE tenant_id = $1', [tenantId]);
+  return rows[0] ? Number(rows[0].exception_copy_retention_days) : 400;
+}
+
+/**
+ * THE RETENTION OF A COPY (decided 2026-10-31): a copy of the gate agent's
+ * messages or calls -- people's addresses among them -- older than the
+ * account's window is blanked (`records` emptied, `purged_at` set), the only
+ * change an appended record ever takes. The exception and everything else
+ * appended to it stay. Answers how many were blanked.
+ */
+export async function blankExpiredCopies(client, tenantId, now = null) {
+  const days = await copyRetentionDays(client, tenantId);
+  const { rowCount } = await client.query(
+    `UPDATE exception_records SET records = '[]'::jsonb, purged_at = COALESCE($2::timestamptz, now())
+      WHERE tenant_id = $1 AND source = ANY($4::text[]) AND purged_at IS NULL
+        AND copied_at < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,
+    [tenantId, now, days, GATE_AGENT_SOURCES],
+  );
+  return rowCount;
 }
 
 /** The exceptions of a garage in `[from, to)`, oldest first: the day's list. */
@@ -445,6 +497,8 @@ function presentRecord(r) {
     asked_to: r.asked_to,
     complete: r.complete,
     copied_at: r.copied_at,
+    // Blanked by the retention purge: the copy is gone, and when it went.
+    purged_at: r.purged_at,
     records: r.records,
   };
 }

@@ -22,6 +22,9 @@
  *   due_shown_whole              the lane is shown the whole stay as what to pay
  *   let_out_owes_whole           a car let out owing the difference is said to owe the whole stay
  *   end_counts_open_case_only    a person's end takes off only the open case's payment
+ *   refund_counted_as_paid       a payment refunded at Stripe is credited whole
+ *   refunds_never_read           the stay's payments are credited without asking Stripe for refunds
+ *   refunds_unread_unsaid        a payment Stripe could not be asked about is credited and nothing says so
  *
  * A return is a new stay (test/exit-rules.test.js):
  *   return_folded_into_old_stay  a car back in soon after an exit is folded into its old stay
@@ -29,6 +32,10 @@
  *   reentry_payment_left_open    the old case's unpaid payment is not canceled at Stripe first
  *   reentry_paid_not_recorded    the old stay does not say what it paid
  *   reentry_unlogged             closing the old case at the return leaves no change-log line
+ *   late_close_after_return_refused  a lane's close arriving after the car came back in is refused
+ *   late_close_at_return_time    such a close writes the stay's exit at the return, not when the car left
+ *   late_close_after_reentry     such a close writes an exit after the car came back in
+ *   late_close_no_exception      a person's opening on such a close leaves no exception
  *
  * The end reads first (test/exit-rules.test.js):
  *   end_cancels_before_reads     a person's end cancels the payment before left_at and the price are read
@@ -50,6 +57,10 @@
  *   no_payment_attempts          the exception keeps no payment attempts
  *   reader_refusal_unkept        the reader's refusal of a case's payment is kept nowhere
  *   gate_agent_not_asked         the gate agent's records are not copied at the let-out
+ *   copy_holds_answer            the let-out and the close wait for the gate agent before answering
+ *   exception_failure_breaks_let_out  an exception that cannot be written takes the let-out back
+ *   copies_never_blanked         a copy of the gate agent's records is kept past its window
+ *   copy_window_ignores_account  the account's own window for the copies is not read
  *   gate_agent_token_unsent      the gate agent is asked without its token
  *   gate_agent_wrong_lane        the agent is asked by the monitor's name for the lane
  *   keyed_kept_whole             a keyed call-back number is kept whole
@@ -69,7 +80,9 @@
  *   stay_pays_past_fee           a stay's payments may add up to more than its fee
  *   two_open_payments            a stay may have two open payments
  *   exceptions_editable          the application may update and delete an exception
- *   records_editable             the application may update and delete what was appended
+ *   records_editable             the application may delete what was appended
+ *   records_edited               an appended record may be edited, not only blanked by the purge
+ *   refunded_counts_in_fee_guard the stay-fee guard counts a refunded payment whole
  *   exception_any_case           an exception may name another lane or stay than its case's
  *   barrier_opened_owing         a barrier opened may owe
  *   record_without_why           a record not copied may say nothing of why
@@ -105,7 +118,7 @@ const SOURCE_BREAKS = [
     why: 'a case superseding a paid one asks the whole price again',
     suite: RULES,
     catches: 'PAID AND LEFT, again and again',
-    edits: [{ file: 'src/app.js', from: '            quote = exits.withCredit(priced, await exits.stayPayments(client, tenantId, sessionId));', to: '            quote = priced;' }],
+    edits: [{ file: 'src/app.js', from: '            quote = exits.withCredit(priced, await exits.stayPayments(client, tenantId, sessionId), { refundsUnread });', to: '            quote = priced;' }],
   },
   {
     name: 'credit_carries_no_limit',
@@ -159,6 +172,27 @@ const SOURCE_BREAKS = [
     edits: [{ file: 'src/exits.js', from: '    owed_minor: dueOf(q),', to: '    owed_minor: q && !q.refusal ? q.fee_minor : null,' }],
   },
   {
+    name: 'refund_counted_as_paid',
+    why: 'a payment refunded at Stripe is credited whole',
+    suite: RULES,
+    catches: 'A REFUND IS NOT PAID',
+    edits: [{ file: 'src/exits.js', from: '  return payments.reduce((sum, p) => sum + Number(p.amount_minor) - Number(p.refunded_minor ?? 0), 0);', to: '  return payments.reduce((sum, p) => sum + Number(p.amount_minor), 0);' }],
+  },
+  {
+    name: 'refunds_never_read',
+    why: "the stay's payments are credited without asking Stripe for refunds",
+    suite: RULES,
+    catches: 'A REFUND IS NOT PAID',
+    edits: [{ file: 'src/app.js', from: '        if (sessionId) refundsUnread = await readStayRefunds({ tenantId, sessionId });\n', to: '' }],
+  },
+  {
+    name: 'refunds_unread_unsaid',
+    why: 'a payment Stripe could not be asked about is credited and nothing says so',
+    suite: RULES,
+    catches: 'REFUNDS UNREAD',
+    edits: [{ file: 'src/exits.js', from: '    ...(refundsUnread.length ? { refunds_unread: refundsUnread } : {}),\n', to: '' }],
+  },
+  {
     name: 'end_counts_open_case_only',
     why: "a person's end takes off only the open case's payment",
     suite: RULES,
@@ -204,6 +238,34 @@ const SOURCE_BREAKS = [
       from: "        await changes.record(client, ctx, {\n          garageId,\n          action: 'exit.closed_on_return',",
       to: "        await (async () => null)(client, ctx, {\n          garageId,\n          action: 'exit.closed_on_return',",
     }],
+  },
+  {
+    name: 'late_close_after_return_refused',
+    why: "a lane's close arriving after the car came back in is refused",
+    suite: RULES,
+    catches: 'A CLOSE AFTER THE CAR CAME BACK IN, PAID',
+    edits: [{ file: 'src/app.js', from: '          returned = exitCase.closed_at ? await stayLeftBeforeReturn(client, tenantId, garageId, exitCase) : null;', to: '          returned = null;' }],
+  },
+  {
+    name: 'late_close_at_return_time',
+    why: "such a close writes the stay's exit at the return, not when the car left",
+    suite: RULES,
+    catches: 'A CLOSE AFTER THE CAR CAME BACK IN, PAID',
+    edits: [{ file: 'src/app.js', from: '        if (returned && exitAt > returned.exit_at) exitAt = new Date(returned.exit_at);', to: '        if (returned) exitAt = new Date(returned.exit_at);' }],
+  },
+  {
+    name: 'late_close_after_reentry',
+    why: 'such a close writes an exit after the car came back in',
+    suite: RULES,
+    catches: 'A CLOSE AFTER THE CAR CAME BACK IN, A PERSON OPENED',
+    edits: [{ file: 'src/app.js', from: '        if (returned && exitAt > returned.exit_at) exitAt = new Date(returned.exit_at);\n', to: '' }],
+  },
+  {
+    name: 'late_close_no_exception',
+    why: "a person's opening on such a close leaves no exception",
+    suite: RULES,
+    catches: 'A CLOSE AFTER THE CAR CAME BACK IN, A PERSON OPENED',
+    edits: [{ file: 'src/app.js', from: '          if (!exitCase.person && (letOutBy || letOut)) {', to: '          if (!returned && !exitCase.person && (letOutBy || letOut)) {' }],
   },
   // --- the end reads first ---------------------------------------------------
   {
@@ -318,7 +380,35 @@ const SOURCE_BREAKS = [
     why: "the gate agent's records are not copied at the let-out",
     suite: EXCEPTIONS,
     catches: "AN ATTENDANT'S LET-OUT OF A CAR THAT OWES",
-    edits: [{ file: 'src/app.js', from: '    await exceptionsRecord.copyGateAgent(write, tenantId, exception);\n', to: '' }],
+    edits: [{ file: 'src/app.js', from: '    exceptionsRecord.copyLater(write, tenantId, exception);\n', to: '' }],
+  },
+  {
+    name: 'copy_holds_answer',
+    why: 'the let-out and the close wait for the gate agent before answering',
+    suite: EXCEPTIONS,
+    catches: 'A SLOW GATE AGENT NEVER HOLDS THE LET-OUT OR THE CLOSE',
+    edits: [{ file: 'src/app.js', from: '    exceptionsRecord.copyLater(write, tenantId, exception);', to: '    await exceptionsRecord.copyGateAgent(write, tenantId, exception);' }],
+  },
+  {
+    name: 'exception_failure_breaks_let_out',
+    why: 'an exception that cannot be written takes the let-out back',
+    suite: EXCEPTIONS,
+    catches: "THE EXCEPTION'S OWN WRITE FAILING NEVER TAKES THE LET-OUT BACK",
+    edits: [{ file: 'src/app.js', from: "      await client.query('ROLLBACK TO SAVEPOINT exception_record');\n", to: "      await client.query('ROLLBACK TO SAVEPOINT exception_record');\n      throw err;\n" }],
+  },
+  {
+    name: 'copies_never_blanked',
+    why: "a copy of the gate agent's records is kept past its window",
+    suite: EXCEPTIONS,
+    catches: "A COPY OF THE GATE AGENT'S RECORDS IS BLANKED",
+    edits: [{ file: 'src/exceptions.js', from: '        AND copied_at < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,', to: '        AND false AND copied_at < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,' }],
+  },
+  {
+    name: 'copy_window_ignores_account',
+    why: "the account's own window for the copies is not read",
+    suite: EXCEPTIONS,
+    catches: "A COPY OF THE GATE AGENT'S RECORDS IS BLANKED",
+    edits: [{ file: 'src/exceptions.js', from: '  return rows[0] ? Number(rows[0].exception_copy_retention_days) : 400;', to: '  return 400;' }],
   },
   {
     name: 'gate_agent_token_unsent',
@@ -432,10 +522,24 @@ const SCHEMA_BREAKS = [
   },
   {
     name: 'records_editable',
-    why: 'the application may update and delete what was appended',
+    why: 'the application may delete what was appended',
     suite: EXCEPTIONS,
     catches: 'THE DATABASE HOLDS THE RECORD',
-    edits: [{ file: ADDED_0048, from: 'GRANT SELECT, INSERT ON exception_records TO openparking_app;', to: 'GRANT SELECT, INSERT, UPDATE, DELETE ON exception_records TO openparking_app;' }],
+    edits: [{ file: ADDED_0048, from: 'GRANT SELECT, INSERT, UPDATE ON exception_records TO openparking_app;', to: 'GRANT SELECT, INSERT, UPDATE, DELETE ON exception_records TO openparking_app;' }],
+  },
+  {
+    name: 'records_edited',
+    why: 'an appended record may be edited, not only blanked by the purge',
+    suite: EXCEPTIONS,
+    catches: 'THE DATABASE HOLDS THE RECORD',
+    edits: [{ file: ADDED_0048, from: '  BEFORE UPDATE ON exception_records', to: '  BEFORE UPDATE OF id ON exception_records' }],
+  },
+  {
+    name: 'refunded_counts_in_fee_guard',
+    why: 'the stay-fee guard counts a refunded payment whole',
+    suite: RULES,
+    catches: 'A REFUND IS NOT PAID',
+    edits: [{ file: ADDED_0048, from: '    SELECT COALESCE(sum(p.amount_minor - p.refunded_minor), 0) INTO taken', to: '    SELECT COALESCE(sum(p.amount_minor), 0) INTO taken' }],
   },
   {
     name: 'exception_any_case',

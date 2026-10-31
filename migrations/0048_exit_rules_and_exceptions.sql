@@ -18,6 +18,14 @@
 --                                     than its case's whole fee: never charged
 --                                     twice.
 --
+-- A REFUND IS NOT PAID. A refund made at Stripe (its dashboard) is read from
+-- the payment's charge when the stay is priced again, and kept on the payment:
+--
+--   exit_payments.refunded_minor   what Stripe says was refunded of it, as last
+--                                  read (0 until read); the credit is the
+--                                  payment less it.
+--   exit_payments.refunds_read_at  when that was read.
+--
 -- A RETURN IS A NEW STAY; A PASS'S VISIT IS A SESSION OF THE PASS.
 --
 --   sessions.entry_qr      a stay a registration QR let in (the lane's `qr`:
@@ -47,7 +55,12 @@
 -- row saying so; the let-out is never held up by it.
 --
 -- No plate is ever in either table: ids, people's names as the change log
--- names them, times, amounts and what the gate agent sent.
+-- names them, times, amounts and what the gate agent sent. What the gate
+-- agent sent names people's addresses: a copy is blanked once it is older
+-- than the account's `tenant_settings.exception_copy_retention_days` (400 by
+-- default, the gate agent's own), by the retention purge -- the one change an
+-- appended record ever takes (`exception_records.purged_at`). The exception
+-- itself stays.
 --
 -- Nothing is backfilled.
 --
@@ -60,6 +73,11 @@ BEGIN;
 -- ---------------------------------------------------------------------------
 -- Paying the difference.
 -- ---------------------------------------------------------------------------
+
+ALTER TABLE exit_payments
+  ADD COLUMN refunded_minor  integer NOT NULL DEFAULT 0,
+  ADD COLUMN refunds_read_at timestamptz,
+  ADD CONSTRAINT exit_payments_refund_within_amount CHECK (refunded_minor >= 0 AND refunded_minor <= amount_minor);
 
 DROP INDEX exit_payments_one_per_stay;
 CREATE UNIQUE INDEX exit_payments_one_open_per_stay ON exit_payments (tenant_id, session_id)
@@ -86,7 +104,8 @@ CREATE FUNCTION exit_payments_within_stay_fee() RETURNS trigger
       RAISE EXCEPTION 'exit_payments: a payment is exactly what its case asks for -- the whole stay less what it paid'
         USING ERRCODE = 'check_violation', CONSTRAINT = 'exit_payments_is_the_due';
     END IF;
-    SELECT COALESCE(sum(p.amount_minor), 0) INTO taken
+    -- What it keeps: a refunded part was never paid.
+    SELECT COALESCE(sum(p.amount_minor - p.refunded_minor), 0) INTO taken
       FROM exit_payments p
      WHERE p.tenant_id = NEW.tenant_id AND p.session_id = NEW.session_id AND p.status <> 'canceled';
     IF taken > fee THEN
@@ -195,6 +214,11 @@ CREATE TABLE exception_records (
   detail        text        CHECK (length(detail) <= 300),
   records       jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(records) = 'array'),
   copied_at     timestamptz NOT NULL DEFAULT now(),
+  -- A gate-agent copy past its window, blanked by the retention purge.
+  purged_at     timestamptz,
+  CONSTRAINT exception_records_purged_copies_only CHECK (
+    purged_at IS NULL OR (source IN ('gate_agent_messages', 'gate_agent_calls') AND records = '[]'::jsonb)
+  ),
   CONSTRAINT exception_records_copied_or_why CHECK (
     (state = 'copied') OR (records = '[]'::jsonb AND NOT complete AND detail IS NOT NULL)
   )
@@ -215,10 +239,40 @@ CREATE POLICY exception_records_tenant_isolation ON exception_records
   USING      (tenant_id = current_tenant_id())
   WITH CHECK (tenant_id = current_tenant_id());
 
--- The record of what happened: written once, appended to, never edited or
--- deleted.
+-- The record of what happened: written once, appended to, never deleted; an
+-- appended copy of the gate agent's records is blanked by the retention
+-- purge and changes in no other way (the trigger below).
 GRANT SELECT, INSERT ON exceptions TO openparking_app;
-GRANT SELECT, INSERT ON exception_records TO openparking_app;
+GRANT SELECT, INSERT, UPDATE ON exception_records TO openparking_app;
+
+CREATE FUNCTION exception_records_only_purged() RETURNS trigger
+  LANGUAGE plpgsql
+  SET search_path = pg_catalog, public
+  AS $$
+  BEGIN
+    IF (NEW.id, NEW.tenant_id, NEW.exception_id, NEW.source, NEW.state, NEW.asked_name, NEW.asked_from, NEW.asked_to,
+        NEW.complete, NEW.detail, NEW.copied_at)
+       IS DISTINCT FROM
+       (OLD.id, OLD.tenant_id, OLD.exception_id, OLD.source, OLD.state, OLD.asked_name, OLD.asked_from, OLD.asked_to,
+        OLD.complete, OLD.detail, OLD.copied_at)
+       OR OLD.purged_at IS NOT NULL OR NEW.purged_at IS NULL OR NEW.records <> '[]'::jsonb THEN
+      RAISE EXCEPTION 'exception_records: an appended record is never edited; a gate-agent copy is only blanked, once, by the retention purge'
+        USING ERRCODE = 'check_violation', CONSTRAINT = 'exception_records_only_purged';
+    END IF;
+    RETURN NEW;
+  END
+  $$;
+
+CREATE TRIGGER exception_records_only_purged
+  BEFORE UPDATE ON exception_records
+  FOR EACH ROW EXECUTE FUNCTION exception_records_only_purged();
+
+-- How long a copy of the gate agent's records is kept: the gate agent's own
+-- default. An account with no settings row reads the same 400, mirrored as
+-- vehicle_retention_days's 30 is (src/repository.js).
+ALTER TABLE tenant_settings
+  ADD COLUMN exception_copy_retention_days integer NOT NULL DEFAULT 400
+    CHECK (exception_copy_retention_days BETWEEN 1 AND 3650);
 
 -- A foreign key is checked without row-level security; these read the
 -- garage, lane, case and stay as the writer, as 0037's do.

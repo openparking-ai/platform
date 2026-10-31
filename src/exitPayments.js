@@ -206,6 +206,30 @@ export function readIntent(config, accountId, intentId) {
   return stripeCall({ method: 'GET', path: `/v1/payment_intents/${encodeURIComponent(intentId)}`, account: accountId }, config);
 }
 
+/**
+ * THE REFUNDED PART OF A PAID INTENT (0048): its latest charge, expanded, says
+ * how much of it was refunded -- at Stripe's dashboard, say, which this
+ * platform hears of nowhere else. One read per payment.
+ */
+export async function refundedOf(config, accountId, intentId) {
+  const intent = await stripeCall({
+    method: 'GET', path: `/v1/payment_intents/${encodeURIComponent(intentId)}?expand%5B%5D=latest_charge`, account: accountId,
+  }, config);
+  const refunded = Number(intent?.latest_charge?.amount_refunded ?? 0);
+  if (!Number.isInteger(refunded) || refunded < 0) throw new StripeUnreachable('Stripe answered a refunded amount this platform cannot read');
+  return refunded;
+}
+
+/** What Stripe said was refunded of a paid payment, kept: never more than it took. */
+export async function recordRefunded(client, tenantId, paymentId, refundedMinor) {
+  const { rows } = await client.query(
+    `UPDATE exit_payments SET refunded_minor = LEAST($3::int, amount_minor), refunds_read_at = now()
+      WHERE tenant_id = $1 AND id = $2 AND status = 'succeeded' RETURNING *`,
+    [tenantId, paymentId, refundedMinor],
+  );
+  return rows[0] ?? null;
+}
+
 export function cancelIntent(config, accountId, intentId, idempotencyKey = undefined) {
   return stripeCall({ method: 'POST', path: `/v1/payment_intents/${encodeURIComponent(intentId)}/cancel`, account: accountId, form: {}, idempotencyKey }, config);
 }

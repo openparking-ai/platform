@@ -268,3 +268,92 @@ test("THE END READS FIRST: a refused left_at, or a rate engine that cannot answe
   assert.equal(ok.status, 200, await ok.clone().text());
   assert.equal(h.stub.intents.get(intent).status, 'canceled', 'then canceled, and the stay ended');
 });
+
+// ---------------------------------------------------------------------------
+// A close that arrives after the car came back in.
+// ---------------------------------------------------------------------------
+
+test('A CLOSE AFTER THE CAR CAME BACK IN, PAID: the old stay closes at the time the lane sent, at what it paid; a resend is the same close; the new stay is untouched', async () => {
+  const g = await cardGarage(h, 'rules-late-paid');
+  const { plate, res: opened } = await enter(h, g, { inMin: 60 });
+  const old = await caseAt(h, g, plate, { exitMin: 40 });
+  await payAndPresent(h, g, old.id);
+  // The exit lane is offline: the car crossed at 39 minutes ago, the close waits in its outbox.
+  const { res: again } = await enter(h, g, { plate, inMin: 10 });
+  assert.equal((await row(g, 'sessions', opened.session.id)).ended.reason, 'superseded');
+  const eventId = randomUUID();
+  const sent = ago(39);
+  const late = () => h.call(g.exit, 'POST', '/lane/sessions/close', { event_id: eventId, exit_id: old.id, exit_at: sent, exit_confirmation: 'confirmed' });
+  const res = await late();
+  assert.equal(res.status, 200, await res.clone().text());
+  const stay = await row(g, 'sessions', opened.session.id);
+  assert.deepEqual([stay.ended, Number(stay.fee_minor), stay.exit_at.toISOString(), stay.let_out, stay.close_event_id],
+    [null, 250, new Date(sent).toISOString(), null, eventId], 'closed at its real exit, at what it paid');
+  const told = await rows(g, `SELECT detail FROM events WHERE kind = 'ended_stay_closed' AND detail->>'session_id' = $1`, [opened.session.id]);
+  assert.equal(told.length, 1);
+  const again2 = await late();
+  assert.deepEqual([again2.status, (await again2.json()).replay], [200, true], 'a resend is the same close');
+  const other = await h.call(g.exit, 'POST', '/lane/sessions/close', { event_id: randomUUID(), exit_id: old.id, exit_at: ago(38), exit_confirmation: 'confirmed' });
+  assert.deepEqual([other.status, (await other.json()).code], [409, 'exit_closed'], 'a second close of it is refused');
+  assert.equal((await row(g, 'sessions', again.session.id)).exit_at, null, 'the stay the car is in now stays open');
+});
+
+test('A CLOSE AFTER THE CAR CAME BACK IN, A PERSON OPENED: the old stay is let out unpaid, owing, with its exception -- once; never after the return', async () => {
+  const g = await cardGarage(h, 'rules-late-letout');
+  const { plate, res: opened } = await enter(h, g, { inMin: 60 });
+  const old = await caseAt(h, g, plate, { exitMin: 40 });
+  const started = await pay(h, g, old.id);
+  const { res: again } = await enter(h, g, { plate, inMin: 10 });
+  assert.equal(intentOf(started).status, 'canceled');
+  const eventId = randomUUID();
+  // The lane's clock is ahead: it says the car left after it came back in.
+  const send = () => h.call(g.exit, 'POST', '/lane/sessions/close', {
+    event_id: eventId, exit_id: old.id, exit_at: ago(5), exit_confirmation: 'confirmed', let_out_by: 'human_open_now',
+  });
+  const res = await send();
+  assert.equal(res.status, 200, await res.clone().text());
+  const stay = await row(g, 'sessions', opened.session.id);
+  assert.deepEqual([stay.fee_minor, stay.let_out.owed_minor, stay.let_out.by], [null, 250, `lane_device:${g.exitDeviceId}`]);
+  assert.equal(stay.exit_at.getTime(), (await row(g, 'sessions', again.session.id)).entry_at.getTime(), 'never after the car came back in');
+  await (await import('../src/exceptions.js')).copiesSettled();
+  const x = await rows(g, 'SELECT kind, source, authority, owed_minor, session_id FROM exceptions WHERE exit_id = $1', [old.id]);
+  assert.deepEqual(x, [{ kind: 'let_out_unpaid', source: 'lane', authority: 'human_open_now', owed_minor: 250, session_id: opened.session.id }]);
+  assert.equal((await send()).status, 200);
+  assert.equal((await rows(g, 'SELECT 1 FROM exceptions WHERE exit_id = $1', [old.id])).length, 1, 'once');
+});
+
+// ---------------------------------------------------------------------------
+// A refund is not paid.
+// ---------------------------------------------------------------------------
+
+test("A REFUND IS NOT PAID: a refund made at Stripe's dashboard is read when the stay is priced again, and only what the payment kept is credited", async () => {
+  const g = await cardGarage(h, 'rules-refund');
+  const { plate } = await enter(h, g, { inMin: 90 });
+  const first = await caseAt(h, g, plate, { exitMin: 1 });
+  const paid = await payAndPresent(h, g, first.id);
+  h.stub.refund(paid.payment.payment_intent_id, 200);
+  const second = await caseAt(h, g, plate);
+  assert.deepEqual([second.needs, second.fee.fee_minor, second.fee.stay_fee_minor, second.fee.credit_minor], ['payment', 200, 500, 300],
+    '500 paid, 200 of it refunded: 300 kept, 200 asked');
+  const recorded = (await rows(g, 'SELECT refunded_minor, refunds_read_at FROM exit_payments WHERE exit_id = $1', [first.id]))[0];
+  assert.deepEqual([recorded.refunded_minor, Boolean(recorded.refunds_read_at)], [200, true], 'kept on the payment');
+  const diff = await payAndPresent(h, g, second.id);
+  assert.equal(h.stub.intents.get(diff.payment.payment_intent_id).amount, 200);
+  assert.equal((await close(h, g, second.id)).status, 200);
+});
+
+test('REFUNDS UNREAD: Stripe not answering for refunds holds no exit up -- the payment is credited as last read, and the case says so', async () => {
+  const g = await cardGarage(h, 'rules-refund-unread');
+  const { plate } = await enter(h, g, { inMin: 90 });
+  const first = await caseAt(h, g, plate, { exitMin: 1 });
+  const paid = await payAndPresent(h, g, first.id);
+  h.stub.refund(paid.payment.payment_intent_id, 500);
+  h.stub.behaviour.failNext = { status: 500, type: 'api_error', code: 'api_error', message: 'down', path: /latest_charge/ };
+  const second = await caseAt(h, g, plate);
+  assert.deepEqual([second.settled, second.fee.credit_minor], [true, 500]);
+  const q = (await row(g, 'exits', second.id)).quote;
+  assert.deepEqual(q.credit.refunds_unread, [(await rows(g, 'SELECT id FROM exit_payments WHERE exit_id = $1', [first.id]))[0].id]);
+  // Asked again once Stripe answers: the refund counts.
+  const third = await caseAt(h, g, plate);
+  assert.deepEqual([third.needs, third.fee.fee_minor, third.fee.credit_minor], ['payment', 500, 0]);
+});

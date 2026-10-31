@@ -78,8 +78,9 @@ export function callRecord({ lane = 'exit', startedAt, keyed = null, revision = 
 export async function startGateAgentStub({ token = null } = {}) {
   const requests = [];
   const store = { messages: [], calls: [] };
-  const behaviour = { status: null, redirect: false, hang: false };
-  const server = http.createServer((req, res) => {
+  const behaviour = { status: null, redirect: false, hang: false, delayMs: 0 };
+  const server = http.createServer(async (req, res) => {
+    if (behaviour.delayMs) await new Promise((r) => setTimeout(r, behaviour.delayMs));
     const url = new URL(req.url, 'http://stub');
     requests.push({ path: url.pathname, query: Object.fromEntries(url.searchParams), authorization: req.headers.authorization ?? null });
     const send = (status, body) => {

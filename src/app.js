@@ -48,6 +48,8 @@ import { verifyUtf8 } from './utf8Body.js';
  */
 class PriorCaseMoved extends Error {}
 const PRIOR_CASE_ATTEMPTS = 3;
+/** How many of a stay's payments are read from Stripe for refunds when it is priced again: the latest. */
+const REFUND_READS_MAX = 5;
 
 const bad = (message) => new HttpError(400, message);
 
@@ -2514,8 +2516,12 @@ export function createApp() {
       // outside any transaction, and the case is closed in the one that
       // writes this one. A payment started on it in between: asked again.
       let out = null;
+      let refundsUnread = [];
       for (let attempt = 1; !out; attempt += 1) {
         if (sessionId) await settlePriorCase({ tenantId, garageId, sessionId, eventId });
+        // What the stay already paid is asked of Stripe again, for refunds,
+        // before it is credited: outside any transaction, bounded.
+        if (sessionId) refundsUnread = await readStayRefunds({ tenantId, sessionId });
         out = await withTenant(tenantId, (client) => writeCase(client)).catch((err) => {
           if (!(err instanceof PriorCaseMoved)) throw err;
           if (attempt >= PRIOR_CASE_ATTEMPTS) throw paymentUnsettled();
@@ -2546,7 +2552,7 @@ export function createApp() {
             // price is not higher. No time limit.
             const vehicle = await exits.vehicleOf(client, tenantId, open.vehicle_id);
             const priced = await quoteStay(client, { tenantId, garage, laneId, session: open, vehicle, exitAt });
-            quote = exits.withCredit(priced, await exits.stayPayments(client, tenantId, sessionId));
+            quote = exits.withCredit(priced, await exits.stayPayments(client, tenantId, sessionId), { refundsUnread });
           } else {
             method = 'none';
             sessionId = null;
@@ -3053,11 +3059,43 @@ export function createApp() {
       ...(payments.length ? {
         paid: {
           exit_id: payments[payments.length - 1].exit_id,
-          amount_minor: payments.reduce((sum, p) => sum + Number(p.amount_minor), 0),
+          amount_minor: exits.keptOf(payments),
           currency: payments[0].currency,
         },
       } : {}),
     };
+  }
+
+  /**
+   * A REFUND IS NOT PAID (decided 2026-10-31): before a new case credits what
+   * the stay paid, each of its succeeded payments -- at most REFUND_READS_MAX,
+   * the latest, in parallel -- is read from Stripe with its latest charge,
+   * and what was refunded of it (at Stripe's dashboard, say) is kept on the
+   * payment. Answers the payments Stripe could not be asked about now: they
+   * are credited as last read, and the case says so (`refunds_unread`). The
+   * exit is never held up for it.
+   */
+  async function readStayRefunds({ tenantId, sessionId }) {
+    const paid = await withTenant(tenantId, (client) => exits.stayPayments(client, tenantId, sessionId));
+    if (!paid.length) return [];
+    const config = connectConfig();
+    const asked = paid.slice(-REFUND_READS_MAX);
+    const unread = paid.slice(0, -REFUND_READS_MAX).map((p) => p.id);
+    const read = await Promise.all(asked.map(async (p) => {
+      try {
+        return { p, refunded: await exitPayments.refundedOf(config, p.account_id, p.payment_intent_id) };
+      } catch (err) {
+        if (err instanceof StripeUnreachable || err instanceof StripeError) return { p, refunded: null };
+        throw err;
+      }
+    }));
+    await withTenant(tenantId, async (client) => {
+      for (const { p, refunded } of read) {
+        if (refunded === null) unread.push(p.id);
+        else if (refunded !== Number(p.refunded_minor) || !p.refunds_read_at) await exitPayments.recordRefunded(client, tenantId, p.id, refunded);
+      }
+    });
+    return unread;
   }
 
   /**
@@ -3113,6 +3151,23 @@ export function createApp() {
     }
   }
 
+  /**
+   * The stay a case was closed with when the car came back in (0048): the
+   * case closed `stay_ended` by that return, and the stay still ended as
+   * superseded by the same new stay -- locked, the case's lock already held.
+   * Null for any other closed case, or a stay a close has since closed.
+   */
+  async function stayLeftBeforeReturn(client, tenantId, garageId, exitCase) {
+    if (exitCase.ended?.why !== 'stay_ended' || !exitCase.ended.by_session || !exitCase.session_id) return null;
+    const { rows } = await client.query(
+      `SELECT * FROM sessions WHERE tenant_id = $1 AND garage_id = $2 AND id = $3
+          AND ended->>'reason' = 'superseded' AND ended->>'by_session' = $4
+        FOR UPDATE`,
+      [tenantId, garageId, exitCase.session_id, exitCase.ended.by_session],
+    );
+    return rows[0] ?? null;
+  }
+
   /** The lane computer, as an exception names who pressed it: its id and its name. */
   async function laneDeviceName(client, tenantId, deviceId) {
     const { rows } = await client.query('SELECT name FROM lane_devices WHERE tenant_id = $1 AND id = $2', [tenantId, deviceId]);
@@ -3141,8 +3196,11 @@ export function createApp() {
 
   /**
    * AFTER AN EXCEPTION'S LET-OUT COMMITTED: the payment as it then stood,
-   * and the gate agent's messages and calls for the lane so far, appended.
-   * Never throws: the car is out whatever happens here.
+   * appended (this platform's own database, before the answer); and the gate
+   * agent's messages and calls for the lane so far, copied AFTER the answer
+   * -- started here, never awaited, so a slow or silent gate agent never
+   * holds the let-out or the lane's close. Never throws: the car is out
+   * whatever happens here.
    */
   async function afterException(tenantId, exception, { payment = null }) {
     const write = (fn) => withTenant(tenantId, fn);
@@ -3151,7 +3209,7 @@ export function createApp() {
     } catch (err) {
       console.error(`[exceptions] the payment after the let-out was not written for exception ${exception.id}: ${err.message ?? err}`);
     }
-    await exceptionsRecord.copyGateAgent(write, tenantId, exception);
+    exceptionsRecord.copyLater(write, tenantId, exception);
   }
 
   /**
@@ -3381,12 +3439,22 @@ export function createApp() {
 
         let exitCase = null;
         let letOut = null;
+        let returned = null;
         if (exitId) {
           const keptClose = await exits.caseByCloseEvent(client, tenantId, String(closeEventId));
           if (keptClose) return { session: null, exitCase: keptClose, closed: false, replay: true };
           exitCase = await exits.caseById(client, tenantId, garageId, exitId, { lock: true });
           if (!exitCase) throw new HttpError(404, 'exit case not found', 'exit_not_found');
-          if (exitCase.closed_at) {
+          // A CLOSE AFTER THE CAR CAME BACK IN (0048): the lane was offline,
+          // a person opened, and the car's next entry closed this case and
+          // ended its stay before the close arrived. It is still that stay's
+          // exit: the stay closes at the time the lane sent (never after the
+          // return), on the case's own figures, let out or paid as the case
+          // stood -- and a person's opening is a let-out and an exception
+          // like any other. Once: the stay is then closed, and a second
+          // close event is refused as before.
+          returned = exitCase.closed_at ? await stayLeftBeforeReturn(client, tenantId, garageId, exitCase) : null;
+          if (exitCase.closed_at && !returned) {
             throw conflict('exit_closed', exitCase.ended?.why === 'superseded'
               ? 'this exit case was superseded by a newer case for the same stay; close that one'
               : exitCase.ended ? 'this exit case was closed when a person ended its stay' : 'this exit case was closed by another exit event');
@@ -3415,7 +3483,9 @@ export function createApp() {
         }
 
         const named = exitCase?.session_id ?? sessionId;
-        const openByCase = exitCase ? await repo.findOpenSessionById(client, tenantId, garageId, exitCase.session_id) : null;
+        const openByCase = exitCase
+          ? returned ?? await repo.findOpenSessionById(client, tenantId, garageId, exitCase.session_id)
+          : null;
         const vehicle = exitCase
           ? (openByCase ? await exits.vehicleOf(client, tenantId, openByCase.vehicle_id) : null)
           : await repo.upsertVehicle(client, tenantId, { plate, ticketRef, seenAt: exitAt });
@@ -3436,7 +3506,8 @@ export function createApp() {
         // stay's exit: the stay closes and prices from it, and `ended` goes.
         // Asked before the open stay's ordering guard below: an exit before
         // the car's current stay came in may be the exit of the one before.
-        let wasEnded = null;
+        let wasEnded = returned;
+        if (returned && exitAt > returned.exit_at) exitAt = new Date(returned.exit_at);
         if (!exitCase && (!open || exitAt < open.entry_at)) {
           wasEnded = await repo.endedStayAt(client, tenantId, garageId,
             named ? { sessionId: named } : { vehicleId: vehicle.id }, exitAt);
@@ -3668,7 +3739,10 @@ export function createApp() {
               eventId: `${stuck.ENDED_STAY_CLOSED_EVENT_KIND}:${closed.id}`,
               kind: stuck.ENDED_STAY_CLOSED_EVENT_KIND,
               occurredAt: exitAt,
-              detail: { actor: 'platform:close', session_id: closed.id, close_event_id: String(closeEventId), was: wasEnded.ended },
+              detail: {
+                actor: 'platform:close', session_id: closed.id, close_event_id: String(closeEventId), was: wasEnded.ended,
+                exit_at_sent: sentExitAt.toISOString(),
+              },
             }] : []),
             ...(clocksApart ? [{
               garageId,
@@ -3755,9 +3829,11 @@ export function createApp() {
             },
           ]);
         }
-        const closedCase = exitCase
+        // A case closed by the car's return stays closed as it was: its close
+        // event is the stay's, where a resend finds it.
+        const closedCase = exitCase && !returned
           ? await exits.markClosed(client, tenantId, exitCase.id, { closeEventId: String(closeEventId), closedAt: exitAt })
-          : null;
+          : exitCase;
         return { session: closed, exitCase: closedCase, closed: true, replay: false, releaseAfter: validated.releaseAfter };
       });
 
@@ -4177,7 +4253,7 @@ export function createApp() {
         const payments = await exits.stayPayments(client, req.tenantId, stay.id);
         const paid = payments.length ? {
           exit_id: payments[payments.length - 1].exit_id,
-          amount_minor: payments.reduce((sum, p) => sum + Number(p.amount_minor), 0),
+          amount_minor: exits.keptOf(payments),
           currency: payments[0].currency,
         } : null;
         const row = await repo.endStay(client, req.tenantId, stay.id, {

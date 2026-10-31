@@ -78,7 +78,9 @@ export const TENANT_TABLES = [
          RETURNING id`,
         [t, w.garage, w.exitLane],
       ),
-    appendOnly: true,
+    // Appended to and never deleted; a gate-agent copy is blanked by the
+    // retention purge and changes in no other way (its trigger).
+    noDelete: true,
   },
   {
     table: 'entry_pictures',

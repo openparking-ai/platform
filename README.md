@@ -1966,7 +1966,16 @@ them; a quote not priced higher keeps the figures of the case whose payment
 paid it, and the new price as `repriced`. The lane reads `fee.fee_minor` as
 what to pay (the difference), `fee.stay_fee_minor` and `fee.credit_minor`
 beside it. A car let out owing the difference is let out unpaid owing it,
-with what it had paid (`let_out.paid_minor`).
+with what it had paid (`let_out.paid_minor`). **A refund is not paid**:
+before a new case credits the stay's payments, each (the latest 5) is read
+from Stripe with its latest charge, in parallel and outside any transaction,
+and what was refunded of it -- at Stripe's dashboard, which this platform
+hears of nowhere else -- is kept on the payment (`refunded_minor`,
+`refunds_read_at`); only what a payment kept is credited, and the stay-fee
+guard counts it so. Stripe not answering holds no exit up: the payment is
+credited as last read and the case says so (`credit.refunds_unread`). A
+refund is read only then -- when the car comes back to an exit; a person's
+end and a return credit what was last read.
 
 **A return is a new stay** -- for a transient car. *"when the car leaves.
 It's gone. When it comes back new time starts."* An entry after the stay
@@ -1975,7 +1984,13 @@ for a re-approach at the entry only); the old stay is closed completely --
 its case closed, its unpaid payment canceled at Stripe, a paid one kept paid
 on it -- and the new stay carries no time, fee, payment, let-out or case
 (above, "The same car again"). A car that never left -- backed off at the
-exit -- is still the same stay: its next case supersedes the old one.
+exit -- is still the same stay: its next case supersedes the old one. **A
+lane's close that arrives after the car came back in** (the exit lane was
+offline, a person opened, the car returned before the outbox drained) is
+still that stay's exit: the stay closes at the time the lane sent -- never
+after the return -- on its case's figures, paid or let out unpaid as the case
+stood, a person's opening with its exception; a resend is the same close, a
+second close event `409 exit_closed`.
 
 **A pass's visits are sessions of the pass.** *"Monthlies, garage passes are
 different. 'new session' type."* Each in and out of a pass holder is its own
@@ -2024,7 +2039,13 @@ gate agent's messages and calls for the lane** over [case opened - 15 min,
 let-out + 15 min], copied with their own ids and revisions -- who was paged,
 on which sink, when, what each answered; who called, who was rung, who
 answered. A call's keyed call-back number is kept as its last two digits
-(`keyed_last2`), as a text receipt keeps its number.
+(`keyed_last2`), as a text receipt keeps its number. **Nothing here waits on
+the gate agent**: the exception is written with the let-out, the answer goes,
+and the copy runs after it; a let-out whose exception cannot be written
+stands, the failure is logged by its case, and the sweep writes it from the
+record. **A copy is blanked past its window**: `tenant_settings.exception_copy_retention_days`
+(400 by default, the gate agent's own; 1 to 3650), by `npm run purge`, which
+says how many, nothing else; the exception and the rest stay.
 
 - `GET /api/v1/garages/:garageId/exceptions?day=YYYY-MM-DD` -- the garage's
   own local day (today when unnamed), oldest first, with `count` and
