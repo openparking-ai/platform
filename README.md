@@ -1290,7 +1290,7 @@ transient, transient with card on file."* Every close now names which
   customer has a seat; a test asserts nothing writes it.
 
 Before pricing, the close consults **`garage-pass`** (`access-in-store
---direction exit`) and **`monthly-billing`** (`covered-in-store --entered-at`)
+--direction exit --entered-at`) and **`monthly-billing`** (`covered-in-store --entered-at`)
 — each through its own command line, run as a subprocess with the environment
 this platform was given (`GARAGE_PASS_DSN`, `MONTHLY_BILLING_DSN` are theirs;
 `ENTITLEMENT_BIN_DIR` names where the scripts are, else the PATH). This platform
@@ -1665,11 +1665,16 @@ second open case:
   its reader, outside any transaction; a card being authorised on it, or
   Stripe out of reach, is `503 payment_unsettled` with nothing written, and
   the lane sends the case again;
-- if the old payment had already succeeded, the new case carries the fee it
-  paid and is settled `why: "paid"` (`paid_at_exit` names the old case, and
-  `payment` is that payment): **"I paid, the gate didn't open" -- the paid
-  stay opens.** The stay closes priced at what was paid. Nothing is charged
-  twice: one live or paid payment per stay;
+- if the old payment had already succeeded, the car paid and backed out
+  before the closing loop: **the same stay** (0048, below). The new case
+  prices the WHOLE stay again, credits everything the stay paid at its other
+  cases, and asks only the difference: `fee.fee_minor` is what this exit
+  asks for, `fee.stay_fee_minor` the whole stay, `fee.credit_minor` what it
+  paid. Not priced higher, it asks nothing and is settled `why: "paid"`
+  (`paid_at_exit` names the case whose payment paid it, and `payment` is
+  that payment) -- **"I paid, the gate didn't open": the paid stay opens.**
+  The stay closes at its whole price; its payments add up to it, each part
+  charged once;
 - the old case is closed with no close event and `ended: {why:
   "superseded", superseded_by}` on the lane's read; an `exit_superseded`
   event, and an `exit.superseded` change-log line by the lane computer,
@@ -1750,11 +1755,16 @@ touches a card number.
   `client_secret` for Stripe's Terminal SDK on the phone, with an
   `exit.payment_start` change-log line.
 
-**One payment per stay.** The intent is created with an idempotency key
-derived from the case, so a resend, a retry or a second attendant gets the
-same intent; a declined card is tried again on that intent, never a new one.
-A second case for the same stay cannot start a payment while the first is
-live or paid (`exit_payments_one_per_stay`, `409 stay_payment_elsewhere`).
+**One payment per case, one open per stay.** The intent is created with an
+idempotency key derived from the case, so a resend, a retry or a second
+attendant gets the same intent; a declined card is tried again on that intent,
+never a new one. A second case for the same stay cannot start a payment while
+the first is open (`exit_payments_one_open_per_stay`, `409
+stay_payment_elsewhere`). Once one has succeeded, a later case of the stay
+asks only the difference (0048): a payment is exactly what its case asks for,
+and what a stay paid and is paying never adds up to more than its whole fee
+(`exit_payments_within_stay_fee`, a trigger; `409 stay_paid_already` at the
+route, the intent just made canceled).
 
 **Paid is Stripe's word at the recorded amount.** While a payment is open,
 each `GET /api/v1/lane/exits/:exitId` reads the intent from Stripe, at most
@@ -1825,11 +1835,21 @@ at, by, why}` when a person decided.
   ended by then: it is ended as superseded at the new entry and the new
   visit gets its own stay, never folded into the old one. Within
   `REAPPROACH_MINUTES` it is one arrival -- a car backing out and coming in
-  again -- and the open answers the stay already open. An open whose entry is
+  again -- and the open answers the stay already open, **unless that stay
+  reached an exit lane by then** (0048): a car that has been at an exit has
+  been out, and its entry is a new stay however soon it comes. An open whose entry is
   **earlier** than a stay of the car already here is an earlier visit
   delivered late: it is stored already ended, superseded by the next. A car
   nobody could read (0036) is a vehicle of its own every time, so it never
-  supersedes another. Each superseded stay is a `stay_ended` event.
+  supersedes another. Each superseded stay is a `stay_ended` event. **The old
+  stay is closed completely** (0048): its open exit case is closed with it
+  (`ended: {why: "stay_ended", by: "lane_device:<entry computer>", by_session}`,
+  an `exit_stay_reentered` event and an `exit.closed_on_return` change-log
+  line), its unpaid payment canceled at Stripe first -- a card being
+  authorised, or Stripe out of reach, is `503 payment_unsettled` with nothing
+  written, and the lane sends the open again -- a paid one stays paid and the
+  old stay's `ended` says so (`paid: {exit_id, amount_minor, currency}`, with
+  `exit_cases`); a car a person let out keeps its exception on the old stay.
 - **A late close.** A close whose exit falls inside a stay that was ended
   (superseded or by a person) closes that stay after all: `ended` cleared,
   priced like any close, and an `ended_stay_closed` event. A close whose exit
@@ -1868,7 +1888,11 @@ at, by, why}` when a person decided.
   Stripe first, then the case is closed with `ended: {why: "stay_ended",
   by}`; a payment that succeeded stays paid, is never canceled, and the
   stay's `ended` carries it (`paid: {exit_id, amount_minor, currency}`,
-  with `exit_cases`). A card being authorised at that moment: `409
+  every payment of the stay summed, `exit_id` the latest, with
+  `exit_cases`). **The reads come first** (0048): the stay, `left_at` and
+  what it owes are read before anything is canceled at Stripe, so a refused
+  `left_at` or a rate engine that cannot answer fails the end with every
+  payment as it was. A card being authorised at that moment: `409
   payment_in_progress`, nothing changed; Stripe out of reach: `503
   payment_unsettled`. A validation held on the stay is handed to the
   release. A `stay_ended` event and a `stay.end` change-log line -- who and
@@ -1924,6 +1948,123 @@ partial open-stays index the ones still inside, so the count no longer reads
 the garage's whole history. `npm run occupancy-plan` builds a scratch
 database of 300,000 stays and prints the plan and the time before and after;
 0044 builds the index `CONCURRENTLY`, outside a transaction.
+
+### The exit's rules, and the exceptions (0048)
+
+The owner's rules of 2026-10-30/31, and the record he asked for.
+
+**Paid and left.** *"we have a closing loop. After that the car paid and
+left. If it backs out after paying, give credit and charge the additional
+part."* A stay is finished when the car crosses the closing loop after the
+gate (the close). A car that paid and backed out before it is the same stay,
+with no time limit: at its next exit the WHOLE stay is priced again, every
+payment the stay made at its other cases is credited, and only the
+difference is asked -- nothing when the price is not higher, never a
+negative figure. The case's quote keeps the whole stay's figures (what the
+close writes) with `credit: {paid_minor, payments}` and `due_minor` beside
+them; a quote not priced higher keeps the figures of the case whose payment
+paid it, and the new price as `repriced`. The lane reads `fee.fee_minor` as
+what to pay (the difference), `fee.stay_fee_minor` and `fee.credit_minor`
+beside it. A car let out owing the difference is let out unpaid owing it,
+with what it had paid (`let_out.paid_minor`).
+
+**A return is a new stay** -- for a transient car. *"when the car leaves.
+It's gone. When it comes back new time starts."* An entry after the stay
+reached an exit lane is never folded back into it (`REAPPROACH_MINUTES` is
+for a re-approach at the entry only); the old stay is closed completely --
+its case closed, its unpaid payment canceled at Stripe, a paid one kept paid
+on it -- and the new stay carries no time, fee, payment, let-out or case
+(above, "The same car again"). A car that never left -- backed off at the
+exit -- is still the same stay: its next case supersedes the old one.
+
+**A pass's visits are sessions of the pass.** *"Monthlies, garage passes are
+different. 'new session' type."* Each in and out of a pass holder is its own
+stay -- a session of the pass -- asked about at its own exit with its own entry
+(`--entered-at`, to both modules), so the pass's own rules (its days, its
+hours, a car replaced on it) are judged per session and nothing carries from
+one to the next: a session the pass does not cover is priced from its own
+entry. The pass a session belonged to is kept on it (`sessions.pass_session`:
+`{module, pass_id, covered, reason, covering_term}`, or the monthly agreement
+that covered it) and the past stays carry it as `pass: {module, pass_id,
+covered}`.
+
+**A car a QR let in.** The lane's open may carry `qr: {enrolment, passed_by,
+qr_plate}` (lane-controller's contract: a registration QR the pass module
+passed `same_plate`, `look_alike`, `one_difference` or `nothing_read`), each
+key only when the module answered it; it is kept on the stay
+(`sessions.entry_qr`), checked to its shape (`400` otherwise; a key this
+build does not know is left on the lane). At the exit garage-pass is asked
+**by the QR's plate** (`asked_as: "qr_plate"` on the record), so a car let in
+on one difference or with nothing read is covered as the pass it is; monthly
+billing is asked by the plate as read, or not at all with none. Garage-pass
+has no verb to ask by an enrolment id: the id and how it passed are kept on
+the stay and on its `pass_session`. The purge takes `qr_plate` with the
+vehicle.
+
+**The exceptions.** *"record it as exceptions and add as much information as
+we can. what happened, who did what, gate agent sent messages times, who
+received, etc."* Whenever a person lets a car out -- an attendant's let-out,
+or a close naming the case with `let_out_by`, or a case that closes owing --
+one record per exit case is written in the same transaction: `kind`
+`let_out_unpaid` (it still owed) or `barrier_opened` (a person opened for a
+car that owed nothing more); the garage, lane, stay and case; who pressed it
+(the change log's name for the key or owner, or the lane computer and its
+name) and when; the reason typed; the authority the lane named; what it owed
+and what the stay had paid; and, as it stood at that moment (`story`), the
+case as the lane read it, the stay (never its plate), every payment of the
+stay -- states, times, Stripe's codes, the intent id, never card data -- and
+the lane's events from the window's start, a lane's own detail cut to its
+codes (the reader's refusals of a case's payment among them: each is kept as
+an `exit_reader_refused` event at the lane, `{exit_id, code}`, when the
+lane's pay is refused `reader_offline`, `reader_busy` or `no_reader_bound`).
+Stripe's declines are as the payment last recorded them (`last_failure`): the
+platform keeps the latest, not each. Appended after, never edited: the case's payment once the let-out
+canceled it, the platform's events at the lane to the window's end, and **the
+gate agent's messages and calls for the lane** over [case opened - 15 min,
+let-out + 15 min], copied with their own ids and revisions -- who was paged,
+on which sink, when, what each answered; who called, who was rung, who
+answered. A call's keyed call-back number is kept as its last two digits
+(`keyed_last2`), as a text receipt keeps its number.
+
+- `GET /api/v1/garages/:garageId/exceptions?day=YYYY-MM-DD` -- the garage's
+  own local day (today when unnamed), oldest first, with `count` and
+  `let_out_unpaid`; `GET /api/v1/garages/:garageId/exceptions/:exceptionId`
+  -- one record's whole story, `payment_after_let_out`, `lane_events_after`
+  and each copy of the gate agent's records under `gate_agent: {messages,
+  calls}`, copied or saying why not. Through the garage only: another
+  account's or garage's is `404 exception_not_found`. The reconciliation
+  report counts them (`exceptions: {since, let_out_unpaid, barrier_opened,
+  total}`). Permissions, for a platform with linked accounts (#78): both are
+  `stays:read`.
+- **Where the gate agent is** is the deployment's: `GATE_AGENTS_FILE` names a
+  JSON file on this server, re-read at each copy --
+  `{"garages": {"<garage id>": {"monitor": {"url", "token_file"}, "agent":
+  {"url", "token_file"}, "lanes": {"<lane id>": {"monitor_lane",
+  "agent_lane"}}}}}`. `monitor_lane` is the lane's own `lane_id` as it
+  publishes it on `GET /v1/lane`; `agent_lane` is the agent's own
+  `[lanes.<name>]`, which is not the lane's id -- the site maps each platform
+  lane to both, once, here. A URL is http or https with no user, query or
+  fragment; off loopback it must be https and name a token file. A token is
+  read from its file at each request and never logged; a redirect is never
+  followed; each request has 3 seconds, an answer at most 4 MiB, at most 10
+  pages of 500. Unset, or a garage or lane not named, is `not_configured`; no
+  answer is `not_reachable`; a refusal or an answer this build cannot read is
+  `refused`, each with a sentence. **Never in the let-out's way**: the car is
+  out first.
+- **`npm run complete-exceptions`**, on a schedule (every few minutes): once
+  an exception's window has passed it copies the gate agent's whole window
+  again (`complete: true`) and the lane's events after the let-out; an
+  unreachable gate agent is asked again, at most 6 times, until 24 hours
+  after the window; a let-out whose own write of its exception failed gets
+  one from the record (`story.recovered`). One tenant at a time; counts only.
+- Written once and appended to, never updated or deleted (no grant); forced
+  under row-level security; an exception names its own case's lane and stay
+  (a trigger).
+
+`test/exit-rules.test.js`, `test/exceptions.test.js` and
+`test/pass-sessions.test.js` (the real garage-pass, at `garage-pass.pin`)
+hold each; `npm run exit-rules-fail-control` breaks each in turn and requires
+the named test red.
 
 ### The inventory walk (0040)
 

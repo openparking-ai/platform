@@ -174,6 +174,23 @@ pictures are not deleted. Taken off the list, both rules apply again as to any o
 its confidence) is personal data like a plate: the purge nulls it with the stay's descriptors, on the sessions of
 every vehicle it redacts.
 
+**Added with migration 0048:** a stay a registration QR let in keeps the QR
+(`sessions.entry_qr`: its id, how the pass module passed it, and the plate it
+was made for). The plate is personal data like any plate: the purge removes
+`qr_plate` on the sessions of every vehicle it redacts and keeps the QR's id
+and how it passed. `sessions.pass_session` names the pass a stay was a session
+of by the pass module's id, not a person or a car; it is kept.
+
+The exceptions (`exceptions`, `exception_records`) hold no plate: a stay by its
+id, a lane event's detail cut to its codes. They are the record of a car let
+out and are kept like the change log -- written once, never edited, outside the
+purge. What they copy from the gate agent names people's addresses as the
+gate agent keeps them -- the email addresses a message went to, the SIP
+addresses a call rang and was answered from -- because who received is the
+question the record answers; a call-back number a person keyed, a driver's
+phone, is kept as its last two digits only. **Recorded as kept, with no
+window yet.**
+
 ## What is never redacted
 
 - **Enrolled vehicles**, while enrolled.
