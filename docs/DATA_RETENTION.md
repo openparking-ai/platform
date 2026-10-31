@@ -37,6 +37,7 @@ everything identifying is replaced:
 ```
 plate         -> 'redacted:<row id>'   (keeps the unique index satisfied, carries nothing)
 ticket_ref    -> 'redacted:<row id>'   (the same, for a stay identified by a ticket)
+unread_ref    -> 'redacted:<row id>'   (the same, for a car whose plate nobody could read)
 plate_region  -> NULL
 make          -> NULL
 model         -> NULL
@@ -57,6 +58,15 @@ constraint and fail the whole purge, and filling neither would leave the ticket
 as the one identity retention could not remove. `test/retention.test.js` asserts
 the redaction and carries the control that a ticket inside the window is left
 alone.
+
+**Added with migration 0036:** a car the lane's loops saw go in and whose plate
+nobody could read is a stay too, and its vehicle carries neither a plate nor a
+ticket but `unread_ref` -- the lane's event id of that stay's open, one row per
+unread car. It is not a plate and names no person, but it is the key of a car's
+stay, so it is redacted the same way, on the same window, in the same statement,
+and the row keeps exactly one identity. What was measured of the car -- make,
+model, colour -- goes as it does for a plate. `test/unread-identity.test.js`
+asserts it.
 
 **Added with migration 0008:** the same constraint also refuses an identity that
 is an EMPTY STRING in either column. `'' IS NULL` is false, so 0007's XOR alone
@@ -136,17 +146,54 @@ documents and nothing about a person or a car. The purge does not touch it, and
 which the purge redacted a vehicle. The `rate_plan_stored` event beside it names
 an operator token, not a person, and is append-only like every event.
 
-## Pictures kept with an entry (U7f, 0033)
+## Pictures: the lane's (U7f, 0033) and the walk's (0040)
 
-A lane sends the pictures it took between the vend and the closing loop, and at the closing loop. They are personal
-data on the same terms as the plate. They are **deleted**, not redacted: one week after the stay that holds them
-closed, or one week after they were taken when no stay holds them (a tailgater nobody identified, a banned car
-refused at the entry). A car still inside keeps its pictures. `npm run purge` runs both rules.
+A lane sends the pictures it took of the car at its arming read (since 0036), between the vend and the closing loop,
+and at the closing loop; a person on an inventory walk photographs the parked cars. Both are personal data on the
+same terms as the plate. A lane picture is **deleted**; a walk picture is forgotten and its sighting keeps what was
+read. Both go **30 days** after they were taken, a day being 24 hours. The owner set 30 days on 2026-10-26; it was one
+week.
+
+**A stay keeps the pictures it holds** -- the lane's of its entry, and the walk's a finished walk listed as seeing
+it -- while the car is inside, then for 30 days after it left (by the exit or a person's ending), and while its
+customer has paid picture storage (`sessions.pictures_paid_until`, 0041; nothing writes it yet). A walk past the
+retention window is kept while one of its pictures is -- but **not the other cars' plates** (0046): past the window
+the purge blanks the plate, the positioned characters and the readers' plates of every sighting whose picture is
+gone (or that never had one), and every plate in the walk's four lists but the `seen_with_stay` row of the stay
+whose picture keeps the walk. What was read, who read it, the rows and the stay ids stay; again on each run, as more
+pictures go. The freeze triggers on a closed walk allow exactly that blanking and nothing else.
+
+The job is `npm run purge-pictures` (`npm run purge` runs it first), one tenant at a time under that tenant's row
+security; it prints counts only. `test/picture-retention.test.js` holds each rule, and
+`scripts/picture-retention-fail-control.js` breaks each one.
 
 **A car on a banned list is held:** while it is listed, its vehicle is not redacted by the window above and its
 pictures are not deleted. Taken off the list, both rules apply again as to any other car.
 
-The arming loop's pictures are not stored anywhere, and nothing here touches them.
+**What was read of an unread car's plate** below the lane's confidence (0036, `sessions.entry_unsure_plate` and
+its confidence) is personal data like a plate: the purge nulls it with the stay's descriptors, on the sessions of
+every vehicle it redacts.
+
+**Added with migration 0048:** a stay a registration QR let in keeps the QR
+(`sessions.entry_qr`: its id, how the pass module passed it, and the plate it
+was made for). The plate is personal data like any plate: the purge removes
+`qr_plate` on the sessions of every vehicle it redacts and keeps the QR's id
+and how it passed. `sessions.pass_session` names the pass a stay was a session
+of by the pass module's id, not a person or a car; it is kept.
+
+The exceptions (`exceptions`, `exception_records`) hold no plate: a stay by its
+id, a lane event's detail cut to its codes. They are the record of a car let
+out and are kept like the change log -- written once, never edited, outside the
+purge. What they copy from the gate agent names people's addresses as the
+gate agent keeps them -- the email addresses a message went to, the SIP
+addresses a call rang and was answered from -- because who received is the
+question the record answers; a call-back number a person keyed, a driver's
+phone, is kept as its last two digits only. Those copies are **blanked**
+once older than the account's `tenant_settings.exception_copy_retention_days`
+-- 400 days by default, the gate agent's own, 1 to 3650 -- by the retention
+purge (`npm run purge`), counts only: `records` emptied, `purged_at` set, the
+only change an appended record takes. The exception row stays, with the
+change log's rules.
 
 ## What is never redacted
 

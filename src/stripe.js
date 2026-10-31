@@ -65,10 +65,11 @@ export class StripeUnreachable extends Error {}
  * `account` sets the `Stripe-Account` header: the call acts ON that connected
  * account (a direct charge, and its device resources, belong to it).
  * `idempotencyKey` makes a retried create return the first result instead of
- * making a second object.
+ * making a second object. `timeoutMs` bounds the wait (30 s unless a caller
+ * that must not hold anything up says less); past it, Stripe was not reached.
  */
 export async function stripeCall(
-  { method, path, form, account, idempotencyKey },
+  { method, path, form, account, idempotencyKey, timeoutMs = 30_000 },
   config = connectConfig(),
 ) {
   if (!config.key) throw new StripeUnreachable('no Stripe key is configured');
@@ -87,7 +88,7 @@ export async function stripeCall(
 
   let res;
   try {
-    res = await fetch(`${config.base}${path}`, { method, headers, body, signal: AbortSignal.timeout(30_000) });
+    res = await fetch(`${config.base}${path}`, { method, headers, body, signal: AbortSignal.timeout(timeoutMs) });
   } catch (err) {
     throw new StripeUnreachable(`Stripe could not be reached: ${err.message}`);
   }

@@ -241,6 +241,8 @@ test('no amount travels to either module: the argv carries an identity, a garage
     garage_pass: [
       'access-in-store', '--tenant', modules.garage_pass.tenant, '--garage', w.gpGarage,
       '--vehicle', w.passCar, '--lane', w.exitLane, '--direction', 'exit', '--at', '2026-09-10T14:00:00.000Z',
+      // Each visit is a session of the pass, judged with its own entry (0048).
+      '--entered-at', '2026-09-10T12:00:00.000Z',
     ],
     monthly_billing: [
       'covered-in-store', '--tenant', modules.monthly_billing.tenant, '--garage', w.mbGarage,

@@ -13,6 +13,10 @@
  * copy of `migrations/` with the statement edited out -- a rule held only by
  * the code is a rule one direct INSERT goes around -- and the suite runs
  * against it. Needs the same environment as the suite.
+ *
+ * `invite_counts_hours` is caught on any day and on any database, UTC
+ * included: the suite runs its connections in a zone whose clocks change in
+ * the coming week, so 168 hours and seven calendar days always differ there.
  */
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -27,9 +31,20 @@ const LINKS = ['test/account-links.test.js'];
 const OUTPUT = ['test/account-links-output.test.js'];
 const COVERAGE = ['test/rls-coverage.test.js'];
 const MIGRATION = '0032_operator_invites_and_password_resets.sql';
-
 const BREAKS = [
   // --- check 1: the invite, end to end
+  {
+    name: 'invite_lasts_six_days',
+    why: 'an invite lasts six days, not seven',
+    suite: LINKS,
+    edits: [{ file: 'src/invites.js', from: 'now() + make_interval(days => $5)) RETURNING expires_at', to: 'now() + make_interval(days => $5 - 1)) RETURNING expires_at' }],
+  },
+  {
+    name: 'invite_counts_hours',
+    why: 'an invite lasts 168 hours, not seven days on the calendar',
+    suite: LINKS,
+    edits: [{ file: 'src/invites.js', from: 'now() + make_interval(days => $5)) RETURNING expires_at', to: 'now() + make_interval(hours => $5 * 24)) RETURNING expires_at' }],
+  },
   {
     name: 'old_link_accepts_after_resend',
     why: 'a replaced invite still reads as ready, so the old link accepts after a resend',

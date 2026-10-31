@@ -13,6 +13,76 @@
 
 export const TENANT_TABLES = [
   {
+    table: 'exits',
+    // A car at an exit that found no stay (0037): each its own event id.
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+         VALUES ($1, $2, $3, 'tt' || replace(gen_random_uuid()::text, '-', ''), now(), 'none')
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    // The record of why a car was let out: updated as it settles, never deleted.
+    noDelete: true,
+  },
+  {
+    table: 'exit_payments',
+    // A payment started at a phone reader (0038) for a case of its own.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH e AS (
+           INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+           VALUES ($1, $2, $3, 'tp' || replace(gen_random_uuid()::text, '-', ''), now(), 'none') RETURNING id)
+         INSERT INTO exit_payments (tenant_id, garage_id, exit_id, channel, account_id, payment_intent_id, amount_minor, currency, started_by)
+         SELECT $1, $2, e.id, 'phone_reader', 'acct_tt', 'pi_tt' || replace(gen_random_uuid()::text, '-', ''), 500, 'usd', 'test' FROM e
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    // The record of money taken: never deleted.
+    noDelete: true,
+  },
+  {
+    table: 'exceptions',
+    // A car a person let out (0048), about a case of its own at that case's lane.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH e AS (
+           INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+           VALUES ($1, $2, $3, 'tx' || replace(gen_random_uuid()::text, '-', ''), now(), 'none') RETURNING id)
+         INSERT INTO exceptions (tenant_id, garage_id, lane_id, exit_id, kind, source, done_by, let_out_at, case_opened_at,
+                                 window_from, window_to, story)
+         SELECT $1, $2, $3, e.id, 'let_out_unpaid', 'attendant', 'test', now(), now(),
+                now() - interval '15 minutes', now() + interval '15 minutes', '{}'::jsonb FROM e
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    // The record of what happened: written once, never edited or deleted.
+    appendOnly: true,
+  },
+  {
+    table: 'exception_records',
+    // What was learned after a let-out (0048), appended to an exception of its own.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH e AS (
+           INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+           VALUES ($1, $2, $3, 'tr' || replace(gen_random_uuid()::text, '-', ''), now(), 'none') RETURNING id),
+         x AS (
+           INSERT INTO exceptions (tenant_id, garage_id, lane_id, exit_id, kind, source, done_by, let_out_at, case_opened_at,
+                                   window_from, window_to, story)
+           SELECT $1, $2, $3, e.id, 'barrier_opened', 'lane', 'test', now(), now(),
+                  now() - interval '15 minutes', now() + interval '15 minutes', '{}'::jsonb FROM e
+           RETURNING id)
+         INSERT INTO exception_records (tenant_id, exception_id, source, state, detail)
+         SELECT $1, x.id, 'gate_agent_messages', 'not_configured', 'gate agent not configured: test' FROM x
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    // Appended to and never deleted; a gate-agent copy is blanked by the
+    // retention purge and changes in no other way (its trigger).
+    noDelete: true,
+  },
+  {
     table: 'entry_pictures',
     // A picture kept with an entry (0033): each its own picture_ref, so rows
     // collide with nothing but a policy.
@@ -385,6 +455,53 @@ export const TENANT_TABLES = [
          RETURNING id`,
         [t, w.garage, w.entryLane],
       ),
+  },
+  {
+    table: 'walks',
+    // A person has one open walk at a garage, so each row is another person's.
+    insert: (c, t, w) =>
+      c.query(`INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, 'key:' || gen_random_uuid()) RETURNING id`, [t, w.garage]),
+  },
+  {
+    table: 'walk_sightings',
+    // A walk of its own and a typed plate on it.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH k AS (
+           INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, 'key:' || gen_random_uuid()) RETURNING id
+         )
+         INSERT INTO walk_sightings (tenant_id, walk_id, read, plate, taken_at, added_by)
+         SELECT $1, k.id, 'typed', 'ROW1', now(), 'key:row' FROM k
+         RETURNING id`,
+        [t, w.garage],
+      ),
+    // Changed only by a pick, an answer or a picture forgotten; it goes with its walk -- the grant has no DELETE.
+    noDelete: true,
+  },
+  {
+    table: 'walk_stays',
+    // A walk of its own listing a stay of its own, as its finish does just before the walk is closed.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH k AS (
+           INSERT INTO walks (tenant_id, garage_id, started_by)
+           VALUES ($1, $2, 'key:' || gen_random_uuid()) RETURNING id
+         ), v AS (
+           INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'WK-' || gen_random_uuid()) RETURNING id
+         ), s AS (
+           INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                                 open_event_id, entry_confirmation)
+           SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD', gen_random_uuid()::text, 'confirmed' FROM v
+           RETURNING id
+         )
+         INSERT INTO walk_stays (tenant_id, walk_id, session_id, list)
+         SELECT $1, k.id, s.id, 'seen' FROM k, s
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+    // Written once at the finish and deleted with its walk: no UPDATE and no DELETE grant.
+    writeOnce: true,
+    noDelete: true,
   },
   {
     table: 'lane_devices',

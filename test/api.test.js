@@ -780,10 +780,14 @@ test('an event kind no lane emits is refused, and the refusal names it', async (
 test('every kind this platform publishes is a kind it accepts', async () => {
   // Derived from the exported set rather than from a list written here: a list
   // typed into a test cannot notice anything added to the thing it covers.
+  // A lane's qr_presented is accepted only as a QR it could not present, so
+  // it carries that detail (test/lane-qr.test.js holds the refusal of any other).
+  const detailFor = { qr_presented: { answered: false } };
   const events = LANE_EVENT_KINDS.map((kind) => ({
     event_id: randomUUID(),
     kind,
     occurred_at: new Date().toISOString(),
+    ...(detailFor[kind] ? { detail: detailFor[kind] } : {}),
   }));
   const res = await fetch(`${base}/api/v1/lane/events`, asDevice(entryToken, { events }));
   assert.equal(res.status, 202);

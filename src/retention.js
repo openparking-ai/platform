@@ -20,6 +20,8 @@
  * would violate the constraint and fail the whole purge; writing it into
  * neither would leave a ticket — which a person read out loud and which
  * identifies a stay — as the one piece of identity retention could not remove.
+ * A car whose plate nobody could read (0036) carries `unread_ref`, the key of
+ * its one stay, and it is redacted the same way, so the row keeps its shape.
  *
  * A SHADOW SEARCH (migration 0011) ages out with the stay it shadowed: the
  * row's session references -- `session_id`, `candidate_ids`, `matched_ids` --
@@ -41,6 +43,15 @@
  * plate is. Both are nulled on every session of every vehicle this run
  * redacts, and on no other: the session keeps its times and its fee, exactly
  * as before.
+ *
+ * An INVENTORY WALK (0040) holds plates a person photographed or typed: it
+ * is deleted, with its sightings and the stays it listed, once it finished,
+ * was abandoned, or (neither) started longer ago than the window, and none
+ * of its pictures is still kept. Its pictures, and the lane's, go by their
+ * own rule, in the picture job (src/pictureRetention.js). One kept picture
+ * keeps the walk, but not the other cars' plates (0046): past the window,
+ * the plate of every sighting whose picture is gone is blanked, and every
+ * plate in its lists but the row of the stay that keeps the picture.
  */
 import { withTenant } from './db.js';
 import * as repo from './repository.js';
@@ -85,6 +96,8 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
                                   ELSE 'redacted:' || v.id END,
               ticket_ref   = CASE WHEN v.ticket_ref IS NULL THEN NULL
                                   ELSE 'redacted:' || v.id END,
+              unread_ref   = CASE WHEN v.unread_ref IS NULL THEN NULL
+                                  ELSE 'redacted:' || v.id END,
               plate_region = NULL,
               make         = NULL,
               model        = NULL,
@@ -106,6 +119,35 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
             AND vehicle_id = ANY($2::uuid[])`,
         [tenantId, rows.map((r) => r.id)],
       );
+      // The plate a registration QR was made for (0048): a plate, so it goes
+      // with the vehicle; the QR's id and how it passed stay on the stay.
+      await client.query(
+        `UPDATE sessions SET entry_qr = NULLIF(entry_qr - 'qr_plate', '{}'::jsonb)
+          WHERE tenant_id = $1 AND entry_qr ? 'qr_plate' AND vehicle_id = ANY($2::uuid[])`,
+        [tenantId, rows.map((r) => r.id)],
+      );
+      // What was read of an unread car's plate below the lane's confidence
+      // (0036): a plate's text, so it goes with the descriptors.
+      await client.query(
+        `UPDATE sessions SET entry_unsure_plate = NULL, entry_unsure_plate_confidence = NULL
+          WHERE tenant_id = $1 AND entry_unsure_plate IS NOT NULL AND vehicle_id = ANY($2::uuid[])`,
+        [tenantId, rows.map((r) => r.id)],
+      );
+      // The ID the exit matched by (0037): plate characters, colour, size --
+      // on the stay, and on every exit case that found it.
+      await client.query(
+        `UPDATE sessions SET entry_plate_state = NULL, entry_plate_rule = NULL, entry_plate_pattern = NULL,
+                             entry_colour_code = NULL, entry_size = NULL
+          WHERE tenant_id = $1 AND vehicle_id = ANY($2::uuid[])
+            AND (entry_plate_state IS NOT NULL OR entry_colour_code IS NOT NULL OR entry_size IS NOT NULL)`,
+        [tenantId, rows.map((r) => r.id)],
+      );
+      await client.query(
+        `UPDATE exits SET plate_state = NULL, plate_rule = NULL, plate_pattern = NULL, colour_code = NULL, size = NULL
+          WHERE tenant_id = $1
+            AND session_id IN (SELECT s.id FROM sessions s WHERE s.tenant_id = $1 AND s.vehicle_id = ANY($2::uuid[]))`,
+        [tenantId, rows.map((r) => r.id)],
+      );
       // The entitlement record (0015) names the identity the modules were
       // asked about, inside the argv and their answers. Nulled with the
       // descriptors; `exit_outcome` stays -- the outcome survives, who it was
@@ -113,6 +155,13 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
       await client.query(
         `UPDATE sessions SET entitlement = NULL
           WHERE tenant_id = $1 AND entitlement IS NOT NULL AND vehicle_id = ANY($2::uuid[])`,
+        [tenantId, rows.map((r) => r.id)],
+      );
+      // The same record on a stay a person ended (0043, `ended.owed`): out
+      // with the vehicle, what it owed kept.
+      await client.query(
+        `UPDATE sessions SET ended = ended #- '{owed,entitlement}'
+          WHERE tenant_id = $1 AND vehicle_id = ANY($2::uuid[]) AND ended->'owed' ? 'entitlement'`,
         [tenantId, rows.map((r) => r.id)],
       );
       // The shadow rows about those vehicles' stays: references out, figure kept.
@@ -125,7 +174,69 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
         [tenantId, rows.map((r) => r.id), now],
       );
     }
-    return { tenantId, retentionDays: days, redacted: rows.length, wouldRedact: rows.length };
+    // An exit case that found no stay (the driver's word, or a person) has no
+    // vehicle to age out with: its ID goes when the window has passed since
+    // the car left.
+    await client.query(
+      `UPDATE exits SET plate_state = NULL, plate_rule = NULL, plate_pattern = NULL, colour_code = NULL, size = NULL
+        WHERE tenant_id = $1 AND session_id IS NULL
+          AND (plate_state IS NOT NULL OR colour_code IS NOT NULL OR size IS NOT NULL)
+          AND COALESCE(closed_at, exit_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,
+      [tenantId, now, days],
+    );
+    // A walk one of whose pictures is still kept (src/pictureRetention.js)
+    // waits for it: deleting the walk would take the picture with it.
+    const { rowCount: walks } = await client.query(
+      `DELETE FROM walks w
+        WHERE w.tenant_id = $1
+          AND COALESCE(w.finished_at, w.abandoned_at, w.started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)
+          AND NOT EXISTS (
+                SELECT 1 FROM walk_sightings ws
+                 WHERE ws.tenant_id = w.tenant_id AND ws.walk_id = w.id AND ws.picture IS NOT NULL)`,
+      [tenantId, now, days],
+    );
+    // A walk still there past the window waits for a picture a stay keeps
+    // (0046): every other car's plate goes. A sighting whose picture is gone
+    // -- or that never had one -- has its plate, its characters and the
+    // readers' plates blanked, once; the plates in its lists are set to null
+    // but in the `seen_with_stay` rows that hold a kept picture. Again on a
+    // later run, as more pictures go.
+    const { rowCount: sightingsBlanked } = await client.query(
+      `UPDATE walk_sightings ws
+          SET plate = NULL, plate_state = NULL, plate_rule = NULL, plate_pattern = NULL,
+              readers = walk_readers_blanked(ws.readers), plate_blanked_at = COALESCE($2::timestamptz, now())
+         FROM walks w
+        WHERE ws.tenant_id = $1 AND w.tenant_id = ws.tenant_id AND w.id = ws.walk_id
+          AND ws.picture IS NULL AND ws.plate_blanked_at IS NULL
+          AND (ws.plate IS NOT NULL OR ws.plate_pattern IS NOT NULL OR ws.readers <> walk_readers_blanked(ws.readers))
+          AND COALESCE(w.finished_at, w.abandoned_at, w.started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)`,
+      [tenantId, now, days],
+    );
+    const { rowCount: listsBlanked } = await client.query(
+      `WITH due AS (
+         SELECT w.id, w.lists,
+                ARRAY(SELECT (e.row->>'stay')::uuid
+                        FROM jsonb_array_elements(w.lists->'seen_with_stay') AS e(row)
+                       WHERE EXISTS (
+                               SELECT 1 FROM walk_sightings ws
+                                WHERE ws.tenant_id = w.tenant_id AND ws.walk_id = w.id AND ws.picture IS NOT NULL
+                                  AND (e.row->'sightings' ? ws.id::text
+                                       OR EXISTS (SELECT 1 FROM walk_sightings a
+                                                   WHERE a.tenant_id = ws.tenant_id AND a.walk_id = ws.walk_id AND a.confirms = ws.id
+                                                     AND e.row->'sightings' ? a.id::text)))) AS keep
+           FROM walks w
+          WHERE w.tenant_id = $1 AND jsonb_typeof(w.lists) = 'object'
+            AND COALESCE(w.finished_at, w.abandoned_at, w.started_at) < COALESCE($2::timestamptz, now()) - make_interval(days => $3)
+       )
+       UPDATE walks w SET lists = walk_lists_blanked(d.lists, d.keep)
+         FROM due d
+        WHERE w.tenant_id = $1 AND w.id = d.id AND w.lists IS DISTINCT FROM walk_lists_blanked(d.lists, d.keep)`,
+      [tenantId, now, days],
+    );
+    return {
+      tenantId, retentionDays: days, redacted: rows.length, wouldRedact: rows.length, walksDeleted: walks,
+      walkSightingsBlanked: sightingsBlanked, walkListsBlanked: listsBlanked,
+    };
   });
 }
 

@@ -18,6 +18,7 @@ import * as ratePlans from './ratePlans.js';
 import * as repo from './repository.js';
 import { validationDelta } from './validations.js';
 import { taxDelta } from './taxes.js';
+import { countSince as exceptionsSince } from './exceptions.js';
 
 /**
  * The fee the ENGINE's quote came to on a row: the row's fee less its
@@ -423,6 +424,9 @@ export async function reconcile(client, tenantId, garageId, { since, maxHours })
     },
     lane_decisions: await laneDecidedCloses(client, tenantId, garageId, since),
     lane_decisions_unchecked: await repo.uncheckedLaneDecisionCount(client, tenantId, garageId),
+    // The cars people let out and the barriers they opened in the window
+    // (0048): `GET /garages/:garageId/exceptions` lists each, day by day.
+    exceptions: await exceptionsSince(client, tenantId, garageId, since),
     vehicles_counted_out: VEHICLES_COUNTED_OUT_UNAVAILABLE,
   };
 }

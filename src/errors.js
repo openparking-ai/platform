@@ -15,5 +15,8 @@ export class HttpError extends Error {
     // with a code. The plan store attaches the engine's findings here: a list
     // an operator works through is data, not a sentence.
     this.details = null;
+    // Whole seconds a caller is asked to wait before trying again: sent as
+    // `Retry-After` beside a 429 or a 503, and nowhere else.
+    this.retryAfter = null;
   }
 }

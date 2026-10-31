@@ -153,6 +153,18 @@ jobs:
       - name: Retention purge runs clean on a fresh database
         run: npm run purge
 
+      - name: Picture job runs clean and says counts only
+        run: |
+          line="$(npm run -s purge-pictures)"
+          echo "$line"
+          echo "$line" | grep -Eqx 'pictures: [0-9]+ tenant\(s\); removed [0-9]+ lane picture\(s\) and [0-9]+ walk picture\(s\)\.'
+
+      - name: The exceptions' sweep runs clean on a fresh database
+        run: |
+          line="$(npm run -s complete-exceptions)"
+          echo "$line"
+          echo "$line" | grep -Eqx 'exceptions: [0-9]+ tenant\(s\); [0-9]+ written from the record, [0-9]+ finished, 0 tenant\(s\) left for the next run\.'
+
       - name: RLS fail-control
         # Proves the isolation suite actually measures isolation, by requiring
         # it to FAIL against a scratch database with RLS stripped out.
@@ -201,6 +213,95 @@ jobs:
         # `migrations/` with one constraint edited out, because a rule enforced
         # only at a route is a rule one direct INSERT goes around.
         run: npm run ticket-identity-fail-control
+
+      - name: Unread-identity fail-control
+        # A car whose plate nobody could read is a stay too (0036). Each break
+        # removes one property that makes that safe -- the open reading it,
+        # one vehicle per unread car, alone and only `true`, the purge, the
+        # candidate set's name for it, the count of cars inside and the lane's
+        # feed counting it, an unread car never ban-listed, `no_open_command`
+        # stored, what was read below the confidence kept and purged and never
+        # beside a plate, the open's event id a UUID, and the two halves of
+        # 0036's constraint -- and requires test/unread-identity.test.js to go
+        # red with at least one of its tests still green.
+        run: npm run unread-identity-fail-control
+
+      - name: Exit-case fail-control
+        # The car at an exit, found by its ID (0037). Each break removes one
+        # property the exit rests on -- the matcher's exclusions (a differing
+        # sure character, colour or size, unreadable against read), folding,
+        # a clear winner, the picker sent pictures only, within a limit, once,
+        # never with a car hidden, its answer one number; the driver's word
+        # bounded and once; the gate settled only at zero, covered or by a
+        # named person; the close writing the case's fee; the entry's ID kept
+        # and purged -- and two halves of 0037's constraints, and requires
+        # test/exit-match.test.js and test/exits.test.js to go red.
+        run: npm run exits-fail-control
+
+      - name: Exit-payments fail-control
+        # Paying at the exit (0038). Each break removes one property the
+        # payment rests on -- the intent the case's fee, in person, captured
+        # at once, on the garage's account, one per case by its idempotency
+        # key; paid only at the recorded amount; the reader's refusals named
+        # and a timeout never a failure; only this lane's reader; a person's
+        # letting out canceling the intent; the poll reading Stripe; a text
+        # receipt once, paid, US and Canada only, the number not kept -- and
+        # three of 0038's guards, and requires test/exit-payments.test.js to
+        # go red.
+        run: npm run exit-payments-fail-control
+
+      - name: Exit-let-out fail-control
+        # Canceling an exit's payment, and a car a person let out (0042).
+        # Each break removes one property -- the cancel canceling the intent
+        # at Stripe with its idempotency key, never a paid one, never under a
+        # card being authorised, the reader cleared only while it shows the
+        # case's intent, a canceled payment never taken again; the close
+        # canceling first and writing the stay let out unpaid, never at the
+        # quoted fee, with the lane computer named and the line in the change
+        # log once; the past stays saying so; a driver's time with its
+        # offset; each route only its own garage and lane -- and three of
+        # 0042's guards, and requires test/exit-let-out.test.js to go red.
+        run: npm run exit-let-out-fail-control
+
+      - name: Stay-endings fail-control
+        # A stay no exit closed (0039). Each break removes one property the
+        # ending rests on -- the same car again later superseding its old stay
+        # unpriced, within one arrival the same stay, an earlier entry stored
+        # ended, an unread car never superseding; the count at the car's own
+        # entry; a late close finding the stay it ended; the clocks apart on
+        # a close; the named 404s; the stuck list; a person ending a stay
+        # once, with a reason, not at an exit, not another garage's, the
+        # held validation released and the change logged -- and three of
+        # 0039's guards, and requires test/stay-endings.test.js to go red.
+        run: npm run stay-endings-fail-control
+
+      - name: Inventory walks fail-control
+        # Breaks the inventory walk (0040) one property at a time -- the cap
+        # on open walks, a walk reached only through its garage, a typed plate
+        # confirmed and folded, a picture written fresh, opened, taken whole
+        # and read by a named reader, an empty plate from it, the reader off
+        # or down, a sighting sent again (by client_ref or by its picture)
+        # kept and read once, the rate limit, a typed answer that does not say
+        # so, the candidates and the pick, an answered sighting leaving the
+        # lists, the four lists and the finish frozen, the stuck list reading
+        # the latest walk of its own garage that saw at least the garage's
+        # threshold of it (exactly the threshold included), "walk incomplete
+        # (N%)" said otherwise, the reason `not_seen_on_walk`, retention,
+        # a line naming no plate -- and eleven of 0040's guards, among them a
+        # closed walk frozen for the app role, and requires test/walks.test.js
+        # to go red.
+        run: npm run walks-fail-control
+
+      - name: Garage clean-up fail-control
+        # Breaks 17 properties of the clean-up (0043) -- the garage's own age
+        # for the stuck list, the walk's stays on it, each stay's pictures
+        # served through its own stay and garage only, an ended stay owing
+        # what its exit would have charged when the car left and an abandoned
+        # one nothing, the past stays saying so, a reason on one line, a
+        # change-log line with what the stay was and became and no plate --
+        # and six of 0043's guards, and requires test/stay-cleanup.test.js to
+        # go red.
+        run: npm run stay-cleanup-fail-control
 
       - name: Descriptor fail-control
         # A session carries the appearance descriptor its entry read produced
@@ -315,6 +416,16 @@ jobs:
         # and requires test/bans.test.js to go red in the test that names it.
         run: npm run bans-fail-control
 
+      - name: Picture-retention fail-control
+        # 0041 and the picture job. Each break removes one property -- the
+        # 30 days (29, 31, exactly 30, a day of 24 hours across a clock
+        # change), an open stay keeping its lane and walk pictures, the 30
+        # days after the car left, a picture a typed plate answered, paid
+        # storage and its end, the job reaching every tenant and saying
+        # counts only, a walk kept while a picture of it is -- and requires
+        # test/picture-retention.test.js to go red in the test that names it.
+        run: npm run picture-retention-fail-control
+
       - name: Rates-and-open fail-control
         # U7g. Each break removes one property -- the try priced by the
         # close's own tax path, the try storing nothing and limited to 20 a
@@ -415,6 +526,20 @@ jobs:
         # a ticket stay consulted without its ticket, and two schema
         # statements never created -- and the suite must go red.
         run: npm run exit-outcomes-fail-control
+
+      - name: Lane QR fail-control
+        # A QR shown at a lane is asked of garage-pass through its own door.
+        # Each property is broken in turn -- the gate opening on anything but
+        # covered, a valid QR kept shut when nothing was read or on a
+        # look-alike or one-difference read, a refused QR shutting a covered
+        # car, could-not-answer relayed as an answer, the token, the plate or
+        # the QR's plate written into the event, the event without passed_by
+        # or the enrolment id, the plate in a log line, the door's error
+        # quoting the argv, no event, no rate limit or one limit for every
+        # lane, a stale presentation taken, the direction taken from the body,
+        # a lane's qr_presented taken with any detail, a control character
+        # reaching the module -- and the file must go red.
+        run: npm run lane-qr-fail-control
 
       - name: Validations fail-control
         # A validation at the exit (0019, amendment A1): the claim made at the
@@ -539,6 +664,27 @@ jobs:
         # no second COMMIT, the 503, /healthz asking the database -- taken out
         # of a copy must turn the file red; the client listener five runs of five.
         run: npm run db-restart-fail-control
+
+      - name: Exit-rules fail-control
+        # The owner's exit rules and the exceptions (0048). Breaks 61
+        # properties -- the whole stay priced again with every payment
+        # credited and only the difference asked, never negative, never the
+        # whole again; a return after an exit a new stay with the old one's
+        # case closed and its unpaid payment canceled at Stripe first, a paid
+        # one kept on it; a person's end reading before Stripe; each visit of
+        # a pass its own session, asked with its own entry and kept with its
+        # pass; a QR's car asked about by the QR's plate; the exception
+        # written with the let-out, with no plate, its payments and the
+        # lane's events, the gate agent's messages and calls copied with
+        # their ids, by the token from its file, never following a redirect,
+        # the let-out never held up nor kept waiting, a failed write never
+        # taking it back; a close after the car came back in still that
+        # stay's exit; a refund never counted as paid; a copy blanked past
+        # its window; an exception's pictures by id, served through it only;
+        # the day's list saying the gate agent in short; the day in the path;
+        # a refund read never past 3 s -- and twelve of 0048's guards. Each break
+        # must turn the named test red, the rest of its file still green.
+        run: npm run exit-rules-fail-control
 
 
   sign-in-control:

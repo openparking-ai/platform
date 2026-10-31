@@ -6,21 +6,21 @@
  * to go red in the test that names the property. A pass is the failure; so
  * is a red in some other test.
  *
- *   never_removed         the week rule removes nothing
- *   removed_while_inside  a stay still open loses its pictures with the week
+ *   never_removed         the 30-day rule removes nothing
+ *   removed_while_inside  a stay still open loses its pictures with the 30 days
  *   tailgater_unmarked    a tailgater stay is stored as an ordinary one
  *   listed_switch_off     a tailgater is listed with "ban tailgaters" off
  *   reach_ignored         a ban reaches every garage of the account whatever the reach
  *   removal_ignored       taking a car off the list leaves it on
- *   listed_aged_out       a listed car's pictures go with the week
+ *   listed_aged_out       a listed car's pictures go with the 30 days
  *   listed_redacted       a listed car's vehicle is redacted by the retention window
  *   added_by_hand         a route that puts a car on the list
  *   listed_unread         a tailgater with no identity read is listed (gate F5)
- *   week_of_eight_days    the week is eight days (re-gate G2)
- *   week_of_six_days      the week is six days (re-gate G2)
+ *   thirty_one_days       the 30 days are 31 (re-gate G2)
+ *   twenty_nine_days      the 30 days are 29 (re-gate G2)
  *
  * The arming loop's pictures have no control here: none is stored anywhere,
- * so there is no picture for the week rule to take by mistake.
+ * so there is no picture for the 30-day rule to take by mistake.
  *
  * Needs the same environment as the suite (the rate engine, the database).
  */
@@ -35,15 +35,15 @@ const SUITE = 'test/bans.test.js';
 const BREAKS = [
   {
     name: 'never_removed',
-    why: 'the week rule removes nothing',
-    red: ['ONE WEEK AFTER THE CAR LEFT'],
+    why: 'the 30-day rule removes nothing',
+    red: ['30 DAYS AFTER THE CAR LEFT'],
     edits: [{ file: 'src/bans.js', from: '    `DELETE FROM entry_pictures p\n      WHERE p.tenant_id = $1\n', to: '    `DELETE FROM entry_pictures p\n      WHERE p.tenant_id = $1 AND false\n' }],
   },
   {
     name: 'removed_while_inside',
-    why: 'a stay still open loses its pictures with the week',
-    red: ['ONE WEEK AFTER THE CAR LEFT'],
-    edits: [{ file: 'src/bans.js', from: '                              AND s.exit_at IS NOT NULL\n                              AND s.exit_at < ', to: '                              AND COALESCE(s.exit_at, s.entry_at) < ' }],
+    why: 'a stay still open loses its pictures with the 30 days',
+    red: ['30 DAYS AFTER THE CAR LEFT'],
+    edits: [{ file: 'src/bans.js', from: '                 AND (s.exit_at IS NULL\n                      OR s.exit_at > ', to: '                 AND (false\n                      OR s.exit_at > ' }],
   },
   {
     name: 'tailgater_unmarked',
@@ -71,7 +71,7 @@ const BREAKS = [
   },
   {
     name: 'listed_aged_out',
-    why: "a listed car's pictures go with the week",
+    why: "a listed car's pictures go with the 30 days",
     red: ['A LISTED CAR IS KEPT WHOLE'],
     edits: [{ file: 'src/bans.js', from: '        AND NOT EXISTS (\n              SELECT 1 FROM banned_vehicles b JOIN sessions s ON s.id = b.session_id\n               WHERE s.tenant_id = p.tenant_id AND s.open_event_id = p.event_id)\n', to: '' }],
   },
@@ -93,16 +93,16 @@ const BREAKS = [
     edits: [{ file: 'src/bans.js', from: 'if (!session.tailgater || !garage.ban_tailgaters || !session.entry_descriptor) return false;', to: 'if (!session.tailgater || !garage.ban_tailgaters) return false;' }],
   },
   {
-    name: 'week_of_eight_days',
-    why: 'the week is eight days',
-    red: ['ONE WEEK AFTER THE CAR LEFT'],
-    edits: [{ file: 'src/bans.js', from: 'export const PICTURE_DAYS = 7;', to: 'export const PICTURE_DAYS = 8;' }],
+    name: 'thirty_one_days',
+    why: 'the 30 days are 31',
+    red: ['30 DAYS AFTER THE CAR LEFT'],
+    edits: [{ file: 'src/bans.js', from: 'export const PICTURE_DAYS = 30;', to: 'export const PICTURE_DAYS = 31;' }],
   },
   {
-    name: 'week_of_six_days',
-    why: 'the week is six days',
-    red: ['ONE WEEK AFTER THE CAR LEFT'],
-    edits: [{ file: 'src/bans.js', from: 'export const PICTURE_DAYS = 7;', to: 'export const PICTURE_DAYS = 6;' }],
+    name: 'twenty_nine_days',
+    why: 'the 30 days are 29',
+    red: ['30 DAYS AFTER THE CAR LEFT'],
+    edits: [{ file: 'src/bans.js', from: 'export const PICTURE_DAYS = 30;', to: 'export const PICTURE_DAYS = 29;' }],
   },
 ];
 

@@ -90,10 +90,11 @@ fee computed. The demo lane has no closing loops, so its entries settle as
 |---|---|
 | `GET /api/v1/lane/rules` | what the lane caches so it can decide offline: the garage's plans whole, its space class, each linked module's register, the open stays with a cursor — the slow cadence |
 | `GET /api/v1/lane/stays?since=<cursor>` | every stay changed since the cursor, closed rows included — the fast cadence; without `since`, the full open set; every answer also carries the lane's own `lane` state and `board` |
-| `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` |
-| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater` (U7f) |
+| `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` (1-64 of `A-Za-z0-9_-`) |
+| `POST /api/v1/lane/redeem-enrolment` | a QR shown at the lane: garage-pass binds the car or says why not; `open` only on covered; rate-limited per device; the token is kept nowhere |
+| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater` (U7f); identified by a plate, a ticket, or `plate_unreadable: true` (0036), with an optional `no_open_command` and, for an unread car, `unsure_plate` and its confidence; `event_id` 1-64 of `A-Za-z0-9_-` |
 | `POST /api/v1/lane/pictures` | a picture kept with an entry (U7f): `{picture_ref, event_id, taken_at, image}`, the image base64, a JPEG or a PNG, at most 3 MiB; idempotent on `picture_ref` |
-| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id`; requires `exit_confirmation`; carries and echoes an optional `descriptor` |
+| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id` (1-64 of `A-Za-z0-9_-`); requires `exit_confirmation`; carries and echoes an optional `descriptor` |
 
 ### A stay is identified by a plate or by a ticket — exactly one
 
@@ -128,6 +129,44 @@ unique per tenant and that it looks like one.
 It is personal data on the same terms a plate is, and the retention purge
 redacts it on the same window — see
 [docs/DATA_RETENTION.md](docs/DATA_RETENTION.md).
+
+**And a car whose plate nobody could read (0036).** The owner's rule: every car
+that crosses a lane's activation loop and then its closing loop is a stay,
+whatever opened the barrier, and "unreadable" is part of the car's identity,
+not a failure to have one. Such a car had no identity to open a stay on, so it
+got into the garage and into no record. An entry's open now takes, instead of a
+plate or a ticket, `plate_unreadable: true` — alone, and only `true`: beside a
+plate it would say the plate was both read and not, and beside a ticket it
+would be two cars, so either is a `400`. The stay's vehicle carries neither a
+plate nor a ticket but `unread_ref`, the open's own event id: **one row per
+unread car**, because nothing here can say two unread cars are the same car and
+a vehicle with an open stay takes no second one — a shared "unreadable" row
+would fold every unread car in the garage into the first one's stay. A replayed
+open is the same row and the same stay. The database holds the rule too
+(`vehicles_exactly_one_identity` over three columns, `vehicles_tenant_unread_ref_key`).
+The close by plate and the exit's lookup take a plate or a ticket, as before;
+an unread car's stay is found and closed through its **exit case** (0037,
+below), by the car's ID. A car counts as inside from its entry to its exit,
+with no age-out. The stay counts
+among the cars inside (0034) and is on the lane's feed with no plate and no
+ticket.
+
+**What was seen is kept, and is not an identity.** Beside `plate_unreadable`
+the open may carry `unsure_plate` and `unsure_plate_confidence` -- what the
+camera read below the lane's confidence, and that confidence, both or neither
+-- held on the stay as `entry_unsure_plate` for the exit's matching. No route
+finds a stay by it, nothing compares it to a plate, and no ban lists it; the
+purge nulls it with the stay's descriptors. Beside a plate or a ticket it is a
+`400`. **`no_open_command: true`** says the lane's loops saw the car go in and
+no open command let it in; it is its own field, and `tailgater` keeps its own
+meaning (*Pictures, tailgaters and banned cars*): an unread open that says
+`tailgater: true` is stored as not one, and opens all the same. **A lane's
+`event_id`** -- on the open, the close and every log event -- is 1 to 64
+characters of letters, digits, hyphen and underscore, or a `400`: the open's
+is now the key an unread car's vehicle is held under, so an object coerced to
+text, a value shaped like the purge's `redacted:` or an unbounded string is
+refused. Our lane's UUIDs and another lane's own ids (`tp-0001`) fit. `npm run unread-identity-fail-control` breaks
+each property in turn.
 
 ### Every session records what saw the car
 
@@ -783,7 +822,7 @@ breaks each property in turn.
     GET /api/v1/garages/<id>/stays/closed?from=<instant>&to=<instant>[&limit=<n>][&after=<next>]
         {garage_id, from, to, limit, next,
          stays: [{entry_at, exit_at, fee_minor, subtotal_minor, currency, exit_outcome, pricing_refused,
-                  occupancy_at_entry_bp}]}
+                  occupancy_at_entry_bp, ended}]}
 
 The garage's own history: the stays that **closed** in `[from, to)`, oldest exit
 first, a page at a time (`next` is the `after` for the following page, `null`
@@ -930,19 +969,26 @@ credential. `npm run setup-fail-control` breaks each property in turn.
 ### Pictures, tailgaters and banned cars (U7f, 0033)
 
 His answers, 2026-10-11: pictures at the closing loop and between the vend and it, kept one week after the car
-leaves; a tailgater whose identity is read is a stay like any other and pays at the exit; banning tailgaters is
+leaves (30 days since 2026-10-26, below); a tailgater whose identity is read is a stay like any other and pays at the exit; banning tailgaters is
 the owner's choice in the location setup, off until they turn it on, and so is whether the list covers this
 garage or all their garages; a ban lasts until someone takes the car off; no car is put on the list by hand.
 
 - **Pictures** (`entry_pictures`) are kept against the lane's event id of the entry record: a stay's open, a
-  tailgater nobody identified, a banned car refused. `npm run purge` removes them one week after the stay that
-  holds them closed, or one week after they were taken when no stay holds them. A car still inside keeps its
-  pictures, and so does a car on the list. The arming loop's pictures are not stored, here or anywhere.
-- **A tailgater stay** is opened with `tailgater: true` and prices at the exit as any other.
+  crossing no car made, a banned car refused. Since 0036 a stay's pictures include the arming read's, the
+  ones its car was identified from. They are removed **30 days** after they were taken (the owner's answer
+  of 2026-10-26; it was one week), by the picture job, *Picture retention* below. A car still inside keeps
+  its pictures, then for 30 days after it left, and for as long as its customer has paid picture storage; a
+  car on the list keeps them.
+- **A tailgater stay** is opened with `tailgater: true` and prices at the exit as any other: a car no vend let
+  in whose plate was READ. Since 0036 the lane opens a stay for every car through the gate that no open command
+  let in, read or not, and marks it `no_open_command: true` -- its own field: a car nobody could read is a stay
+  (`plate_unreadable`, *A stay is identified...*) with `no_open_command` and never `tailgater`.
 - **Two settings** on `PATCH /garages/:id`, off by default: `ban_tailgaters` (true or false) and `ban_reach`
   (`garage` or `all`).
-- **The list** (`banned_vehicles`): with `ban_tailgaters` on, a tailgater stay opened with a `descriptor` is
-  listed. Nothing else lists a car. A ban reaches its own garage, or every garage of the account when the garage
+- **The list** (`banned_vehicles`): with `ban_tailgaters` on, a tailgater stay opened with a `descriptor` and
+  a READ plate is listed -- never a car nobody could read, whatever its open says (0036): a monthly with a dirty
+  plate through a raised barrier would otherwise be refused at every entry on a match nobody can check. Nothing
+  else lists a car. A ban reaches its own garage, or every garage of the account when the garage
   it was listed at says `all`. Each lane gets the bans that reach it on `GET /lane/rules` as `banned:
   [{id, descriptor}]`, and refuses a car whose descriptor matches one.
 - **While listed**, the car's vehicle is not redacted and its pictures are not removed. Taken off, both follow
@@ -1272,8 +1318,13 @@ that. The engine counts nothing; this platform counts, and hands it the figure.
   return it. The garage map writes its count of switched-on spots here; without
   a map the owner types it. Anything else is `400 garage_spaces_refused`.
 - **`sessions.occupancy_at_entry_bp`**: `floor(10000 x cars inside / spaces)`,
-  at most 10000, set when the stay opens: every open stay of the garage, any
-  kind of space, before this one. Counted inside the open's transaction behind
+  at most 10000, set when the stay opens: every stay of the garage, any kind
+  of space, a car nobody could read included (0036), that was inside **at
+  this car's own entry** -- came in by then and had not come out by then.
+  A lane that delivers its open late counts the cars that were in when the
+  car came in, not when the open arrived; nothing ages a stay out of the
+  count (a stay no exit closed leaves it when it is ended, 0039 below).
+  Counted inside the open's transaction behind
   a per-garage lock, so two lanes opening at once count each other (n and n+1,
   never n twice). Null when the garage has no `spaces`. **No lane sets it**:
   one sent on the open or in an event is ignored.
@@ -1424,7 +1475,7 @@ transient, transient with card on file."* Every close now names which
   customer has a seat; a test asserts nothing writes it.
 
 Before pricing, the close consults **`garage-pass`** (`access-in-store
---direction exit`) and **`monthly-billing`** (`covered-in-store --entered-at`)
+--direction exit --entered-at`) and **`monthly-billing`** (`covered-in-store --entered-at`)
 — each through its own command line, run as a subprocess with the environment
 this platform was given (`GARAGE_PASS_DSN`, `MONTHLY_BILLING_DSN` are theirs;
 `ENTITLEMENT_BIN_DIR` names where the scripts are, else the PATH). This platform
@@ -1449,6 +1500,50 @@ builds a database for each module from its own migrations (`garage-pass.pin`,
 `monthly-billing.pin`; CI checks them out), seeds through their doors, and drives
 all of it through the lane's close. `npm run exit-outcomes-fail-control` breaks
 each property in turn.
+
+### A QR shown at the lane: garage-pass binds the car, or says why not
+
+A driver whose car the registers do not cover can scan the QR garage-pass
+issued for it. The lane presents what the scanner read with the identity its
+camera measured: `POST /api/v1/lane/redeem-enrolment` with `{token, vehicle,
+presented_at}` (`vehicle` null when it read none). This platform asks
+garage-pass through its own door, `redeem-enrolment`, under the garage's
+garage-pass link, with the device's own lane and direction — never the
+body's. The module spends the QR once, binds the car and answers the movement;
+both halves come back verbatim beside `open`, which is **true for a covered
+answer and nothing else**. A refused QR is not a refused car: the answer is the
+car's own, so a car the registers already cover still opens on its pass.
+
+Whether the car is the QR's car is garage-pass's decision too — the owner's
+rule of 2026-10-30, *similar enough gets a pass*. A valid QR made for a plate
+passes when the lane read the same plate, the same once look-alikes are one
+character (0OQD, 1IL, 8B, 5S, 2Z, 6G), one character off (only on a QR plate of
+five characters or more), or nothing usable (`vehicle` null). The enrolment half
+is then `recognised`, with `passed_by` naming which — `same_plate`,
+`look_alike`, `one_difference` or `nothing_read` — and `qr_plate` the plate the
+QR answers for, so the lane checks its owner's deny rule against the car it lets
+in. Only a clearly different plate is `match_required`: nothing opens on that QR
+until a picture match or a person confirms it.
+
+- `200` — garage-pass answered; open or shut, and its sentence says why.
+- `409 qr_not_linked` — the garage names no garage-pass garage.
+- `409 qr_stale` — `presented_at` more than two minutes ago; `409 clock_skew`
+  ahead of this server's clock.
+- `429` — the device has presented ten QRs this minute.
+- `503 qr_unanswered` — garage-pass could not answer. The lane treats this as
+  offline: a QR cannot be checked, so a pass-only entry stays shut and the exit
+  is the attendant's.
+
+**The token and the plate are kept nowhere.** The token rides on the module's
+argv because that is its door, and nowhere else: not in the answer, not in an
+error, not in a log line, not in the `qr_presented` event, which records what
+happened to the QR (by its enrolment id, and how the car passed for it:
+`passed_by`, one of the four names or null) and to the gate, and whether the
+lane read an identity — never `qr_plate` or any other plate. A lane posts
+`qr_presented` itself only for a QR it could not present, with
+`answered: false` and nothing beyond `reason`, `direction` and
+`read_identity`. `test/lane-qr.test.js` runs against the real garage-pass;
+`npm run lane-qr-fail-control` breaks each property in turn.
 
 ### The rules payload: what the exit decides from, off the barrier's path
 
@@ -1720,6 +1815,115 @@ the three missing, each route above answers `409 connect_not_configured`,
 *"This deployment has no Stripe Connect configured."*, asks Stripe nothing,
 and every other route behaves exactly as without it.
 
+### The exit, by the car's ID (0037)
+
+The entry and exit cameras are a matched pair under the same light, so a car
+is identified by both ends giving the **same ID**, not by an exact plate: the
+plate as positioned characters, the sure ones folded (`O`/`0`, `I`/`1`,
+`B`/`8`, `S`/`5`) and the rest `?`, under a named rule (`opvid-plate-chars/1`);
+or the fact that it was `unreadable`, or `not_seen`; the colour code
+(`opvid-colour/1`); the size when one is measured. An entry's open may carry
+`plate_characters` (`{state, rule, pattern}`), `color_code` and `size`, and the
+stay keeps them (`entry_plate_state`, `entry_plate_rule`,
+`entry_plate_pattern`, `entry_colour_code`, `entry_size`); the purge nulls them
+with the plate.
+
+**Every car at an exit lane the lane could not let out on its own copy is a
+case** — `POST /api/v1/lane/exits` with `{event_id, exit_at, plate_characters?,
+color_code?, size?, session_id?}`:
+
+| `method` | how the stay was decided |
+|---|---|
+| `lane` | the lane matched it from its own copy and named it (`session_id`) |
+| `single` | one open stay agreed with the car's ID, clearly (`src/exitMatch.js`) |
+| `picker` | a few agreed; the picker chose one by pictures (`src/exitPicker.js`) |
+| `none` | no stay found; the driver has not said yet |
+| `driver_word` | no stay found; the driver's stated entry time was priced |
+
+**The matcher** excludes a stay on any component that disagrees: a sure
+character that differs in its position, a colour code further than 0.20
+(vehicle-id's stated assumption, not a measurement), a different size, a read
+plate against an unreadable one. An unreadable plate matches unreadable
+plates only; `not_seen` (no picture of the plate at all) says nothing either
+way, as does anything that cannot be compared. A stay wins alone with 3 sure
+characters in agreement (or 2 with the colour or size beside them) and 2 more
+than the next stay; an unreadable plate wins alone when it is the only stay
+left and its colour or size agrees. Otherwise up to 10 candidates go to the
+picker; more than that, or nothing left, is `none`. A stay opened by an older
+lane with a whole plate counts as every position sure.
+
+**The picker** (off unless `EXIT_PICKER_KEY_FILE` names the file holding an
+Anthropic API key, re-read on every ask) is shown the exit's pictures (the
+lane's `POST /pictures` under the case's `event_id`) and each candidate's
+entry pictures, numbered, and asked only which number is the same car, or 0.
+Pictures only: no plate, colour, time or id is sent, and only the number is
+kept, with the model, the time it took and the pictures shown. It is asked
+outside any transaction, within `EXIT_PICKER_TIMEOUT_MS` (8000 by default,
+1000 to 30000), once per car: a resend of the same `event_id` is the same case.
+No answer in time, an answer that is not one number in range, or a candidate
+with no pictures (it could never be chosen) is `none`. The model is
+`EXIT_PICKER_MODEL`, `claude-sonnet-5-5` by default.
+
+**None found:** an `exit_unmatched` event for the attendants, then the
+driver's word — `POST /api/v1/lane/exits/:exitId/word {entry_at}`, once, no
+later than the exit and no more than 90 days before it — priced by the engine
+on the garage's own rules (no module is asked: there is no plate), kept on
+the case, and an `exit_driver_word` event. The stay that car really was stays
+open; a person ends it.
+
+**Settled** is the one thing the lane opens on: covered by a module, a fee of
+zero, paid by card (0038, below), or a person who let the car out. A fee
+above zero says `needs: "payment"`; an unpriced one `needs: "person"`; no
+stay `needs: "driver_word"`. `GET /api/v1/lane/exits/:exitId` is what the
+lane polls.
+
+**A person**: `GET /api/v1/garages/:garageId/exits` lists the cases still at a
+lane, with the candidates and what the picker said;
+`POST /api/v1/garages/:garageId/exits/:exitId/let-out {reason}` settles one,
+once, with who and why on the case, an `exit_let_out_by_person` event, and an
+`exit.let_out` change-log line.
+
+**A second case for the same stay supersedes the first** (0045). A stay has
+one open case at a time, and the lane drops its case when the car leaves the
+loop unsettled: the gate faulted, the car backed off, the driver went to
+fetch a card or to the other exit lane. When the car comes back -- to the
+same lane or another -- its new case takes the old one's place, never a
+second open case:
+
+- the old case's open payment is canceled at Stripe first, and cleared from
+  its reader, outside any transaction; a card being authorised on it, or
+  Stripe out of reach, is `503 payment_unsettled` with nothing written, and
+  the lane sends the case again;
+- if the old payment had already succeeded, the car paid and backed out
+  before the closing loop: **the same stay** (0048, below). The new case
+  prices the WHOLE stay again, credits everything the stay paid at its other
+  cases, and asks only the difference: `fee.fee_minor` is what this exit
+  asks for, `fee.stay_fee_minor` the whole stay, `fee.credit_minor` what it
+  paid. Not priced higher, it asks nothing and is settled `why: "paid"`
+  (`paid_at_exit` names the case whose payment paid it, and `payment` is
+  that payment) -- **"I paid, the gate didn't open": the paid stay opens.**
+  The stay closes at its whole price; its payments add up to it, each part
+  charged once;
+- the old case is closed with no close event and `ended: {why:
+  "superseded", superseded_by}` on the lane's read; an `exit_superseded`
+  event, and an `exit.superseded` change-log line by the lane computer,
+  naming both cases, the stay and how the old payment stood -- no plate.
+
+A case the platform closed answers its lane's close, payment, word and
+let-out with `409 exit_closed`.
+
+The poll, the driver's word and the receipt answer only at the case's own
+lane (`409 exit_on_another_lane`).
+
+**The close** takes `exit_id` instead of a plate. A case with a stay closes it
+— an unread one included — writing the case's own figures (the fee shown, as
+`asDecided`), never a second price. A case with no stay (the driver's word, or
+a person) is closed on the case itself; the response's `session` is `null`.
+
+A case is never deleted (no DELETE grant), is forced under row-level security,
+and names only its own account's lane and stay (a trigger, as 0033's). A lane
+with a case on record is not removed.
+
 ### A garage's card reader, bound to a lane
 
 Under direct charges the reader belongs to the garage's own Stripe account,
@@ -1748,6 +1952,594 @@ Each create is **refused while the account cannot take a card**. Stripe is
 asked for `card_payments` at the moment of the request, and the read is kept
 like any other. A lane holds one reader at a time, and a reader serves one
 lane at a time, at the route and at the table.
+
+### Paying at the exit (0038)
+
+An exit case that says `needs: "payment"` is paid with a card, in person, on
+the garage's own Stripe account (direct charges, `Stripe-Account` header):
+one PaymentIntent for the case's fee as shown, `card_present` (and
+`interac_present` in Canadian dollars), captured at once. Nothing here
+touches a card number.
+
+- **At the lane's reader** — `POST /api/v1/lane/exits/:exitId/pay` (the exit
+  lane's device, its own case only) creates the intent and hands it to the
+  reader bound to that lane (`process_payment_intent`). The answer's `sent`
+  is `true`, `false` (the intent was not waiting for a card: paid or being
+  paid), or `"unknown"` (the reader did not acknowledge in time; it may have
+  it — the poll says). `POST .../pay/cancel` cancels the intent at Stripe,
+  idempotently, and clears the reader while it shows it; a card that already
+  paid is never canceled (`409 exit_paid`), and a card being authorised is
+  not cut off (`409 payment_in_progress`).
+- **The reader holding another car's fee.** Stripe refuses a new payment
+  while the reader is busy (`terminal_reader_busy`). The reader is then read:
+  this case's own intent already waiting for its card is `sent: true`;
+  another case's intent -- a car gone whose cancel did not land -- is
+  canceled at Stripe and cleared from the reader first, then this case's is
+  sent, so a driver never pays another car's fee; one that paid in that
+  instant is recorded paid, never canceled. A card being authorised on it,
+  or an action this platform did not start, is `409 reader_busy` and nothing
+  is touched.
+- **At an attendant's phone** — `POST /api/v1/garages/:garageId/exits/:exitId/pay`
+  (an operator token) creates the same intent and answers its
+  `client_secret` for Stripe's Terminal SDK on the phone, with an
+  `exit.payment_start` change-log line.
+
+**One payment per case, one open per stay.** The intent is created with an
+idempotency key derived from the case, so a resend, a retry or a second
+attendant gets the same intent; a declined card is tried again on that intent,
+never a new one. A second case for the same stay cannot start a payment while
+the first is open (`exit_payments_one_open_per_stay`, `409
+stay_payment_elsewhere`). Once one has succeeded, a later case of the stay
+asks only the difference (0048): a payment is exactly what its case asks for,
+and what a stay paid and is paying never adds up to more than its whole fee
+(`exit_payments_within_stay_fee`, a trigger; `409 stay_paid_already` at the
+route, the intent just made canceled).
+
+**Paid is Stripe's word at the recorded amount.** While a payment is open,
+each `GET /api/v1/lane/exits/:exitId` reads the intent from Stripe, at most
+once every 2 seconds; nothing listens for webhooks. The case is settled
+(`why: "paid"`) only when the intent has succeeded at the amount and currency
+recorded. A decline is kept as `last_failure` and the case still needs
+payment. Stripe out of reach is not a failed poll: the case answers as last
+recorded.
+
+Refused before any card: a closed or settled case (`exit_closed`,
+`exit_settled`), one that needs the driver's word or a person first
+(`nothing_to_pay_yet`), another lane's case, a lane with no reader
+(`no_reader_bound`), a garage with no Stripe account, a reader on another
+account, a fee below the card minimum (`fee_below_card_minimum`: a person
+decides). The reader's own refusals are named: `503 reader_offline`,
+`409 reader_busy`.
+
+**A person who lets the car out** while a payment is open cancels the
+intent, so no card is taken for a settled exit; if Stripe says it had
+already succeeded, that is recorded instead — paid and let out.
+
+**Checked against Stripe itself.** The suite runs against a stand-in
+(`test/stripe-stub.js`); `node scripts/stripe-test-mode-check.js` runs the
+platform's own payment calls against Stripe's **test mode** with a simulated
+reader: an intent made once per case, handed to the reader, a second one
+refused while the reader is busy, the reader cleared and an intent canceled
+with its key, a declined card, a good card on the same intent, and a cancel
+of the paid intent refused. It takes only a test key (`sk_test_` or
+`rk_test_`, from the file `STRIPE_TEST_KEY_FILE` names, or `STRIPE_API_KEY`)
+and refuses any other before anything is sent; it never prints the key.
+`STRIPE_TEST_ACCOUNT` (an `acct_` id) is the test connected account it acts
+on as a garage's own; unset, the key's own account. With no key it runs
+nothing (exit 2). It is never run by CI, which holds no key.
+
+**Offline.** The lane's reader is driven from here, so it takes no card
+while it or Stripe is offline: the case still needs payment and a person
+decides. A phone reader may store a card offline and forward it later; that
+payment is not seen here until Stripe has it.
+
+**A text receipt** — `POST /api/v1/lane/exits/:exitId/receipt {phone}`, once
+per paid case, to a **United States or Canadian number only**: the Caribbean
+and US-territory area codes, toll-free, premium and service codes are
+refused (`400 phone_not_us_or_canada`) before anything is sent. The number is
+used for the one send and kept nowhere; the payment keeps its last two
+digits, the time and the provider's reference. The provider is the
+deployment's, read at each send: `TEXT_PROVIDER` (`twilio`), `TEXT_ACCOUNT`,
+`TEXT_KEY_FILE` (an absolute path, re-read every send) and `TEXT_FROM`. With
+any unset, receipts are off (`409 text_receipts_off`).
+
+A payment is never deleted, is forced under row-level security, names only
+its own account's case and stay (a trigger). What it pays for, its amount
+and its intent never change; once succeeded or canceled it stays so; its
+receipt is written once.
+
+### Ending a stay no exit closed (0039)
+
+A car can leave without its exit being seen: a lane down, a gate up, a car
+that tailgated out. Its stay would sit open for ever, count as inside and
+price the next car on a fuller garage. A stay no exit closed is **ended**:
+`exit_at` set, no exit lane, no close event, **unpriced** (no fee, no
+pricing) and `sessions.ended` saying why --
+`{reason: "superseded", at, by_session}`, or `{reason: "ended" | "abandoned",
+at, by, why}` when a person decided.
+
+- **The same car again.** One vehicle row is one whole plate or ticket. An
+  open for a car that already has an open stay, at an entry more than
+  `REAPPROACH_MINUTES` later (default 10, 1 to 60), means the old stay had
+  ended by then: it is ended as superseded at the new entry and the new
+  visit gets its own stay, never folded into the old one. Within
+  `REAPPROACH_MINUTES` it is one arrival -- a car backing out and coming in
+  again -- and the open answers the stay already open, **unless that stay
+  reached an exit lane by then** (0048): a car that has been at an exit has
+  been out, and its entry is a new stay however soon it comes. An open whose entry is
+  **earlier** than a stay of the car already here is an earlier visit
+  delivered late: it is stored already ended, superseded by the next. A car
+  nobody could read (0036) is a vehicle of its own every time, so it never
+  supersedes another. Each superseded stay is a `stay_ended` event. **The old
+  stay is closed completely** (0048): its open exit case is closed with it
+  (`ended: {why: "stay_ended", by: "lane_device:<entry computer>", by_session}`,
+  an `exit_stay_reentered` event and an `exit.closed_on_return` change-log
+  line), its unpaid payment canceled at Stripe first -- a card being
+  authorised, or Stripe out of reach, is `503 payment_unsettled` with nothing
+  written, and the lane sends the open again -- a paid one stays paid and the
+  old stay's `ended` says so (`paid: {exit_id, amount_minor, currency}`, with
+  `exit_cases`); a car a person let out keeps its exception on the old stay.
+- **A late close.** A close whose exit falls inside a stay that was ended
+  (superseded or by a person) closes that stay after all: `ended` cleared,
+  priced like any close, and an `ended_stay_closed` event. A close whose exit
+  is before the stay's entry by no more than twice `MAX_CLOCK_SKEW_SECONDS`
+  is the two lanes' clocks apart: the exit is taken as the entry, with an
+  `exit_before_entry` event. A close with nothing to close names why:
+  `404 session_not_open` for a stay named by id, `404 no_open_stay` for a
+  plate or ticket with no open stay.
+- **The stays looking stuck** --
+  `GET /api/v1/garages/:garageId/stays/stuck?older_than_hours=` (an
+  operator token; 1 to 2160): the open stays that came in more than that
+  many hours ago -- the garage's own `stuck_after_hours` (0043) when the
+  reader names no age -- and those the latest complete walk did not see
+  (0040), oldest first, as `{older_than_hours, stuck_after_hours, stays:
+  [{id, plate, plate_whole, ticket, unread, entered_at, entry_lane, at_exit,
+  last_seen_on_walk, why, pictures}]}`. `pictures` is the entry pictures
+  (0033) kept with the stay's open, newest first, at most 4, each `{id,
+  taken_at}`; `GET .../stays/:stayId/pictures/:pictureId` is one of them,
+  `private, no-store`, and 404 through any other stay or garage.
+- **The garage's age** -- `PATCH /api/v1/garages/:garageId
+  {stuck_after_hours}`: a whole number of hours, 1 to 2160; 24 until the
+  garage sets another. A `garage.update` line with before and after.
+- **A person ends one** --
+  `POST /api/v1/garages/:garageId/stays/:stayId/end {outcome, reason, left_at?}`:
+  `outcome` is `"ended"` (the car left; `left_at`, if given, is when -- not
+  before its entry, not in the future) or `"abandoned"` (the car is gone and
+  nobody knows when; no `left_at`). `reason` is required, at most 500
+  characters on one line (`400 reason_invalid` for a line break or a
+  control character), and kept as typed: a screen shows it as text. **It
+  goes into the change log as typed, so it must not name the car**: a
+  screen that asks for it says so in its help text ("why the stay ended --
+  do not type the plate: the reason goes to the change log"). Once: an
+  ended stay is `409 stay_not_open`. **An exit case left open on the stay**
+  -- the car left the lane without its close, after a let-out or not --
+  **never blocks it** (0045): the case's unpaid payment is canceled at
+  Stripe first, then the case is closed with `ended: {why: "stay_ended",
+  by}`; a payment that succeeded stays paid, is never canceled, and the
+  stay's `ended` carries it (`paid: {exit_id, amount_minor, currency}`,
+  every payment of the stay summed, `exit_id` the latest, with
+  `exit_cases`). **The reads come first** (0048): the stay, `left_at` and
+  what it owes are read before anything is canceled at Stripe, so a refused
+  `left_at` or a rate engine that cannot answer fails the end with every
+  payment as it was. A card being authorised at that moment: `409
+  payment_in_progress`, nothing changed; Stripe out of reach: `503
+  payment_unsettled`. A validation held on the stay is handed to the
+  release. A `stay_ended` event and a `stay.end` change-log line -- who and
+  when, as every line; the stay by its id, the cases it closed and no
+  vehicle; `before: {open, entered_at, exit_at}`, `after: {open, outcome,
+  reason, entered_at, exit_at, owed_minor, currency}`, with
+  `exit_cases_closed` when it closed a case and `paid_minor` when one had
+  paid.
+- **What an ended stay owes (0043).** A stay that `ended` owes what its exit
+  would have charged at `left_at`: the exit's own quote -- the modules
+  asked, then the rates, then the tax. Garage-pass answers for a lane and no
+  lane was crossed, so it is asked at **each of the garage's exit lanes**,
+  and a pass any of them covers covers the stay, as it would have at the
+  exit (the record lists the lanes asked, `asked_at_lanes`). A garage with
+  no exit lane has nowhere to ask: the pass is not asked, and the ending
+  says so -- `pass_unasked: true`, on `ended.owed`, in the end's answer and
+  in the past stays -- so a person can see what was priced without it. It
+  is kept on `ended.owed` (`{outcome, fee_minor, subtotal_minor, currency,
+  breakdown, plan_version, covered_by, refused, pass_unasked, entitlement}`;
+  `entitlement` is what each module was asked and said, and the retention
+  purge takes it out with the vehicle) and answered as `owed_minor`: 0 when
+  covered, null when the rates refused to price it. **A stay that paid at an
+  exit** before a person ended it owes the rest: `owed_minor` -- in the
+  end's answer, its event, its change-log line and the past stays -- is
+  `ended.owed.fee_minor` less `ended.paid.amount_minor`, never below 0;
+  `ended.owed` keeps the exit's whole quote and `ended.paid` what was paid.
+  **Nothing is charged**, whatever card the car has: the stay stays
+  unpriced (`fee_minor` is what a stay paid at its exit), and the garage
+  collects what it owes its own way. An abandoned stay owes nothing.
+  Pricing needs the rate engine: with it down, `ended` is refused as the
+  exit is, and `abandoned` still works.
+
+The past stays (`GET /garages/:garageId/stays/closed`) carry `ended`, the
+reason, on a stay that was ended, and `owed_minor` beside a null `fee_minor`
+on one that owes, with `pass_unasked`; a stay a person let out owing (0042)
+is `let_out_unpaid`, with what it owed as `owed_minor`. The database holds the shape: an ended stay is unpriced,
+has no exit lane or close event, a known reason, and who and why when a
+person decided; only a stay that `ended` may owe, in its own currency, a
+whole number of minor units, nothing when covered.
+
+The routes' permissions, for a platform with linked accounts (#78): the list
+and the pictures are `stays:read`, the end is `stays:change`, and the
+garage's age is `garages:change`.
+
+`test/stay-endings.test.js` and `test/stay-cleanup.test.js` hold each; `npm
+run stay-endings-fail-control` and `npm run stay-cleanup-fail-control` break
+each in turn.
+
+**Counting the cars inside (0044).** Every open counts the cars inside at the
+car's entry behind the garage's lock. `sessions_garage_exit_idx` (tenant,
+garage, `exit_at`) gives the stays that left after that instant, and the
+partial open-stays index the ones still inside, so the count no longer reads
+the garage's whole history. `npm run occupancy-plan` builds a scratch
+database of 300,000 stays and prints the plan and the time before and after;
+0044 builds the index `CONCURRENTLY`, outside a transaction.
+
+### The exit's rules, and the exceptions (0048)
+
+The owner's rules of 2026-10-30/31, and the record he asked for.
+
+**Paid and left.** *"we have a closing loop. After that the car paid and
+left. If it backs out after paying, give credit and charge the additional
+part."* A stay is finished when the car crosses the closing loop after the
+gate (the close). A car that paid and backed out before it is the same stay,
+with no time limit: at its next exit the WHOLE stay is priced again, every
+payment the stay made at its other cases is credited, and only the
+difference is asked -- nothing when the price is not higher, never a
+negative figure. The case's quote keeps the whole stay's figures (what the
+close writes) with `credit: {paid_minor, payments}` and `due_minor` beside
+them; a quote not priced higher keeps the figures of the case whose payment
+paid it, and the new price as `repriced`. The lane reads `fee.fee_minor` as
+what to pay (the difference), `fee.stay_fee_minor` and `fee.credit_minor`
+beside it. A car let out owing the difference is let out unpaid owing it,
+with what it had paid (`let_out.paid_minor`). **A refund is not paid**:
+before a new case credits the stay's payments, each (the latest 5) is read
+from Stripe with its latest charge, in parallel and outside any transaction,
+and what was refunded of it -- at Stripe's dashboard, which this platform
+hears of nowhere else -- is kept on the payment (`refunded_minor`,
+`refunds_read_at`); only what a payment kept is credited, and the stay-fee
+guard counts it so. Stripe not answering holds no exit up: the payment is
+credited as last read and the case says so (`credit.refunds_unread`). A
+refund is read only then -- when the car comes back to an exit -- once, each
+read given 3 seconds before Stripe is taken as silent; a person's end and a
+return credit what was last read.
+
+**A return is a new stay** -- for a transient car. *"when the car leaves.
+It's gone. When it comes back new time starts."* An entry after the stay
+reached an exit lane is never folded back into it (`REAPPROACH_MINUTES` is
+for a re-approach at the entry only); the old stay is closed completely --
+its case closed, its unpaid payment canceled at Stripe, a paid one kept paid
+on it -- and the new stay carries no time, fee, payment, let-out or case
+(above, "The same car again"). A car that never left -- backed off at the
+exit -- is still the same stay: its next case supersedes the old one. **A
+lane's close that arrives after the car came back in** (the exit lane was
+offline, a person opened, the car returned before the outbox drained) is
+still that stay's exit: the stay closes at the time the lane sent -- never
+after the return -- on its case's figures, paid or let out unpaid as the case
+stood, a person's opening with its exception; a resend is the same close, a
+second close event `409 exit_closed`.
+
+**A pass's visits are sessions of the pass.** *"Monthlies, garage passes are
+different. 'new session' type."* Each in and out of a pass holder is its own
+stay -- a session of the pass -- asked about at its own exit with its own entry
+(`--entered-at`, to both modules), so the pass's own rules (its days, its
+hours, a car replaced on it) are judged per session and nothing carries from
+one to the next: a session the pass does not cover is priced from its own
+entry. The pass a session belonged to is kept on it (`sessions.pass_session`:
+`{module, pass_id, covered, reason, covering_term}`, or the monthly agreement
+that covered it) and the past stays carry it as `pass: {module, pass_id,
+covered}`.
+
+**A car a QR let in.** The lane's open may carry `qr: {enrolment, passed_by,
+qr_plate}` (lane-controller's contract: a registration QR the pass module
+passed `same_plate`, `look_alike`, `one_difference` or `nothing_read`), each
+key only when the module answered it; it is kept on the stay
+(`sessions.entry_qr`), checked to its shape (`400` otherwise; a key this
+build does not know is left on the lane). At the exit garage-pass is asked
+**by the QR's plate** (`asked_as: "qr_plate"` on the record), so a car let in
+on one difference or with nothing read is covered as the pass it is; monthly
+billing is asked by the plate as read, or not at all with none. Garage-pass
+has no verb to ask by an enrolment id: the id and how it passed are kept on
+the stay and on its `pass_session`. The purge takes `qr_plate` with the
+vehicle.
+
+**The exceptions.** *"record it as exceptions and add as much information as
+we can. what happened, who did what, gate agent sent messages times, who
+received, etc."* Whenever a person lets a car out -- an attendant's let-out,
+or a close naming the case with `let_out_by`, or a case that closes owing --
+one record per exit case is written in the same transaction: `kind`
+`let_out_unpaid` (it still owed) or `barrier_opened` (a person opened for a
+car that owed nothing more); the garage, lane, stay and case; who pressed it
+(the change log's name for the key or owner, or the lane computer and its
+name) and when; the reason typed; the authority the lane named; what it owed
+and what the stay had paid; and, as it stood at that moment (`story`), the
+case as the lane read it, the stay (never its plate), every payment of the
+stay -- states, times, Stripe's codes, the intent id, never card data -- and
+the lane's events from the window's start, a lane's own detail cut to its
+codes (the reader's refusals of a case's payment among them: each is kept as
+an `exit_reader_refused` event at the lane, `{exit_id, code}`, when the
+lane's pay is refused `reader_offline`, `reader_busy` or `no_reader_bound`).
+Stripe's declines are as the payment last recorded them (`last_failure`): the
+platform keeps the latest, not each. Appended after, never edited: the case's payment once the let-out
+canceled it, the platform's events at the lane to the window's end, and **the
+gate agent's messages and calls for the lane** over [case opened - 15 min,
+let-out + 15 min], copied with their own ids and revisions -- who was paged,
+on which sink, when, what each answered; who called, who was rung, who
+answered. A call's keyed call-back number is kept as its last two digits
+(`keyed_last2`), as a text receipt keeps its number. **Nothing here waits on
+the gate agent**: the exception is written with the let-out, the answer goes,
+and the copy runs after it; a let-out whose exception cannot be written
+stands, the failure is logged by its case, and the sweep writes it from the
+record. **A copy is blanked past its window**: `tenant_settings.exception_copy_retention_days`
+(400 by default, the gate agent's own; 1 to 3650), by `npm run purge`, which
+says how many, nothing else; the exception and the rest stay.
+
+- `GET /api/v1/garages/:garageId/exceptions?day=YYYY-MM-DD` -- the garage's
+  own local day (today when unnamed), oldest first, with `count` and
+  `let_out_unpaid`, and on each exception the gate agent in short --
+  `gate_agent: {messages, failed_deliveries, calls, calls_answered, copy,
+  copies: {messages, calls}, purged}`: from the latest copy of each, the
+  messages and the deliveries of them that failed (`state: "failed"`), the
+  calls and those a person answered (`person_answered_at` set); `copy` is
+  `complete` (copied after the window), `pending` (part-way, or not yet),
+  `not_reachable` or `not_configured`, the worse of the two sources'.
+  `GET /api/v1/garages/:garageId/exceptions/day/:day` is the same list, the
+  day (`YYYY-MM-DD`, the garage's own date) in the path; a day that is not a
+  date is `400 day_invalid`. `GET /api/v1/garages/:garageId/exceptions/:exceptionId`
+  -- one record's whole story, `payment_after_let_out`, `lane_events_after`,
+  each copy of the gate agent's records under `gate_agent: {messages,
+  calls}`, copied or saying why not, and its pictures by id: `pictures:
+  {entry: [{id, taken_at}], exit: [{id, taken_at, exit_id}], lane: [{id,
+  taken_at, lane_id}]}` -- the lane's pictures kept with its stay's entry,
+  with its case and the stay's other cases, and any other its lane kept in
+  its window, as they stand (a picture the retention job deleted is not
+  listed), at most 50 of each. Each image is
+  `GET /api/v1/garages/:garageId/exceptions/:exceptionId/pictures/:pictureId`,
+  `private, no-store`, only for a picture the exception lists. Through the garage only: another
+  account's or garage's is `404 exception_not_found`. The reconciliation
+  report counts them (`exceptions: {since, let_out_unpaid, barrier_opened,
+  total}`). Permissions, for a platform with linked accounts (#78): both are
+  `stays:read`.
+- **Where the gate agent is** is the deployment's: `GATE_AGENTS_FILE` names a
+  JSON file on this server, re-read at each copy --
+  `{"garages": {"<garage id>": {"monitor": {"url", "token_file"}, "agent":
+  {"url", "token_file"}, "lanes": {"<lane id>": {"monitor_lane",
+  "agent_lane"}}}}}`. `monitor_lane` is the lane's own `lane_id` as it
+  publishes it on `GET /v1/lane`; `agent_lane` is the agent's own
+  `[lanes.<name>]`, which is not the lane's id -- the site maps each platform
+  lane to both, once, here. A URL is http or https with no user, query or
+  fragment; off loopback it must be https and name a token file. A token is
+  read from its file at each request and never logged; a redirect is never
+  followed; each request has 3 seconds, an answer at most 4 MiB, at most 10
+  pages of 500. Unset, or a garage or lane not named, is `not_configured`; no
+  answer is `not_reachable`; a refusal or an answer this build cannot read is
+  `refused`, each with a sentence. **Never in the let-out's way**: the car is
+  out first.
+- **`npm run complete-exceptions`**, on a schedule (every few minutes): once
+  an exception's window has passed it copies the gate agent's whole window
+  again (`complete: true`) and the lane's events after the let-out; an
+  unreachable gate agent is asked again, at most 6 times, until 24 hours
+  after the window; a let-out whose own write of its exception failed gets
+  one from the record (`story.recovered`). One tenant at a time; counts only.
+- Written once and appended to, never updated or deleted (no grant); forced
+  under row-level security; an exception names its own case's lane and stay
+  (a trigger).
+
+`test/exit-rules.test.js`, `test/exceptions.test.js` and
+`test/pass-sessions.test.js` (the real garage-pass, at `garage-pass.pin`)
+hold each; `npm run exit-rules-fail-control` breaks each in turn and requires
+the named test red.
+
+### The inventory walk (0040)
+
+A person walks the garage with a phone and photographs every car parked
+there, or types its plate. Finished, the walk is four lists, frozen when it
+finishes and never worked out again: the cars seen that have an open stay,
+the cars seen that have none, the open stays nobody saw, and the cars whose
+plate could not be read. It is how a garage finds the stays no exit closed
+(see "Ending a stay no exit closed"): the stuck list reads the walks.
+
+Every route takes an operator token, acts at the garage in its path and
+refuses another tenant's garage or walk, or a walk reached through another
+of its garages (`404 walk_not_found`). Who did each step is the operator
+key it was done with, kept on the walk and on each sighting, with the
+change's own "done by" beside it once changes carry one. Each change is one
+change-log line about the walk -- `walk.start`, `walk.sighting`,
+`walk.pick`, `walk.finish` -- that names no plate.
+
+⚠ **Known limit: "a person" is the operator key, for now.** Nothing on this
+branch reads a person's name from the request yet (that arrives with the
+"done by" of the people and permissions change). So a relay that holds one
+operator key for a whole company makes every attendant on that key the
+same person: they share one walk at a garage, starting again answers it,
+and when one of them finishes it the others' sightings still on their
+phones are refused (`409 walk_finished`). Until then, give each person a
+key of their own, or have one person walk at a time. A walk finished early
+like that usually saw too little of the garage to feed the stuck list (see
+"The stuck list reads the walks").
+
+- **Start** -- `POST /api/v1/garages/:garageId/walks {}` →
+  `201 {walk: {id, started_at}}`. A person has one unfinished walk at a
+  garage: starting again answers that walk (`200`), so a phone that lost it
+  carries on. Other people start their own. A walk left unfinished
+  `WALK_ABANDON_HOURS` (12) after it started is **abandoned**: it takes no
+  more sightings, picks or finish (`409 walk_abandoned`), has no lists, and
+  its person's next start begins a new walk.
+- **A sighting** --
+  `POST /api/v1/garages/:garageId/walks/:walkId/sightings
+  {picture?, plate?, confirmed, client_ref?, confirms?, taken_at?}` →
+  `201 {sighting: SIGHTING}`.
+  - `picture`: a JPEG or a PNG, base64, at most 3 MiB, as a lane's picture.
+    It is opened and written fresh (no metadata, no location), sent to the
+    deployment's vehicle-id to read. That fresh picture is kept
+    `PICTURE_DAYS` (30) from when it was taken, as a lane's picture is, so a
+    person can look at it again -- longer when a finished walk listed it as
+    seeing a stay (*Picture retention*) -- then it is forgotten and the
+    sighting keeps what was read. The reader is fast-alpr, the one plate reader.
+  - `plate`: a plate the person typed or confirmed, with `confirmed: true`
+    (`400 plate_not_confirmed` without it): letters and digits, 1 to 10 once
+    spaces and dashes are taken out. A sighting with a plate is matched on
+    it, picture or not.
+  - `client_ref`: the phone's own id for the sighting, at most 100 characters.
+    The phone sends again when it heard no answer; the same `client_ref` on
+    the same walk answers the sighting already kept (`200`), so it is counted
+    once. Without one, the same picture sent again (the same bytes) answers
+    the sighting already kept, read once; a plate typed again is a second
+    sighting, but a car seen twice lists once, with or without a stay.
+  - `confirms`: the id of an earlier sighting of this walk that this one
+    answers -- the person's reading of a plate the reader was unsure of. The
+    earlier one leaves the lists; this one stands for it. A typed plate sent
+    with neither `confirms` nor `client_ref` (a phone that answers a
+    sighting by typing its plate) answers an earlier one only where that can
+    be told: the one unanswered `unsure` sighting whose sure characters all
+    agree with the plate. A `none` has no character to agree with, so only
+    `confirms` answers it: without one it stays in `not_readable`. Anything
+    else is a new car. The change-log
+    line says `confirms_inferred: true` when the platform worked it out.
+  - `taken_at`: when the picture was taken (not in the future); the time it
+    arrived otherwise.
+  - Refused: `409 walk_finished` on a finished walk, `409 walk_abandoned` on
+    an abandoned one; `409 walk_full` past 5000 on one walk (finish it and
+    start another); `429 too_many_sightings` past `SIGHTINGS_PER_MINUTE`
+    (120) a minute from one key, before the picture is opened, since every
+    picture is opened by the same one-at-a-time decoder as the lanes'
+    pictures -- with `Retry-After`, the whole seconds (at least 1) until that
+    key's minute ends: the phone waits that long and keeps the picture until
+    it is saved;
+    `400 confirms_invalid` for `confirms` that is not a sighting of this walk and `409 sighting_already_confirmed` for one a
+    later sighting already answers; `400 picture_invalid` for a picture that
+    does not open; `503 reader_unanswered` when vehicle-id did not answer
+    (nothing is kept: send it again).
+
+  `SIGHTING` is `{id, plate, read, why, readers, needs_confirmation,
+  plate_characters, candidates, picked_stay, confirms, has_picture, taken_at,
+  added_by}` (`why`, on
+  `read: "none"` only: `unreadable`, `not_seen` or `reader_off`):
+
+  | the reader's answer | `read` | `plate` | `needs_confirmation` |
+  |---|---|---|---|
+  | every character sure | `agreed` | the whole plate | `false` |
+  | some characters sure | `unsure` | the pattern, `?` where unsure | `true` |
+  | nothing sure, or nothing read | `none` | `null` | `true` |
+  | a plate the person gave | `typed` | that plate | `false` |
+
+  `readers` is `[{reader: "fast-alpr", plate, confidence}]` for a picture
+  (empty for a typed plate). `plate_characters` is vehicle-id's
+  `{state, rule, pattern}`, what the matching uses. A read with every
+  character sure but an empty `plate` takes the pattern as its plate. With
+  no vehicle-id set up (`VEHICLE_ID_URL` unset), a picture is kept as
+  `read: "none"`, `why: "reader_off"`, for the person to type. `candidates` is the open
+  stays the plate fits when there is more than one, `[{stay, plate,
+  entered_at}]`, for the person to pick.
+- **Pick** -- `POST /api/v1/garages/:garageId/walks/:walkId/sightings/:sightingId/pick {stay}`
+  → `200 {sighting}`: which of its candidates the car is. `400
+  stay_not_a_candidate` for any other stay; `409 walk_finished` or
+  `409 walk_abandoned` once the walk is closed.
+- **Finish** -- `POST /api/v1/garages/:garageId/walks/:walkId/finish {}` →
+  `200 {walk: {id, started_at, finished_at, lists: WALK_LISTS, feeds_stuck,
+  seen_percent, complete_percent, incomplete}}`, again the same on a finished
+  walk. `WALK_LISTS` is
+  - `seen_with_stay`: `[{stay, plate, entered_at, sightings}]` -- a stay a
+    sighting's plate matched alone, or the one the person picked; listed
+    once however many times it was seen.
+  - `seen_without_stay`: `[{sighting, plate, candidates, sightings}]` -- a
+    plate no open stay fits, or one that fits several and was not picked (its
+    candidates stay in the next list); one whole plate is listed once, with
+    every sighting of it.
+  - `stay_not_seen`: `[{stay, plate, entered_at}]` -- the stays open when the
+    walk started, still open at its end, that no sighting matched. A stay that
+    came in after the walk started is never "not seen".
+  - `not_readable`: `[{sighting, plate: null, why}]` -- a picture with nothing
+    sure on it, not answered by a later sighting.
+  - `incomplete`: `"walk incomplete (N%)"` when the walk saw too little to
+    feed the stuck list, otherwise null.
+
+  `feeds_stuck` says whether this walk's "not seen" list feeds the stuck
+  list (below): only when the walk saw at least the garage's
+  `walk_complete_percent` of the stays it was checking -- those open when it
+  started and still open at its end. The setting is 80 unless the garage
+  sets another, 1 to 100 (`PATCH /garages/:id {walk_complete_percent}`,
+  0040); the walk keeps the one in force when it finished
+  (`complete_percent`). `seen_percent` is the share it saw, rounded down,
+  null when there was no stay to check; the comparison is made whole, so
+  exactly the setting feeds. A walk under it -- no sightings, or part of the
+  garage -- keeps its lists as they are, lists no stay as stuck, and says
+  `incomplete: "walk incomplete (N%)"` in its answer and its lists.
+- **Read** -- `GET /api/v1/garages/:garageId/walks/:walkId` → the walk
+  (`abandoned_at` set once abandoned, `feeds_stuck`, `seen_percent`,
+  `complete_percent` and `incomplete` once finished), its
+  sightings and, once finished, its lists.
+- **A sighting's picture** --
+  `GET /api/v1/garages/:garageId/walks/:walkId/sightings/:sightingId/picture`
+  → the image bytes, `image/jpeg` or `image/png`, `Cache-Control: private,
+  no-store`; `404` when the sighting has none, its days are over, or it is
+  not this walk's.
+
+**Matching** is the exit's (0037, `src/exitMatch.js`): the sure characters in
+their positions, folded, against the garage's stays open at some point during
+the walk. **A phone's picture is not the lane's camera** -- other light, other
+distance -- so the colour and the size from a walk picture never exclude a
+stay, and a phone's "unreadable" is never matched against a lane's: the plate
+characters decide.
+
+**The stuck list reads the walks**: `last_seen_on_walk` is when a finished
+walk last saw the stay, and a stay the garage's latest walk that feeds the
+stuck list did not see, and no walk finished after it saw, is listed
+whatever its age, with `why: "not_seen_on_walk"`. A listing only shows the
+stay to a person: nothing ends a stay but a person, with a reason ("Ending
+a stay no exit closed"). Ending one means the exit no longer finds it, so
+that car would leave on the driver's word: end a stay only once it is
+really gone.
+
+**Frozen in the database**, not only in the code: once a walk is finished
+or abandoned, its row never changes (no new lists, never open again), its
+sightings take nothing new and change only by losing their picture after
+its days, and its listed stays are never added to; the application role
+cannot delete a sighting or a listed stay at all (they go with their walk),
+nor change a listed stay. A sighting never moves to another walk, open or
+closed, so it never leaves a finished walk's record for an open walk's
+share.
+
+The walks hold plates and are personal data: a walk is deleted with its
+sightings once it finished or was abandoned -- or, neither, started --
+longer ago than the tenant's retention window (`retention_days`), in the
+same purge as the vehicles -- and not while one of its pictures is still
+kept: deleting the walk would take the picture with it. Its pictures go by
+the picture job (*Picture retention*). One car's kept picture does not keep
+the others' plates (0046): past the window, a sighting whose picture is gone
+has its plate, its characters and the readers' plates blanked
+(`plate_blanked_at`), and the lists keep a plate only on the
+`seen_with_stay` row of the stay that keeps the picture; rows, stay ids and
+what was read stay. The freeze triggers allow exactly that blanking on a
+closed walk, and nothing else.
+
+### Picture retention
+
+The lane's pictures (`entry_pictures`, 0033) and the walk's (0040) are
+removed by one scheduled job, `npm run purge-pictures`, daily (`npm run
+purge` runs it too, first), one tenant at a time under that tenant's row
+security. It prints one line, counts only: `pictures: N tenant(s); removed
+L lane picture(s) and W walk picture(s).`
+
+- **30 days after it was taken**, a picture goes. A day is 24 hours,
+  whatever the database's time zone; the 30th day over is gone, so a
+  picture exactly 30 days old is removed and one a second younger is kept.
+- **A stay keeps the pictures it holds**: the lane's of its entry, and a
+  walk's that a finished walk listed as seeing it (in `seen_with_stay`,
+  itself or through the typed plate that answered it). It keeps them while
+  the car is inside, then for 30 days after it left -- by the exit, or by a
+  person ending it -- and while its customer has paid picture storage.
+- **Paid storage** is `sessions.pictures_paid_until` (0041): the time up to
+  which the stay's customer has paid to keep its pictures. **Nothing writes
+  it yet**: a storage fee is money, taken where a stay's money is (the
+  payment at the exit), and that payment does not take one.
+- **A car on the banned list** keeps its lane pictures while listed.
+- **An exit decision** keeps no picture of its own: no exit case points at
+  a walk picture. The walk pictures of the stay it closed are the stay's,
+  kept with the stay, as above.
 
 ## Deploying
 

@@ -81,6 +81,22 @@ jobs:
         run: npm run devices-and-codes-fail-control
       - name: Ticket-identity fail-control
         run: npm run ticket-identity-fail-control
+      - name: Unread-identity fail-control
+        run: npm run unread-identity-fail-control
+      - name: Exit-case fail-control
+        run: npm run exits-fail-control
+      - name: Exit-payments fail-control
+        run: npm run exit-payments-fail-control
+      - name: Exit-let-out fail-control
+        run: npm run exit-let-out-fail-control
+      - name: Stay-endings fail-control
+        run: npm run stay-endings-fail-control
+      - name: Inventory walks fail-control
+        run: npm run walks-fail-control
+      - name: Garage clean-up fail-control
+        run: npm run stay-cleanup-fail-control
+      - name: Exit-rules fail-control
+        run: npm run exit-rules-fail-control
       - name: Descriptor fail-control
         run: npm run descriptor-fail-control
       - name: Shadow-run fail-control
@@ -105,6 +121,8 @@ jobs:
         run: npm run fill-rule-fail-control
       - name: Pictures-and-bans fail-control
         run: npm run bans-fail-control
+      - name: Picture-retention fail-control
+        run: npm run picture-retention-fail-control
       - name: Rates-and-open fail-control
         run: npm run rates-and-open-fail-control
       - name: Owner-language fail-control
@@ -151,6 +169,8 @@ jobs:
 
       - name: Exit-outcomes fail-control
         run: npm run exit-outcomes-fail-control
+      - name: Lane QR fail-control
+        run: npm run lane-qr-fail-control
       - name: Validations fail-control
         run: npm run validations-fail-control
       - name: Validations-door fail-control
