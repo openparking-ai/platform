@@ -34,8 +34,8 @@
  *   close_any_garage             a close names another garage's case
  *   second_case_not_superseding  a second case for the same stay leaves the open one open
  *   superseded_payment_left_open a superseded case's open payment is not canceled at Stripe first
- *   stay_payment_not_counted     a payment the stay made at a superseded case does not settle the new one
- *   paid_fee_not_carried         a case superseding a paid one is priced afresh, not on the fee paid
+ *   stay_payment_not_counted     a stay's earlier payment that covers the whole stay is not this case's payment
+ *   paid_not_credited            a case superseding a paid one asks the whole price again, not the difference (0048)
  *   superseding_unlogged         a superseding leaves no line in the change log
  *   end_payment_left_open        a person's end leaves the stay's open payment uncanceled
  *   end_owed_ignores_paid        a stay that paid at an exit is answered owing the whole price
@@ -258,12 +258,12 @@ SOURCE_BREAKS.push(
   {
     name: 'stay_payment_not_counted',
     why: 'a payment the stay made at a superseded case does not settle the new one',
-    edits: [{ file: 'src/exits.js', from: "  if (row.stay_payment?.status === 'succeeded') return row.stay_payment;\n", to: '' }],
+    edits: [{ file: 'src/exits.js', from: "  if (creditCovers(row.quote) && row.stay_payment?.status === 'succeeded') return row.stay_payment;\n", to: '' }],
   },
   {
-    name: 'paid_fee_not_carried',
-    why: 'a case superseding a paid one is priced afresh, not on the fee paid',
-    edits: [{ file: 'src/app.js', from: '            if (paid) {\n              // PAID AT THE CASE IT SUPERSEDES', to: '            if (false) {\n              // PAID AT THE CASE IT SUPERSEDES' }],
+    name: 'paid_not_credited',
+    why: 'a case superseding a paid one asks the whole price again, not the difference (0048)',
+    edits: [{ file: 'src/app.js', from: '            quote = exits.withCredit(priced, await exits.stayPayments(client, tenantId, sessionId));', to: '            quote = priced;' }],
   },
   {
     name: 'superseding_unlogged',
@@ -273,7 +273,7 @@ SOURCE_BREAKS.push(
   {
     name: 'end_payment_left_open',
     why: "a person's end leaves the stay's open payment uncanceled",
-    edits: [{ file: 'src/app.js', from: '      await settleCasesBeforeEnd(req);\n', to: '' }],
+    edits: [{ file: 'src/app.js', from: '      await settleCasesBeforeEnd(req, staged);\n', to: '' }],
   },
   {
     name: 'end_owed_ignores_paid',
