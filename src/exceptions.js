@@ -446,6 +446,124 @@ export async function countSince(client, tenantId, garageId, since) {
   return { since, ...rows[0], total: rows[0].let_out_unpaid + rows[0].barrier_opened };
 }
 
+/** The most pictures of one kind an exception lists. */
+export const PICTURES_MAX = 50;
+
+/**
+ * THE PICTURES OF AN EXCEPTION, by id (the lane's pictures, 0033): those kept
+ * with its stay's entry (the stay's open event), with its exit case and every
+ * case of the same stay (each case's event), and any other the exception's
+ * lane kept in its window [case opened - 15 min, let-out + 15 min] -- as
+ * they stand now, so a picture the retention job has deleted is not listed.
+ * Ids and times only; the image is served one at a time by `pictureOf`.
+ */
+export async function picturesOf(client, tenantId, x) {
+  const { rows } = await client.query(
+    `WITH stay AS (SELECT open_event_id FROM sessions WHERE tenant_id = $1 AND id = $3),
+          cases AS (SELECT id, event_id FROM exits WHERE tenant_id = $1 AND garage_id = $2
+                     AND (id = $4 OR ($3::uuid IS NOT NULL AND session_id = $3)))
+     SELECT p.id, p.taken_at, p.lane_id,
+            CASE WHEN p.event_id = (SELECT open_event_id FROM stay) THEN 'entry'
+                 WHEN p.event_id IN (SELECT event_id FROM cases) THEN 'exit'
+                 ELSE 'lane' END AS kind,
+            (SELECT c.id FROM cases c WHERE c.event_id = p.event_id) AS exit_id
+       FROM entry_pictures p
+      WHERE p.tenant_id = $1 AND p.garage_id = $2
+        AND (p.event_id = (SELECT open_event_id FROM stay)
+             OR p.event_id IN (SELECT event_id FROM cases)
+             OR (p.lane_id = $5 AND p.taken_at >= $6 AND p.taken_at <= $7))
+      ORDER BY p.taken_at, p.id`,
+    [tenantId, x.garage_id, x.session_id, x.exit_id, x.lane_id, x.window_from, x.window_to],
+  );
+  const out = { entry: [], exit: [], lane: [] };
+  for (const r of rows) {
+    if (out[r.kind].length >= PICTURES_MAX) continue;
+    out[r.kind].push({ id: r.id, taken_at: r.taken_at, ...(r.kind === 'exit' ? { exit_id: r.exit_id } : {}), ...(r.kind === 'lane' ? { lane_id: r.lane_id } : {}) });
+  }
+  return out;
+}
+
+/** One picture an exception of this garage lists, as the image itself, or null: no other. */
+export async function pictureOf(client, tenantId, garageId, exceptionId, pictureId) {
+  const { rows } = await client.query('SELECT * FROM exceptions WHERE tenant_id = $1 AND garage_id = $2 AND id = $3', [tenantId, garageId, exceptionId]);
+  if (!rows[0]) return null;
+  const listed = await picturesOf(client, tenantId, rows[0]);
+  if (![...listed.entry, ...listed.exit, ...listed.lane].some((p) => p.id === pictureId)) return null;
+  const picture = await client.query(
+    'SELECT content_type, image FROM entry_pictures WHERE tenant_id = $1 AND garage_id = $2 AND id = $3', [tenantId, garageId, pictureId]);
+  return picture.rows[0] ?? null;
+}
+
+/**
+ * THE GATE AGENT, IN SHORT, for each of `exceptionIds` (the day's list): from
+ * the latest copy of each source -- messages, and of them the deliveries that
+ * failed (`state: "failed"`); calls, and of them those a person answered
+ * (`person_answered_at` set) -- and the copy's state:
+ *
+ *   complete        copied after the window ended
+ *   pending         copied part-way (the window has not ended, or the sweep
+ *                   has not been yet), or not copied yet at all
+ *   not_reachable   the latest try met no answer, or one refused
+ *   not_configured  no gate agent is named for this garage or lane
+ *
+ * `copy` is the worst of the two sources' (not_reachable, pending,
+ * not_configured, complete, in that order); `purged` says the copies were
+ * blanked by the retention purge, and the counts are then 0.
+ */
+export async function gateSummaries(client, tenantId, exceptionIds) {
+  const out = new Map();
+  if (!exceptionIds.length) return out;
+  const { rows } = await client.query(
+    `SELECT DISTINCT ON (r.exception_id, r.source)
+            r.exception_id, r.source, r.state, r.complete, r.purged_at,
+            bool_or(r.complete) OVER (PARTITION BY r.exception_id, r.source) AS ever_complete,
+            jsonb_array_length(r.records) AS n,
+            CASE WHEN r.source = 'gate_agent_messages'
+                 THEN (SELECT count(*)::int FROM jsonb_array_elements(r.records) m,
+                         jsonb_array_elements(CASE WHEN jsonb_typeof(m->'deliveries') = 'array' THEN m->'deliveries' ELSE '[]'::jsonb END) d
+                        WHERE d->>'state' = 'failed') END AS failed,
+            CASE WHEN r.source = 'gate_agent_calls'
+                 THEN (SELECT count(*)::int FROM jsonb_array_elements(r.records) c WHERE coalesce(c->>'person_answered_at', '') <> '') END AS answered
+       FROM exception_records r
+      WHERE r.tenant_id = $1 AND r.exception_id = ANY($2::uuid[]) AND r.source = ANY($3::text[])
+      ORDER BY r.exception_id, r.source, (r.state = 'copied') DESC, r.copied_at DESC, r.id DESC`,
+    [tenantId, exceptionIds, GATE_AGENT_SOURCES],
+  );
+  // The latest copied record gives the counts; the latest record of any state the state.
+  const { rows: latest } = await client.query(
+    `SELECT DISTINCT ON (exception_id, source) exception_id, source, state, complete
+       FROM exception_records
+      WHERE tenant_id = $1 AND exception_id = ANY($2::uuid[]) AND source = ANY($3::text[])
+      ORDER BY exception_id, source, copied_at DESC, id DESC`,
+    [tenantId, exceptionIds, GATE_AGENT_SOURCES],
+  );
+  const stateOf = (copied, last) => {
+    if (copied?.ever_complete) return 'complete';
+    if (!last) return 'pending';
+    if (last.state === 'not_configured') return 'not_configured';
+    if (last.state === 'not_reachable' || last.state === 'refused') return 'not_reachable';
+    return 'pending';
+  };
+  const ORDER = ['not_reachable', 'pending', 'not_configured', 'complete'];
+  for (const id of exceptionIds) {
+    const copied = (source) => rows.find((r) => r.exception_id === id && r.source === source && r.state === 'copied');
+    const last = (source) => latest.find((r) => r.exception_id === id && r.source === source);
+    const m = copied('gate_agent_messages');
+    const c = copied('gate_agent_calls');
+    const states = { messages: stateOf(m, last('gate_agent_messages')), calls: stateOf(c, last('gate_agent_calls')) };
+    out.set(id, {
+      messages: m?.n ?? 0,
+      failed_deliveries: m?.failed ?? 0,
+      calls: c?.n ?? 0,
+      calls_answered: c?.answered ?? 0,
+      copy: ORDER.find((s) => s === states.messages || s === states.calls),
+      copies: states,
+      purged: Boolean(m?.purged_at || c?.purged_at),
+    });
+  }
+  return out;
+}
+
 /** An exception as a list shows it. */
 export function presentSummary(x) {
   return {
@@ -464,12 +582,13 @@ export function presentSummary(x) {
     paid_minor: x.paid_minor,
     currency: x.currency,
     records: x.records ?? undefined,
+    gate_agent: x.gate_agent_summary ?? undefined,
   };
 }
 
 /** One exception's whole story, and everything learned after it. */
 export function presentWhole(x) {
-  const summary = { ...presentSummary(x), records: undefined };
+  const summary = { ...presentSummary(x), records: undefined, gate_agent: undefined };
   const gate = (source) => x.records.filter((r) => r.source === source).map(presentRecord);
   return {
     ...summary,
@@ -478,6 +597,9 @@ export function presentWhole(x) {
     story: x.story,
     payment_after_let_out: x.records.filter((r) => r.source === 'payment_after_let_out').map((r) => r.records[0] ?? null)[0] ?? null,
     lane_events_after: gate('lane_events_after')[0]?.records ?? null,
+    // Ids and times; each image at
+    // GET /garages/:garageId/exceptions/:exceptionId/pictures/:pictureId.
+    pictures: x.pictures ?? { entry: [], exit: [], lane: [] },
     gate_agent: {
       messages: gate('gate_agent_messages'),
       calls: gate('gate_agent_calls'),

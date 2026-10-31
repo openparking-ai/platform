@@ -251,7 +251,10 @@ test("THE DRAFT BESIDE THE STORED PLANS: a draft starting tomorrow prices a car 
   const [overnight, after] = (await res.json()).stays;
   assert.equal(overnight.refused, false, JSON.stringify(overnight));
   assert.equal(overnight.plan_version, 'today-300', 'the car already inside was priced by the draft');
-  assert.equal(overnight.subtotal_minor, 14 * 300);
+  // Fourteen hours on most nights; fifteen on the night the clocks go back
+  // (and thirteen when they go forward): the hours the car was in, priced.
+  const hoursIn = Math.ceil((localToInstant(`${tomorrow}T10:00`, ZONE) - localToInstant(`${today}T20:00`, ZONE)) / 3_600_000);
+  assert.equal(overnight.subtotal_minor, hoursIn * 300);
   // CONTROL: a car that comes in after the draft starts is priced by it.
   assert.equal(after.plan_version, 'tomorrow');
 });

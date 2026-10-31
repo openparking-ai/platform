@@ -90,13 +90,18 @@ const conflict = (code, message) => new HttpError(CONFLICT_STATUS, message, code
 const STAY_NOT_OPEN = 'the stay is not open in this garage: a validation is claimed before the close, never after';
 
 /**
- * AN ID THAT IS NOT AN ID. Every path parameter is a uuid, and one that is not
- * is answered here -- before the handler reads the body, and before anything
+ * AN ID THAT IS NOT AN ID. Every path parameter is a uuid -- but one, the
+ * exceptions' `:day`, a date (`PARAM_SHAPES`) -- and one that is not is
+ * answered here -- before the handler reads the body, and before anything
  * reaches the database, where it was a 500 -- exactly as that route answers an
  * id that names nothing. `test/ids.test.js` walks both routers and requires
  * every parameter to be one of these.
  */
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** The path parameters that are not uuids, and the shape each takes. */
+const PARAM_SHAPES = Object.freeze({ day: /^\d{4}-\d{2}-\d{2}$/ });
+/** The refusal of a day that is not a date in the garage's own time. */
+const DAY_INVALID = () => new HttpError(400, "day is a date in the garage's own time, written YYYY-MM-DD", 'day_invalid');
 //: The Connect routes (0020, 0021) name their not-found with a code; the rest do not.
 const CONNECT_ROUTE = /\/stripe-account|\/readers?(\/|$)/;
 export const ID_PARAMS = Object.freeze({
@@ -115,6 +120,7 @@ export const ID_PARAMS = Object.freeze({
     walkId: () => new HttpError(404, 'walk not found', 'walk_not_found'),
     sightingId: () => new HttpError(404, 'sighting not found', 'sighting_not_found'),
     exceptionId: () => new HttpError(404, 'exception not found', 'exception_not_found'),
+    day: DAY_INVALID,
   }),
   lane: Object.freeze({
     sessionId: () => conflict('stay_not_open', STAY_NOT_OPEN),
@@ -126,7 +132,8 @@ function checkIds(router, params) {
     // Marked, so the change log does not take a malformed id to the
     // database either (src/changes.js): it names nothing, and it never
     // reaches the database at all.
-    router.param(name, (req, _res, next, value) => next(UUID.test(value) ? undefined : Object.assign(notFound(req.route.path), { malformedId: true })));
+    const shape = PARAM_SHAPES[name] ?? UUID;
+    router.param(name, (req, _res, next, value) => next(shape.test(value) ? undefined : Object.assign(notFound(req.route.path), { malformedId: true })));
   }
 }
 
@@ -2603,13 +2610,13 @@ export function createApp() {
       // second open case: its open payment is canceled at Stripe first,
       // outside any transaction, and the case is closed in the one that
       // writes this one. A payment started on it in between: asked again.
+      // What the stay already paid is asked of Stripe again, for refunds,
+      // before it is credited: once, outside any transaction, each read
+      // bounded (exitPayments.REFUND_READ_TIMEOUT_MS) -- never again per try.
+      const refundsUnread = sessionId ? await readStayRefunds({ tenantId, sessionId }) : [];
       let out = null;
-      let refundsUnread = [];
       for (let attempt = 1; !out; attempt += 1) {
         if (sessionId) await settlePriorCase({ tenantId, garageId, sessionId, eventId });
-        // What the stay already paid is asked of Stripe again, for refunds,
-        // before it is credited: outside any transaction, bounded.
-        if (sessionId) refundsUnread = await readStayRefunds({ tenantId, sessionId });
         out = await withTenant(tenantId, (client) => writeCase(client)).catch((err) => {
           if (!(err instanceof PriorCaseMoved)) throw err;
           if (attempt >= PRIOR_CASE_ATTEMPTS) throw paymentUnsettled();
@@ -4135,12 +4142,15 @@ export function createApp() {
    * when, why, what it owed and paid, and how many records were appended.
    * Read through the garage: another account's or garage's is 404. No plate.
    */
-  operator.get('/garages/:garageId/exceptions', async (req, res, next) => {
+  const exceptionsOfDay = async (req, res, next, rawDay) => {
     try {
       const out = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
-        const { day, from, to } = garageDay(req.query.day, garage.timezone);
-        return { day, from, to, rows: await exceptionsRecord.forGarage(client, req.tenantId, garage.id, { from, to }) };
+        const { day, from, to } = garageDay(rawDay, garage.timezone);
+        const rows = await exceptionsRecord.forGarage(client, req.tenantId, garage.id, { from, to });
+        // The gate agent in short, for each: what the page shows without reading every story.
+        const gate = await exceptionsRecord.gateSummaries(client, req.tenantId, rows.map((x) => x.id));
+        return { day, from, to, rows: rows.map((x) => ({ ...x, gate_agent_summary: gate.get(x.id) })) };
       });
       res.json({
         garage_id: req.params.garageId,
@@ -4154,7 +4164,10 @@ export function createApp() {
     } catch (err) {
       next(err);
     }
-  });
+  };
+  operator.get('/garages/:garageId/exceptions', (req, res, next) => exceptionsOfDay(req, res, next, req.query.day));
+  /** The same day, named in the path: `/exceptions/day/YYYY-MM-DD`, the garage's own date. */
+  operator.get('/garages/:garageId/exceptions/day/:day', (req, res, next) => exceptionsOfDay(req, res, next, req.params.day));
 
   /**
    * ONE EXCEPTION'S WHOLE STORY (0048): what happened as it stood at the
@@ -4167,10 +4180,31 @@ export function createApp() {
     try {
       const x = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
-        return exceptionsRecord.one(client, req.tenantId, garage.id, req.params.exceptionId);
+        const found = await exceptionsRecord.one(client, req.tenantId, garage.id, req.params.exceptionId);
+        return found && { ...found, pictures: await exceptionsRecord.picturesOf(client, req.tenantId, found) };
       });
       if (!x) throw new HttpError(404, 'exception not found', 'exception_not_found');
       res.json({ exception: exceptionsRecord.presentWhole(x) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * ONE PICTURE AN EXCEPTION LISTS, as the image itself: its stay's entry, its
+   * case's or the stay's other cases' exit, or the lane's in its window -- and
+   * no other. Through the garage, `private, no-store`; a picture the
+   * retention job has deleted is 404, as at every picture route.
+   */
+  operator.get('/garages/:garageId/exceptions/:exceptionId/pictures/:pictureId', async (req, res, next) => {
+    try {
+      const picture = await withTenant(req.tenantId, async (client) => {
+        const garage = await ownGarage(client, req);
+        return exceptionsRecord.pictureOf(client, req.tenantId, garage.id, req.params.exceptionId, req.params.pictureId);
+      });
+      if (!picture) throw new HttpError(404, 'picture not found');
+      res.set({ 'Content-Type': picture.content_type, 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' });
+      res.send(picture.image);
     } catch (err) {
       next(err);
     }
@@ -5503,8 +5537,9 @@ export { pool, LANE_EVENT_KINDS, CLOSE_UNPRICED_EVENT_KIND };
  */
 function garageDay(raw, timezone) {
   const day = raw === undefined ? instantToLocal(Date.now(), timezone).slice(0, 10) : raw;
-  if (typeof day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day) {
-    throw new HttpError(400, 'day is a date in the garage\'s own time, written YYYY-MM-DD', 'day_invalid');
+  if (typeof day !== 'string' || !PARAM_SHAPES.day.test(day) || Number.isNaN(Date.parse(`${day}T00:00:00Z`))
+    || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day) {
+    throw DAY_INVALID();
   }
   const next = new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
   // Midnight a zone skips (clocks forward at 00:00) is the day's first real minute.
