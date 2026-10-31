@@ -1070,13 +1070,16 @@ export function createApp() {
       if (walkComplete !== undefined && !(Number.isInteger(walkComplete) && walkComplete >= 1 && walkComplete <= 100)) {
         throw bad('walk_complete_percent must be a whole number from 1 to 100 when given');
       }
+      // How old an open stay is before the stuck list shows it (0043).
+      const stuckAfter = stuck.stuckAfterHours(req.body?.stuck_after_hours);
       const given = {
         default_action: action, transient_available: transient, ban_tailgaters: banTailgaters, ban_reach: banReach, spaces,
         walk_complete_percent: walkComplete,
+        stuck_after_hours: stuckAfter,
       };
       const fields = Object.keys(given).filter((f) => given[f] !== undefined);
       if (fields.length === 0) {
-        throw bad('default_action, transient_available, ban_tailgaters, ban_reach, spaces or walk_complete_percent is required');
+        throw bad('default_action, transient_available, ban_tailgaters, ban_reach, spaces, walk_complete_percent or stuck_after_hours is required');
       }
       const garage = await changeTx(req, async (client) => {
         // Read first, locked: the line says what each field was.
@@ -3755,23 +3758,43 @@ export function createApp() {
 
   /**
    * THE STAYS THAT LOOK STUCK (0039): this garage's open stays that came in
-   * at least `older_than_hours` ago (72 by default), and those the latest
-   * finished walk did not see (0040), oldest first, for a person to end. A
-   * read.
+   * at least `older_than_hours` ago (the garage's `stuck_after_hours`, 0043,
+   * unless asked), and those the latest finished walk did not see (0040),
+   * oldest first, each with its entry pictures, for a person to end. A read.
    */
   operator.get('/garages/:garageId/stays/stuck', async (req, res, next) => {
     try {
-      const hours = stuck.olderThanHours(req.query.older_than_hours);
-      const { stays, facts } = await withTenant(req.tenantId, async (client) => {
-        await ownGarage(client, req);
-        const old = await stuck.stuckStays(client, req.tenantId, req.params.garageId, { hours });
-        const facts = await walks.walkFacts(client, req.tenantId, req.params.garageId);
-        const unseen = await stuck.openStaysAmong(client, req.tenantId, req.params.garageId, [...facts.notSeenLast],
+      const { hours, garageHours, stays, facts, pictures } = await withTenant(req.tenantId, async (client) => {
+        const garage = await ownGarage(client, req);
+        const hours = stuck.olderThanHours(req.query.older_than_hours, garage.stuck_after_hours);
+        const old = await stuck.stuckStays(client, req.tenantId, garage.id, { hours });
+        const facts = await walks.walkFacts(client, req.tenantId, garage.id);
+        const unseen = await stuck.openStaysAmong(client, req.tenantId, garage.id, [...facts.notSeenLast],
           new Set(old.map((r) => r.id)));
         const all = [...old, ...unseen].sort((a, b) => a.entry_at - b.entry_at || (a.id < b.id ? -1 : 1));
-        return { stays: all, facts };
+        const pictures = await stuck.entryPictures(client, req.tenantId, garage.id, all.map((r) => r.open_event_id));
+        return { hours, garageHours: garage.stuck_after_hours, stays: all, facts, pictures };
       });
-      res.json({ older_than_hours: hours, stays: stays.map((r) => stuck.presentStuck(r, facts)) });
+      res.json({
+        older_than_hours: hours,
+        stuck_after_hours: garageHours,
+        stays: stays.map((r) => stuck.presentStuck(r, facts, pictures)),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** One entry picture of a stay of this garage (0033), as the image itself. */
+  operator.get('/garages/:garageId/stays/:stayId/pictures/:pictureId', async (req, res, next) => {
+    try {
+      const picture = await withTenant(req.tenantId, async (client) => {
+        const garage = await ownGarage(client, req);
+        return stuck.stayPicture(client, req.tenantId, garage.id, req.params.stayId, req.params.pictureId);
+      });
+      if (!picture) throw new HttpError(404, 'picture not found');
+      res.set({ 'Content-Type': picture.content_type, 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' });
+      res.send(picture.image);
     } catch (err) {
       next(err);
     }
@@ -3781,8 +3804,16 @@ export function createApp() {
    * A PERSON ENDS A STAY NOTHING CLOSED, `{outcome, reason, left_at?}`:
    * `ended` (the car left, at `left_at` or now) or `abandoned` (written off,
    * now). Closed unpriced, with who and why on the stay, an event beside it
-   * and a line in the change log. Once: only an open stay ends. Not while a
-   * car is at an exit lane on it -- a person lets that one out there.
+   * and a line in the change log saying what it was and what it became.
+   * Once: only an open stay ends. An exit case left open on it never
+   * blocks the end (0045): it is closed with the stay.
+   *
+   * A stay that ENDED owes what its exit would have charged at `left_at`
+   * (0043), kept on `ended.owed` and answered as `owed_minor`. Nothing is
+   * charged here, whatever card the car has: the garage collects it its
+   * own way. An abandoned stay owes nothing. A stay that paid at an exit
+   * (`ended.paid`) is answered owing the rest: the price less what was
+   * paid, never below 0.
    */
   operator.post('/garages/:garageId/stays/:stayId/end', async (req, res, next) => {
     try {
@@ -3810,6 +3841,7 @@ export function createApp() {
         if (leftAt < stay.entry_at) throw new HttpError(400, 'left_at is before the stay came in', 'left_at_before_entry');
         const actor = await changes.who(client, req.change);
         const by = `${actor.kind}:${actor.name ?? actor.id ?? ''}`.slice(0, 300);
+        const owed = ask.outcome === 'ended' ? await owedForEnded(client, { tenantId: req.tenantId, garage, stay, leftAt }) : null;
         const closedCases = [];
         let paid = null;
         for (const c of atExit) {
@@ -3824,31 +3856,32 @@ export function createApp() {
           record: {
             by,
             why: ask.reason,
+            ...(owed ? { owed } : {}),
             ...(closedCases.length ? { exit_cases: closedCases.map((c) => c.exit_id) } : {}),
             ...(paid ? { paid } : {}),
           },
         });
         if (!row) throw conflict('stay_not_open', 'this stay is not open: it has already been closed or ended');
+        // What it still owes, as shown: the price less what was paid on the stay, never below 0.
+        const owedMinor = owed ? stuck.owedAfterPaid(owed.fee_minor, paid, row.currency) : null;
         await repo.appendEvents(client, req.tenantId, [{
           garageId: garage.id,
           laneId: null,
           eventId: `${stuck.STAY_ENDED_EVENT_KIND}:${row.id}`,
           kind: stuck.STAY_ENDED_EVENT_KIND,
           occurredAt: now,
-          detail: { actor: by, session_id: row.id, reason: ask.outcome, why: ask.reason, exit_at: row.exit_at },
+          detail: { actor: by, session_id: row.id, reason: ask.outcome, why: ask.reason, exit_at: row.exit_at, owed_minor: owedMinor },
         }]);
         await changes.record(client, req.change, {
           garageId: garage.id,
           action: 'stay.end',
           subject: { kind: 'stay', id: row.id, name: null },
-          before: { open: true },
+          before: { open: true, entered_at: stay.entry_at, exit_at: null },
           after: {
-            open: false,
-            outcome: ask.outcome,
-            reason: ask.reason,
-            exit_at: row.exit_at,
+            open: false, outcome: ask.outcome, reason: ask.reason, entered_at: row.entry_at, exit_at: row.exit_at,
+            owed_minor: owedMinor, currency: row.currency,
             ...(closedCases.length ? { exit_cases_closed: closedCases } : {}),
-            ...(paid ? { paid_minor: paid.amount_minor, currency: paid.currency } : {}),
+            ...(paid ? { paid_minor: paid.amount_minor } : {}),
           },
         });
         return row;
@@ -4628,10 +4661,10 @@ async function priceStay({ garage, plans, session, exitAt }) {
  * about by the modules (they hold plates), so it prices as a transient and
  * says why. `vehicle` null: the driver's word, which no module is asked about.
  */
-async function quoteStay(client, { tenantId, garage, laneId, session, vehicle, exitAt }) {
+async function quoteStay(client, { tenantId, garage, laneId, exitLaneIds = null, session, vehicle, exitAt }) {
   const identity = vehicle?.plate ?? vehicle?.ticket_ref ?? null;
   const asked = identity
-    ? await entitlement.consult({ garage, identity, laneId, entryAt: session.entry_at, exitAt })
+    ? await entitlement.consult({ garage, identity, laneId, exitLaneIds, entryAt: session.entry_at, exitAt })
     : {
         outcome: entitlement.EXIT_OUTCOMES.TRANSIENT,
         covered_by: [],
@@ -4671,6 +4704,26 @@ async function quoteStay(client, { tenantId, garage, laneId, session, vehicle, e
     refusal: null,
     pre_tax: { feeMinor: priced.feeMinor, planVersion: priced.planVersion, breakdown: priced.breakdown, spaceClass: priced.spaceClass },
   };
+}
+
+/**
+ * WHAT A STAY A PERSON ENDED OWES (0043): the exit's own quote at the time
+ * the person said the car left. No exit lane was crossed, and garage-pass
+ * answers for a lane: it is asked at each of the garage's exit lanes, and a
+ * pass any of them covers covers the stay, as it would have at the exit.
+ * With no exit lane it is not asked, and the ending says so
+ * (`pass_unasked`). Monthly billing is asked as at any exit.
+ */
+async function owedForEnded(client, { tenantId, garage, stay, leftAt }) {
+  const vehicle = await exits.vehicleOf(client, tenantId, stay.vehicle_id);
+  const { rows } = await client.query(
+    `SELECT id FROM lanes WHERE tenant_id = $1 AND garage_id = $2 AND direction = 'exit' ORDER BY created_at, id`,
+    [tenantId, garage.id],
+  );
+  const quote = await quoteStay(client, {
+    tenantId, garage, laneId: null, exitLaneIds: rows.map((r) => r.id), session: stay, vehicle, exitAt: leftAt,
+  });
+  return stuck.owedOf(quote);
 }
 
 /**

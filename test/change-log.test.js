@@ -492,8 +492,9 @@ const WRITES = [
     },
     run: (s) => call(base, 'POST', `/garages/${s.g.id}/stays/${s.stay.id}/end`, { as: a, body: { outcome: 'abandoned', reason: 'not seen on three walks' } }),
     line: (l, s) => {
-      assert.deepEqual([l.subject_kind, l.subject_id, l.subject_name, l.before], ['stay', s.stay.id, null, { open: true }]);
-      assert.deepEqual([l.after.open, l.after.outcome, l.after.reason], [false, 'abandoned', 'not seen on three walks']);
+      assert.deepEqual([l.subject_kind, l.subject_id, l.subject_name, l.before.open, l.before.exit_at], ['stay', s.stay.id, null, true, null]);
+      assert.deepEqual([l.after.open, l.after.outcome, l.after.reason, l.after.owed_minor], [false, 'abandoned', 'not seen on three walks', null]);
+      assert.equal(l.before.entered_at, l.after.entered_at);
     },
     state: (s) => one(a.tenant, "SELECT ended->>'reason' AS reason FROM sessions WHERE id = $1", [s.stay.id]),
   },

@@ -1839,34 +1839,91 @@ at, by, why}` when a person decided.
   `404 session_not_open` for a stay named by id, `404 no_open_stay` for a
   plate or ticket with no open stay.
 - **The stays looking stuck** --
-  `GET /api/v1/garages/:garageId/stays/stuck?older_than_hours=72` (an
-  operator token; 1 to 2160, default 72): the open stays that came in before
-  then, oldest first, as `{id, plate, plate_whole, ticket, unread,
-  entered_at, entry_lane, at_exit, last_seen_on_walk, why}`.
+  `GET /api/v1/garages/:garageId/stays/stuck?older_than_hours=` (an
+  operator token; 1 to 2160): the open stays that came in more than that
+  many hours ago -- the garage's own `stuck_after_hours` (0043) when the
+  reader names no age -- and those the latest complete walk did not see
+  (0040), oldest first, as `{older_than_hours, stuck_after_hours, stays:
+  [{id, plate, plate_whole, ticket, unread, entered_at, entry_lane, at_exit,
+  last_seen_on_walk, why, pictures}]}`. `pictures` is the entry pictures
+  (0033) kept with the stay's open, newest first, at most 4, each `{id,
+  taken_at}`; `GET .../stays/:stayId/pictures/:pictureId` is one of them,
+  `private, no-store`, and 404 through any other stay or garage.
+- **The garage's age** -- `PATCH /api/v1/garages/:garageId
+  {stuck_after_hours}`: a whole number of hours, 1 to 2160; 24 until the
+  garage sets another. A `garage.update` line with before and after.
 - **A person ends one** --
   `POST /api/v1/garages/:garageId/stays/:stayId/end {outcome, reason, left_at?}`:
   `outcome` is `"ended"` (the car left; `left_at`, if given, is when -- not
   before its entry, not in the future) or `"abandoned"` (the car is gone and
-  nobody knows when; no `left_at`). `reason` is required. Once: an ended
-  stay is `409 stay_not_open`. **An exit case left open on the stay** -- the
-  car left the lane without its close, after a let-out or not -- **never
-  blocks it** (0045): the case's unpaid payment is canceled at Stripe first,
-  then the case is closed with `ended: {why: "stay_ended", by}`; a payment
-  that succeeded stays paid, is never canceled, and the stay's `ended`
-  carries it (`paid: {exit_id, amount_minor, currency}`, with `exit_cases`).
-  A card being authorised at that moment: `409 payment_in_progress`, nothing
-  changed; Stripe out of reach: `503 payment_unsettled`. A validation held
-  on the stay is handed to the release. A `stay_ended` event and a
-  `stay.end` change-log line, which names the stay, the cases it closed and
-  no vehicle.
+  nobody knows when; no `left_at`). `reason` is required, at most 500
+  characters on one line (`400 reason_invalid` for a line break or a
+  control character), and kept as typed: a screen shows it as text. **It
+  goes into the change log as typed, so it must not name the car**: a
+  screen that asks for it says so in its help text ("why the stay ended --
+  do not type the plate: the reason goes to the change log"). Once: an
+  ended stay is `409 stay_not_open`. **An exit case left open on the stay**
+  -- the car left the lane without its close, after a let-out or not --
+  **never blocks it** (0045): the case's unpaid payment is canceled at
+  Stripe first, then the case is closed with `ended: {why: "stay_ended",
+  by}`; a payment that succeeded stays paid, is never canceled, and the
+  stay's `ended` carries it (`paid: {exit_id, amount_minor, currency}`,
+  with `exit_cases`). A card being authorised at that moment: `409
+  payment_in_progress`, nothing changed; Stripe out of reach: `503
+  payment_unsettled`. A validation held on the stay is handed to the
+  release. A `stay_ended` event and a `stay.end` change-log line -- who and
+  when, as every line; the stay by its id, the cases it closed and no
+  vehicle; `before: {open, entered_at, exit_at}`, `after: {open, outcome,
+  reason, entered_at, exit_at, owed_minor, currency}`, with
+  `exit_cases_closed` when it closed a case and `paid_minor` when one had
+  paid.
+- **What an ended stay owes (0043).** A stay that `ended` owes what its exit
+  would have charged at `left_at`: the exit's own quote -- the modules
+  asked, then the rates, then the tax. Garage-pass answers for a lane and no
+  lane was crossed, so it is asked at **each of the garage's exit lanes**,
+  and a pass any of them covers covers the stay, as it would have at the
+  exit (the record lists the lanes asked, `asked_at_lanes`). A garage with
+  no exit lane has nowhere to ask: the pass is not asked, and the ending
+  says so -- `pass_unasked: true`, on `ended.owed`, in the end's answer and
+  in the past stays -- so a person can see what was priced without it. It
+  is kept on `ended.owed` (`{outcome, fee_minor, subtotal_minor, currency,
+  breakdown, plan_version, covered_by, refused, pass_unasked, entitlement}`;
+  `entitlement` is what each module was asked and said, and the retention
+  purge takes it out with the vehicle) and answered as `owed_minor`: 0 when
+  covered, null when the rates refused to price it. **A stay that paid at an
+  exit** before a person ended it owes the rest: `owed_minor` -- in the
+  end's answer, its event, its change-log line and the past stays -- is
+  `ended.owed.fee_minor` less `ended.paid.amount_minor`, never below 0;
+  `ended.owed` keeps the exit's whole quote and `ended.paid` what was paid.
+  **Nothing is charged**, whatever card the car has: the stay stays
+  unpriced (`fee_minor` is what a stay paid at its exit), and the garage
+  collects what it owes its own way. An abandoned stay owes nothing.
+  Pricing needs the rate engine: with it down, `ended` is refused as the
+  exit is, and `abandoned` still works.
 
 The past stays (`GET /garages/:garageId/stays/closed`) carry `ended`, the
-reason, on a stay that was ended. The database holds the shape: an ended stay
-is unpriced, has no exit lane or close event, a known reason, and who and why
-when a person decided.
+reason, on a stay that was ended, and `owed_minor` beside a null `fee_minor`
+on one that owes, with `pass_unasked`; a stay a person let out owing (0042)
+is `let_out_unpaid`, with what it owed as `owed_minor`. The database holds the shape: an ended stay is unpriced,
+has no exit lane or close event, a known reason, and who and why when a
+person decided; only a stay that `ended` may owe, in its own currency, a
+whole number of minor units, nothing when covered.
 
-`test/stay-endings.test.js` holds each; `npm run stay-endings-fail-control`
-breaks each in turn.
+The routes' permissions, for a platform with linked accounts (#78): the list
+and the pictures are `stays:read`, the end is `stays:change`, and the
+garage's age is `garages:change`.
+
+`test/stay-endings.test.js` and `test/stay-cleanup.test.js` hold each; `npm
+run stay-endings-fail-control` and `npm run stay-cleanup-fail-control` break
+each in turn.
+
+**Counting the cars inside (0044).** Every open counts the cars inside at the
+car's entry behind the garage's lock. `sessions_garage_exit_idx` (tenant,
+garage, `exit_at`) gives the stays that left after that instant, and the
+partial open-stays index the ones still inside, so the count no longer reads
+the garage's whole history. `npm run occupancy-plan` builds a scratch
+database of 300,000 stays and prints the plan and the time before and after;
+0044 builds the index `CONCURRENTLY`, outside a transaction.
 
 ### The inventory walk (0040)
 

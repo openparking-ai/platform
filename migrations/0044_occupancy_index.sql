@@ -1,0 +1,26 @@
+-- 0044 — the cars inside, counted from the stays still inside.
+--
+-- Every open counts the cars inside the garage at the car's entry, behind
+-- the garage's lock (`insideAt`, src/repository.js): the stays that came in
+-- by then and had not left by then. With nothing but the entry index, every
+-- stay the garage ever had came in "by then", so the count read them all --
+-- a sequential scan of the whole history, under the lock every other open
+-- of the garage waits on.
+--
+--   sessions_garage_exit_idx   (tenant_id, garage_id, exit_at): the stays
+--                    that left after the instant counted. The ones still
+--                    open come from `sessions_garage_open_confirmation_idx`
+--                    (garage_id ... WHERE exit_at IS NULL), and the two are
+--                    OR-ed. `scripts/occupancy-plan.js` prints the plan and
+--                    the time before and after, on 300,000 stays.
+--
+-- CONCURRENTLY, so a garage keeps opening while it builds: the one
+-- statement in this file, outside any transaction (scripts/migrate.js sends
+-- a file as one query, and a single statement is not wrapped in one). If
+-- the build stops part-way it leaves an INVALID index of this name, which
+-- IF NOT EXISTS would then keep: drop it (DROP INDEX CONCURRENTLY
+-- sessions_garage_exit_idx) and run this file again.
+--
+-- Run as the database OWNER.
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS sessions_garage_exit_idx ON sessions (tenant_id, garage_id, exit_at);

@@ -24,6 +24,7 @@
  * buckets by local day itself.
  */
 import { HttpError } from './errors.js';
+import { owedAfterPaid } from './stuckStays.js';
 
 export const RANGE_MAX_DAYS = 93;
 export const PAGE_DEFAULT = 1000;
@@ -104,8 +105,10 @@ export async function closedStays(client, tenantId, garageId, { from, to, limit,
     `SELECT s.id, to_json(s.exit_at) #>> '{}' AS exit_key,
             s.entry_at, s.exit_at, s.fee_minor, s.subtotal_minor, s.currency, s.exit_outcome,
             (s.pricing_refusal IS NOT NULL) AS pricing_refused, s.occupancy_at_entry_bp,
-            s.ended->>'reason' AS ended,
-            (s.let_out IS NOT NULL) AS let_out_unpaid, s.let_out->'owed_minor' AS owed_minor
+            s.ended->>'reason' AS ended, (s.ended->'owed'->>'pass_unasked')::boolean AS pass_unasked,
+            (s.let_out IS NOT NULL) AS let_out_unpaid,
+            COALESCE(s.ended->'owed'->'fee_minor', s.let_out->'owed_minor') AS owed_minor,
+            s.ended->'paid' AS paid
        FROM sessions s
       WHERE s.tenant_id = $1 AND s.garage_id = $2
         AND s.exit_at >= $3 AND s.exit_at < $4
@@ -128,9 +131,17 @@ export async function closedStays(client, tenantId, garageId, { from, to, limit,
  * `fee_minor` is null on a covered stay and on one the engine refused to price
  * (`pricing_refused`), which is not a stay that paid nothing. `ended` names
  * how a stay no exit closed ended (0039) -- `superseded`, `ended` or
- * `abandoned` -- and is null on every stay an exit closed. `let_out_unpaid`
- * is a stay a person let out owing, with nothing paid (0042): its fee is
- * null and `owed_minor` is what it owed (null when it could not be priced).
+ * `abandoned` -- and is null on every stay an exit closed. `owed_minor` is
+ * what a stay a person ended because the car left owes (0043) -- its
+ * `fee_minor` stays null, because the stay was not closed priced -- less
+ * what was paid on it at an exit (0045, `ended.paid`), never below 0; and
+ * what a stay a person let out owing (0042) owed. It is null on every other
+ * stay, or when the rates refused to price it. (Read from wherever a stay
+ * keeps what it owes: one COALESCE, so another place is one more argument.)
+ * `let_out_unpaid` is a stay a person let out owing, with nothing paid: its
+ * fee is null. `pass_unasked` is true on an ended stay whose garage links a
+ * pass and had no exit lane to ask it at, false when the pass was asked or
+ * none is linked, and null where nothing is owed or it was not recorded.
  */
 function present(row) {
   return {
@@ -145,6 +156,8 @@ function present(row) {
     occupancy_at_entry_bp: row.occupancy_at_entry_bp,
     ended: row.ended,
     let_out_unpaid: row.let_out_unpaid,
-    owed_minor: row.owed_minor === null ? null : Number(row.owed_minor),
+    // What it still owes: less what was paid on the stay, never below 0.
+    owed_minor: owedAfterPaid(row.owed_minor, row.paid, row.currency),
+    pass_unasked: row.pass_unasked ?? null,
   };
 }

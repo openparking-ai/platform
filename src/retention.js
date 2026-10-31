@@ -150,6 +150,13 @@ export async function redactExpiredVehicles(tenantId, { now = null, dryRun = fal
           WHERE tenant_id = $1 AND entitlement IS NOT NULL AND vehicle_id = ANY($2::uuid[])`,
         [tenantId, rows.map((r) => r.id)],
       );
+      // The same record on a stay a person ended (0043, `ended.owed`): out
+      // with the vehicle, what it owed kept.
+      await client.query(
+        `UPDATE sessions SET ended = ended #- '{owed,entitlement}'
+          WHERE tenant_id = $1 AND vehicle_id = ANY($2::uuid[]) AND ended->'owed' ? 'entitlement'`,
+        [tenantId, rows.map((r) => r.id)],
+      );
       // The shadow rows about those vehicles' stays: references out, figure kept.
       await client.query(
         `UPDATE shadow_searches sh

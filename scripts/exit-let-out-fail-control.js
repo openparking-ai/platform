@@ -38,6 +38,11 @@
  *   paid_fee_not_carried         a case superseding a paid one is priced afresh, not on the fee paid
  *   superseding_unlogged         a superseding leaves no line in the change log
  *   end_payment_left_open        a person's end leaves the stay's open payment uncanceled
+ *   end_owed_ignores_paid        a stay that paid at an exit is answered owing the whole price
+ *   end_owed_below_zero          a stay that paid more than it owes is answered owing a negative figure
+ *   paid_currency_case           Stripe's small-letter currency keeps what was paid from being taken off
+ *   end_line_owed_ignores_paid   the event and change-log line of such a stay say the whole price
+ *   past_owed_ignores_paid       the past stays show such a stay owing the whole price
  *   other_car_intent_left        the reader holding another case's intent refuses this case's
  *   reader_frees_blind           another case's intent on the reader is canceled without reading Stripe
  *   own_intent_busy              this case's own intent waiting on the reader is a refusal
@@ -269,6 +274,35 @@ SOURCE_BREAKS.push(
     name: 'end_payment_left_open',
     why: "a person's end leaves the stay's open payment uncanceled",
     edits: [{ file: 'src/app.js', from: '      await settleCasesBeforeEnd(req);\n', to: '' }],
+  },
+  {
+    name: 'end_owed_ignores_paid',
+    why: 'a stay that paid at an exit is answered owing the whole price',
+    edits: [{ file: 'src/stuckStays.js', from: '  return Math.max(0, owed - Number(paid.amount_minor));', to: '  return owed;' }],
+  },
+  {
+    name: 'end_owed_below_zero',
+    why: 'a stay that paid more than it owes is answered owing a negative figure',
+    edits: [{ file: 'src/stuckStays.js', from: '  return Math.max(0, owed - Number(paid.amount_minor));', to: '  return owed - Number(paid.amount_minor);' }],
+  },
+  {
+    name: 'paid_currency_case',
+    why: "Stripe's small-letter currency keeps what was paid from being taken off",
+    edits: [{
+      file: 'src/stuckStays.js',
+      from: '  if (!paid || String(paid.currency).toUpperCase() !== String(currency).toUpperCase()) return owed;',
+      to: '  if (!paid || paid.currency !== currency) return owed;',
+    }],
+  },
+  {
+    name: 'end_line_owed_ignores_paid',
+    why: 'the event and change-log line of such a stay say the whole price',
+    edits: [{ file: 'src/app.js', from: 'stuck.owedAfterPaid(owed.fee_minor, paid, row.currency)', to: 'stuck.owedAfterPaid(owed.fee_minor, null, row.currency)' }],
+  },
+  {
+    name: 'past_owed_ignores_paid',
+    why: 'the past stays show such a stay owing the whole price',
+    edits: [{ file: 'src/pastStays.js', from: 'owedAfterPaid(row.owed_minor, row.paid, row.currency)', to: 'owedAfterPaid(row.owed_minor, null, row.currency)' }],
   },
   {
     name: 'other_car_intent_left',

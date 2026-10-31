@@ -23,7 +23,7 @@ const PASSWORD = 'correct horse battery staple';
 const PLATE = 'PLANTPLATE9';
 const TICKET = 'PLANTTICKET7';
 const DESCRIPTOR = 'planted-descriptor-silver-hatchback';
-const FIELDS = ['currency', 'ended', 'entry_at', 'exit_at', 'exit_outcome', 'fee_minor', 'let_out_unpaid', 'occupancy_at_entry_bp', 'owed_minor', 'pricing_refused', 'subtotal_minor'];
+const FIELDS = ['currency', 'ended', 'entry_at', 'exit_at', 'exit_outcome', 'fee_minor', 'let_out_unpaid', 'occupancy_at_entry_bp', 'owed_minor', 'pass_unasked', 'pricing_refused', 'subtotal_minor'];
 // The words a database error carries; none may reach an answer.
 const DB_WORDS = /relation|column|syntax|SQLSTATE|violates|constraint|postgres|timestamptz|uuid|select|where/i;
 

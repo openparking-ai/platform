@@ -213,10 +213,10 @@ test('THE STUCK LIST: open stays older than the setting, oldest first, in the ap
   await open(other, { plate: plate(), entry_at: hoursAgo(300) });
 
   const body = await stuckList(g);
-  assert.equal(body.older_than_hours, 72);
+  assert.deepEqual([body.older_than_hours, body.stuck_after_hours], [24, 24], "the garage's setting, 24 unless it set another (0043)");
   assert.deepEqual(body.stays.map((s) => s.id), [oldest.id, unread.id]);
   const [a, b] = body.stays;
-  assert.deepEqual(Object.keys(a).sort(), ['at_exit', 'entered_at', 'entry_lane', 'id', 'last_seen_on_walk', 'plate', 'plate_whole', 'ticket', 'unread', 'why']);
+  assert.deepEqual(Object.keys(a).sort(), ['at_exit', 'entered_at', 'entry_lane', 'id', 'last_seen_on_walk', 'pictures', 'plate', 'plate_whole', 'ticket', 'unread', 'why']);
   assert.deepEqual([a.why, a.last_seen_on_walk, a.unread, a.plate_whole, a.at_exit], ['old', null, false, true, false]);
   assert.deepEqual([b.unread, b.plate, b.plate_whole], [true, null, false]);
   assert.deepEqual((await stuckList(g, '?older_than_hours=150')).stays.map((s) => s.id), [oldest.id]);

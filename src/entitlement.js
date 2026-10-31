@@ -154,13 +154,35 @@ async function ask(module, link, { identity, laneId, entryAt, exitAt }, options)
  * TRANSIENT otherwise. Returns `{ outcome, covered_by, record }`; `record`
  * is what goes on the row.
  */
-export async function consult({ garage, identity, laneId, entryAt, exitAt }, options = {}) {
+export async function consult({ garage, identity, laneId, exitLaneIds = null, entryAt, exitAt }, options = {}) {
   const record = { identity, asked_at: exitAt.toISOString() };
   const coveredBy = [];
   for (const module of Object.keys(MODULES)) {
     const link = garage[MODULES[module].linkColumn];
     if (!link) {
       record[module] = { consulted: false, reason: 'not linked: the garage names no garage in this module' };
+      continue;
+    }
+    if (module === 'garage_pass' && laneId === null) {
+      // A STAY A PERSON ENDED (0043): no lane was crossed, and a pass answers
+      // for a lane. It is asked at each of the garage's exit lanes
+      // (`exitLaneIds`), and covers the stay if any of them says so. A
+      // garage with no exit lane has nowhere to ask: the pass is not asked,
+      // and the record says so (`unasked`) for a person to see.
+      const lanes = exitLaneIds ?? [];
+      if (lanes.length === 0) {
+        record[module] = { consulted: false, unasked: true, reason: 'no exit lane to ask at: a person ended this stay, and a pass answers for a lane' };
+        continue;
+      }
+      const atLanes = [];
+      let answer = null;
+      for (const lane of lanes) {
+        answer = await ask(module, link, { identity, laneId: lane, entryAt, exitAt }, options);
+        atLanes.push({ lane_id: lane, covered: answer.covered });
+        if (answer.covered) break;
+      }
+      record[module] = { ...answer, asked_at_lanes: atLanes };
+      if (atLanes.some((a) => a.covered)) coveredBy.push('garage_pass');
       continue;
     }
     const answer = await ask(module, link, { identity, laneId, entryAt, exitAt }, options);

@@ -378,8 +378,8 @@ const SOURCE_BREAKS = [
     name: 'stuck_ignores_walks',
     why: "the stuck list does not list the stays the latest walk missed",
     file: 'src/app.js',
-    from: "        const unseen = await stuck.openStaysAmong(client, req.tenantId, req.params.garageId, [...facts.notSeenLast],",
-    to: "        const unseen = await stuck.openStaysAmong(client, req.tenantId, req.params.garageId, [],",
+    from: "        const unseen = await stuck.openStaysAmong(client, req.tenantId, garage.id, [...facts.notSeenLast],",
+    to: "        const unseen = await stuck.openStaysAmong(client, req.tenantId, garage.id, [],",
   },
   {
     name: 'stuck_any_walk',
@@ -469,8 +469,8 @@ const SOURCE_BREAKS = [
     name: 'threshold_setting_dropped',
     why: "the garage's walk threshold is never saved",
     file: 'src/app.js',
-    from: "        walk_complete_percent: walkComplete,\n      };",
-    to: "      };",
+    from: "        walk_complete_percent: walkComplete,\n        stuck_after_hours: stuckAfter,",
+    to: "        stuck_after_hours: stuckAfter,",
   },
   {
     name: 'stuck_reason_not_seen',

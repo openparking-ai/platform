@@ -286,6 +286,17 @@ jobs:
         # to go red.
         run: npm run walks-fail-control
 
+      - name: Garage clean-up fail-control
+        # Breaks 17 properties of the clean-up (0043) -- the garage's own age
+        # for the stuck list, the walk's stays on it, each stay's pictures
+        # served through its own stay and garage only, an ended stay owing
+        # what its exit would have charged when the car left and an abandoned
+        # one nothing, the past stays saying so, a reason on one line, a
+        # change-log line with what the stay was and became and no plate --
+        # and six of 0043's guards, and requires test/stay-cleanup.test.js to
+        # go red.
+        run: npm run stay-cleanup-fail-control
+
       - name: Descriptor fail-control
         # A session carries the appearance descriptor its entry read produced
         # (migration 0009) and the one its exit read produced (0010). Each break
