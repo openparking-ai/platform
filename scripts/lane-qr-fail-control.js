@@ -26,6 +26,18 @@ const PLANTS = [
     to: "    open: outcome !== 'refused_to_answer',",
   },
   {
+    name: 'nothing read keeps a valid QR shut (the rule before "similar enough gets a pass")',
+    file: 'src/enrolments.js',
+    from: "    open: outcome === 'covered',",
+    to: "    open: outcome === 'covered' && printed.enrolment.passed_by !== 'nothing_read',",
+  },
+  {
+    name: 'a look-alike or one-difference read keeps a valid QR shut',
+    file: 'src/enrolments.js',
+    from: "    open: outcome === 'covered',",
+    to: "    open: outcome === 'covered' && !['look_alike', 'one_difference'].includes(printed.enrolment.passed_by),",
+  },
+  {
     name: 'a refused QR keeps a covered car shut (a QR refusal read as a car refusal)',
     file: 'src/enrolments.js',
     from: "    open: outcome === 'covered',",
@@ -52,6 +64,30 @@ const PLANTS = [
     file: 'src/enrolments.js',
     from: "  const detail = { lane_id: laneId, direction, read_identity: vehicle !== '' };",
     to: "  const detail = { lane_id: laneId, direction, read_identity: vehicle !== '', vehicle };",
+  },
+  {
+    name: "the QR's plate written into the event",
+    file: 'src/enrolments.js',
+    from: '    passed_by: PASSED_BY.includes(e.passed_by) ? e.passed_by : null,\n',
+    to: '    passed_by: PASSED_BY.includes(e.passed_by) ? e.passed_by : null,\n    qr_plate: e.qr_plate ?? null,\n',
+  },
+  {
+    name: 'the event does not say how the car passed for the QR (no passed_by)',
+    file: 'src/enrolments.js',
+    from: '    passed_by: PASSED_BY.includes(e.passed_by) ? e.passed_by : null,\n',
+    to: '',
+  },
+  {
+    name: "the event does not name the QR (no enrolment id)",
+    file: 'src/enrolments.js',
+    from: "    enrolment: typeof e.enrolment === 'string' ? e.enrolment : null,\n",
+    to: '    enrolment: null,\n',
+  },
+  {
+    name: 'the plate written into a log line',
+    file: 'src/app.js',
+    from: '      await record(enrolments.presentedDetail({ laneId, direction, vehicle, result }));',
+    to: '      console.log(`qr presented at ${laneId}: ${vehicle}`);\n      await record(enrolments.presentedDetail({ laneId, direction, vehicle, result }));',
   },
   {
     name: "the door's error quotes the argv (and with it the token)",

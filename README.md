@@ -1326,6 +1326,17 @@ both halves come back verbatim beside `open`, which is **true for a covered
 answer and nothing else**. A refused QR is not a refused car: the answer is the
 car's own, so a car the registers already cover still opens on its pass.
 
+Whether the car is the QR's car is garage-pass's decision too — the owner's
+rule of 2026-10-30, *similar enough gets a pass*. A valid QR made for a plate
+passes when the lane read the same plate, the same once look-alikes are one
+character (0OQD, 1IL, 8B, 5S, 2Z, 6G), one character off (only on a QR plate of
+five characters or more), or nothing usable (`vehicle` null). The enrolment half
+is then `recognised`, with `passed_by` naming which — `same_plate`,
+`look_alike`, `one_difference` or `nothing_read` — and `qr_plate` the plate the
+QR answers for, so the lane checks its owner's deny rule against the car it lets
+in. Only a clearly different plate is `match_required`: nothing opens on that QR
+until a picture match or a person confirms it.
+
 - `200` — garage-pass answered; open or shut, and its sentence says why.
 - `409 qr_not_linked` — the garage names no garage-pass garage.
 - `409 qr_stale` — `presented_at` more than two minutes ago; `409 clock_skew`
@@ -1338,9 +1349,11 @@ car's own, so a car the registers already cover still opens on its pass.
 **The token and the plate are kept nowhere.** The token rides on the module's
 argv because that is its door, and nowhere else: not in the answer, not in an
 error, not in a log line, not in the `qr_presented` event, which records what
-happened to the QR (by its enrolment id) and to the gate, and whether the lane
-read an identity. A lane posts `qr_presented` itself only for a QR it could not
-present, with `answered: false` and nothing beyond `reason`, `direction` and
+happened to the QR (by its enrolment id, and how the car passed for it:
+`passed_by`, one of the four names or null) and to the gate, and whether the
+lane read an identity — never `qr_plate` or any other plate. A lane posts
+`qr_presented` itself only for a QR it could not present, with
+`answered: false` and nothing beyond `reason`, `direction` and
 `read_identity`. `test/lane-qr.test.js` runs against the real garage-pass;
 `npm run lane-qr-fail-control` breaks each property in turn.
 

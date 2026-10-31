@@ -5,8 +5,10 @@
  *
  * Every open is paired with the same presentation staying shut for a reason
  * the module names; the module's could-not-answer is paired with the same
- * presentation answered once it is back. And the token and the plate are
- * looked for everywhere this platform writes, and are not there.
+ * presentation answered once it is back. Which read passes for the QR's plate
+ * is garage-pass's rule ("similar enough gets a pass", its G33); here, that
+ * each way it passes reaches the lane and the event by name. And the token and
+ * the plate are looked for everywhere this platform writes, and are not there.
  */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -46,6 +48,8 @@ const present = (device, body) =>
     body: JSON.stringify({ presented_at: new Date().toISOString(), ...body }),
   });
 const plate = (tag) => `${tag}${randomUUID().slice(0, 6).toUpperCase()}`;
+/** `car` with its last `n` characters replaced by X, which no look-alike group holds. */
+const offBy = (car, n) => `${car.slice(0, -n)}${'X'.repeat(n)}`;
 const day = (offsetDays = 0) => new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10);
 const qrEvents = (garageId) =>
   withTenant(tenant, async (c) =>
@@ -124,9 +128,11 @@ test('a pass-only entry: the QR shown by its own car opens; the same QR under an
   assert.equal(body.answer.outcome, 'covered');
   assert.equal(body.enrolment.enrolment, w.enrolmentId);
   assert.equal(body.enrolment.recognised, true);
+  assert.equal(body.enrolment.passed_by, 'same_plate');
 
-  // CONTROL: the same QR, a plate it was not made for -- the module asks for a
-  // picture match, and nothing opens on this QR until one is made.
+  // CONTROL: the same QR, a plate clearly not the one it was made for -- the
+  // module asks for a picture match, and nothing opens on this QR until one is
+  // made.
   const other = await present(w.entry, { token: w.qr, vehicle: plate('ZZ') });
   const otherBody = await other.json();
   assert.equal(other.status, 200, JSON.stringify(otherBody));
@@ -135,13 +141,23 @@ test('a pass-only entry: the QR shown by its own car opens; the same QR under an
   assert.notEqual(otherBody.answer.outcome, 'covered');
 });
 
-test('nothing read and an unknown QR: shut, and the module says why; status 200, because it answered', async () => {
+test('nothing read: a valid QR passes as nothing_read; an unknown QR is refused by name; status 200, because it answered', async () => {
   const w = await world();
   const blind = await present(w.entry, { token: w.qr, vehicle: null });
   const blindBody = await blind.json();
   assert.equal(blind.status, 200, JSON.stringify(blindBody));
-  assert.equal(blindBody.open, false);
-  assert.equal(blindBody.enrolment.match_required, true);
+  assert.equal(blindBody.open, true);
+  assert.equal(blindBody.enrolment.recognised, true);
+  assert.equal(blindBody.enrolment.passed_by, 'nothing_read');
+  assert.equal(blindBody.enrolment.match_required, false);
+  assert.equal(blindBody.enrolment.qr_plate, w.car);
+  // CONTROL: nothing read opens on a valid QR and on nothing else -- an
+  // unknown QR with nothing read is refused by name, and stays shut.
+  const blindUnknown = await present(w.entry, { token: `not-a-qr-${randomUUID()}`, vehicle: null });
+  const blindUnknownBody = await blindUnknown.json();
+  assert.equal(blindUnknown.status, 200, JSON.stringify(blindUnknownBody));
+  assert.equal(blindUnknownBody.open, false);
+  assert.equal(typeof blindUnknownBody.enrolment.refused, 'string');
 
   const unknown = await present(w.entry, { token: `not-a-qr-${randomUUID()}`, vehicle: plate('ZZ') });
   const unknownBody = await unknown.json();
@@ -155,6 +171,35 @@ test('nothing read and an unknown QR: shut, and the module says why; status 200,
   const coveredBody = await covered.json();
   assert.equal(typeof coveredBody.enrolment.refused, 'string');
   assert.equal(coveredBody.open, true);
+});
+
+test('similar enough gets a pass: a look-alike and one difference open, by name; two differences ask for a person', async () => {
+  const w = await world();
+  // Q and O are one look-alike group; the car's plate starts QR (see `plate`).
+  const lookAlike = await present(w.entry, { token: w.qr, vehicle: `O${w.car.slice(1)}` });
+  const lookAlikeBody = await lookAlike.json();
+  assert.equal(lookAlike.status, 200, JSON.stringify(lookAlikeBody));
+  assert.equal(lookAlikeBody.open, true);
+  assert.equal(lookAlikeBody.enrolment.passed_by, 'look_alike');
+
+  const oneOff = await present(w.entry, { token: w.qr, vehicle: offBy(w.car, 1) });
+  const oneOffBody = await oneOff.json();
+  assert.equal(oneOff.status, 200, JSON.stringify(oneOffBody));
+  assert.equal(oneOffBody.open, true);
+  assert.equal(oneOffBody.enrolment.passed_by, 'one_difference');
+
+  // CONTROL: one more difference is a clearly different car -- shut on this
+  // QR, no pass named, and a person or a picture match decides.
+  const twoOff = await present(w.entry, { token: w.qr, vehicle: offBy(w.car, 2) });
+  const twoOffBody = await twoOff.json();
+  assert.equal(twoOff.status, 200, JSON.stringify(twoOffBody));
+  assert.equal(twoOffBody.open, false);
+  assert.equal(twoOffBody.enrolment.match_required, true);
+  assert.equal(twoOffBody.enrolment.passed_by, null);
+
+  const events = await qrEvents(w.id);
+  assert.deepEqual(events.map((e) => [e.detail.open, e.detail.passed_by, e.detail.match_required]),
+    [[true, 'look_alike', false], [true, 'one_difference', false], [false, null, true]]);
 });
 
 test('an exit at a garage that enrols at the exit: the QR answers covered there', async () => {
@@ -175,13 +220,14 @@ test('an exit at a garage that enrols at the exit: the QR answers covered there'
 test('the token and the plate are kept nowhere: not in an event, not in a log line', async () => {
   const w = await world();
   const logged = [];
-  const original = console.error;
-  console.error = (...args) => logged.push(args.map(String).join(' '));
+  const LEVELS = ['error', 'warn', 'log', 'info', 'debug'];
+  const original = Object.fromEntries(LEVELS.map((level) => [level, console[level]]));
+  for (const level of LEVELS) console[level] = (...args) => logged.push(args.map(String).join(' '));
   try {
     await present(w.entry, { token: w.qr, vehicle: w.car });
     await present(w.entry, { token: w.qr, vehicle: null });
   } finally {
-    console.error = original;
+    Object.assign(console, original);
   }
   const events = await qrEvents(w.id);
   assert.equal(events.length, 2);
@@ -190,9 +236,14 @@ test('the token and the plate are kept nowhere: not in an event, not in a log li
     assert.ok(!text.includes(w.qr), 'the token is in an event');
     assert.ok(!text.includes(w.car), 'the plate is in an event');
   }
-  assert.deepEqual(events.map((e) => [e.detail.open, e.detail.read_identity]), [[true, true], [false, false]]);
-  assert.equal(events[0].detail.enrolment, w.enrolmentId);
-  for (const line of logged) assert.ok(!line.includes(w.qr), 'the token is in a log line');
+  // What the event does say: how the car passed for the QR, and which QR.
+  assert.deepEqual(events.map((e) => [e.detail.open, e.detail.read_identity, e.detail.passed_by]),
+    [[true, true, 'same_plate'], [true, false, 'nothing_read']]);
+  for (const e of events) assert.equal(e.detail.enrolment, w.enrolmentId);
+  for (const line of logged) {
+    assert.ok(!line.includes(w.qr), 'the token is in a log line');
+    assert.ok(!line.includes(w.car), 'the plate is in a log line');
+  }
   // CONTROL: the event is the presentation's -- it names the lane that saw it.
   assert.equal(events[0].lane_id, w.entryLane);
 });

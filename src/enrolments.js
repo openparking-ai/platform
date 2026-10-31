@@ -11,10 +11,19 @@
  *                                --vehicle V --lane L --direction D --at AT
  *       exit 0 covered · 1 not covered · 2 refused to answer -- each with
  *       one JSON: `{ enrolment, answer }`, the enrolment half `redeemed`,
- *       `recognised`, `match_required` or `refused` (by code, field and
- *       detail), the answer the module's own access answer for this same
- *       movement. Anything else (3: a garage it does not know; a missing
- *       script; a database down) is COULD NOT ANSWER.
+ *       `recognised` (with `passed_by`), `match_required` or `refused` (by
+ *       code, field and detail), the answer the module's own access answer
+ *       for this same movement. Anything else (3: a garage it does not know;
+ *       a missing script; a database down) is COULD NOT ANSWER.
+ *
+ * WHETHER THE CAR IS THE QR'S CAR is the module's decision too -- the owner's
+ * rule of 2026-10-30, "similar enough gets a pass" (garage-pass G33). A valid
+ * QR made for a plate is `recognised` when the lane read the same plate, the
+ * same once look-alikes are one character (0OQD, 1IL, 8B, 5S, 2Z, 6G), one
+ * character off (only on a QR plate of five characters or more, folded), or
+ * nothing usable; `passed_by` names which (`same_plate`, `look_alike`,
+ * `one_difference`, `nothing_read`). Only a clearly different plate is
+ * `match_required`. This platform relays the decision and makes none.
  *
  * THE GATE OPENS ON `covered` AND ON NOTHING ELSE. Not covered, refused to
  * answer, a refused redemption, a picture match the lane has not made: shut,
@@ -29,12 +38,23 @@
  * exit status, never the argv), not in the event this records and not in the
  * response. Neither is the plate: `events` is append-only by grant, the
  * retention purge cannot reach a detail, and a plate written there would be
- * one this platform could never remove. The event says what happened to the
- * QR -- by the enrolment's own id, which the module prints -- and to the gate.
+ * one this platform could never remove. The module's answer names plates
+ * (`qr_plate`, `match_for`, `match_read`) for the lane, which checks its deny
+ * rule against the car it lets in; the event takes none of them. It says what
+ * happened to the QR -- by the enrolment's own id, which the module prints,
+ * and how the car passed for it, `passed_by`, one of four names -- and to the
+ * gate.
  */
 import { door, EntitlementUnavailable } from './entitlement.js';
 
 export const QR_PRESENTED_EVENT_KIND = 'qr_presented';
+
+/**
+ * How a car may pass for a QR's plate (garage-pass `enrolment.PASSED_*`). A
+ * closed set, because the event keeps it forever: anything else the module
+ * printed there is recorded as null, never copied.
+ */
+export const PASSED_BY = Object.freeze(['same_plate', 'look_alike', 'one_difference', 'nothing_read']);
 
 /** What the module's exit status means for a redemption. */
 const ANSWERED = new Map([[0, 'covered'], [1, 'not_covered'], [2, 'refused_to_answer']]);
@@ -57,8 +77,11 @@ export function tokenField(raw) {
 
 /**
  * The identity the lane measured, or '' when it read none. The module takes
- * an empty one: a bound QR shown with nothing read asks for a picture match
- * (`match_required`), and an unbound one is refused by the module, by name.
+ * an empty one: a valid QR made for a plate, shown with nothing read, passes
+ * (`passed_by: nothing_read`, kept on the QR's own row in garage-pass); only a
+ * QR stored before plates were required, bound at its first use, asks for a
+ * picture match then (`match_required`), and an unbound one is refused by the
+ * module, by name.
  */
 export function vehicleField(raw) {
   if (raw === undefined || raw === null) return '';
@@ -107,7 +130,9 @@ export async function redeem({ link, token, vehicle, laneId, direction, at }, op
 /**
  * The record of one presentation, for `events.detail`: what happened to the
  * QR and to the gate. No token, no plate (see the header) -- `read_identity`
- * says only WHETHER the lane read one.
+ * says only WHETHER the lane read one, `passed_by` only HOW the car passed
+ * for the QR's plate (null unless the module recognised it), `enrolment` the
+ * QR's own id.
  */
 export function presentedDetail({ laneId, direction, vehicle, result = null, unavailable = null }) {
   const detail = { lane_id: laneId, direction, read_identity: vehicle !== '' };
@@ -121,6 +146,7 @@ export function presentedDetail({ laneId, direction, vehicle, result = null, una
     enrolment: typeof e.enrolment === 'string' ? e.enrolment : null,
     redeemed: e.redeemed === true,
     recognised: e.recognised === true,
+    passed_by: PASSED_BY.includes(e.passed_by) ? e.passed_by : null,
     match_required: e.match_required === true,
     refused: typeof e.refused === 'string' ? e.refused : null,
   };
