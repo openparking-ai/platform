@@ -357,3 +357,25 @@ test('REFUNDS UNREAD: Stripe not answering for refunds holds no exit up -- the p
   const third = await caseAt(h, g, plate);
   assert.deepEqual([third.needs, third.fee.fee_minor, third.fee.credit_minor], ['payment', 500, 0]);
 });
+
+test('A SILENT STRIPE NEVER KEEPS A RETURNING CAR WAITING: the refund read gives up after 3 seconds, once, and the payment is credited as last read, said so', async () => {
+  const g = await cardGarage(h, 'rules-refund-slow');
+  const { plate } = await enter(h, g, { inMin: 90 });
+  const first = await caseAt(h, g, plate, { exitMin: 1 });
+  await payAndPresent(h, g, first.id);
+  h.stub.behaviour.delayRefundReadMs = 6000;
+  try {
+    const reads = () => h.stub.requests.filter((r) => r.method === 'GET' && r.path.includes('latest_charge')).length;
+    const before = reads();
+    const t0 = Date.now();
+    const second = await caseAt(h, g, plate);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 4500, `the case is answered within the read's 3 s, not Stripe's 6 (${ms} ms)`);
+    assert.deepEqual([second.settled, second.fee.credit_minor], [true, 500]);
+    const q = (await row(g, 'exits', second.id)).quote;
+    assert.equal(q.credit.refunds_unread.length, 1, 'the payment Stripe did not answer for is named');
+    assert.equal(reads() - before, 1, 'one read, not one per try');
+  } finally {
+    h.stub.behaviour.delayRefundReadMs = 0;
+  }
+});

@@ -25,6 +25,7 @@
  *   refund_counted_as_paid       a payment refunded at Stripe is credited whole
  *   refunds_never_read           the stay's payments are credited without asking Stripe for refunds
  *   refunds_unread_unsaid        a payment Stripe could not be asked about is credited and nothing says so
+ *   refund_read_waits_30s        a returning car waits on a silent Stripe for 30 s, not 3
  *
  * A return is a new stay (test/exit-rules.test.js):
  *   return_folded_into_old_stay  a car back in soon after an exit is folded into its old stay
@@ -72,6 +73,15 @@
  *   missing_not_recovered        a let-out whose exception failed never gets one
  *   exceptions_any_garage        one garage's exception is read through another
  *   reconcile_uncounted          the reconciliation does not count the exceptions
+ *   exception_pictures_unlisted  an exception lists no picture
+ *   exception_picture_any        the exception's picture route serves any picture of the garage
+ *   exception_pictures_any_lane  the window's pictures are taken from every lane, not the exception's
+ *   summary_missing              the day's list says nothing of the gate agent
+ *   failed_deliveries_uncounted  the list counts no failed delivery
+ *   answered_calls_all           the list counts every call as answered
+ *   copy_state_always_complete   the list says every copy is complete
+ *   day_path_missing             the day cannot be named in the path
+ *   day_in_path_ignored          a day named in the path is not the day answered
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with one
  * statement of 0048 edited, so the property genuinely never existed there.
@@ -183,7 +193,7 @@ const SOURCE_BREAKS = [
     why: "the stay's payments are credited without asking Stripe for refunds",
     suite: RULES,
     catches: 'A REFUND IS NOT PAID',
-    edits: [{ file: 'src/app.js', from: '        if (sessionId) refundsUnread = await readStayRefunds({ tenantId, sessionId });\n', to: '' }],
+    edits: [{ file: 'src/app.js', from: '      const refundsUnread = sessionId ? await readStayRefunds({ tenantId, sessionId }) : [];', to: '      const refundsUnread = [];' }],
   },
   {
     name: 'refunds_unread_unsaid',
@@ -191,6 +201,13 @@ const SOURCE_BREAKS = [
     suite: RULES,
     catches: 'REFUNDS UNREAD',
     edits: [{ file: 'src/exits.js', from: '    ...(refundsUnread.length ? { refunds_unread: refundsUnread } : {}),\n', to: '' }],
+  },
+  {
+    name: 'refund_read_waits_30s',
+    why: 'a returning car waits on a silent Stripe for 30 s, not 3',
+    suite: RULES,
+    catches: 'A SILENT STRIPE NEVER KEEPS A RETURNING CAR WAITING',
+    edits: [{ file: 'src/exitPayments.js', from: 'export const REFUND_READ_TIMEOUT_MS = 3000;', to: 'export const REFUND_READ_TIMEOUT_MS = 30_000;' }],
   },
   {
     name: 'end_counts_open_case_only',
@@ -479,6 +496,69 @@ const SOURCE_BREAKS = [
     suite: EXCEPTIONS,
     catches: "THE READS ARE THE GARAGE'S OWN",
     edits: [{ file: 'src/exceptions.js', from: "    'SELECT * FROM exceptions WHERE tenant_id = $1 AND garage_id = $2 AND id = $3',", to: "    'SELECT * FROM exceptions WHERE tenant_id = $1 AND $2::uuid IS NOT NULL AND id = $3'," }],
+  },
+  {
+    name: 'exception_pictures_unlisted',
+    why: 'an exception lists no picture',
+    suite: EXCEPTIONS,
+    catches: 'THE PICTURES OF AN EXCEPTION, BY ID',
+    edits: [{ file: 'src/app.js', from: '        return found && { ...found, pictures: await exceptionsRecord.picturesOf(client, req.tenantId, found) };', to: '        return found;' }],
+  },
+  {
+    name: 'exception_picture_any',
+    why: "the exception's picture route serves any picture of the garage",
+    suite: EXCEPTIONS,
+    catches: 'THE PICTURES OF AN EXCEPTION, BY ID',
+    edits: [{ file: 'src/exceptions.js', from: '  if (![...listed.entry, ...listed.exit, ...listed.lane].some((p) => p.id === pictureId)) return null;\n', to: '' }],
+  },
+  {
+    name: 'exception_pictures_any_lane',
+    why: "the window's pictures are taken from every lane, not the exception's",
+    suite: EXCEPTIONS,
+    catches: 'THE PICTURES OF AN EXCEPTION, BY ID',
+    edits: [{ file: 'src/exceptions.js', from: '             OR (p.lane_id = $5 AND p.taken_at >= $6 AND p.taken_at <= $7))', to: '             OR ($5::uuid IS NOT NULL AND p.taken_at >= $6 AND p.taken_at <= $7))' }],
+  },
+  {
+    name: 'summary_missing',
+    why: "the day's list says nothing of the gate agent",
+    suite: EXCEPTIONS,
+    catches: "THE DAY'S LIST SAYS THE GATE AGENT IN SHORT",
+    edits: [{ file: 'src/app.js', from: '        return { day, from, to, rows: rows.map((x) => ({ ...x, gate_agent_summary: gate.get(x.id) })) };', to: '        return { day, from, to, rows };' }],
+  },
+  {
+    name: 'failed_deliveries_uncounted',
+    why: 'the list counts no failed delivery',
+    suite: EXCEPTIONS,
+    catches: "THE DAY'S LIST SAYS THE GATE AGENT IN SHORT",
+    edits: [{ file: 'src/exceptions.js', from: "                        WHERE d->>'state' = 'failed') END AS failed,", to: '                        WHERE false) END AS failed,' }],
+  },
+  {
+    name: 'answered_calls_all',
+    why: 'the list counts every call as answered',
+    suite: EXCEPTIONS,
+    catches: "THE DAY'S LIST SAYS THE GATE AGENT IN SHORT",
+    edits: [{ file: 'src/exceptions.js', from: "WHERE coalesce(c->>'person_answered_at', '') <> '') END AS answered", to: 'WHERE true) END AS answered' }],
+  },
+  {
+    name: 'copy_state_always_complete',
+    why: 'the list says every copy is complete',
+    suite: EXCEPTIONS,
+    catches: "THE DAY'S LIST SAYS THE GATE AGENT IN SHORT",
+    edits: [{ file: 'src/exceptions.js', from: "    if (copied?.ever_complete) return 'complete';", to: "    return 'complete';" }],
+  },
+  {
+    name: 'day_path_missing',
+    why: 'the day cannot be named in the path',
+    suite: EXCEPTIONS,
+    catches: "THE DAY'S LIST SAYS THE GATE AGENT IN SHORT",
+    edits: [{ file: 'src/app.js', from: "  operator.get('/garages/:garageId/exceptions/day/:day', (req, res, next) => exceptionsOfDay(req, res, next, req.params.day));\n", to: '' }],
+  },
+  {
+    name: 'day_in_path_ignored',
+    why: 'a day named in the path is not the day answered',
+    suite: EXCEPTIONS,
+    catches: "THE DAY'S LIST SAYS THE GATE AGENT IN SHORT",
+    edits: [{ file: 'src/app.js', from: "exceptionsOfDay(req, res, next, req.params.day));", to: 'exceptionsOfDay(req, res, next, req.query.day));' }],
   },
   {
     name: 'reconcile_uncounted',

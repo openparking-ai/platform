@@ -43,6 +43,12 @@ export const PAYMENT_STARTED_EVENT_KIND = 'exit_payment_started';
 export const PAID_EVENT_KIND = 'exit_paid';
 export const PAYMENT_CANCELED_EVENT_KIND = 'exit_payment_canceled';
 
+/**
+ * How long a refund read waits for Stripe (0048): a car is at the barrier, so
+ * past this Stripe is taken as silent and the payment is credited as last read.
+ */
+export const REFUND_READ_TIMEOUT_MS = 3000;
+
 /** The least time between two reads of one intent from Stripe, while a lane polls. */
 export const READ_EVERY_MS = 2000;
 
@@ -214,6 +220,7 @@ export function readIntent(config, accountId, intentId) {
 export async function refundedOf(config, accountId, intentId) {
   const intent = await stripeCall({
     method: 'GET', path: `/v1/payment_intents/${encodeURIComponent(intentId)}?expand%5B%5D=latest_charge`, account: accountId,
+    timeoutMs: REFUND_READ_TIMEOUT_MS,
   }, config);
   const refunded = Number(intent?.latest_charge?.amount_refunded ?? 0);
   if (!Number.isInteger(refunded) || refunded < 0) throw new StripeUnreachable('Stripe answered a refunded amount this platform cannot read');

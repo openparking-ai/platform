@@ -157,6 +157,7 @@ export async function startStripeStub() {
           if (req.method === 'GET' && !pi[2]) {
             // `expand[]=latest_charge`: the charge, with what was refunded of it.
             if (!url.searchParams.getAll('expand[]').includes('latest_charge')) return send(200, intent);
+            if (behaviour.delayRefundReadMs) await new Promise((resolve) => setTimeout(resolve, behaviour.delayRefundReadMs));
             const charge = intent.status === 'succeeded'
               ? { id: `ch_${intent.id.slice(3)}`, object: 'charge', amount: intent.amount, amount_refunded: intent.refunded ?? 0 }
               : null;

@@ -2019,8 +2019,9 @@ hears of nowhere else -- is kept on the payment (`refunded_minor`,
 `refunds_read_at`); only what a payment kept is credited, and the stay-fee
 guard counts it so. Stripe not answering holds no exit up: the payment is
 credited as last read and the case says so (`credit.refunds_unread`). A
-refund is read only then -- when the car comes back to an exit; a person's
-end and a return credit what was last read.
+refund is read only then -- when the car comes back to an exit -- once, each
+read given 3 seconds before Stripe is taken as silent; a person's end and a
+return credit what was last read.
 
 **A return is a new stay** -- for a transient car. *"when the car leaves.
 It's gone. When it comes back new time starts."* An entry after the stay
@@ -2094,10 +2095,26 @@ says how many, nothing else; the exception and the rest stay.
 
 - `GET /api/v1/garages/:garageId/exceptions?day=YYYY-MM-DD` -- the garage's
   own local day (today when unnamed), oldest first, with `count` and
-  `let_out_unpaid`; `GET /api/v1/garages/:garageId/exceptions/:exceptionId`
-  -- one record's whole story, `payment_after_let_out`, `lane_events_after`
-  and each copy of the gate agent's records under `gate_agent: {messages,
-  calls}`, copied or saying why not. Through the garage only: another
+  `let_out_unpaid`, and on each exception the gate agent in short --
+  `gate_agent: {messages, failed_deliveries, calls, calls_answered, copy,
+  copies: {messages, calls}, purged}`: from the latest copy of each, the
+  messages and the deliveries of them that failed (`state: "failed"`), the
+  calls and those a person answered (`person_answered_at` set); `copy` is
+  `complete` (copied after the window), `pending` (part-way, or not yet),
+  `not_reachable` or `not_configured`, the worse of the two sources'.
+  `GET /api/v1/garages/:garageId/exceptions/day/:day` is the same list, the
+  day (`YYYY-MM-DD`, the garage's own date) in the path; a day that is not a
+  date is `400 day_invalid`. `GET /api/v1/garages/:garageId/exceptions/:exceptionId`
+  -- one record's whole story, `payment_after_let_out`, `lane_events_after`,
+  each copy of the gate agent's records under `gate_agent: {messages,
+  calls}`, copied or saying why not, and its pictures by id: `pictures:
+  {entry: [{id, taken_at}], exit: [{id, taken_at, exit_id}], lane: [{id,
+  taken_at, lane_id}]}` -- the lane's pictures kept with its stay's entry,
+  with its case and the stay's other cases, and any other its lane kept in
+  its window, as they stand (a picture the retention job deleted is not
+  listed), at most 50 of each. Each image is
+  `GET /api/v1/garages/:garageId/exceptions/:exceptionId/pictures/:pictureId`,
+  `private, no-store`, only for a picture the exception lists. Through the garage only: another
   account's or garage's is `404 exception_not_found`. The reconciliation
   report counts them (`exceptions: {since, let_out_unpaid, barrier_opened,
   total}`). Permissions, for a platform with linked accounts (#78): both are

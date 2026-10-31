@@ -36,6 +36,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import sharp from 'sharp';
 import { pool, withTenant, superuserClient } from './helpers.js';
 import * as exceptions from '../src/exceptions.js';
 import { startGateAgentStub, message, callRecord } from './gate-agent-stub.js';
@@ -479,4 +480,96 @@ test("A COPY OF THE GATE AGENT'S RECORDS IS BLANKED PAST THE ACCOUNT'S WINDOW --
   await letOut(g, other.id);
   assert.equal(await blank(2), 2);
   await assert.rejects(withTenant(g.tenant, (c) => c.query(`UPDATE tenant_settings SET exception_copy_retention_days = 0 WHERE tenant_id = $1`, [g.tenant])), /check constraint/);
+});
+
+const JPEG = await sharp({ create: { width: 64, height: 48, channels: 3, background: { r: 30, g: 90, b: 200 } } }).jpeg().toBuffer();
+/** A picture the lane keeps under an event id (0033): its id, as stored. */
+async function picture(g, device, eventId, takenAt) {
+  const ref = randomUUID().slice(0, 30);
+  const res = await h.call(device, 'POST', '/lane/pictures', { picture_ref: ref, event_id: eventId, taken_at: takenAt, image: JPEG.toString('base64') });
+  assert.ok([200, 201].includes(res.status), await res.clone().text());
+  return (await rows(g, 'SELECT id FROM entry_pictures WHERE picture_ref = $1', [ref]))[0].id;
+}
+
+test('THE PICTURES OF AN EXCEPTION, BY ID: its stay\'s entry, its case\'s exit, the lane\'s in its window -- each served through the exception and its garage only, and gone with the retention', async () => {
+  const g = await cardGarage(h, 'exc-pictures');
+  delete process.env.GATE_AGENTS_FILE;
+  const openEvent = randomUUID();
+  const { plate } = await enter(h, g, { inMin: 40, eventId: openEvent });
+  const exitEvent = randomUUID();
+  const exit = await caseAt(h, g, plate, { eventId: exitEvent });
+  const entryPic = await picture(g, g.entry, openEvent, ago(40));
+  const exitPic = await picture(g, g.exit, exitEvent, ago(0.4));
+  const lanePic = await picture(g, g.exit, randomUUID(), ago(2));
+  const oldPic = await picture(g, g.exit, randomUUID(), ago(300));
+  const otherLane = await picture(g, g.entry, randomUUID(), ago(1));
+  await letOut(g, exit.id);
+  const x = await exceptionOfCase(g, exit.id);
+  const whole = await oneOf(g, x.id);
+  assert.deepEqual(whole.pictures.entry.map((p) => p.id), [entryPic]);
+  assert.deepEqual(whole.pictures.exit.map((p) => [p.id, p.exit_id]), [[exitPic, exit.id]]);
+  assert.deepEqual(whole.pictures.lane.map((p) => [p.id, p.lane_id]), [[lanePic, g.world.exitLane]], "the lane's in the window, not before it nor another lane's");
+  assert.ok(!JSON.stringify(whole.pictures).includes('image'), 'ids and times only');
+
+  const get = (op, garage, pictureId) => h.call(op, 'GET', `/garages/${garage}/exceptions/${x.id}/pictures/${pictureId}`);
+  for (const id of [entryPic, exitPic, lanePic]) {
+    const res = await get(g.op, g.world.garage, id);
+    assert.equal(res.status, 200);
+    assert.deepEqual([res.headers.get('content-type'), res.headers.get('cache-control'), res.headers.get('x-content-type-options')], ['image/jpeg', 'private, no-store', 'nosniff']);
+    assert.ok((await res.arrayBuffer()).byteLength > 0);
+  }
+  for (const id of [oldPic, otherLane]) assert.equal((await get(g.op, g.world.garage, id)).status, 404, 'a picture the exception does not list');
+  const other = await cardGarage(h, 'exc-pictures-other');
+  assert.equal((await get(other.op, g.world.garage, entryPic)).status, 404, "another account's key");
+  assert.equal((await get(other.op, other.world.garage, entryPic)).status, 404, 'through another garage');
+  // The retention job deletes a picture: it is listed no more, and not served.
+  await withTenant(g.tenant, (c) => c.query('DELETE FROM entry_pictures WHERE id = $1', [lanePic]));
+  assert.deepEqual((await oneOf(g, x.id)).pictures.lane, []);
+  assert.equal((await get(g.op, g.world.garage, lanePic)).status, 404);
+});
+
+test("THE DAY'S LIST SAYS THE GATE AGENT IN SHORT: messages, failed deliveries, calls, answered calls and the copy's state -- and the day may be named in the path", async () => {
+  const g = await cardGarage(h, 'exc-summary');
+  configureGate(g);
+  const failing = message({ lane: 'lane-1', at: ago(1), revision: 700 });
+  failing.deliveries[0].state = 'failed';
+  gate.store.messages.push(failing, message({ lane: 'lane-1', at: ago(1), revision: 701 }));
+  const answered = callRecord({ lane: 'exit', startedAt: ago(1), revision: 700 });
+  const unanswered = { ...callRecord({ lane: 'exit', startedAt: ago(1), revision: 701 }), person_answered_at: null, person_answered_as: null };
+  gate.store.calls.push(answered, unanswered);
+  const a = await caseAt(h, g, (await enter(h, g)).plate);
+  await letOut(g, a.id);
+  delete process.env.GATE_AGENTS_FILE;
+  const b = await caseAt(h, g, (await enter(h, g)).plate);
+  await letOut(g, b.id);
+  configureGate(g, { url: 'http://127.0.0.1:9' });
+  const c = await caseAt(h, g, (await enter(h, g)).plate);
+  await letOut(g, c.id);
+
+  const list = await listOf(g);
+  const byCase = (exitId) => list.exceptions.find((x) => x.exit_id === exitId).gate_agent;
+  const summaryA = byCase(a.id);
+  assert.ok(summaryA.messages >= 2 && summaryA.failed_deliveries >= 1 && summaryA.calls >= 2 && summaryA.calls_answered >= 1, JSON.stringify(summaryA));
+  assert.equal(summaryA.calls - summaryA.calls_answered >= 1, true);
+  assert.deepEqual([summaryA.copy, summaryA.copies, summaryA.purged], ['pending', { messages: 'pending', calls: 'pending' }, false], 'copied, the window still open');
+  assert.deepEqual(byCase(b.id), { messages: 0, failed_deliveries: 0, calls: 0, calls_answered: 0, copy: 'not_configured', copies: { messages: 'not_configured', calls: 'not_configured' }, purged: false });
+  assert.equal(byCase(c.id).copy, 'not_reachable');
+  // The sweep after the window: complete.
+  const x = await exceptionOfCase(g, a.id);
+  configureGate(g);
+  await exceptions.finish((fn) => withTenant(g.tenant, fn), g.tenant, x, { now: new Date(x.window_to.getTime() + 60_000) });
+  assert.equal((await listOf(g)).exceptions.find((e) => e.exit_id === a.id).gate_agent.copy, 'complete');
+
+  // The day in the path: the same answer as ?day=.
+  const today = list.day;
+  const byPath = await h.call(g.op, 'GET', `/garages/${g.world.garage}/exceptions/day/${today}`);
+  assert.equal(byPath.status, 200, await byPath.clone().text());
+  const pathList = await byPath.json();
+  assert.deepEqual([pathList.day, pathList.count, pathList.from, pathList.to], [today, list.count, list.from, list.to]);
+  for (const bad of ['2026-02-30', '2026-13-01', '31-10-2026', 'today']) {
+    const res = await h.call(g.op, 'GET', `/garages/${g.world.garage}/exceptions/day/${bad}`);
+    assert.deepEqual([res.status, (await res.json()).code], [400, 'day_invalid'], bad);
+  }
+  const other = await cardGarage(h, 'exc-summary-other');
+  assert.equal((await h.call(other.op, 'GET', `/garages/${g.world.garage}/exceptions/day/${today}`)).status, 404, "another account's garage");
 });
