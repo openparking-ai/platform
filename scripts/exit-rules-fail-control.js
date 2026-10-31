@@ -551,7 +551,7 @@ const SOURCE_BREAKS = [
     why: 'the day cannot be named in the path',
     suite: EXCEPTIONS,
     catches: "THE DAY'S LIST SAYS THE GATE AGENT IN SHORT",
-    edits: [{ file: 'src/app.js', from: "  operator.get('/garages/:garageId/exceptions/day/:day', (req, res, next) => exceptionsOfDay(req, res, next, req.params.day));\n", to: '' }],
+    edits: [{ file: 'src/app.js', from: "  operator.get('/garages/:garageId/exceptions/day/:day', may('stays:read'), (req, res, next) => exceptionsOfDay(req, res, next, req.params.day));\n", to: '' }],
   },
   {
     name: 'day_in_path_ignored',

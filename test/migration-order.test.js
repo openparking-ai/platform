@@ -20,7 +20,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { readdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import pg from 'pg';
 import { LINE_SUBJECTS } from '../src/changes.js';
@@ -40,6 +41,8 @@ const MAIN_CHANGE_LOG = ['0037_exit_cases.sql', '0039_stay_endings.sql', '0042_l
  *   inventory walk   src/app.js: a walk (`walk`), feat/inventory-walk-20261027.
  *   garage cleanup   src/app.js: stuck stays cleared (`stay`), and the walk's
  *                    and main's own, feat/garage-cleanup-20261028.
+ *   exit rules       0048 (#89, #90): exceptions are their own tables; their
+ *                    code writes no subject or actor beyond these.
  *   this branch      a passkey (`passkey`); a linked person as the actor.
  * and every subject and actor of the code before them.
  */
@@ -84,6 +87,24 @@ async function scratch(fn) {
   }
 }
 
+/** scripts/migrate.js, the runner a deployment uses, over exactly `names`, as `url`'s role; what it printed. */
+function migrate(url, files, names) {
+  const dir = mkdtempSync(join(tmpdir(), 'openparking-order-'));
+  try {
+    for (const f of names) writeFileSync(join(dir, f), files.get(f));
+    const run = spawnSync(process.execPath, ['scripts/migrate.js'], {
+      cwd: ROOT, encoding: 'utf8', env: { ...process.env, DATABASE_URL: url, MIGRATIONS_DIR: dir },
+    });
+    assert.equal(run.status, 0, run.stderr);
+    return run.stdout;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** The order a database's migrations were applied in. */
+const appliedOrder = async (c) => (await c.query('SELECT filename FROM schema_migrations ORDER BY applied_at, filename')).rows.map((r) => r.filename);
+
 /** The values a CHECK's IN list names, read from the database. */
 async function listed(c, constraint) {
   const def = (await c.query("SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = $1 AND conrelid = 'garage_changes'::regclass", [constraint])).rows[0].def;
@@ -100,15 +121,16 @@ test('0047 COMES AFTER main\'s change-log migrations, and shares its number with
   assert.equal(new Set(numbers).size, numbers.length, `two migrations share a number: ${numbers.filter((n, i) => numbers.indexOf(n) !== i).join(', ')}`);
 });
 
-test('0047 ON MAIN: lines main\'s code wrote stay valid, and every value the exit, walk, cleanup and passkey code writes is taken; one no code writes is refused', async () => {
+test('0047 ON A DATABASE THAT HAS MAIN: the runner applies it last, after 0048; lines main\'s code wrote stay valid, every value the exit, walk, cleanup and passkey code writes is taken, one no code writes is refused', async () => {
   const files = migrationFiles();
-  // Every migration before 0047, as a deployment that has main has them; none after it.
-  const before = [...files.keys()].sort().filter((f) => f < OURS);
+  // Every other migration, 0048 included, as a deployment that has main has them; then 0047.
+  const others = [...files.keys()].sort().filter((f) => f !== OURS);
+  assert.ok(others.some((f) => f > OURS), 'no migration after 0047 to apply before it: this test no longer shows the runner taking 0047 late');
   await scratch(async (url) => {
+    migrate(url, files, others);
     const c = new pg.Client({ connectionString: url });
     await c.connect();
     try {
-      for (const f of before) await c.query(files.get(f));
       // Lines as main's code writes them, before 0047: an exit case, a stay,
       // a lane computer letting a car out. 0047's VALIDATE reads them.
       const tenant = (await c.query("INSERT INTO tenants (slug, name) VALUES ('order', 'order') RETURNING id")).rows[0].id;
@@ -121,7 +143,10 @@ test('0047 ON MAIN: lines main\'s code wrote stay valid, and every value the exi
       await line('owner', randomUUID(), 'stay', 'owner@example.com');
       await line('computer', randomUUID(), 'exit', 'Exit computer');
 
-      await c.query(files.get(OURS));
+      // The runner, given 0047 beside what it has applied, applies 0047 alone, last.
+      const said = migrate(url, files, [...others, OURS]);
+      assert.deepEqual(said.split('\n').filter((l) => l.startsWith('apply ')), [`apply ${OURS}`]);
+      assert.equal((await appliedOrder(c)).at(-1), OURS);
 
       for (const subject of SUBJECTS_WRITTEN) await line('owner', randomUUID(), subject, 'owner@example.com');
       for (const actor of ACTORS_WITH_ID) await line(actor, randomUUID(), 'garage', 'a name');
@@ -161,4 +186,24 @@ test('THE CODE\'S LIST IS THE TABLE\'S: every subject src/changes.js lets a line
   } finally {
     await c.end();
   }
+});
+
+test('0047 ON A FRESH DATABASE: the runner applies every migration in file order, 0047 before 0048, and ends with the same lists', async () => {
+  const files = migrationFiles();
+  const all = [...files.keys()].sort();
+  await scratch(async (url) => {
+    migrate(url, files, all);
+    const c = new pg.Client({ connectionString: url });
+    await c.connect();
+    try {
+      const order = await appliedOrder(c);
+      assert.deepEqual([...order].sort(), all);
+      const at = (f) => order.indexOf(f);
+      for (const later of all.filter((f) => f > OURS)) assert.ok(at(OURS) < at(later), `${later} was applied before ${OURS}`);
+      assert.deepEqual(await listed(c, 'garage_changes_subject_kind_check'), [...SUBJECTS_WRITTEN].sort());
+      assert.deepEqual(await listed(c, 'garage_changes_actor_kind_check'), [...ACTORS_WITH_ID, ...ACTORS_WITHOUT].sort());
+    } finally {
+      await c.end();
+    }
+  });
 });

@@ -767,7 +767,8 @@ includes `read`):
     payouts   the payouts view
     account   the account itself, its keys
     inventory walks through a garage and what they saw
-    stays     open and past stays, ending a stuck one
+    stays     open and past stays, the stuck list, ending a stuck one; the cars at an
+              exit, letting one out, paying at a phone reader; the exceptions
     log       the change log and refused attempts
 
 **The admin and every operator key hold all of them**, at every garage, so

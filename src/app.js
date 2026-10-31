@@ -4155,7 +4155,7 @@ export function createApp() {
    * the driver's word, a person, a payment -- and, for a case the picker
    * was asked about, what it was shown and answered.
    */
-  operator.get('/garages/:garageId/exits', async (req, res, next) => {
+  operator.get('/garages/:garageId/exits', may('stays:read'), async (req, res, next) => {
     try {
       const open = await withTenant(req.tenantId, async (client) => {
         await ownGarage(client, req);
@@ -4197,9 +4197,9 @@ export function createApp() {
       next(err);
     }
   };
-  operator.get('/garages/:garageId/exceptions', (req, res, next) => exceptionsOfDay(req, res, next, req.query.day));
+  operator.get('/garages/:garageId/exceptions', may('stays:read'), (req, res, next) => exceptionsOfDay(req, res, next, req.query.day));
   /** The same day, named in the path: `/exceptions/day/YYYY-MM-DD`, the garage's own date. */
-  operator.get('/garages/:garageId/exceptions/day/:day', (req, res, next) => exceptionsOfDay(req, res, next, req.params.day));
+  operator.get('/garages/:garageId/exceptions/day/:day', may('stays:read'), (req, res, next) => exceptionsOfDay(req, res, next, req.params.day));
 
   /**
    * ONE EXCEPTION'S WHOLE STORY (0048): what happened as it stood at the
@@ -4208,7 +4208,7 @@ export function createApp() {
    * events to the window's end, and each copy of the gate agent's messages
    * and calls, with their own ids, or why it could not be made.
    */
-  operator.get('/garages/:garageId/exceptions/:exceptionId', async (req, res, next) => {
+  operator.get('/garages/:garageId/exceptions/:exceptionId', may('stays:read'), async (req, res, next) => {
     try {
       const x = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4228,7 +4228,7 @@ export function createApp() {
    * no other. Through the garage, `private, no-store`; a picture the
    * retention job has deleted is 404, as at every picture route.
    */
-  operator.get('/garages/:garageId/exceptions/:exceptionId/pictures/:pictureId', async (req, res, next) => {
+  operator.get('/garages/:garageId/exceptions/:exceptionId/pictures/:pictureId', may('stays:read'), async (req, res, next) => {
     try {
       const picture = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4247,7 +4247,7 @@ export function createApp() {
    * owed, with who and why on the case, an event beside it, and a line in
    * the change log. Once per case, and only while the car is at the lane.
    */
-  operator.post('/garages/:garageId/exits/:exitId/let-out', async (req, res, next) => {
+  operator.post('/garages/:garageId/exits/:exitId/let-out', may('stays:change'), async (req, res, next) => {
     try {
       let exception = null;
       const reason = req.body?.reason;
@@ -4304,7 +4304,7 @@ export function createApp() {
    * unless asked), and those the latest finished walk did not see (0040),
    * oldest first, each with its entry pictures, for a person to end. A read.
    */
-  operator.get('/garages/:garageId/stays/stuck', async (req, res, next) => {
+  operator.get('/garages/:garageId/stays/stuck', may('stays:read'), async (req, res, next) => {
     try {
       const { hours, garageHours, stays, facts, pictures } = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4328,7 +4328,7 @@ export function createApp() {
   });
 
   /** One entry picture of a stay of this garage (0033), as the image itself. */
-  operator.get('/garages/:garageId/stays/:stayId/pictures/:pictureId', async (req, res, next) => {
+  operator.get('/garages/:garageId/stays/:stayId/pictures/:pictureId', may('stays:read'), async (req, res, next) => {
     try {
       const picture = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4362,7 +4362,7 @@ export function createApp() {
    * `left_at` or a rate engine that cannot answer fails the request with
    * every payment as it was.
    */
-  operator.post('/garages/:garageId/stays/:stayId/end', async (req, res, next) => {
+  operator.post('/garages/:garageId/stays/:stayId/end', may('stays:change'), async (req, res, next) => {
     try {
       const ask = stuck.endRequest(req.body, parseTime);
       const now = new Date();
@@ -4503,7 +4503,7 @@ export function createApp() {
     return null;
   };
 
-  operator.post('/garages/:garageId/walks', async (req, res, next) => {
+  operator.post('/garages/:garageId/walks', may('inventory:change'), async (req, res, next) => {
     try {
       const { walk, created } = await changeTx(req, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4539,7 +4539,7 @@ export function createApp() {
     (ask.clientRef ? await walks.sightingByRef(client, req.tenantId, walk.id, ask.clientRef) : null)
       ?? (digest ? await walks.sightingByPicture(client, req.tenantId, walk.id, digest) : null);
 
-  operator.post('/garages/:garageId/walks/:walkId/sightings', readPicture, async (req, res, next) => {
+  operator.post('/garages/:garageId/walks/:walkId/sightings', may('inventory:change'), readPicture, async (req, res, next) => {
     try {
       // The phone waits the `Retry-After` it is sent and keeps the picture
       // until it is saved: whole seconds until this key's minute ends.
@@ -4635,7 +4635,7 @@ export function createApp() {
     }
   });
 
-  operator.post('/garages/:garageId/walks/:walkId/sightings/:sightingId/pick', async (req, res, next) => {
+  operator.post('/garages/:garageId/walks/:walkId/sightings/:sightingId/pick', may('inventory:change'), async (req, res, next) => {
     try {
       const stayId = req.body?.stay;
       const { sighting, stays } = await changeTx(req, async (client) => {
@@ -4660,7 +4660,7 @@ export function createApp() {
     }
   });
 
-  operator.post('/garages/:garageId/walks/:walkId/finish', async (req, res, next) => {
+  operator.post('/garages/:garageId/walks/:walkId/finish', may('inventory:change'), async (req, res, next) => {
     try {
       const walk = await changeTx(req, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4698,7 +4698,7 @@ export function createApp() {
     }
   });
 
-  operator.get('/garages/:garageId/walks/:walkId/sightings/:sightingId/picture', async (req, res, next) => {
+  operator.get('/garages/:garageId/walks/:walkId/sightings/:sightingId/picture', may('inventory:read'), async (req, res, next) => {
     try {
       const picture = await withTenant(req.tenantId, async (client) => {
         await ownGarage(client, req);
@@ -4713,7 +4713,7 @@ export function createApp() {
     }
   });
 
-  operator.get('/garages/:garageId/walks/:walkId', async (req, res, next) => {
+  operator.get('/garages/:garageId/walks/:walkId', may('inventory:read'), async (req, res, next) => {
     try {
       const out = await withTenant(req.tenantId, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4734,7 +4734,7 @@ export function createApp() {
    * then presents the card to it. The case is settled when Stripe says the
    * intent succeeded -- the lane's poll, or this route asked again, reads it.
    */
-  operator.post('/garages/:garageId/exits/:exitId/pay', connectRoute(async (req, res) => {
+  operator.post('/garages/:garageId/exits/:exitId/pay', may('stays:change'), connectRoute(async (req, res) => {
     const garage = await withTenant(req.tenantId, (client) => ownGarage(client, req));
     const { row, clientSecret } = await payCase({
       tenantId: req.tenantId, garageId: garage.id, exitId: req.params.exitId, channel: 'phone_reader',

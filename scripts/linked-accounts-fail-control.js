@@ -393,6 +393,13 @@ const SOURCE_BREAKS = [
     to: "  operator.get('/garages/:garageId/lanes', async (req, res, next) => {",
   },
   {
+    name: 'stuck_list_unpermitted',
+    why: "main's stuck list names no permission, so a person reaches it at any garage",
+    file: 'src/app.js',
+    from: "  operator.get('/garages/:garageId/stays/stuck', may('stays:read'), async (req, res, next) => {",
+    to: "  operator.get('/garages/:garageId/stays/stuck', async (req, res, next) => {",
+  },
+  {
     name: 'change_covers_nothing',
     why: 'a change does not cover its read',
     file: 'src/permissions.js',

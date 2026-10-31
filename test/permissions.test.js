@@ -303,3 +303,44 @@ test('THE ACCOUNT\'S OWN LINES ARE FOR THE WHOLE ACCOUNT: a reader at some garag
   // The admin and a key read the whole account, as before.
   assert.ok((await call(`/api/v1/garages/${a.one.garage}/changes`, { key: a.key })).json.changes.some((c) => c.garage_id === null));
 });
+
+test('MAIN\'S EXITS, STAYS, EXCEPTIONS AND WALKS: each names its permission, and a garage outside the list answers as one that does not exist', async () => {
+  const routes = operatorRoutes(theApp);
+  const named = (method, path) => routes.find((r) => r.method === method && r.path === path)?.handlers[0].permission;
+  const expected = [
+    ['GET', '/garages/:garageId/exits', 'stays:read'],
+    ['POST', '/garages/:garageId/exits/:exitId/let-out', 'stays:change'],
+    ['POST', '/garages/:garageId/exits/:exitId/pay', 'stays:change'],
+    ['GET', '/garages/:garageId/exceptions', 'stays:read'],
+    ['GET', '/garages/:garageId/exceptions/day/:day', 'stays:read'],
+    ['GET', '/garages/:garageId/exceptions/:exceptionId', 'stays:read'],
+    ['GET', '/garages/:garageId/exceptions/:exceptionId/pictures/:pictureId', 'stays:read'],
+    ['GET', '/garages/:garageId/stays/stuck', 'stays:read'],
+    ['GET', '/garages/:garageId/stays/:stayId/pictures/:pictureId', 'stays:read'],
+    ['POST', '/garages/:garageId/stays/:stayId/end', 'stays:change'],
+    ['POST', '/garages/:garageId/walks', 'inventory:change'],
+    ['POST', '/garages/:garageId/walks/:walkId/sightings', 'inventory:change'],
+    ['POST', '/garages/:garageId/walks/:walkId/sightings/:sightingId/pick', 'inventory:change'],
+    ['POST', '/garages/:garageId/walks/:walkId/finish', 'inventory:change'],
+    ['GET', '/garages/:garageId/walks/:walkId/sightings/:sightingId/picture', 'inventory:read'],
+    ['GET', '/garages/:garageId/walks/:walkId', 'inventory:read'],
+  ];
+  for (const [method, path, permission] of expected) assert.equal(named(method, path), permission, `${method} ${path}`);
+
+  const a = await account('pm-main-routes');
+  const reader = await linked(a, { garages: [a.one.garage], permissions: ['stays:read', 'inventory:read'] });
+  // Their own garage reads; the other garage is not found, as one that is not there.
+  for (const path of ['exits', 'stays/stuck', 'exceptions']) {
+    assert.equal((await call(`/api/v1/garages/${a.one.garage}/${path}`, { cookie: reader.token })).status, 200, path);
+    const outside = await call(`/api/v1/garages/${a.two.garage}/${path}`, { cookie: reader.token });
+    const nothing = await call(`/api/v1/garages/00000000-0000-4000-8000-000000000000/${path}`, { cookie: reader.token });
+    assert.equal(outside.status, 404, `${path}: ${outside.text}`);
+    assert.equal(outside.text, nothing.text, path);
+  }
+  // A read does not start a walk; a person without stays:read reads no exits.
+  const walk = await call(`/api/v1/garages/${a.one.garage}/walks`, { cookie: reader.token, method: 'POST', body: {} });
+  assert.equal(walk.status, 403, walk.text);
+  assert.equal(walk.json.code, PERMISSION_REFUSED.code);
+  const other = await linked(a, { garages: 'all', permissions: ['garages:read'] });
+  assert.equal((await call(`/api/v1/garages/${a.one.garage}/exits`, { cookie: other.token })).status, 403);
+});
