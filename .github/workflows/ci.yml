@@ -159,6 +159,12 @@ jobs:
           echo "$line"
           echo "$line" | grep -Eqx 'pictures: [0-9]+ tenant\(s\); removed [0-9]+ lane picture\(s\) and [0-9]+ walk picture\(s\)\.'
 
+      - name: The exceptions' sweep runs clean on a fresh database
+        run: |
+          line="$(npm run -s complete-exceptions)"
+          echo "$line"
+          echo "$line" | grep -Eqx 'exceptions: [0-9]+ tenant\(s\); [0-9]+ written from the record, [0-9]+ finished, 0 tenant\(s\) left for the next run\.'
+
       - name: RLS fail-control
         # Proves the isolation suite actually measures isolation, by requiring
         # it to FAIL against a scratch database with RLS stripped out.
@@ -642,6 +648,25 @@ jobs:
         # no second COMMIT, the 503, /healthz asking the database -- taken out
         # of a copy must turn the file red; the client listener five runs of five.
         run: npm run db-restart-fail-control
+
+      - name: Exit-rules fail-control
+        # The owner's exit rules and the exceptions (0048). Breaks 51
+        # properties -- the whole stay priced again with every payment
+        # credited and only the difference asked, never negative, never the
+        # whole again; a return after an exit a new stay with the old one's
+        # case closed and its unpaid payment canceled at Stripe first, a paid
+        # one kept on it; a person's end reading before Stripe; each visit of
+        # a pass its own session, asked with its own entry and kept with its
+        # pass; a QR's car asked about by the QR's plate; the exception
+        # written with the let-out, with no plate, its payments and the
+        # lane's events, the gate agent's messages and calls copied with
+        # their ids, by the token from its file, never following a redirect,
+        # the let-out never held up nor kept waiting, a failed write never
+        # taking it back; a close after the car came back in still that
+        # stay's exit; a refund never counted as paid; a copy blanked past
+        # its window -- and twelve of 0048's guards. Each break
+        # must turn the named test red, the rest of its file still green.
+        run: npm run exit-rules-fail-control
 
 
   sign-in-control:

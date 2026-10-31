@@ -9,14 +9,17 @@
  *                 platform creates the same PaymentIntent and answers its
  *                 client secret; the phone collects it.
  *
- * ONE PAYMENT PER STAY. One PaymentIntent per case, created with an
- * idempotency key derived from the case; a declined card is tried again on
- * the SAME intent (Stripe: "re-use the same PaymentIntent to help avoid
- * double charges"), never a new one. A second case for the same stay cannot
- * start a second payment while the first is live or paid (0038's index).
+ * ONE PAYMENT PER CASE, ONE OPEN PER STAY. One PaymentIntent per case,
+ * created with an idempotency key derived from the case; a declined card is
+ * tried again on the SAME intent (Stripe: "re-use the same PaymentIntent to
+ * help avoid double charges"), never a new one. A second case for the same
+ * stay cannot start a payment while the first is open (0048's index); once
+ * the first succeeded, the second asks only the difference (0048's trigger
+ * holds it to that: what a stay paid never adds up to more than its fee).
  *
- * THE AMOUNT IS THE PLATFORM'S: the case's fee as shown. Stripe's answer is
- * taken as paid only when its amount and currency are the ones recorded.
+ * THE AMOUNT IS THE PLATFORM'S: what the case asks for -- its fee, less what
+ * the stay already paid at its earlier cases (`exits.dueOf`). Stripe's answer
+ * is taken as paid only when its amount and currency are the ones recorded.
  *
  * CANCELED ONLY ON STRIPE'S WORD. A cancel reads the intent first: one that
  * succeeded is paid, and is never refunded or voided here; one a card is
@@ -133,9 +136,16 @@ export async function insertPayment(client, tenantId, p) {
     );
     return { row: rows[0] ?? (await paymentOf(client, tenantId, p.exitId)), created: rows.length === 1 };
   } catch (err) {
-    if (err.code === '23505' && err.constraint === 'exit_payments_one_per_stay') {
+    if (err.code === '23505' && err.constraint === 'exit_payments_one_open_per_stay') {
       throw new ConnectRefusal(409, 'stay_payment_elsewhere',
-        "this car's stay already has a payment started or taken at another exit case; a person decides");
+        "this car's stay already has a payment started at another exit case; a person decides");
+    }
+    // 0048: a payment is exactly what its case asks for, and a stay never
+    // pays more than its whole fee -- a case priced before another of its
+    // payments succeeded asks again, never charges twice.
+    if (err.code === '23514' && (err.constraint === 'exit_payments_within_stay_fee' || err.constraint === 'exit_payments_is_the_due')) {
+      throw new ConnectRefusal(409, 'stay_paid_already',
+        "this car's stay has already paid what this case asks for at another exit case; a person decides");
     }
     throw err;
   }
@@ -194,6 +204,30 @@ export function createIntent(config, accountId, body, exitId) {
 
 export function readIntent(config, accountId, intentId) {
   return stripeCall({ method: 'GET', path: `/v1/payment_intents/${encodeURIComponent(intentId)}`, account: accountId }, config);
+}
+
+/**
+ * THE REFUNDED PART OF A PAID INTENT (0048): its latest charge, expanded, says
+ * how much of it was refunded -- at Stripe's dashboard, say, which this
+ * platform hears of nowhere else. One read per payment.
+ */
+export async function refundedOf(config, accountId, intentId) {
+  const intent = await stripeCall({
+    method: 'GET', path: `/v1/payment_intents/${encodeURIComponent(intentId)}?expand%5B%5D=latest_charge`, account: accountId,
+  }, config);
+  const refunded = Number(intent?.latest_charge?.amount_refunded ?? 0);
+  if (!Number.isInteger(refunded) || refunded < 0) throw new StripeUnreachable('Stripe answered a refunded amount this platform cannot read');
+  return refunded;
+}
+
+/** What Stripe said was refunded of a paid payment, kept: never more than it took. */
+export async function recordRefunded(client, tenantId, paymentId, refundedMinor) {
+  const { rows } = await client.query(
+    `UPDATE exit_payments SET refunded_minor = LEAST($3::int, amount_minor), refunds_read_at = now()
+      WHERE tenant_id = $1 AND id = $2 AND status = 'succeeded' RETURNING *`,
+    [tenantId, paymentId, refundedMinor],
+  );
+  return rows[0] ?? null;
 }
 
 export function cancelIntent(config, accountId, intentId, idempotencyKey = undefined) {

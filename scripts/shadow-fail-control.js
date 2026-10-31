@@ -72,6 +72,9 @@ const SNAPSHOT_BLOCK = `        if (exitDescriptor !== null) {
           decisionInputs,
           validation: validated.record,
           letOut,
+          // THE PASS THIS STAY WAS A SESSION OF (0048), as its own exit was
+          // told: each visit of a pass is its own session.
+          passSession: passSessionFor(asked, localDecision, open.entry_qr ?? null),
         });
 `;
 
@@ -93,6 +96,9 @@ const BREAKS = [
           decisionInputs,
           validation: validated.record,
           letOut,
+          // THE PASS THIS STAY WAS A SESSION OF (0048), as its own exit was
+          // told: each visit of a pass is its own session.
+          passSession: passSessionFor(asked, localDecision, open.entry_qr ?? null),
         });
 
         if (exitDescriptor !== null) {

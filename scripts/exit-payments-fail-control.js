@@ -153,8 +153,8 @@ const SOURCE_BREAKS = [
     name: 'person_leaves_intent_open',
     why: "a person's letting out leaves the intent open",
     file: 'src/app.js',
-    from: '      res.json({ exit: exits.presentForPerson(await cancelForPerson(req.tenantId, row.garage_id, row)) });',
-    to: '      res.json({ exit: exits.presentForPerson(row) });',
+    from: '      const settled = await cancelForPerson(req.tenantId, row.garage_id, row);',
+    to: '      const settled = row;',
   },
   {
     name: 'poll_never_reads',

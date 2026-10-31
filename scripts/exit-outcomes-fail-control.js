@@ -92,14 +92,14 @@ const SOURCE_BREAKS = [
     name: 'cannot_decide_is_transient',
     why: 'a module that could not answer is recorded as not covered',
     file: 'src/entitlement.js',
-    from: '    const answer = await ask(module, link, { identity, laneId, entryAt, exitAt }, options);\n    record[module] = answer;',
+    from: '    const answer = await ask(module, link, { identity: asked, laneId, entryAt, exitAt }, options);\n    record[module] = asQr(answer);',
     to: `    let answer;
     try {
-      answer = await ask(module, link, { identity, laneId, entryAt, exitAt }, options);
+      answer = await ask(module, link, { identity: asked, laneId, entryAt, exitAt }, options);
     } catch (err) {
       answer = { consulted: true, module, link, covered: false, error: String(err.message) };
     }
-    record[module] = answer;`,
+    record[module] = asQr(answer);`,
   },
   {
     name: 'link_unprobed',

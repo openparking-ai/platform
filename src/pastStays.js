@@ -108,7 +108,7 @@ export async function closedStays(client, tenantId, garageId, { from, to, limit,
             s.ended->>'reason' AS ended, (s.ended->'owed'->>'pass_unasked')::boolean AS pass_unasked,
             (s.let_out IS NOT NULL) AS let_out_unpaid,
             COALESCE(s.ended->'owed'->'fee_minor', s.let_out->'owed_minor') AS owed_minor,
-            s.ended->'paid' AS paid
+            s.ended->'paid' AS paid, s.pass_session
        FROM sessions s
       WHERE s.tenant_id = $1 AND s.garage_id = $2
         AND s.exit_at >= $3 AND s.exit_at < $4
@@ -142,6 +142,8 @@ export async function closedStays(client, tenantId, garageId, { from, to, limit,
  * fee is null. `pass_unasked` is true on an ended stay whose garage links a
  * pass and had no exit lane to ask it at, false when the pass was asked or
  * none is linked, and null where nothing is owed or it was not recorded.
+ * `pass` is the pass the stay was a session of (0048) -- `{module, pass_id,
+ * covered}`, a garage-pass id, never a person's or a car's -- or null.
  */
 function present(row) {
   return {
@@ -159,5 +161,8 @@ function present(row) {
     // What it still owes: less what was paid on the stay, never below 0.
     owed_minor: owedAfterPaid(row.owed_minor, row.paid, row.currency),
     pass_unasked: row.pass_unasked ?? null,
+    pass: row.pass_session
+      ? { module: row.pass_session.module, pass_id: row.pass_session.pass_id ?? null, covered: row.pass_session.covered }
+      : null,
   };
 }
