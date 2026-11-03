@@ -44,6 +44,7 @@ import { EVERYTHING, permit, reaches } from './permissions.js';
 import * as linkedAccounts from './linkedAccounts.js';
 import { AccountsUndecided } from './accountsDoor.js';
 import { readDoneBy } from './doneBy.js';
+import { createPlatformAdminRouter } from './platformAdmin.js';
 
 /**
  * The stay's open exit case changed, or took a payment, between the cancel
@@ -911,6 +912,11 @@ export function createApp() {
     if (await databaseAnswers()) return res.json({ ok: true, db: 'connected' });
     return res.status(503).json({ ok: false, db: 'unreachable' });
   });
+
+  // The platform admin's one read (src/platformAdmin.js, 0049): before the
+  // operator router, which answers 401 to everything under /api/v1. Off (404)
+  // unless PLATFORM_ADMIN_KEY_FILE is set.
+  app.use('/api/v1/platform-admin', createPlatformAdminRouter());
 
   // -------------------------------------------------------------------------
   // Operator surface.
