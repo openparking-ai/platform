@@ -30,7 +30,10 @@ import { generateDeviceToken, hashToken } from '../src/auth.js';
 // Every SECURITY DEFINER function there is, by what it needs from the owner.
 // A new one is refused by the walk below until it is put in one of these.
 const OPENS_THE_LOOKUP = [
-  'list_tenant_ids_for_maintenance', 'record_refused_change', 'resolve_lane_device',
+  'list_tenant_ids_for_maintenance',
+  // 0049: the platform admin's one read, across every account on purpose (src/platformAdmin.js).
+  'platform_admin_summary',
+  'record_refused_change', 'resolve_lane_device',
   // 0032: a link is presented, and its tenant is what is being found out.
   'resolve_operator_invite', 'resolve_operator_invite_for_email', 'resolve_operator_password_reset',
 ];

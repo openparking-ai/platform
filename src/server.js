@@ -7,6 +7,7 @@ import { assertCanSend, readEmailSettings } from './email.js';
 import { assertStartSettings } from './startSettings.js';
 import { assertValidationsDoor } from './validations.js';
 import { assertAccountsDoor, doorConfigured as accountsDoorConfigured } from './accountsDoor.js';
+import { readPlatformAdminSettings } from './platformAdmin.js';
 
 // Before the port opens, not after. A service that starts and then discovers it
 // is behind has already served requests, and the requests it served are the
@@ -22,6 +23,8 @@ try {
   ({ PORT: port } = assertStartSettings());
   assertValidationsDoor();
   assertAccountsDoor();
+  // The platform admin's door (src/platformAdmin.js): a key file named that is not absolute refuses to start.
+  if (!readPlatformAdminSettings().on) console.log('[platform] the platform admin door is off: PLATFORM_ADMIN_KEY_FILE is not set');
   await assertSchemaCurrent();
 } catch (err) {
   console.error(`[platform] REFUSING TO SERVE: ${err.message}`);
