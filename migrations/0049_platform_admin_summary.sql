@@ -12,10 +12,13 @@
 -- (name, entry or exit, closed or open); and two counts. NO plate, NO vehicle,
 -- NO picture, NO person, NO money: nothing a stay holds but its two times.
 --
---   cars_in   stays whose car came in (entry_at) on a garage-local day from
---             p_from to p_to, both included -- a car still inside counts.
---   cars_out  stays whose car left (exit_at) on a garage-local day in the same
---             range.
+--   cars_in   cars through an ENTRY gate: stays that opened (entry_at, always
+--             at an entry lane) on a garage-local day from p_from to p_to, both
+--             included -- a car still inside counts.
+--   cars_out  cars through an EXIT gate: stays that closed at an exit lane
+--             (exit_lane_id set) on a garage-local day in the same range. A
+--             stay ended without an exit (0039: superseded, ended by a person,
+--             abandoned) has no exit lane and is not counted out.
 --
 -- HOW IT READS ACROSS ACCOUNTS WITHOUT WIDENING ANYTHING. The account list
 -- comes through the definer lookup 0031 made (`tenants`, `garages`, `lanes`
@@ -81,6 +84,7 @@ CREATE FUNCTION platform_admin_summary_body(p_from date, p_to date)
                    AND s.entry_at <  ((p_to + 1)::timestamp AT TIME ZONE g.timezone)),
                (SELECT count(*) FROM sessions s
                  WHERE s.garage_id = g.id
+                   AND s.exit_lane_id IS NOT NULL
                    AND s.exit_at >= (p_from::timestamp AT TIME ZONE g.timezone)
                    AND s.exit_at <  ((p_to + 1)::timestamp AT TIME ZONE g.timezone))
           FROM (SELECT 1) one

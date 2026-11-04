@@ -3,8 +3,9 @@
  *
  * Held here: every account is in it with its garages, their lanes (entry or
  * exit, closed or open) and number of spaces, and an account with no garage
- * is in it too; cars in and out are counted on the GARAGE'S local day, both
- * ends of the range included, a car still inside counted in but not out; no
+ * is in it too; cars in (entry gate) and out (exit gate) are counted on the
+ * GARAGE'S local day, both ends of the range included, a car still inside or
+ * ended with no exit gate counted in but not out; no
  * plate, ticket, descriptor or vehicle id is anywhere in the answer; no key,
  * a wrong key and an unreadable key file are 401 and never echo what was
  * sent; past the refusal count the caller is 429; days that are not two
@@ -81,6 +82,13 @@ before(async () => {
     await stay(c, world, v, '2026-09-02T12:00:00Z', '2026-09-02T14:00:00Z'); // in and out on the 2nd
     await stay(c, world, v, '2026-09-03T03:30:00Z', '2026-09-03T04:30:00Z'); // in on the 2nd (local), out on the 3rd
     await stay(c, world, v2, '2026-09-02T20:00:00Z', null); // in on the 2nd, still inside
+    // In through the entry gate on the 2nd, then ended by a person with no exit gate (0039): in, never out.
+    const id = randomUUID();
+    await c.query(
+      `INSERT INTO sessions (id, tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, exit_at, open_event_id, currency, entry_confirmation, entry_descriptor, ended)
+       VALUES ($1,$2,$3,$4,$5,'2026-09-02T15:00:00Z','2026-09-02T16:00:00Z',$6,'USD','confirmed',$7,$8)`,
+      [id, tenant, world.garage, v2, world.entryLane, `open-${id}`, DESCRIPTOR,
+        { reason: 'ended', at: '2026-09-02T16:00:00Z', by: 'test', why: 'The car was towed.' }]);
   });
 });
 
@@ -108,13 +116,13 @@ test('every account is in it, with its garages, lanes and spaces; an account wit
   assert.deepEqual(e.garages, []);
 });
 
-test('cars in and out are counted on the garage\'s own day; a car still inside is in, not out', async () => {
+test('cars in are entry-gate stays and cars out exit-gate stays, on the garage\'s own day; a car still inside, or ended with no exit gate, is in, not out', async () => {
   const day2 = mine((await get('/summary?from=2026-09-02&to=2026-09-02')).json).find((x) => x.id === tenant).garages[0];
-  assert.deepEqual([day2.carsIn, day2.carsOut], [3, 2]);
+  assert.deepEqual([day2.carsIn, day2.carsOut], [4, 2]);
   const day1 = mine((await get('/summary?from=2026-09-01&to=2026-09-01')).json).find((x) => x.id === tenant).garages[0];
   assert.deepEqual([day1.carsIn, day1.carsOut], [1, 0]);
   const range = mine((await get('/summary?from=2026-09-01&to=2026-09-03')).json).find((x) => x.id === tenant).garages[0];
-  assert.deepEqual([range.carsIn, range.carsOut], [4, 3]);
+  assert.deepEqual([range.carsIn, range.carsOut], [5, 3]);
   const none = mine((await get('/summary?from=2026-08-01&to=2026-08-31')).json).find((x) => x.id === tenant).garages[0];
   assert.deepEqual([none.carsIn, none.carsOut], [0, 0]);
 });
