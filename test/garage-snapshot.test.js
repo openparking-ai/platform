@@ -28,7 +28,7 @@ const TICKET = 'PLANTTICKET7';
 const DESCRIPTOR = 'planted-descriptor-silver-hatchback';
 const PERSON = 'Planted Person Name';
 const INTENT = 'pi_PLANTEDINTENT5';
-const ACCOUNT = 'acct_PLANTEDACCOUNT3';
+const ACCOUNT = 'acct_fakeplanted3';
 // The words a database error carries; none may reach an answer.
 const DB_WORDS = /relation|column|syntax|SQLSTATE|violates|constraint|postgres|timestamptz|uuid|select|where/i;
 const NO_GARAGE = '00000000-0000-4000-8000-000000000000';
