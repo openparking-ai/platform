@@ -398,6 +398,14 @@ jobs:
         # test/past-stays.test.js to go red.
         run: npm run past-stays-fail-control
 
+      - name: Garage-snapshot fail-control
+        # A garage's own numbers (src/garageSnapshot.js). Each break removes one
+        # property -- a stay with no exit gate not counted out, a car still
+        # inside counted in, money only from payments, a refund apart, the
+        # garage's own days, one currency, the permission, the 404, no identity
+        # in the answer -- and requires test/garage-snapshot.test.js to go red.
+        run: npm run garage-snapshot-fail-control
+
       - name: Fill-rule fail-control
         # The fill rule's figures (0034). Each break removes one property --
         # the per-garage lock on opens, closed stays not counted, the figure

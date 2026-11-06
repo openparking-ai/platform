@@ -117,6 +117,8 @@ jobs:
         run: npm run garage-reads-fail-control
       - name: Past-stays fail-control
         run: npm run past-stays-fail-control
+      - name: Garage-snapshot fail-control
+        run: npm run garage-snapshot-fail-control
       - name: Fill-rule fail-control
         run: npm run fill-rule-fail-control
       - name: Pictures-and-bans fail-control

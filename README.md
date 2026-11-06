@@ -841,6 +841,38 @@ code (`range_invalid`, `range_too_long`, `page_size_invalid`, `cursor_invalid`).
 `test/past-stays.test.js` holds each; `npm run past-stays-fail-control` breaks
 each in turn.
 
+### A garage's own numbers
+
+    GET /api/v1/garages/<id>/today     (money:read)
+        {today: {date, entries, exits, open_stays, takings_minor, currency}}
+    GET /api/v1/garages/<id>/snapshot?from=YYYY-MM-DD&to=YYYY-MM-DD     (money:read)
+        {from, to, currency, open_stays, spaces,
+         days: [{date, cars_in, cars_out, takings_minor, refunds_minor, average_stay_minutes}],
+         by_hour: [{hour, cars_in, cars_out, takings_minor}],
+         by_lane: [{lane_id, name, direction, closed, cars}]}
+
+Read-only, under the caller's own account, for the garage's own local days,
+whatever their length when the clocks change. `today` is the garage's day now;
+`from` and `to` are both included, 1 to 366 days, and anything else is refused
+`400 days_refused`, in a sentence. `by_hour` is always 24 rows: the hour the
+clocks repeat is one row and the hour they skip is zeros. `by_lane` is every
+lane of the garage, closed or open, each with the cars through it. `spaces` is
+null when the garage has none stated.
+
+**Cars in** are stays opened at an entry lane on the day, including cars still
+inside. **Cars out** are stays closed at an exit lane on the day; a stay ended
+with no exit gate (superseded, ended by a person, abandoned) is not counted out.
+`average_stay_minutes` is of the cars counted out that day, rounded to the
+minute, and null when there were none.
+
+**Takings** are what was paid: `exit_payments` that succeeded, on the day they
+succeeded, gross, tax included. **Refunds** are apart, on the day of the payment
+they came out of, as Stripe last said them. `sessions.fee_minor` is a price, not
+a payment, and is never read here. Money in a currency other than the garage's
+is refused `409 currency_mixed`, never added. No plate, vehicle, picture, person
+or payment id is in either answer. `test/garage-snapshot.test.js` holds each;
+`npm run garage-snapshot-fail-control` breaks each in turn.
+
 ### Making a garage
 
     POST /api/v1/garages   {name, timezone, currency, default_action?, space_class?, transient_available?}   201 {garage}

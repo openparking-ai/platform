@@ -15,6 +15,7 @@ import * as enrolments from './enrolments.js';
 import * as validations from './validations.js';
 import { reconcile } from './reconcile.js';
 import * as pastStays from './pastStays.js';
+import * as garageSnapshot from './garageSnapshot.js';
 import * as stripeAccount from './stripeAccount.js';
 import * as terminal from './terminal.js';
 import * as signIn from './signIn.js';
@@ -4148,6 +4149,49 @@ export function createApp() {
     if (!garage) throw new HttpError(404, 'garage not found');
     return garage;
   };
+
+  /**
+   * THE GARAGE'S OWN NUMBERS between two of its local days (src/garageSnapshot.js).
+   * Money in another currency than the garage's is refused, never added: a
+   * total of two currencies is a number of neither.
+   */
+  const snapshotFigures = async (client, req, garage, from, to) => {
+    const figures = await garageSnapshot.read(client, req.tenantId, garage, { from, to });
+    if (figures.currencies.some((c) => c !== garage.currency)) {
+      throw conflict('currency_mixed', "Some of these takings are in a different currency from the garage's, so they cannot be added together.");
+    }
+    return figures;
+  };
+
+  /** Today at this garage, its own local day: what the phone's Today screen shows. */
+  operator.get('/garages/:garageId/today', may('money:read'), async (req, res, next) => {
+    try {
+      const today = await withTenant(req.tenantId, async (client) => {
+        const garage = await ownGarage(client, req);
+        const { day, from, to } = garageDay(undefined, garage.timezone);
+        return garageSnapshot.presentToday(day, await snapshotFigures(client, req, garage, from, to), garage.currency);
+      });
+      res.json({ today });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** A range of the garage's local days, `from` to `to`, both included, 1 to 366 of them. */
+  operator.get('/garages/:garageId/snapshot', may('money:read'), async (req, res, next) => {
+    try {
+      const out = await withTenant(req.tenantId, async (client) => {
+        const garage = await ownGarage(client, req);
+        const days = garageSnapshot.readDays(req.query);
+        const { from } = garageDay(days.first, garage.timezone);
+        const { to } = garageDay(days.last, garage.timezone);
+        return garageSnapshot.presentRange(days, await snapshotFigures(client, req, garage, from, to), garage);
+      });
+      res.json(out);
+    } catch (err) {
+      next(err);
+    }
+  });
 
   /**
    * THE EXIT CASES STILL AT A LANE (0037): every car at an exit of this
