@@ -4194,30 +4194,32 @@ export function createApp() {
   };
 
   /**
-   * One key's turn: so many a minute and so many at once, each past that a 429
-   * with its `Retry-After`, so one key cannot hold the pool the lanes also use.
-   * After the permission, so a refused caller is not counted.
+   * One caller's turn: so many a minute and so many at once, each past that a
+   * 429 with its `Retry-After`, so one key cannot hold the pool the lanes also
+   * use. Answers what gives the turn back. It is held as long as the read
+   * runs, whether or not the caller is still there: a caller who hangs up
+   * leaves the database working, and its turn with it.
    */
-  const snapshotTurn = (req, res, next) => {
+  const snapshotTurn = (req) => {
     const who = `${req.actor.kind}:${req.actor.id}`;
     const limit = snapshotLimiter.attempt(who);
     const going = snapshotsGoing.get(who) ?? 0;
     if (!limit.allowed || going >= garageSnapshot.READS_AT_ONCE) {
       const refusal = new HttpError(429, 'Too many reads of these numbers. Wait a moment and try again.', 'too_many_reads');
       refusal.retryAfter = limit.allowed ? 1 : limit.retryAfterSeconds;
-      return next(refusal);
+      throw refusal;
     }
     snapshotsGoing.set(who, going + 1);
-    res.once('close', () => {
+    return () => {
       const left = snapshotsGoing.get(who) - 1;
       if (left > 0) snapshotsGoing.set(who, left);
       else snapshotsGoing.delete(who);
-    });
-    return next();
+    };
   };
 
-  /** Inside the caller's tenant, each statement bounded: SET LOCAL's reach, this transaction and no other. */
+  /** One turn, inside the caller's tenant, each statement bounded: SET LOCAL's reach, this transaction and no other. */
   const snapshotRead = async (req, fn) => {
+    const giveBack = snapshotTurn(req);
     try {
       return await withTenant(req.tenantId, async (client) => {
         await client.query("SELECT set_config('statement_timeout', $1, true)", [String(startSetting('SNAPSHOT_TIMEOUT_MS'))]);
@@ -4228,11 +4230,13 @@ export function createApp() {
       const refusal = new HttpError(503, 'These numbers took too long to read. Try again in a moment, or ask for fewer days.', 'snapshot_timed_out');
       refusal.retryAfter = 5;
       throw refusal;
+    } finally {
+      giveBack();
     }
   };
 
   /** Today at this garage, its own local day: what the phone's Today screen shows. */
-  operator.get('/garages/:garageId/today', may('money:read'), snapshotTurn, async (req, res, next) => {
+  operator.get('/garages/:garageId/today', may('money:read'), async (req, res, next) => {
     try {
       const today = await snapshotRead(req, async (client) => {
         const garage = await ownGarage(client, req);
@@ -4246,7 +4250,7 @@ export function createApp() {
   });
 
   /** A range of the garage's local days, `from` to `to`, both included, 1 to 366 of them. */
-  operator.get('/garages/:garageId/snapshot', may('money:read'), snapshotTurn, async (req, res, next) => {
+  operator.get('/garages/:garageId/snapshot', may('money:read'), async (req, res, next) => {
     try {
       const out = await snapshotRead(req, async (client) => {
         const garage = await ownGarage(client, req);

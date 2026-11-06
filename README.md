@@ -878,8 +878,9 @@ and is never read here. Money in a currency other than the garage's is refused
 `409 currency_mixed`, never added. No plate, vehicle, picture, person or payment
 id is in either answer.
 
-One key may make 120 of these reads a minute and have 4 going at once; past
-either it is `429 too_many_reads` with a `Retry-After`. Each statement of a read
+One key or person may make 120 of these reads a minute and have 4 going at once,
+counted until the read ends even if the caller hangs up; past either it is `429
+too_many_reads` with a `Retry-After`. Each statement of a read
 is bounded by `SNAPSHOT_TIMEOUT_MS` (5 seconds), past which it is `503
 snapshot_timed_out`. No other route is touched by either.
 `test/garage-snapshot.test.js` holds each; `npm run garage-snapshot-fail-control`
@@ -904,8 +905,9 @@ event: a `refund` when it grew, a negative `reversal` when it shrank, nothing
 when it did not. An event id is counted once. `exit_payments.refunded_minor` is
 kept to the same total, so the exit's credit reads what the payment kept. An
 event for an account no garage holds, a payment no exit took or a canceled
-payment is answered 200 and touches nothing; a payment still open here, or Stripe
-not answering, is `503` and Stripe sends it again. Disputes and chargebacks are
+payment is answered 200 and touches nothing; a payment still open here, Stripe
+not answering, or more than 2 events at work at once in this process is `503`, and
+Stripe sends it again. Disputes and chargebacks are
 not refunds and are not here. Nothing is backfilled. `test/exit-refunds.test.js`
 holds each.
 

@@ -41,7 +41,9 @@
  * another event type, an account no garage holds, a payment no exit took. A
  * payment still open here is answered 503: its refund is real and the poll has
  * not caught up, so Stripe sends it again. Any failure reading Stripe is the
- * same 503, and a retry is safe. No charge dispute is read here: a dispute is
+ * same 503, and a retry is safe. So is an event past EVENTS_AT_ONCE: the turn
+ * above needs the Stripe read inside the transaction, so a connection is held
+ * for it, and the lanes share that pool. The count is this process's. No charge dispute is read here: a dispute is
  * not a refund.
  */
 import { createHmac, timingSafeEqual } from 'node:crypto';
@@ -51,6 +53,10 @@ import { connectConfig, StripeError, StripeUnreachable } from './stripe.js';
 
 //: Stripe's own default for a signed time.
 export const TOLERANCE_SECONDS = 300;
+
+//: The most events at work at once, each holding a connection while Stripe is
+//: read and while it waits its payment's turn. Past it, 503: Stripe sends it again.
+export const EVENTS_AT_ONCE = 2;
 
 //: Every one but `charge.refunded` carries a Refund; all name the PaymentIntent.
 export const REFUND_EVENTS = Object.freeze(['charge.refunded', 'refund.created', 'refund.updated', 'refund.failed', 'charge.refund.updated']);
@@ -132,11 +138,19 @@ async function settle(client, tenantId, { eventId, account, intent, at }, config
   return rowCount === 1 ? 'recorded' : 'unchanged';
 }
 
+let eventsGoing = 0;
+
 /** One verified event. Answers `recorded`, `unchanged` or `ignored`; throws TryAgainLater. */
 export async function handleEvent(event, config = connectConfig()) {
   const about = refundEvent(event);
   if (!about) return 'ignored';
-  const { rows } = await query('SELECT tenant_id FROM resolve_stripe_account($1)', [about.account]);
-  if (rows.length === 0) return 'ignored';
-  return withTenant(rows[0].tenant_id, (client) => settle(client, rows[0].tenant_id, about, config));
+  if (eventsGoing >= EVENTS_AT_ONCE) throw new TryAgainLater('too many events at once');
+  eventsGoing += 1;
+  try {
+    const { rows } = await query('SELECT tenant_id FROM resolve_stripe_account($1)', [about.account]);
+    if (rows.length === 0) return 'ignored';
+    return await withTenant(rows[0].tenant_id, (client) => settle(client, rows[0].tenant_id, about, config));
+  } finally {
+    eventsGoing -= 1;
+  }
 }

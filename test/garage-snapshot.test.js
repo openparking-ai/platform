@@ -18,6 +18,7 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import net from 'node:net';
 import { createApp } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld, superuserClient } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
@@ -119,6 +120,38 @@ async function refundOf(c, w, payment, { amount, at, currency = 'usd' }) {
       `evt_fake${randomUUID().replaceAll('-', '')}`, at],
   );
 }
+
+/** A person of the account, signed in, as the headers their reads carry. */
+async function signedIn(a, over) {
+  const p = door.person(a.tenant, over);
+  const r = await fetch(`${base}/api/v1/auth/sign-in`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: p.email, password: p.password }) });
+  assert.equal(r.status, 200, await r.text());
+  return { cookie: r.headers.getSetCookie().find((x) => x.startsWith(`${signIn.COOKIE}=`)).split(';')[0] };
+}
+
+/** A read sent on a raw socket, and the socket: to hang up on it. */
+function rawRead(path, headers) {
+  const { hostname, port } = new URL(base);
+  const socket = net.connect(Number(port), hostname);
+  socket.on('error', () => {});
+  const lines = [`GET /api/v1${path} HTTP/1.1`, `Host: ${hostname}`, ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`)];
+  socket.write(`${lines.join('\r\n')}\r\n\r\n`);
+  return socket;
+}
+
+const until = async (ok, what) => {
+  for (let i = 0; i < 200; i += 1) {
+    if (await ok()) return;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.fail(what);
+};
+
+/** Whom each read is counted against: a key, and a person's session. */
+const callers = async (a) => [
+  ['a key', { authorization: `Bearer ${a.key}` }],
+  ['a person', await signedIn(a, { garages: 'all', permissions: ['money:read'] })],
+];
 
 before(async () => {
   process.env.ADMIN_ORIGIN = 'https://admin.example.test';
@@ -474,6 +507,45 @@ test('ONE KEY, AT ONCE: past the limit a read is refused at once, and the turns 
   assert.equal((await get(`/garages/${w.garage}/today`, a.key)).status, 200, 'every turn was given back');
 });
 
+test('A CALLER WHO HANGS UP AT ONCE leaves no turn behind, a key or a person', async () => {
+  const a = await account('snap-hang-up');
+  const w = a.world;
+  for (const [who, headers] of await callers(a)) {
+    const gone = await Promise.all(Array.from({ length: READS_AT_ONCE * 2 }, () => new Promise((resolve) => {
+      const socket = rawRead(`/garages/${w.garage}/today`, headers);
+      socket.once('connect', () => setImmediate(() => { socket.destroy(); resolve(); }));
+    })));
+    assert.equal(gone.length, READS_AT_ONCE * 2);
+    await new Promise((r) => setTimeout(r, 300));
+    // Every turn back: as many reads as the limit, all at once.
+    const answers = await Promise.all(Array.from({ length: READS_AT_ONCE }, () => fetchAs(`/garages/${w.garage}/today`, headers)));
+    assert.deepEqual(answers.map((r) => r.status), Array(READS_AT_ONCE).fill(200), who);
+  }
+});
+
+test('A CALLER WHO HANGS UP KEEPS ITS TURN while its read still runs, so hanging up does not pass the limit, a key or a person', async () => {
+  const a = await account('snap-hang-up-late');
+  const w = a.world;
+  for (const [who, headers] of await callers(a)) {
+    const su = superuserClient();
+    await su.connect();
+    await su.query('BEGIN');
+    await su.query('LOCK TABLE exit_refunds IN ACCESS EXCLUSIVE MODE');
+    try {
+      const sockets = Array.from({ length: READS_AT_ONCE }, () => rawRead(`/garages/${w.garage}/today`, headers));
+      await new Promise((r) => setTimeout(r, 150));
+      for (const socket of sockets) socket.destroy();
+      await new Promise((r) => setTimeout(r, 50));
+      const refused = await fetchAs(`/garages/${w.garage}/today`, headers);
+      assert.equal(refused.status, 429, `${who}: ${refused.text}`);
+    } finally {
+      await su.query('ROLLBACK');
+      await su.end();
+    }
+    await until(async () => (await fetchAs(`/garages/${w.garage}/today`, headers)).status === 200, `${who}: the turns come back when the reads end`);
+  }
+});
+
 test("A READ THAT RUNS LONG is cut off in a sentence, and the timeout stays with that read", async () => {
   const a = await account('snap-timeout');
   const w = a.world;
@@ -527,16 +599,18 @@ test("ANOTHER ACCOUNT'S GARAGE is the same 404 as one that does not exist; no ac
     const entryLane = (await c.query(`INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1,$2,'Second Entry','entry') RETURNING id`, [a.tenant, garage])).rows[0].id;
     const exitLane = (await c.query(`INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1,$2,'Second Exit','exit') RETURNING id`, [a.tenant, garage])).rows[0].id;
     const there = { ...a.world, garage, entryLane, exitLane };
-    await paid(c, there, await cameIn(c, there, '2026-09-01T15:00:00Z', entryLane), { amount: 900, at: '2026-09-01T16:00:00Z' });
+    const payment = await paid(c, there, await cameIn(c, there, '2026-09-01T15:00:00Z', entryLane), { amount: 900, at: '2026-09-01T16:00:00Z' });
+    await refundOf(c, there, payment, { amount: 40, at: '2026-09-01T17:00:00Z' });
     return { garage };
   });
   const mine = await snapshot(a.world, a.key, '2026-09-01', '2026-09-01');
   assert.equal(mine.json.days[0].cars_in, 2);
   assert.equal(mine.json.open_stays, 2);
   assert.equal(mine.json.days[0].takings_minor, 0);
+  assert.equal(mine.json.days[0].refunds_minor, 0, "another garage's refund is not this one's");
   assert.deepEqual(mine.json.by_lane.map((l) => l.name), ['Entry 1', 'Exit 1']);
   const theirSecond = await snapshot(second, a.key, '2026-09-01', '2026-09-01');
-  assert.deepEqual([theirSecond.json.days[0].cars_in, theirSecond.json.days[0].takings_minor, theirSecond.json.open_stays], [1, 900, 1]);
+  assert.deepEqual([theirSecond.json.days[0].cars_in, theirSecond.json.days[0].takings_minor, theirSecond.json.days[0].refunds_minor, theirSecond.json.open_stays], [1, 900, 40, 1]);
 });
 
 test('MONEY:READ: a person without it is refused, one with it reads, and a garage outside their list is not there', async () => {
@@ -544,13 +618,7 @@ test('MONEY:READ: a person without it is refused, one with it reads, and a garag
   const w = a.world;
   const other = await asTenant(w, async (c) => (await c.query(
     `INSERT INTO garages (tenant_id, name, timezone, currency) VALUES ($1,'Other','America/New_York','USD') RETURNING id`, [a.tenant])).rows[0].id);
-  const person = async (permissions) => {
-    const p = door.person(a.tenant, { garages: [w.garage], permissions });
-    const r = await fetch(`${base}/api/v1/auth/sign-in`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: p.email, password: p.password }) });
-    assert.equal(r.status, 200, await r.text());
-    const c = r.headers.getSetCookie().find((x) => x.startsWith(`${signIn.COOKIE}=`));
-    return { cookie: c.split(';')[0] };
-  };
+  const person = (permissions) => signedIn(a, { garages: [w.garage], permissions });
   const without = await person(['garages:read', 'stays:read']);
   const holder = await person(['money:read']);
   for (const tail of ['today', 'snapshot?from=2026-09-01&to=2026-09-01']) {

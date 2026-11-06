@@ -17,7 +17,7 @@ import { createHmac, randomUUID } from 'node:crypto';
 import { createApp } from '../src/app.js';
 import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
-import { TOLERANCE_SECONDS } from '../src/exitRefunds.js';
+import { EVENTS_AT_ONCE, TOLERANCE_SECONDS } from '../src/exitRefunds.js';
 import { startStripeStub } from './stripe-stub.js';
 
 const SECRET = 'whsec_fakesigningsecret';
@@ -302,6 +302,39 @@ test('TWO EVENTS OF ONE REFUND AT ONCE take turns: the total is recorded once', 
     stub.behaviour.delayRefundReadMs = 0;
   }
   assert.deepEqual((await ledger(w)).map((x) => x.amount_minor), [500]);
+});
+
+test('TOO MANY EVENTS AT ONCE: past the limit each is 503 at once and holds no connection, the limit comes back, and each is taken when sent again', async () => {
+  const worlds = await Promise.all(Array.from({ length: EVENTS_AT_ONCE + 3 }, (_, i) => paidAndLeft(`wh-busy-${i}`)));
+  const events = worlds.map((w) => {
+    stub.setRefunded(w.intent, 100);
+    return refundEvent(w);
+  });
+  stub.behaviour.delayRefundReadMs = 300;
+  let answers;
+  try {
+    answers = await Promise.all(events.map((raw) => send(raw)));
+  } finally {
+    stub.behaviour.delayRefundReadMs = 0;
+  }
+  const statuses = answers.map((r) => r.status);
+  assert.equal(statuses.filter((x) => x === 200).length, EVENTS_AT_ONCE, statuses.join());
+  assert.equal(statuses.filter((x) => x === 503).length, events.length - EVENTS_AT_ONCE, statuses.join());
+  assert.ok(answers.filter((r) => r.status === 503).every((r) => Number(r.retryAfter) >= 1));
+
+  for (const raw of events) assert.equal((await send(raw)).status, 200);
+  for (const w of worlds) assert.deepEqual((await ledger(w)).map((x) => x.amount_minor), [100]);
+});
+
+test('AN EVENT THAT FAILS gives its place back', async () => {
+  const w = await paidAndLeft('wh-gives-back');
+  stub.setRefunded(w.intent, 100);
+  const raw = refundEvent(w);
+  for (let i = 0; i < EVENTS_AT_ONCE + 1; i += 1) {
+    stub.behaviour.failNext = { status: 500, path: /payment_intents/, message: 'down' };
+    assert.equal((await send(raw)).status, 503);
+  }
+  assert.equal((await send(raw)).status, 200);
 });
 
 test('A PAYMENT CANCELED here is left alone', async () => {
