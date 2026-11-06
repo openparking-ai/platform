@@ -25,6 +25,8 @@ export const START_SETTINGS = Object.freeze({
   // Two entries of one car this close together are one arrival; further
   // apart, the later one ends the earlier stay as superseded (0039).
   REAPPROACH_MINUTES: { min: 1, max: 60, fallback: 10 },
+  // The longest one statement of a garage's numbers may run (src/garageSnapshot.js).
+  SNAPSHOT_TIMEOUT_MS: { min: 100, max: 60000, fallback: 5000 },
 });
 
 /** The value, or `why` it is not one. Unset is the default. */

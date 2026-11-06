@@ -42,6 +42,26 @@ export const TENANT_TABLES = [
     noDelete: true,
   },
   {
+    table: 'exit_refunds',
+    // A refund of a payment of its own (0051), under an event id of its own.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH e AS (
+           INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+           VALUES ($1, $2, $3, 'tr' || replace(gen_random_uuid()::text, '-', ''), now(), 'none') RETURNING id),
+         p AS (
+           INSERT INTO exit_payments (tenant_id, garage_id, exit_id, channel, account_id, payment_intent_id, amount_minor, currency, started_by)
+           SELECT $1, $2, e.id, 'phone_reader', 'acct_tt', 'pi_tr' || replace(gen_random_uuid()::text, '-', ''), 500, 'usd', 'test' FROM e
+           RETURNING id)
+         INSERT INTO exit_refunds (tenant_id, garage_id, exit_payment_id, kind, amount_minor, refunded_total, currency, stripe_event_id, refunded_at)
+         SELECT $1, $2, p.id, 'refund', 100, 100, 'usd', 'evt_tt' || replace(gen_random_uuid()::text, '-', ''), now() FROM p
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    // The record of a refund: written once, never edited or deleted.
+    appendOnly: true,
+  },
+  {
     table: 'exceptions',
     // A car a person let out (0048), about a case of its own at that case's lane.
     insert: (c, t, w) =>

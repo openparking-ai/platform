@@ -576,7 +576,7 @@ const SOURCE_BREAKS = [
     why: 'a day before 1970 is taken',
     suite: EXCEPTIONS,
     catches: "THE DAY'S LIST SAYS THE GATE AGENT IN SHORT",
-    edits: [{ file: 'src/app.js', from: " || Number(day.slice(0, 4)) < 1970\n", to: '\n' }],
+    edits: [{ file: 'src/app.js', from: " || Number(day.slice(0, 4)) < 1970 ||", to: ' ||' }],
   },
   {
     name: 'story_credit_dropped',

@@ -19,6 +19,8 @@
  *   CONNECT_REFRESH_URL   onboarding, and where it sends one whose link
  *                         expired. Both, with the key, are what "Connect is
  *                         configured" means here.
+ *   STRIPE_WEBHOOK_SECRET the signing secret of the Connect endpoint that hears
+ *                         refunds (src/exitRefunds.js). Unset, that door is off.
  *   STRIPE_API_BASE       optional; the API's origin. Only tests set it.
  */
 import { encodeForm } from './form.js';

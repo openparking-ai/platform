@@ -33,9 +33,11 @@ const OPENS_THE_LOOKUP = [
   'list_tenant_ids_for_maintenance', 'record_refused_change', 'resolve_lane_device',
   // 0032: a link is presented, and its tenant is what is being found out.
   'resolve_operator_invite', 'resolve_operator_invite_for_email', 'resolve_operator_password_reset',
+  // 0051: an event names a connected account, and its tenant is what is being found out.
+  'resolve_stripe_account',
 ];
 // The FORCED tables a definer reads across accounts, each with 0031's policy.
-const LOOKUP_TABLES = ['tenants', 'garages', 'lanes', 'operator_invites', 'operator_password_resets'];
+const LOOKUP_TABLES = ['tenants', 'garages', 'lanes', 'operator_invites', 'operator_password_resets', 'garage_stripe_accounts'];
 const READS_NO_FORCED_TABLE = [
   'resolve_linked_session', // linked_sessions (0047)
   'resolve_operator_passkey', // operator_passkeys, operator_users (0047)

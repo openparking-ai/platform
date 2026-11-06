@@ -841,6 +841,76 @@ code (`range_invalid`, `range_too_long`, `page_size_invalid`, `cursor_invalid`).
 `test/past-stays.test.js` holds each; `npm run past-stays-fail-control` breaks
 each in turn.
 
+### A garage's own numbers
+
+    GET /api/v1/garages/<id>/today     (money:read)
+        {today: {date, entries, exits, open_stays, takings_minor, refunds_minor, currency}}
+    GET /api/v1/garages/<id>/snapshot?from=YYYY-MM-DD&to=YYYY-MM-DD     (money:read)
+        {from, to, currency, open_stays, spaces,
+         days: [{date, cars_in, cars_out, takings_minor, refunds_minor, average_stay_minutes}],
+         by_hour: [{hour, cars_in, cars_out, takings_minor, refunds_minor}],
+         by_lane: [{lane_id, name, direction, closed, cars}]}
+
+Read-only, under the caller's own account, for the garage's own local days,
+whatever their length when the clocks change. `today` is the garage's day now.
+`from` and `to` are both included, 1 to 366 days. A day missing or not written
+YYYY-MM-DD, a last day before the first, or more than 366 days is refused `400
+days_refused`; a day written that way that is not a real date, or is before 1970
+or after 9998, is refused `400 day_invalid`, as for every garage day. `by_hour`
+is always 24 rows: the hour the clocks repeat is one row and the hour they skip
+is zeros. `by_lane` is every lane of the garage, closed or open, each with the
+cars through it. `spaces` is null when the garage has none stated.
+
+**Cars in** are stays opened at an entry lane on the day, including cars still
+inside. **Cars out** are stays closed at an exit lane on the day; a stay ended
+with no exit gate (superseded, ended by a person, abandoned) is not counted out.
+`average_stay_minutes` is of the cars counted out that day, rounded to the
+minute, and null when there were none.
+
+**Takings** are what was paid: `exit_payments` that succeeded, on the day they
+succeeded (when this platform first read it so, not Stripe's own time), tax
+included. **Refunds** come from the ledger below and land on the day they were
+refunded, whichever day the payment was; a refund that failed is a negative line
+on the day Stripe said so. `snapshot` shows takings gross and refunds apart.
+`today`'s `takings_minor` is net of today's refunds, and is below zero on a day
+that refunded more than it took. `sessions.fee_minor` is a price, not a payment,
+and is never read here. Money in a currency other than the garage's is refused
+`409 currency_mixed`, never added. No plate, vehicle, picture, person or payment
+id is in either answer.
+
+One key or person may make 120 of these reads a minute and have 4 going at once,
+counted until the read ends even if the caller hangs up; past either it is `429
+too_many_reads` with a `Retry-After`. Each statement of a read
+is bounded by `SNAPSHOT_TIMEOUT_MS` (5 seconds), past which it is `503
+snapshot_timed_out`. No other route is touched by either.
+`test/garage-snapshot.test.js` holds each; `npm run garage-snapshot-fail-control`
+breaks each in turn.
+
+### Refunds made at Stripe
+
+    POST /api/v1/stripe/webhook     (Stripe's signature)     200 {received: true}
+
+There is no refund button here: a refund is made on the garage's own Stripe
+account. Stripe tells this platform through a Connect webhook, which is **off
+unless the deployment sets `STRIPE_WEBHOOK_SECRET`**, the signing secret of an
+endpoint listening to connected accounts for `charge.refunded`, `refund.created`,
+`refund.updated` and `refund.failed` (`charge.refund.updated`, deprecated, is read
+too). Unset, the path is one that does not exist.
+
+The signature is over the bytes sent, and a signed time more than five minutes
+away is refused `400 signature_refused`. An event is a snapshot, so the payment's
+refunded total is read from Stripe, on the garage's account, and the difference
+from what the ledger holds is one row of `exit_refunds` (0051), dated by the
+event: a `refund` when it grew, a negative `reversal` when it shrank, nothing
+when it did not. An event id is counted once. `exit_payments.refunded_minor` is
+kept to the same total, so the exit's credit reads what the payment kept. An
+event for an account no garage holds, a payment no exit took or a canceled
+payment is answered 200 and touches nothing; a payment still open here, Stripe
+not answering, or more than 2 events at work at once in this process is `503`, and
+Stripe sends it again. Disputes and chargebacks are
+not refunds and are not here. Nothing is backfilled. `test/exit-refunds.test.js`
+holds each.
+
 ### Making a garage
 
     POST /api/v1/garages   {name, timezone, currency, default_action?, space_class?, transient_available?}   201 {garage}
@@ -1999,7 +2069,7 @@ route, the intent just made canceled).
 
 **Paid is Stripe's word at the recorded amount.** While a payment is open,
 each `GET /api/v1/lane/exits/:exitId` reads the intent from Stripe, at most
-once every 2 seconds; nothing listens for webhooks. The case is settled
+once every 2 seconds; a payment listens for no webhook. The case is settled
 (`why: "paid"`) only when the intent has succeeded at the amount and currency
 recorded. A decline is kept as `last_failure` and the case still needs
 payment. Stripe out of reach is not a failed poll: the case answers as last
@@ -2206,14 +2276,14 @@ beside it. A car let out owing the difference is let out unpaid owing it,
 with what it had paid (`let_out.paid_minor`). **A refund is not paid**:
 before a new case credits the stay's payments, each (the latest 5) is read
 from Stripe with its latest charge, in parallel and outside any transaction,
-and what was refunded of it -- at Stripe's dashboard, which this platform
-hears of nowhere else -- is kept on the payment (`refunded_minor`,
+and what was refunded of it -- at Stripe's dashboard -- is kept on the payment (`refunded_minor`,
 `refunds_read_at`); only what a payment kept is credited, and the stay-fee
 guard counts it so. Stripe not answering holds no exit up: the payment is
 credited as last read and the case says so (`credit.refunds_unread`). A
-refund is read only then -- when the car comes back to an exit -- once, each
+refund is read here only when the car comes back to an exit -- once, each
 read given 3 seconds before Stripe is taken as silent; a person's end and a
-return credit what was last read.
+return credit what was last read. Where the deployment has the webhook on
+("Refunds made at Stripe"), it keeps the same total up to date as refunds happen.
 
 **A return is a new stay** -- for a transient car. *"when the car leaves.
 It's gone. When it comes back new time starts."* An entry after the stay
