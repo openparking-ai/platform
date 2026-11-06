@@ -306,6 +306,15 @@ export async function startStripeStub() {
       const intent = intents.get(intentId);
       intent.refunded = (intent.refunded ?? 0) + amountMinor;
     },
+    /** A paid intent on `account`, for a test that needs nothing else of the flow. */
+    paidIntent(id, account, amount) {
+      if (!accounts.has(account)) accounts.set(account, { id: account });
+      intents.set(id, { id, object: 'payment_intent', on: account, status: 'succeeded', amount, currency: 'usd' });
+    },
+    /** What Stripe now says was refunded of the intent: a refund that failed takes it down. */
+    setRefunded(intentId, amountMinor) {
+      intents.get(intentId).refunded = amountMinor;
+    },
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }

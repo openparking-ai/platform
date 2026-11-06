@@ -26,8 +26,8 @@
  * being authorised on is left to finish and asked about again. The record
  * says canceled only when Stripe answered with a canceled intent.
  *
- * PULL, NOT PUSH, as the account's state is (0020): nothing listens for
- * Stripe's webhooks. The lane polls the case while the driver pays; each
+ * PULL, NOT PUSH, as the account's state is (0020): a payment listens for no
+ * webhook of Stripe's (only a refund does, src/exitRefunds.js). The lane polls the case while the driver pays; each
  * poll reads the intent from Stripe, at most once every READ_EVERY_MS.
  *
  * Offline: the lane's reader is driven from here (Stripe's server-driven
@@ -214,8 +214,8 @@ export function readIntent(config, accountId, intentId) {
 
 /**
  * THE REFUNDED PART OF A PAID INTENT (0048): its latest charge, expanded, says
- * how much of it was refunded -- at Stripe's dashboard, say, which this
- * platform hears of nowhere else. One read per payment.
+ * how much of it was refunded -- at Stripe's dashboard, say. One read per
+ * payment.
  */
 export async function refundedOf(config, accountId, intentId) {
   const intent = await stripeCall({

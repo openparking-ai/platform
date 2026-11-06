@@ -14,11 +14,12 @@
  *
  * MONEY IS WHAT WAS PAID, never `sessions.fee_minor`: that is the price, not
  * proof of payment. Takings are `exit_payments` that succeeded, by
- * `succeeded_at`, gross, tax included. Refunds are shown apart, on the day of
- * the payment they came out of and not on the day they were made, so a
- * day's takings and its refunds are the same payments and a past day's
- * takings never move. `refunded_minor` is what Stripe said when it was last
- * read (0048).
+ * `succeeded_at`, tax included. Refunds come from the ledger (0051) and land on
+ * the day they were refunded, whichever day the payment was: a refund this week
+ * of last month's payment shows this week, and a reversal nets out on its own
+ * day, so a past day's takings never move. A range shows takings gross and
+ * refunds apart; today's takings are net of today's refunds, and go below zero
+ * on a day that refunded more than it took.
  *
  * AN AVERAGE STAY is of the cars counted out that day, on the day they left:
  * a stay with no exit gate has no time a gate saw it leave.
@@ -33,13 +34,17 @@
  * selects times, lanes and amounts, and the answer is built field by field.
  *
  * ONE QUERY, the rows rolled up by the garage's hour once and read from there,
- * whatever the range. Three indexes take it to the rows wanted: the stays'
- * by entry and by exit (0039, 0044) and the payments' (0050).
+ * whatever the range. Four indexes take it to the rows wanted: the stays'
+ * by entry and by exit (0039, 0044), the payments' (0050) and the refunds' (0051).
  */
 import { HttpError } from './errors.js';
 import { toMinor } from './money.js';
 
 export const RANGE_MAX_DAYS = 366;
+//: The most reads one key may make a minute. A company's phones share its key.
+export const READS_PER_MINUTE = 120;
+//: The most reads one key may have going at once: well under the pool's ten.
+export const READS_AT_ONCE = 4;
 
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const refused = () => new HttpError(
@@ -78,10 +83,14 @@ export async function read(client, tenantId, garage, { from, to }) {
         WHERE s.tenant_id = $1 AND s.garage_id = $2 AND s.exit_lane_id IS NOT NULL
           AND s.exit_at >= $3 AND s.exit_at < $4
        UNION ALL
-       SELECT p.succeeded_at AT TIME ZONE $5, NULL, 0, 0, NULL, p.amount_minor, p.refunded_minor, upper(p.currency)
+       SELECT p.succeeded_at AT TIME ZONE $5, NULL, 0, 0, NULL, p.amount_minor, 0, upper(p.currency)
          FROM exit_payments p
         WHERE p.tenant_id = $1 AND p.garage_id = $2 AND p.status = 'succeeded'
           AND p.succeeded_at >= $3 AND p.succeeded_at < $4
+       UNION ALL
+       SELECT r.refunded_at AT TIME ZONE $5, NULL, 0, 0, NULL, 0, r.amount_minor, upper(r.currency)
+         FROM exit_refunds r
+        WHERE r.tenant_id = $1 AND r.garage_id = $2 AND r.refunded_at >= $3 AND r.refunded_at < $4
      ),
      hours AS (
        SELECT date_trunc('hour', local) AS at, lane_id, currency, sum(cars_in) AS cars_in, sum(cars_out) AS cars_out,
@@ -95,7 +104,8 @@ export async function read(client, tenantId, garage, { from, to }) {
          FROM hours GROUP BY 1
      ),
      by_hour AS (
-       SELECT extract(hour FROM at)::int AS hour, sum(cars_in) AS cars_in, sum(cars_out) AS cars_out, sum(takings) AS takings_minor
+       SELECT extract(hour FROM at)::int AS hour, sum(cars_in) AS cars_in, sum(cars_out) AS cars_out,
+              sum(takings) AS takings_minor, sum(refunds) AS refunds_minor
          FROM hours GROUP BY 1
      ),
      by_lane AS (
@@ -143,7 +153,8 @@ export function presentToday(day, figures, currency) {
     entries: d.cars_in,
     exits: d.cars_out,
     open_stays: figures.open_stays,
-    takings_minor: d.takings_minor,
+    takings_minor: d.takings_minor - d.refunds_minor,
+    refunds_minor: d.refunds_minor,
     currency,
   };
 }
@@ -163,6 +174,7 @@ export function presentRange({ first, last }, figures, garage) {
       cars_in: Number(hour(h)?.cars_in ?? 0),
       cars_out: Number(hour(h)?.cars_out ?? 0),
       takings_minor: toMinor(hour(h)?.takings_minor ?? 0, 'takings_minor'),
+      refunds_minor: toMinor(hour(h)?.refunds_minor ?? 0, 'refunds_minor'),
     })),
     by_lane: figures.lanes.map((l) => ({ lane_id: l.lane_id, name: l.name, direction: l.direction, closed: l.closed, cars: Number(l.cars) })),
   };

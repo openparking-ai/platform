@@ -4,12 +4,14 @@
  *
  * Held here: a car still inside counts in; a stay ended with no exit gate does
  * not count out; money is succeeded payments and never a stay's price; a
- * refund is shown apart, on its payment's day; two currencies are refused, not
- * added; a day is the garage's own across a clock change; the days refused in
- * one sentence with no database words; another account's garage is the same
- * 404 as one that does not exist, and a person without `money:read` is
- * refused; and nothing that identifies a car, a person or a payment is in
- * either answer (each is planted, and none is found).
+ * refund lands on the day it was refunded, and today's takings are net of it;
+ * two currencies are refused, not added; a day is the garage's own across a
+ * clock change, today's too; the first and last instant of a day are held; the
+ * days refused in one sentence with no database words; another account's
+ * garage is the same 404 as one that does not exist, and a person without
+ * `money:read` is refused; one key is bounded by the minute and at once, and a
+ * read by a statement timeout; and nothing that identifies a car, a person or
+ * a payment is in either answer (each is planted, and none is found).
  *
  * `npm run garage-snapshot-fail-control` breaks each in turn.
  */
@@ -17,10 +19,11 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { createApp } from '../src/app.js';
-import { pool, withTenant, createTenant, buildWorld } from './helpers.js';
+import { pool, withTenant, createTenant, buildWorld, superuserClient } from './helpers.js';
 import { generateDeviceToken, hashToken } from '../src/auth.js';
 import * as signIn from '../src/signIn.js';
 import { instantToLocal } from '../src/garageTime.js';
+import { READS_AT_ONCE, READS_PER_MINUTE } from '../src/garageSnapshot.js';
 import { accountsStandIn } from './accounts-stand-in.js';
 
 const PLATE = 'PLANTPLATE9';
@@ -85,8 +88,8 @@ async function endedNoGate(c, id, at, reason) {
   await c.query(`UPDATE sessions SET exit_at = $2, ended = $3 WHERE id = $1`, [id, at, JSON.stringify({ reason, at, ...why })]);
 }
 
-/** A payment of a stay: open, then as `status` says, at `at`, with `refunded` of it refunded. */
-async function paid(c, w, stay, { amount, at, status = 'succeeded', refunded = 0, currency = 'usd' }) {
+/** A payment of a stay: open, then as `status` says, at `at`. */
+async function paid(c, w, stay, { amount, at, status = 'succeeded', currency = 'usd' }) {
   const exit = (await c.query(
     `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method, session_id, quote)
      VALUES ($1,$2,$3,$4,$5,'single',$6,$7) RETURNING id`,
@@ -100,11 +103,21 @@ async function paid(c, w, stay, { amount, at, status = 'succeeded', refunded = 0
     [w.tenantId, w.garage, exit, stay, ACCOUNT, `${INTENT}${randomUUID().replaceAll('-', '')}`, amount, currency, PERSON],
   )).rows[0].id;
   if (status === 'succeeded') {
-    await c.query(`UPDATE exit_payments SET status = 'succeeded', succeeded_at = $2, refunded_minor = $3, refunds_read_at = now() WHERE id = $1`, [id, at, refunded]);
+    await c.query(`UPDATE exit_payments SET status = 'succeeded', succeeded_at = $2 WHERE id = $1`, [id, at]);
   } else if (status === 'canceled') {
     await c.query(`UPDATE exit_payments SET status = 'canceled', canceled_at = $2 WHERE id = $1`, [id, at]);
   }
   return id;
+}
+
+/** One line of the refund ledger (0051): `amount` of `payment` at `at`, negative for a reversal. */
+async function refundOf(c, w, payment, { amount, at, currency = 'usd' }) {
+  await c.query(
+    `INSERT INTO exit_refunds (tenant_id, garage_id, exit_payment_id, kind, amount_minor, refunded_total, currency, stripe_event_id, refunded_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [w.tenantId, w.garage, payment, amount > 0 ? 'refund' : 'reversal', amount, Math.abs(amount), currency,
+      `evt_fake${randomUUID().replaceAll('-', '')}`, at],
+  );
 }
 
 before(async () => {
@@ -123,7 +136,7 @@ after(async () => {
   door.end();
 });
 
-test("TODAY: the phone's shape, for the garage's own day: a car still inside in, a car from yesterday out, what was paid", async () => {
+test("TODAY: the phone's shape, for the garage's own day: a car still inside in, a car from yesterday out, takings net of today's refunds", async () => {
   const a = await account('snap-today');
   const w = a.world;
   // A zone where it is the middle of the day, so nothing here crosses midnight.
@@ -134,9 +147,15 @@ test("TODAY: the phone's shape, for the garage's own day: a car still inside in,
   const ago = (ms) => new Date(now - ms).toISOString();
   await asTenant(w, async (c) => {
     await cameIn(c, w, ago(60_000)); // still inside
+    await cameIn(c, w, ago(4 * 86_400_000)); // inside since before today
+    await cameIn(c, w, ago(5 * 86_400_000)); // and another
     const fromYesterday = await cameIn(c, w, ago(3 * 86_400_000));
     await leftByGate(c, w, fromYesterday, ago(30_000));
-    await paid(c, w, fromYesterday, { amount: 1250, at: ago(40_000), refunded: 250 });
+    const payment = await paid(c, w, fromYesterday, { amount: 1250, at: ago(40_000) });
+    await refundOf(c, w, payment, { amount: 250, at: ago(20_000) });
+    // A refund today of an old payment comes off today.
+    const old = await paid(c, w, await cameIn(c, w, ago(9 * 86_400_000)), { amount: 900, at: ago(8 * 86_400_000) });
+    await refundOf(c, w, old, { amount: 100, at: ago(10_000) });
   });
   const r = await get(`/garages/${w.garage}/today`, a.key);
   assert.equal(r.status, 200, r.text);
@@ -145,12 +164,54 @@ test("TODAY: the phone's shape, for the garage's own day: a car still inside in,
       date: instantToLocal(now, zone).slice(0, 10),
       entries: 1,
       exits: 1,
-      open_stays: 1,
-      takings_minor: 1250, // gross: the refund is the range's to show
+      open_stays: 4,
+      takings_minor: 900,
+      refunds_minor: 350,
       currency: 'USD',
     },
   });
   assert.equal(r.noStore, 'no-store');
+});
+
+test("TODAY IS THE GARAGE'S DAY, not UTC's: in the zone whose date differs from UTC's now", async () => {
+  const a = await account('snap-today-zone');
+  const w = a.world;
+  const utc = new Date().toISOString().slice(0, 10);
+  const zone = ['Pacific/Kiritimati', 'Pacific/Pago_Pago'].find((z) => instantToLocal(Date.now(), z).slice(0, 10) !== utc);
+  await asTenant(w, (c) => c.query('UPDATE garages SET timezone = $2 WHERE id = $1', [w.garage, zone]));
+  const r = await get(`/garages/${w.garage}/today`, a.key);
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.today.date, instantToLocal(Date.now(), zone).slice(0, 10));
+  assert.notEqual(r.json.today.date, utc);
+});
+
+test('TODAY ACROSS A CLOCK CHANGE: the 25th hour and the 23-hour day are still today, and no neighbour is', async (t) => {
+  const a = await account('snap-today-clocks');
+  const w = a.world;
+  await asTenant(w, async (c) => {
+    await cameIn(c, w, '2026-11-01T03:59:00Z'); // 23:59 on 31 October
+    await cameIn(c, w, '2026-11-01T04:00:00Z'); // the day's first minute
+    await cameIn(c, w, '2026-11-02T04:30:00Z'); // 23:30 EST, the 25th hour
+    await cameIn(c, w, '2026-11-02T05:00:00Z'); // 00:00 on the 2nd
+    await cameIn(c, w, '2026-03-08T04:59:00Z'); // 23:59 on the 7th
+    await cameIn(c, w, '2026-03-08T05:00:00Z'); // the day's first minute
+    await cameIn(c, w, '2026-03-09T03:30:00Z'); // 23:30 EDT, the 23rd hour
+    await cameIn(c, w, '2026-03-09T04:00:00Z'); // 00:00 on the 9th
+  });
+  const at = async (now) => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.parse(now) });
+    try {
+      return await get(`/garages/${w.garage}/today`, a.key);
+    } finally {
+      t.mock.timers.reset();
+    }
+  };
+  const back = await at('2026-11-02T04:45:00Z');
+  assert.equal(back.status, 200, back.text);
+  assert.deepEqual([back.json.today.date, back.json.today.entries], ['2026-11-01', 2]);
+  const forward = await at('2026-03-09T03:45:00Z');
+  assert.equal(forward.status, 200, forward.text);
+  assert.deepEqual([forward.json.today.date, forward.json.today.entries], ['2026-03-08', 2]);
 });
 
 test('CARS: in counts a car still inside; out counts an exit lane and no stay that ended without one', async () => {
@@ -162,8 +223,9 @@ test('CARS: in counts a car still inside; out counts an exit lane and no stay th
     const left = await cameIn(c, w, '2026-09-01T13:00:00Z'); // 09:00 in New York
     await leftByGate(c, w, left, '2026-09-01T14:30:00Z'); // 90 minutes
     const quick = await cameIn(c, w, '2026-09-01T13:30:00Z');
-    await leftByGate(c, w, quick, '2026-09-01T14:00:00Z', { lane }); // 30 minutes, at the lane closed since
+    await leftByGate(c, w, quick, '2026-09-01T14:01:00Z', { lane }); // 31 minutes, at the lane closed since
     await cameIn(c, w, '2026-09-01T15:00:00Z'); // still inside
+    await cameIn(c, w, '2026-08-20T15:00:00Z'); // inside since before the range: inside, not in
     for (const reason of ['superseded', 'ended', 'abandoned']) {
       await endedNoGate(c, await cameIn(c, w, '2026-09-01T16:00:00Z'), '2026-09-01T18:00:00Z', reason);
     }
@@ -173,17 +235,17 @@ test('CARS: in counts a car still inside; out counts an exit lane and no stay th
   assert.equal(r.status, 200, r.text);
   assert.deepEqual(Object.keys(r.json).sort(), ['by_hour', 'by_lane', 'currency', 'days', 'from', 'open_stays', 'spaces', 'to']);
   assert.equal(r.json.currency, 'USD');
-  assert.equal(r.json.open_stays, 1);
+  assert.equal(r.json.open_stays, 2);
   assert.equal(r.json.spaces, null);
   assert.deepEqual(r.json.days, [
-    { date: '2026-09-01', cars_in: 6, cars_out: 2, takings_minor: 0, refunds_minor: 0, average_stay_minutes: 60 },
+    { date: '2026-09-01', cars_in: 6, cars_out: 2, takings_minor: 0, refunds_minor: 0, average_stay_minutes: 61 }, // 60.5, rounded
     { date: '2026-09-02', cars_in: 0, cars_out: 0, takings_minor: 0, refunds_minor: 0, average_stay_minutes: null },
   ]);
   // Hours are the garage's: 09:00 and 10:00 in New York, not 13:00 at UTC.
   assert.equal(r.json.by_hour.length, 24);
   assert.deepEqual(r.json.by_hour.map((h) => h.hour), Array.from({ length: 24 }, (_, i) => i));
-  assert.deepEqual(r.json.by_hour[9], { hour: 9, cars_in: 2, cars_out: 0, takings_minor: 0 });
-  assert.deepEqual(r.json.by_hour[10], { hour: 10, cars_in: 0, cars_out: 2, takings_minor: 0 });
+  assert.deepEqual(r.json.by_hour[9], { hour: 9, cars_in: 2, cars_out: 0, takings_minor: 0, refunds_minor: 0 });
+  assert.deepEqual(r.json.by_hour[10], { hour: 10, cars_in: 0, cars_out: 2, takings_minor: 0, refunds_minor: 0 });
   assert.equal(r.json.by_hour.reduce((n, h) => n + h.cars_out, 0), 2);
   assert.deepEqual(r.json.by_lane, [
     { lane_id: w.entryLane, name: 'Entry 1', direction: 'entry', closed: false, cars: 6 },
@@ -195,25 +257,62 @@ test('CARS: in counts a car still inside; out counts an exit lane and no stay th
   assert.equal((await snapshot(w, a.key, '2026-09-01', '2026-09-01')).json.spaces, 80);
 });
 
-test("MONEY: what succeeded, on its garage-local day, never a stay's price; a refund apart, on its payment's day", async () => {
+test("MONEY: what succeeded, on its garage-local day, never a stay's price; a refund on the day it was refunded, a reversal on its own", async () => {
   const a = await account('snap-money');
   const w = a.world;
   await asTenant(w, async (c) => {
     // A price of 900 and no payment: nothing was taken.
     await leftByGate(c, w, await cameIn(c, w, '2026-09-01T13:00:00Z'), '2026-09-01T14:00:00Z', { fee: 900 });
     // 23:30 on the 1st in New York, 03:30 on the 2nd at UTC.
-    await paid(c, w, await cameIn(c, w, '2026-09-01T20:00:00Z'), { amount: 1000, at: '2026-09-02T03:30:00Z', refunded: 300 });
+    const first = await paid(c, w, await cameIn(c, w, '2026-09-01T20:00:00Z'), { amount: 1000, at: '2026-09-02T03:30:00Z' });
     // 00:30 on the 2nd in New York.
     await paid(c, w, await cameIn(c, w, '2026-09-01T21:00:00Z'), { amount: 500, at: '2026-09-02T04:30:00Z' });
     await paid(c, w, await cameIn(c, w, '2026-09-01T22:00:00Z'), { amount: 700, at: '2026-09-02T05:00:00Z', status: 'open' });
     await paid(c, w, await cameIn(c, w, '2026-09-01T22:30:00Z'), { amount: 800, at: '2026-09-02T05:00:00Z', status: 'canceled' });
+    // Two refunds on the 4th, days after the payment, at 10:00 and 10:30 in New York.
+    await refundOf(c, w, first, { amount: 300, at: '2026-09-04T14:00:00Z' });
+    await refundOf(c, w, first, { amount: 200, at: '2026-09-04T14:30:00Z' });
+    // One of them failed, the next day: back on that day, not undone on the 4th.
+    await refundOf(c, w, first, { amount: -200, at: '2026-09-05T15:00:00Z' });
   });
-  const r = await snapshot(w, a.key, '2026-09-01', '2026-09-02');
+  const r = await snapshot(w, a.key, '2026-09-01', '2026-09-05');
   assert.equal(r.status, 200, r.text);
-  const money = r.json.days.map((d) => [d.date, d.takings_minor, d.refunds_minor]);
-  assert.deepEqual(money, [['2026-09-01', 1000, 300], ['2026-09-02', 500, 0]]);
+  assert.deepEqual(r.json.days.map((d) => [d.date, d.takings_minor, d.refunds_minor]), [
+    ['2026-09-01', 1000, 0], ['2026-09-02', 500, 0], ['2026-09-03', 0, 0], ['2026-09-04', 0, 500], ['2026-09-05', 0, -200],
+  ]);
   assert.equal(r.json.by_hour[23].takings_minor, 1000);
   assert.equal(r.json.by_hour[0].takings_minor, 500);
+  assert.equal(r.json.by_hour[10].refunds_minor, 500, 'by the hour it was refunded, added up');
+  assert.equal(r.json.by_hour[11].refunds_minor, -200);
+  assert.equal(r.json.by_hour[23].refunds_minor, 0);
+
+  // A refund this week of a payment outside the range is still this week's.
+  const week = await snapshot(w, a.key, '2026-09-04', '2026-09-04');
+  assert.deepEqual([week.json.days[0].takings_minor, week.json.days[0].refunds_minor], [0, 500]);
+});
+
+test("A DAY'S EDGES: its first instant is in, the next day's first instant is out, for cars out, payments and refunds", async () => {
+  const a = await account('snap-edges');
+  const w = a.world;
+  const first = '2026-09-02T04:00:00.000Z'; // 00:00 on the 2nd in New York
+  const next = '2026-09-03T04:00:00.000Z'; // 00:00 on the 3rd
+  await asTenant(w, async (c) => {
+    for (const [i, at] of [[1, first], [2, next]]) {
+      const stay = await cameIn(c, w, '2026-09-01T12:00:00Z');
+      await leftByGate(c, w, stay, at);
+      const payment = await paid(c, w, stay, { amount: 100 * i, at });
+      await refundOf(c, w, payment, { amount: 10 * i, at });
+    }
+  });
+  const r = await snapshot(w, a.key, '2026-09-02', '2026-09-02');
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.days[0].cars_out, 1);
+  assert.equal(r.json.by_lane.find((l) => l.direction === 'exit').cars, 1);
+  assert.equal(r.json.by_hour.reduce((n, h) => n + h.cars_out, 0), 1);
+  assert.equal(r.json.days[0].takings_minor, 100);
+  assert.equal(r.json.by_hour.reduce((n, h) => n + h.takings_minor, 0), 100);
+  assert.equal(r.json.days[0].refunds_minor, 10);
+  assert.equal(r.json.by_hour.reduce((n, h) => n + h.refunds_minor, 0), 10);
 });
 
 test('A BIG SUM stays a whole number of minor units, and comes as a number', async () => {
@@ -235,6 +334,9 @@ test('TWO CURRENCIES are refused in a sentence, on both reads, and only for the 
     await paid(c, w, await cameIn(c, w, '2026-09-01T20:00:00Z'), { amount: 100, at: '2026-09-01T21:00:00Z' });
     await paid(c, w, await cameIn(c, w, '2026-09-02T20:00:00Z'), { amount: 100, at: '2026-09-02T21:00:00Z' });
     await paid(c, w, await cameIn(c, w, '2026-09-03T20:00:00Z'), { amount: 100, at: '2026-09-03T21:00:00Z', currency: 'eur' });
+    // A refund of it, on a later day, is in that currency too.
+    const late = await paid(c, w, await cameIn(c, w, '2026-08-20T20:00:00Z'), { amount: 100, at: '2026-08-20T21:00:00Z', currency: 'eur' });
+    await refundOf(c, w, late, { amount: 50, at: '2026-09-10T15:00:00Z', currency: 'eur' });
   });
   const mixed = await snapshot(w, a.key, '2026-09-01', '2026-09-03');
   assert.equal(mixed.status, 409, mixed.text);
@@ -242,6 +344,9 @@ test('TWO CURRENCIES are refused in a sentence, on both reads, and only for the 
   assert.match(mixed.json.error, /different currency/);
   assert.doesNotMatch(mixed.text, DB_WORDS);
   assert.equal((await snapshot(w, a.key, '2026-09-01', '2026-09-02')).json.days[1].takings_minor, 100);
+
+  const refund = await snapshot(w, a.key, '2026-09-10', '2026-09-10');
+  assert.equal(refund.status, 409, refund.text);
 
   const b = await account('snap-currency-today');
   await asTenant(b.world, async (c) => {
@@ -314,8 +419,85 @@ test('THE DAYS: 1 to 366 of them, and anything else refused in one plain sentenc
     const r = await get(`/garages/${w.garage}/snapshot?${q}`, a.key);
     assert.equal(r.status, 400, `${q}: ${r.text}`);
     assert.match(r.json.error, /^(Choose a first and a last day|day is a date)/, q);
+    assert.ok(['days_refused', 'day_invalid'].includes(r.json.code), q);
     assert.doesNotMatch(r.text, DB_WORDS, q);
   }
+});
+
+test('THE LAST DAYS OF THE CALENDAR are refused, not a 500, whatever the zone', async () => {
+  const a = await account('snap-year-9999');
+  const w = a.world;
+  await asTenant(w, (c) => c.query(`UPDATE garages SET timezone = 'UTC' WHERE id = $1`, [w.garage]));
+  for (const q of ['from=9999-12-30&to=9999-12-31', 'from=9999-12-31&to=9999-12-31', 'from=9999-01-01&to=9999-01-02']) {
+    const r = await get(`/garages/${w.garage}/snapshot?${q}`, a.key);
+    assert.equal(r.status, 400, `${q}: ${r.text}`);
+    assert.equal(r.json.code, 'day_invalid', q);
+  }
+  assert.equal((await snapshot(w, a.key, '9998-12-30', '9998-12-31')).status, 200);
+});
+
+test('ONE KEY, BY THE MINUTE: past the limit it is 429 with a Retry-After; another key and other routes are not held', async () => {
+  const a = await account('snap-limit');
+  const b = await account('snap-limit-other');
+  const w = a.world;
+  for (let i = 0; i < READS_PER_MINUTE; i += 1) {
+    const r = await get(`/garages/${w.garage}/today`, a.key);
+    assert.equal(r.status, 200, `read ${i}: ${r.text}`);
+  }
+  const res = await fetch(`${base}/api/v1/garages/${w.garage}/today`, { headers: { authorization: `Bearer ${a.key}` } });
+  assert.equal(res.status, 429);
+  assert.equal((await res.json()).code, 'too_many_reads');
+  assert.ok(Number(res.headers.get('retry-after')) >= 1);
+  assert.equal((await snapshot(w, a.key, '2026-09-01', '2026-09-01')).status, 429, 'one limit for both reads');
+  assert.equal((await get(`/garages/${b.world.garage}/today`, b.key)).status, 200);
+  assert.equal((await get(`/garages/${w.garage}/lanes`, a.key)).status, 200);
+});
+
+test('ONE KEY, AT ONCE: past the limit a read is refused at once, and the turns come back', async () => {
+  const a = await account('snap-at-once');
+  const w = a.world;
+  const su = superuserClient();
+  await su.connect();
+  await su.query('BEGIN');
+  await su.query('LOCK TABLE exit_refunds IN ACCESS EXCLUSIVE MODE');
+  try {
+    const held = Array.from({ length: READS_AT_ONCE }, () => get(`/garages/${w.garage}/today`, a.key));
+    await new Promise((r) => setTimeout(r, 150));
+    const refused = await get(`/garages/${w.garage}/today`, a.key);
+    assert.equal(refused.status, 429, refused.text);
+    await su.query('ROLLBACK');
+    for (const r of await Promise.all(held)) assert.equal(r.status, 200, r.text);
+  } finally {
+    await su.query('ROLLBACK').catch(() => {});
+    await su.end();
+  }
+  assert.equal((await get(`/garages/${w.garage}/today`, a.key)).status, 200, 'every turn was given back');
+});
+
+test("A READ THAT RUNS LONG is cut off in a sentence, and the timeout stays with that read", async () => {
+  const a = await account('snap-timeout');
+  const w = a.world;
+  const su = superuserClient();
+  await su.connect();
+  await su.query('BEGIN');
+  await su.query('LOCK TABLE exit_refunds IN ACCESS EXCLUSIVE MODE');
+  process.env.SNAPSHOT_TIMEOUT_MS = '200';
+  try {
+    for (const tail of ['today', 'snapshot?from=2026-09-01&to=2026-09-01']) {
+      const res = await fetch(`${base}/api/v1/garages/${w.garage}/${tail}`, { headers: { authorization: `Bearer ${a.key}` } });
+      const body = await res.json();
+      assert.equal(res.status, 503, JSON.stringify(body));
+      assert.equal(body.code, 'snapshot_timed_out');
+      assert.ok(Number(res.headers.get('retry-after')) >= 1);
+      assert.doesNotMatch(body.error, DB_WORDS);
+    }
+  } finally {
+    delete process.env.SNAPSHOT_TIMEOUT_MS;
+    await su.query('ROLLBACK');
+    await su.end();
+  }
+  const seen = await Promise.all(Array.from({ length: 10 }, () => pool.query('SHOW statement_timeout')));
+  assert.ok(seen.every((r) => r.rows[0].statement_timeout === '0'), 'the pool keeps no timeout');
 });
 
 test("ANOTHER ACCOUNT'S GARAGE is the same 404 as one that does not exist; no account's numbers reach another; nor one garage's another's", async () => {
@@ -388,7 +570,8 @@ test('NO IDENTITY: a plate, a ticket, a descriptor, a person, payment ids and th
   const planted = await asTenant(w, async (c) => {
     const stay = await cameIn(c, w, ago(120_000));
     const vehicle = (await c.query('SELECT vehicle_id FROM sessions WHERE id = $1', [stay])).rows[0].vehicle_id;
-    const payment = await paid(c, w, stay, { amount: 500, at: ago(60_000), refunded: 100 });
+    const payment = await paid(c, w, stay, { amount: 500, at: ago(60_000) });
+    await refundOf(c, w, payment, { amount: 100, at: ago(50_000) });
     await leftByGate(c, w, stay, ago(30_000));
     const ticketed = (await c.query('INSERT INTO vehicles (tenant_id, ticket_ref) VALUES ($1, $2) RETURNING id', [w.tenantId, TICKET])).rows[0].id;
     const inside = await cameIn(c, w, ago(10_000));

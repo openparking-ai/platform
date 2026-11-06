@@ -34,6 +34,7 @@ import * as exits from './exits.js';
 import * as exitMatch from './exitMatch.js';
 import * as exitPicker from './exitPicker.js';
 import * as exitPayments from './exitPayments.js';
+import * as exitRefunds from './exitRefunds.js';
 import * as textReceipt from './textReceipt.js';
 import * as stuck from './stuckStays.js';
 import * as walks from './walks.js';
@@ -888,6 +889,35 @@ export function createApp() {
   // so a body that cannot be parsed is answered with their one sentence and
   // never with the parser's text, which quotes what was sent.
   app.use('/api/v1/auth', signIn.createAuthRouter(authSettings));
+
+  // Stripe's refund events (src/exitRefunds.js): before the body parser, because
+  // the signature is over the bytes sent, and before the operator router, which
+  // answers 401 to everything under /api/v1. With no secret set, the path goes
+  // on to that router as a path that does not exist.
+  const rawBody = express.raw({ type: () => true, limit: '1mb' });
+  app.post('/api/v1/stripe/webhook', (req, res, next) => {
+    if (!exitRefunds.webhookSecret()) return next('route');
+    return rawBody(req, res, (err) => next(err ? Object.assign(err, { bodyUnreadable: true }) : undefined));
+  }, async (req, res, next) => {
+    try {
+      res.set('Cache-Control', 'no-store');
+      if (!exitRefunds.signedByStripe(req.body, req.get('stripe-signature'), exitRefunds.webhookSecret(), Math.floor(Date.now() / 1000))) {
+        return res.status(400).json({ error: 'That is not a signed event.', code: 'signature_refused' });
+      }
+      let event;
+      try {
+        event = JSON.parse(req.body.toString('utf8'));
+      } catch {
+        return res.status(200).json({ received: true });
+      }
+      await exitRefunds.handleEvent(event);
+      return res.status(200).json({ received: true });
+    } catch (err) {
+      if (!(err instanceof exitRefunds.TryAgainLater)) return next(err);
+      res.set('Retry-After', '60');
+      return res.status(503).json({ error: 'Not now: send it again.', code: 'try_again_later' });
+    }
+  });
 
   // Any failure to read a body is marked as one, so it is answered in one
   // fixed sentence (below), whatever the path. A body that is not UTF-8 is
@@ -4163,10 +4193,48 @@ export function createApp() {
     return figures;
   };
 
-  /** Today at this garage, its own local day: what the phone's Today screen shows. */
-  operator.get('/garages/:garageId/today', may('money:read'), async (req, res, next) => {
+  /**
+   * One key's turn: so many a minute and so many at once, each past that a 429
+   * with its `Retry-After`, so one key cannot hold the pool the lanes also use.
+   * After the permission, so a refused caller is not counted.
+   */
+  const snapshotTurn = (req, res, next) => {
+    const who = `${req.actor.kind}:${req.actor.id}`;
+    const limit = snapshotLimiter.attempt(who);
+    const going = snapshotsGoing.get(who) ?? 0;
+    if (!limit.allowed || going >= garageSnapshot.READS_AT_ONCE) {
+      const refusal = new HttpError(429, 'Too many reads of these numbers. Wait a moment and try again.', 'too_many_reads');
+      refusal.retryAfter = limit.allowed ? 1 : limit.retryAfterSeconds;
+      return next(refusal);
+    }
+    snapshotsGoing.set(who, going + 1);
+    res.once('close', () => {
+      const left = snapshotsGoing.get(who) - 1;
+      if (left > 0) snapshotsGoing.set(who, left);
+      else snapshotsGoing.delete(who);
+    });
+    return next();
+  };
+
+  /** Inside the caller's tenant, each statement bounded: SET LOCAL's reach, this transaction and no other. */
+  const snapshotRead = async (req, fn) => {
     try {
-      const today = await withTenant(req.tenantId, async (client) => {
+      return await withTenant(req.tenantId, async (client) => {
+        await client.query("SELECT set_config('statement_timeout', $1, true)", [String(startSetting('SNAPSHOT_TIMEOUT_MS'))]);
+        return fn(client);
+      });
+    } catch (err) {
+      if (err?.code !== QUERY_CANCELED) throw err;
+      const refusal = new HttpError(503, 'These numbers took too long to read. Try again in a moment, or ask for fewer days.', 'snapshot_timed_out');
+      refusal.retryAfter = 5;
+      throw refusal;
+    }
+  };
+
+  /** Today at this garage, its own local day: what the phone's Today screen shows. */
+  operator.get('/garages/:garageId/today', may('money:read'), snapshotTurn, async (req, res, next) => {
+    try {
+      const today = await snapshotRead(req, async (client) => {
         const garage = await ownGarage(client, req);
         const { day, from, to } = garageDay(undefined, garage.timezone);
         return garageSnapshot.presentToday(day, await snapshotFigures(client, req, garage, from, to), garage.currency);
@@ -4178,9 +4246,9 @@ export function createApp() {
   });
 
   /** A range of the garage's local days, `from` to `to`, both included, 1 to 366 of them. */
-  operator.get('/garages/:garageId/snapshot', may('money:read'), async (req, res, next) => {
+  operator.get('/garages/:garageId/snapshot', may('money:read'), snapshotTurn, async (req, res, next) => {
     try {
-      const out = await withTenant(req.tenantId, async (client) => {
+      const out = await snapshotRead(req, async (client) => {
         const garage = await ownGarage(client, req);
         const days = garageSnapshot.readDays(req.query);
         const { from } = garageDay(days.first, garage.timezone);
@@ -5141,6 +5209,10 @@ const sightingLimiter = signIn.addressLimiter({ max: walks.SIGHTINGS_PER_MINUTE,
 /** How many QRs one lane device may present a minute: a car a scan, with room for a driver's retries. */
 export const QR_PER_MINUTE = 10;
 const qrLimiter = signIn.addressLimiter({ max: QR_PER_MINUTE, windowSeconds: 60 });
+const snapshotLimiter = signIn.addressLimiter({ max: garageSnapshot.READS_PER_MINUTE, windowSeconds: 60 });
+const snapshotsGoing = new Map();
+//: Postgres's code for a statement that ran past its timeout.
+const QUERY_CANCELED = '57014';
 
 /** One `{ entry, exit }` of a try, read in the garage's time and refused by name. */
 function tryStay(raw, i, timezone) {
@@ -5618,9 +5690,11 @@ export { pool, LANE_EVENT_KINDS, CLOSE_UNPRICED_EVENT_KIND };
  */
 function garageDay(raw, timezone) {
   const day = raw === undefined ? instantToLocal(Date.now(), timezone).slice(0, 10) : raw;
-  // A real date from 1970 to 9999: year 0000 and the like are no garage's day
-  // (the time zone database cannot place them), and refused, not a 500.
-  if (typeof day !== 'string' || !PARAM_SHAPES.day.test(day) || Number(day.slice(0, 4)) < 1970
+  // A real date from 1970 to 9998: year 0000 and the like are no garage's day
+  // (the time zone database cannot place them), and refused, not a 500. Nor
+  // 9999: the day's edges are looked for a day either side, and year 10000 is
+  // a reading a garage's clock cannot write.
+  if (typeof day !== 'string' || !PARAM_SHAPES.day.test(day) || Number(day.slice(0, 4)) < 1970 || Number(day.slice(0, 4)) > 9998
     || Number.isNaN(Date.parse(`${day}T00:00:00Z`)) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day) {
     throw DAY_INVALID();
   }
