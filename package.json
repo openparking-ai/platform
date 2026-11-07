@@ -48,6 +48,7 @@
     "release-validation-holds": "node scripts/release-validation-holds.js",
     "complete-exceptions": "node scripts/complete-exceptions.js",
     "sweep-exit-payments": "node scripts/sweep-exit-payments.js",
+    "sweep-exit-check": "node scripts/sweep-exit-check.js",
     "demo": "node scripts/demo.js",
     "purge": "node scripts/purge-vehicles.js",
     "purge-pictures": "node scripts/purge-pictures.js",

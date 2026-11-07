@@ -23,9 +23,13 @@
  */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { pool, withTenant } from './helpers.js';
 import {
-  sweepOpenPayments, recordCaseIntent, whileHoldingSweepLock, writtenDownSince, MIN_AGE_MS, OLD_EVERY_MS, RECENT_MS,
+  sweepOpenPayments, recordCaseIntent, whileHoldingSweepLock, reportWrittenDown, MIN_AGE_MS, OLD_EVERY_MS, RECENT_MS,
 } from '../src/exitPaymentSweep.js';
 import {
   startHarness, cardGarage, enter, caseAt, pay, caseOf, close, rows, plateNo, unconfigure, configure,
@@ -531,17 +535,26 @@ test('THE CLOSE FINDS IT FIRST: the same', async () => {
   assert.equal(await afterLetOut(g, c.x), 'succeeded');
 });
 
-test('A LANE POLL REACHES A CLOSED CASE FIRST: written down once all the same, and counted for the alarm', async () => {
+test('A LANE POLL REACHES A CLOSED CASE FIRST: written down once all the same, and reported by exactly one run', async () => {
   const g = await cardGarage(h, 'found-closed');
-  const since = new Date();
-  assert.equal(await writtenDownSince(g.tenant, since), 0, 'control: nothing yet');
+  assert.equal(await reportWrittenDown(g.tenant), 0, 'control: nothing yet');
   const c = await paidAtTheReader(g);
   await withTenant(g.tenant, (cl) => cl.query(`UPDATE exits SET closed_at = now(), ended = $2 WHERE id = $1`,
     [c.exit.id, { why: 'stay_ended', by: 'user:someone', at: new Date().toISOString() }]));
   await caseOf(h, g, c.exit.id);
   assert.equal((await eventsOf(g, 'exit_payment_unplaced', c.exit.id)).length, 1);
-  assert.equal(await writtenDownSince(g.tenant, since), 1);
-  assert.equal(await writtenDownSince(g.tenant, new Date(Date.now() + 60_000)), 0, 'control: only since then');
+  assert.equal(await reportWrittenDown(g.tenant), 1);
+  assert.equal(await reportWrittenDown(g.tenant), 0, 'reported once');
+  assert.equal((await eventsOf(g, 'exit_payment_reported', c.exit.id)).length, 1);
+});
+
+test('A CHARGE WRITTEN DOWN LONG AGO is still reported: nothing ages out; two runs at once take it once', async () => {
+  const g = await cardGarage(h, 'report-old');
+  const c = await refundedWhole(g);
+  await sweep(g);
+  const [a, b] = await Promise.all([reportWrittenDown(g.tenant), reportWrittenDown(g.tenant)]);
+  assert.equal(a + b, 1);
+  assert.equal((await eventsOf(g, 'exit_payment_unplaced', c.exit.id)).length, 1, 'the charge itself stands');
 });
 
 test("THE SWEEP LANDS WHILE A LET-OUT'S CANCEL HANGS: the let-out's older copy does not cover what it found", async () => {
@@ -641,9 +654,25 @@ test('A RUN PAST ITS DEADLINE reads no more; the next reads them', async () => {
   const g = await cardGarage(h, 'sweep-deadline');
   const c = await paidAtTheReader(g);
   const from = h.stub.requests.length;
-  assert.equal((await sweep(g, { deadline: Date.now() - 1 })).paid, 0);
+  assert.deepEqual(await sweep(g, { deadline: Date.now() - 1 }), { due: 0, paid: 0, unplaced: 0, failed: 0 }, 'it says what it read: nothing');
   assert.deepEqual(stripeReads(from), []);
   assert.equal((await sweep(g)).paid, 1, 'control: the next run');
   assert.equal((await paymentOf(g, c.exit.id)).status, 'succeeded');
+});
+
+test('A RUN STUCK PAST ITS DEADLINE is ended by its watchdog, exit 1', () => {
+  const root = resolve(import.meta.dirname, '..');
+  const dir = mkdtempSync(join(tmpdir(), 'sweep-watchdog-'));
+  try {
+    const hang = join(dir, 'hang.mjs');
+    writeFileSync(hang, `import pg from ${JSON.stringify(join(root, 'node_modules/pg/lib/index.js'))};\npg.Pool.prototype.connect = () => new Promise(() => {});\n`);
+    const r = spawnSync(process.execPath, ['--import', hang, join(root, 'scripts/sweep-exit-payments.js')], {
+      env: { ...process.env, SWEEP_DEADLINE_MS: '50', SWEEP_WATCHDOG_AFTER_MS: '100' }, encoding: 'utf8', timeout: 8000,
+    });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /stuck past its deadline/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 

@@ -167,10 +167,9 @@ jobs:
 
       - name: The exit payments' sweep runs clean after the suite
         run: |
-          # After the suite: its own charges written down may be in the window, and exit 1.
-          line="$(npm run -s sweep-exit-payments || true)"
-          echo "$line"
-          echo "$line" | grep -Eqx 'exit payments: [0-9]+ tenant\(s\); 0 read, 0 recorded paid, [0-9]+ written down lately, 0 left for the next run\.'
+          # After the suite, which leaves charges written down: the first run
+          # must report them and exit 1, the second find none and exit 0.
+          npm run -s sweep-exit-check -- --expect-charges
 
       - name: RLS fail-control
         # Proves the isolation suite actually measures isolation, by requiring

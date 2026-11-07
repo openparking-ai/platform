@@ -33,8 +33,9 @@
  *   waiting for a card      nothing changes but what Stripe last said.
  *
  * Written down is one `exit_payment_unplaced` event, and a line on the error
- * output of whichever process found it. The scheduled run exits 1 for any
- * written down lately, by anyone (`writtenDownSince`). Nothing is refunded here.
+ * output of whichever process found it. Exactly one scheduled run reports each,
+ * by anyone written, and exits 1 for it (`reportWrittenDown`). Nothing is
+ * refunded here.
  *
  * WHAT IT ASKS ABOUT: open payments at least MIN_AGE_MS old, which a lane has
  * had its turn at, not read in the last READ_QUIET_MS -- those older than
@@ -45,7 +46,8 @@
  *
  * ONE RUN AT A TIME (`whileHoldingSweepLock`): reads are one after another, so a
  * Stripe that hangs would stack a process a minute. A run that finds another
- * working stops, and a run stops reading at its deadline (RUN_DEADLINE_MS).
+ * working stops. A run stops reading at its deadline (RUN_DEADLINE_MS), and the
+ * script's watchdog ends one stuck past it (WATCHDOG_AFTER_MS), lock and all.
  */
 import { pool, withTenant } from './db.js';
 import * as exits from './exits.js';
@@ -63,8 +65,8 @@ export const SWEEP_LIMIT = 200;
 export const SWEEP_READ_TIMEOUT_MS = 10_000;
 /** A run stops reading after this long; what it did not reach is the next run's. */
 export const RUN_DEADLINE_MS = 5 * 60_000;
-/** How far back a scheduled run looks for charges written down: two runs see each, so none is missed. */
-export const ALARM_WINDOW_MS = 2 * 60_000;
+/** How long past that deadline a run may last before its watchdog ends it, exit 1. */
+export const WATCHDOG_AFTER_MS = 60_000;
 
 const paidEvent = (client, tenantId, row, payment) => repo.appendEvents(client, tenantId, [{
   garageId: row.garage_id,
@@ -177,7 +179,7 @@ const backOfTheLine = (tenantId, paymentId) => withTenant(tenantId, (client) => 
   `UPDATE exit_payments SET read_at = now() WHERE tenant_id = $1 AND id = $2 AND status = 'open'`, [tenantId, paymentId]));
 
 /**
- * One run over one account. Answers counts: `due` asked about, `paid` recorded
+ * One run over one account. Answers counts: `due` actually read, `paid` recorded
  * paid by this run, `unplaced` written down by this run, `failed` left for the
  * next. A deployment with no Stripe key has nothing to ask.
  */
@@ -185,9 +187,9 @@ export async function sweepOpenPayments(tenantId, { now = new Date(), limit = SW
   const summary = { due: 0, paid: 0, unplaced: 0, failed: 0 };
   if (!config.key) return summary;
   const due = await withTenant(tenantId, (client) => duePayments(client, tenantId, now, limit));
-  summary.due = due.length;
   for (const p of due) {
     if (Date.now() >= deadline) break;
+    summary.due += 1;
     try {
       const intent = await exitPayments.readIntentWithCharge(config, p.account_id, p.payment_intent_id, { timeoutMs: SWEEP_READ_TIMEOUT_MS });
       let found = null;
@@ -203,13 +205,24 @@ export async function sweepOpenPayments(tenantId, { now = new Date(), limit = SW
   return summary;
 }
 
-/** How many charges this account had written down since `since`, by any read: what a scheduled run alarms on. */
-export async function writtenDownSince(tenantId, since) {
-  const { rows } = await withTenant(tenantId, (client) => client.query(
-    'SELECT count(*)::int AS n FROM events WHERE tenant_id = $1 AND kind = $2 AND occurred_at >= $3',
-    [tenantId, exitPayments.UNPLACED_EVENT_KIND, since],
+/**
+ * THE CHARGES WRITTEN DOWN THAT NO RUN HAS REPORTED, by any read, however long
+ * ago, each marked now with its own `exit_payment_reported` event: `events` is
+ * append-only, and its unique id means two runs cannot both take one. Answers
+ * how many this call took: what a scheduled run exits 1 for.
+ */
+export async function reportWrittenDown(tenantId) {
+  const { rowCount } = await withTenant(tenantId, (client) => client.query(
+    `INSERT INTO events (tenant_id, garage_id, lane_id, event_id, kind, occurred_at, detail)
+     SELECT e.tenant_id, e.garage_id, e.lane_id, $3 || ':' || e.event_id, $3, now(),
+            jsonb_build_object('of', e.event_id, 'why', e.detail->>'why', 'exit_id', e.detail->>'exit_id')
+       FROM events e
+      WHERE e.tenant_id = $1 AND e.kind = $2
+        AND NOT EXISTS (SELECT 1 FROM events r WHERE r.tenant_id = $1 AND r.event_id = $3 || ':' || e.event_id)
+     ON CONFLICT (tenant_id, event_id) DO NOTHING`,
+    [tenantId, exitPayments.UNPLACED_EVENT_KIND, exitPayments.REPORTED_EVENT_KIND],
   ));
-  return rows[0].n;
+  return rowCount;
 }
 
 /**

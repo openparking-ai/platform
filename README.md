@@ -2039,11 +2039,12 @@ one that lands late changes nothing on it.
 Up to 200 payments per account per run (`SWEEP_LIMIT`), the longest unread
 first, and a read that failed goes to the back of the line, so every payment
 gets its turn; Stripe's errors are logged and asked again next run. One run at a
-time: a run that finds another at work stops, and a run stops reading after 5
-minutes. It prints counts and a line on the error output for each charge it wrote
-down, and exits 1 when a read failed or a charge was written down in the last 2
-minutes, by it or by any other read, so each is seen by about two runs. No Stripe
-key: nothing to ask.
+time: a run that finds another at work stops. A run stops reading after 5
+minutes, and one stuck a minute past that is ended by a watchdog, exit 1. It
+prints what it actually read, and exits 1 when a read failed or a charge written
+down by any read has not been reported yet. Each is reported by exactly one run,
+however long runs take: an `exit_payment_reported` event is its mark. `npm run
+sweep-exit-check` holds the exit code to the counts. No Stripe key: nothing to ask.
 
 **When it was paid is Stripe's word** wherever the read carries the charge
 (`latest_charge.created`): the sweep, a let-out, the case that found it. A

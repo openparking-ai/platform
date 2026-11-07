@@ -57,10 +57,19 @@
  *   stale_copy_appended         a let-out's older copy is appended over a later one
  *   paid_minor_whole            an exception counts a part refund as paid
  *   alarm_misses_others         a charge written down elsewhere is not counted
+ *   reported_twice              a charge is reported by every run
+ *   unread_counted_as_read      a run past its deadline counts what it never read
+ *   no_watchdog                 a stuck run is never ended
  *   runs_stack                  a run does not stop for one already working
  *   deadline_ignored            a run reads on past its deadline
  *   charge_read_long            a close waits 30 seconds for a charge read
  *   let_out_reads_charge_twice  a let-out waits for the charge twice
+ *
+ * EXIT CODE breaks are applied to a copy too, and `scripts/sweep-exit-check.js`,
+ * the check CI runs, is REQUIRED to refuse them and pass the intact script:
+ *
+ *   always_exit_0               the alarm never fires
+ *   always_exit_1               the alarm fires every minute
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with one
  * statement of 0038 edited, so the property genuinely never existed there.
@@ -90,6 +99,7 @@ const SCRATCH = process.env.EXIT_PAYMENTS_SCRATCH_DB || 'openparking_exit_paymen
 const SWEEP = 'src/exitPaymentSweep.js';
 // Its tests wait out a timeout: only the breaks that need them run them.
 const TIMING = ['--test', 'test/exit-payment-timing.test.js'];
+const SWEEP_SUITE = ['--test', 'test/exit-payment-sweep.test.js'];
 const CASE_LOCK = {
   from: 'const row = await exits.caseById(client, tenantId, garageId, exitId, { lock: true });',
   to: 'const row = await exits.caseById(client, tenantId, garageId, exitId);',
@@ -424,8 +434,29 @@ const SOURCE_BREAKS = [
     name: 'alarm_misses_others',
     why: 'a charge written down by a close, a let-out or a lane is not counted',
     file: SWEEP,
-    from: "'SELECT count(*)::int AS n FROM events WHERE tenant_id = $1 AND kind = $2 AND occurred_at >= $3',",
-    to: "'SELECT 0 AS n FROM events WHERE tenant_id = $1 AND kind = $2 AND occurred_at >= $3 LIMIT 1',",
+    from: '  return rowCount;\n',
+    to: '  return rowCount * 0;\n',
+  },
+  {
+    name: 'reported_twice',
+    why: 'a charge is reported by every run',
+    file: SWEEP,
+    from: "$3 || ':' || e.event_id, $3, now(),",
+    to: "$3 || ':' || e.event_id || ':' || gen_random_uuid(), $3, now(),",
+  },
+  {
+    name: 'unread_counted_as_read',
+    why: 'a run past its deadline counts what it never read',
+    file: SWEEP,
+    from: '    if (Date.now() >= deadline) break;\n    summary.due += 1;\n',
+    to: '    summary.due += 1;\n    if (Date.now() >= deadline) break;\n',
+  },
+  {
+    name: 'no_watchdog',
+    why: 'a stuck run is never ended',
+    file: 'scripts/sweep-exit-payments.js',
+    from: "console.error('exit payments: this run is stuck past its deadline; ending it.');\n  process.exit(1);",
+    to: "console.error('exit payments: waiting.');",
   },
   {
     name: 'runs_stack',
@@ -641,6 +672,34 @@ for (const brk of SOURCE_BREAKS) {
       writeFileSync(path, source.replace(edit.from, edit.to));
     }
     if (anchored && !judge(brk.name, brk.why, run(dir, {}, brk.suite))) failures += 1;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+console.log('\n== control D: the sweep exit check must refuse a wrong exit code ==');
+for (const [name, to] of [['intact', null], ['always_exit_0', 'process.exit(0);'], ['always_exit_1', 'process.exit(1);']]) {
+  const dir = stage();
+  try {
+    const path = join(dir, 'scripts/sweep-exit-payments.js');
+    const source = readFileSync(path, 'utf8');
+    const last = 'process.exit(total.failed || total.written ? 1 : 0);';
+    if (!source.includes(last)) {
+      console.error(`  ${name.padEnd(36)} *** ANCHOR NOT FOUND ***`);
+      failures += 1;
+      continue;
+    }
+    if (to) writeFileSync(path, source.replace(last, to));
+    // Reports what any earlier run left, then the suite leaves charges to report.
+    spawnSync(process.execPath, ['scripts/sweep-exit-payments.js'], { cwd: dir, stdio: 'pipe' });
+    run(dir, {}, SWEEP_SUITE);
+    const check = spawnSync(process.execPath, ['scripts/sweep-exit-check.js', '--expect-charges'], { cwd: dir, encoding: 'utf8' });
+    if ((check.status === 0) === (to === null)) {
+      console.log(`  ${name.padEnd(36)} ${to ? 'refused' : 'passes'} as required`);
+    } else {
+      console.error(`  ${name.padEnd(36)} *** check exited ${check.status} ***\n${check.stdout}${check.stderr}`);
+      failures += 1;
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

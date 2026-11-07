@@ -56,6 +56,8 @@ export const PAID_EVENT_KIND = 'exit_paid';
 export const PAYMENT_CANCELED_EVENT_KIND = 'exit_payment_canceled';
 /** Stripe took a card and no record can say paid, or the case was over when it was found: written down once. */
 export const UNPLACED_EVENT_KIND = 'exit_payment_unplaced';
+/** That written-down charge was reported by a scheduled run: its mark, since `events` is append-only. */
+export const REPORTED_EVENT_KIND = 'exit_payment_reported';
 /** `last_failure` of a payment Stripe took and refunded whole before anything recorded it. */
 export const REFUNDED_FIRST = 'refunded_before_recorded';
 /** Why a payment refunded in part before anything recorded it was written down. */
