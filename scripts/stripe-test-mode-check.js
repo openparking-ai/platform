@@ -23,7 +23,9 @@
  *       decline on it, the reader's action failed;
  *    7  a good card on the same intent: succeeded, at the amount made;
  *    8  a cancel of the succeeded intent: refused by Stripe, still succeeded
- *       -- a paid intent is never canceled.
+ *       -- a paid intent is never canceled;
+ *    9  the paid intent read with its charge: when Stripe took the card, and
+ *       nothing refunded -- what the sweep's paid date and refund check read.
  *
  * NEVER LIVE. The key must be a TEST key (`sk_test_` or `rk_test_`): any
  * other key is refused before anything is sent. The key is read from the
@@ -185,6 +187,11 @@ async function main() {
   }
   const stillPaid = await exitPayments.readIntent(config, account, a.id);
   check(8, refusedCancel !== null && stillPaid.status === 'succeeded', `a cancel of the paid intent is refused (${refusedCancel ?? 'not refused'}); it stays paid`);
+
+  // 9. What the sweep reads of a paid intent.
+  const charged = await exitPayments.readIntentWithCharge(config, account, a.id);
+  check(9, exitPayments.chargedAt(charged) !== null && charged.latest_charge?.amount_refunded === 0,
+    'read with its charge: when Stripe took the card, and nothing refunded');
 
   if (failures) {
     console.error(`\n${failures} check(s) failed: the stand-in's shapes and Stripe's test mode disagree there.`);

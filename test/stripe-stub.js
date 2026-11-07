@@ -159,7 +159,7 @@ export async function startStripeStub() {
             if (!url.searchParams.getAll('expand[]').includes('latest_charge')) return send(200, intent);
             if (behaviour.delayRefundReadMs) await new Promise((resolve) => setTimeout(resolve, behaviour.delayRefundReadMs));
             const charge = intent.status === 'succeeded'
-              ? { id: `ch_${intent.id.slice(3)}`, object: 'charge', amount: intent.amount, amount_refunded: intent.refunded ?? 0 }
+              ? { id: `ch_${intent.id.slice(3)}`, object: 'charge', amount: intent.amount, amount_refunded: intent.refunded ?? 0, created: intent.charged_at }
               : null;
             return send(200, { ...intent, latest_charge: charge });
           }
@@ -287,9 +287,10 @@ export async function startStripeStub() {
     cancels,
     /**
      * A card at the reader or the phone: paid, or declined -- the intent back
-     * to waiting for a card, as Stripe leaves it, with the decline on it.
+     * to waiting for a card, as Stripe leaves it, with the decline on it. `at`
+     * is when Stripe took it: now, unless a test says otherwise.
      */
-    presentCard(intentId, { decline = null } = {}) {
+    presentCard(intentId, { decline = null, at = new Date() } = {}) {
       const intent = intents.get(intentId);
       if (decline) {
         intent.status = 'requires_payment_method';
@@ -297,6 +298,7 @@ export async function startStripeStub() {
         finishAction(intentId, { status: 'failed', failure_code: 'card_declined' });
       } else {
         intent.status = 'succeeded';
+        intent.charged_at = Math.floor(at.getTime() / 1000);
         intent.last_payment_error = null;
         finishAction(intentId, { status: 'succeeded' });
       }
