@@ -752,6 +752,58 @@ A linked person's change-log lines name them by the email the module gave
 (`actor_kind` `linked`). Their language comes from the module; `PUT
 /api/v1/auth/language` changes it for that session only.
 
+### A trusted server's door
+
+Another server of the same deployment can let the admin sign in somewhere else,
+with the password chosen here, and keep no copy of it. It asks three things. All
+are `POST`, under `/api/v1/auth/trusted/person/`, with
+`Authorization: Bearer <the key>`:
+
+| | Sent | Answered |
+|---|---|---|
+| `check-password` | `email`, `password`, `clientAddress` | 200 the person; or sign-in's one refusal, 401 `sign_in_refused` |
+| `check` | `personId`, `tenantId` | 200 the person; or 404 `person_gone` |
+| `forgot-password` | `email`, `clientAddress` | 200, the one sentence of `POST /forgot`, and its email |
+
+The person is `{personId, tenantId, name, companyName, email, language, version}`.
+`name` is null: this platform keeps no person's name. `companyName` is the
+tenant's. `version` is a digest that moves when the password, the email, the
+person or the tenant does, and with nothing else; it says nothing of the hash.
+
+**Off unless named.** `TRUSTED_SERVER_KEY_SHA256` holds the sha256 of the key, 64
+lower-case hex characters. Unset, or with no `ADMIN_ORIGIN`, the routes do not
+exist. A wrong key answers what a path that is no route answers, before anything
+else is read, and the comparison is constant-time. An operator key is no use
+here: no tenant is known before a sign-in. No session or cookie is made.
+
+**The caller's address, not the asker's.** `clientAddress` is the person's, read
+as sign-in reads a socket's, and counted against sign-in's own limit, hash line
+and lock rows: ten wrong passwords lock that address out of that account at both
+doors and at no other address. `forgot-password` shares `/forgot`'s count the
+same way. With no readable `clientAddress` nobody is looked at.
+
+**Refused before anyone is looked at**, 400 `sign_in_unreadable`: a body not of
+exactly these keys, a control character in the email, an email over 254
+characters, a password empty or over the rule's 1024 characters, an address that
+is not one. A body past 16 KB is 413 `body_too_large`. An unknown email, a wrong
+password, a locked address, a right password during a lock, a stored hash that
+cannot be read and a row held by something else are all the one refusal, after
+the same statements and one hash each. Every answer but `check`'s waits for
+`SIGN_IN_REFUSAL_FLOOR_MS`. A person a linked accounts module keeps is an unknown
+email here: this door never asks the module.
+
+**A stall stays here.** The door has its own small pool (`src/boundedDatabase.js`),
+so it never takes a connection from the shared one, and its own places for each
+call (`src/personDoor.js`): a call finding them taken is answered `503
+sign_in_busy` and holds nothing. A place on `check-password` is held to the floor,
+so this door hashes at most that many per floor. No call waits on the database
+past its deadline: it answers `503 database_unavailable`, and a connection that
+failed is dropped, so the door reopens by itself. Each 503 and 429 carries
+`Retry-After`.
+
+**Mounted behind no proxy route of its own:** a deployment's public proxy has no
+reason to pass `/api/v1/auth/trusted/`, and should not.
+
 ### Permissions: one on every operator route
 
 **Every operator route names exactly one permission**, and a request whose

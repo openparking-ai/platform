@@ -241,11 +241,11 @@ export async function acceptInvite(invite, { passwordHash, language }) {
  * names one: the same statements run, and for nobody they find and write
  * nothing (`nobody` is sign-in's NOBODY). Answers what to send, or null.
  */
-export async function requestReset(email, nobody) {
-  const found = (await query('SELECT * FROM resolve_operator_user($1)', [email])).rows[0] ?? null;
+export async function requestReset(email, nobody, db = { query, inTenant: withTenant }) {
+  const found = (await db.query('SELECT * FROM resolve_operator_user($1)', [email])).rows[0] ?? null;
   const user = found ?? nobody;
   const token = newResetToken();
-  const made = await withTenant(user.tenant_id, async (c) => {
+  const made = await db.inTenant(user.tenant_id, async (c) => {
     // A day after it was made, a reset is of no further use to anyone.
     await c.query(`DELETE FROM operator_password_resets WHERE user_id = $1 AND created_at < now() - interval '1 day'`, [user.user_id]);
     await c.query(

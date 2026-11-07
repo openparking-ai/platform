@@ -12,7 +12,9 @@
  *   PUT  /api/v1/auth/language   {language} -> the signed-in admin's own language (0025)
  *
  * and, beside them, the four doors behind an emailed link -- an invite, and a
- * forgotten password -- in src/accountDoors.js (0032), held to the same rules.
+ * forgotten password -- in src/accountDoors.js (0032), held to the same rules;
+ * and, only on a deployment that names a trusted server, its own door in
+ * src/personDoor.js, which runs these same statements and adds nothing to them.
  *
  * What each rule is for, because each is one of the ways sign-in went wrong on
  * the maintainer's other systems:
@@ -68,6 +70,7 @@ import * as changes from './changes.js';
 import { generateDeviceToken, hashToken } from './auth.js';
 import { dummyHash, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
 import { mountAccountDoors } from './accountDoors.js';
+import { mountPersonDoor } from './personDoor.js';
 import { notify, readEmailSettings } from './email.js';
 import { passkeyAddedEmail } from './emailText.js';
 import { verifyUtf8 } from './utf8Body.js';
@@ -195,6 +198,17 @@ export function readTrustProxy(raw) {
   return value;
 }
 
+/**
+ * TRUSTED_SERVER_KEY_SHA256 as the 32 bytes it names, or null when unset: then
+ * the trusted server's door is not mounted at all (src/personDoor.js). The
+ * digest is the setting, never the key: this environment alone opens nothing.
+ */
+export function readTrustedServerKey(raw) {
+  if (raw === undefined || raw === '') return null;
+  if (!/^[0-9a-f]{64}$/.test(raw)) throw new Error('TRUSTED_SERVER_KEY_SHA256 must be the sha256 of the key, 64 lower-case hex characters');
+  return Buffer.from(raw, 'hex');
+}
+
 export function readAuthSettings(env = process.env) {
   let adminOrigin = null;
   if (env.ADMIN_ORIGIN !== undefined && env.ADMIN_ORIGIN !== '') {
@@ -235,6 +249,7 @@ export function readAuthSettings(env = process.env) {
     accountsRecheckSeconds: whole(env, 'ACCOUNTS_RECHECK_SECONDS'),
     accountsFloorMs: whole(env, 'ACCOUNTS_SIGN_IN_FLOOR_MS'),
     passkeys: passkeys.readPasskeySettings(env, adminOrigin),
+    trustedServerKey: readTrustedServerKey(env.TRUSTED_SERVER_KEY_SHA256),
   };
 }
 
@@ -256,8 +271,13 @@ function hextets(address) {
  * is declared, and then Express's reading of `X-Forwarded-For` under it.
  */
 export function callerAddress(req, settings) {
-  let address = (settings.trustProxy === null ? req.socket.remoteAddress : req.ip) ?? 'unknown';
-  address = address.replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/, '');
+  const address = (settings.trustProxy === null ? req.socket.remoteAddress : req.ip) ?? 'unknown';
+  return countedAddress(address);
+}
+
+/** An address as limits and locks count it: IPv4 plain, IPv6 by its /64. */
+export function countedAddress(given) {
+  let address = given.replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/, '');
   if (isIPv6(address)) address = `${hextets(address.split('%')[0]).slice(0, 4).join(':')}::/64`;
   return address.slice(0, 64);
 }
@@ -389,17 +409,16 @@ export function noStore(_req, res, next) {
 }
 
 // ---------------------------------------------------------------------------
-// What a sign-in does. On an object so a test can reach in and make one part
-// fail; nothing else replaces them.
+// The statements of a sign-in, run on whatever connection is given, inside a
+// transaction in the user's tenant. Sign-in runs them on the shared pool; the
+// trusted server's door on its own connections (src/boundedDatabase.js). One
+// copy of each, so neither door can come to count a thing the other does not.
 // ---------------------------------------------------------------------------
 
-export const internals = {
-  verifyPassword,
-
+export const statements = {
   /** The lock row of this user at this address. For NOBODY: the same statement, finding nothing. */
-  async lockOf(user, address) {
-    return withTenant(user.tenant_id, async (c) =>
-      (await c.query('SELECT failed_count, locked_until FROM operator_sign_in_locks WHERE user_id = $1 AND address = $2', [user.user_id, address])).rows[0] ?? null);
+  async lockRow(c, user, address) {
+    return (await c.query('SELECT failed_count, locked_until FROM operator_sign_in_locks WHERE user_id = $1 AND address = $2', [user.user_id, address])).rows[0] ?? null;
   },
 
   /**
@@ -412,10 +431,9 @@ export const internals = {
    * the full number again to lock. During a lock a wrong password still
    * counts and re-arms it.
    */
-  async recordFailure(user, address, counted) {
-    await withTenant(user.tenant_id, (c) =>
-      c.query(
-        `INSERT INTO operator_sign_in_locks AS l (tenant_id, user_id, address, failed_count, locked_until)
+  async writeFailure(c, user, address, counted) {
+    await c.query(
+      `INSERT INTO operator_sign_in_locks AS l (tenant_id, user_id, address, failed_count, locked_until)
          SELECT $1, $2, $3, 1, CASE WHEN 1 >= $4 THEN now() + make_interval(mins => $5) END
           WHERE $6::boolean AND EXISTS (SELECT 1 FROM operator_users u WHERE u.id = $2 AND u.tenant_id = $1)
          ON CONFLICT (user_id, address) DO UPDATE SET
@@ -425,8 +443,40 @@ export const internals = {
              WHEN l.locked_until <= now() THEN NULL
              ELSE l.locked_until END,
            updated_at = now()`,
-        [user.tenant_id, user.user_id, address, MAX_FAILED, LOCK_MINUTES, counted],
-      ));
+      [user.tenant_id, user.user_id, address, MAX_FAILED, LOCK_MINUTES, counted],
+    );
+  },
+
+  /** The user's row, held, while it still has the hash the password was checked against. */
+  async holdProvedRow(c, user) {
+    return c.query('SELECT language FROM operator_users WHERE id = $1 AND password_hash = $2 FOR SHARE', [user.user_id, user.password_hash]);
+  },
+
+  /** A right password clears this address's count on this user. */
+  async clearLock(c, user, address) {
+    await c.query('DELETE FROM operator_sign_in_locks WHERE user_id = $1 AND address = $2', [user.user_id, address]);
+  },
+};
+
+/** Whether a lock row is holding now. */
+export const lockHolds = (lock) => Boolean(lock?.locked_until && new Date(lock.locked_until) > new Date());
+
+// ---------------------------------------------------------------------------
+// What a sign-in does. On an object so a test can reach in and make one part
+// fail; nothing else replaces them.
+// ---------------------------------------------------------------------------
+
+export const internals = {
+  verifyPassword,
+
+  /** The lock row of this user at this address, in its tenant (`statements.lockRow`). */
+  async lockOf(user, address) {
+    return withTenant(user.tenant_id, (c) => statements.lockRow(c, user, address));
+  },
+
+  /** The failure write, in the user's tenant (`statements.writeFailure`). */
+  async recordFailure(user, address, counted) {
+    await withTenant(user.tenant_id, (c) => statements.writeFailure(c, user, address, counted));
   },
 
   /**
@@ -439,9 +489,9 @@ export const internals = {
   async mintSession(user, address, settings) {
     const token = generateDeviceToken();
     const row = await withTenant(user.tenant_id, async (c) => {
-      const still = await c.query('SELECT language FROM operator_users WHERE id = $1 AND password_hash = $2 FOR SHARE', [user.user_id, user.password_hash]);
+      const still = await statements.holdProvedRow(c, user);
       if (still.rowCount !== 1) return null;
-      await c.query('DELETE FROM operator_sign_in_locks WHERE user_id = $1 AND address = $2', [user.user_id, address]);
+      await statements.clearLock(c, user, address);
       // This user's ended sessions are of no further use to anyone.
       await c.query(
         `DELETE FROM operator_tokens WHERE user_id = $1 AND kind = 'session'
@@ -522,7 +572,7 @@ function signInBody(body) {
 }
 
 /** A failure inside the auth routes, in words that can hold nothing secret: its class and its code. */
-function logFailure(where, err) {
+export function logFailure(where, err) {
   const kind = err?.constructor?.name ?? 'Error';
   console.error(`[auth] ${where} failed: ${kind}${err?.code ? ` ${err.code}` : ''}`);
 }
@@ -643,7 +693,7 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
       if (!found && accountsDoor.doorConfigured()) return await linkedSignIn(req, res, body, address, leave);
       const user = found ?? NOBODY;
       const lock = await internals.lockOf(user, address);
-      const locked = Boolean(lock?.locked_until && new Date(lock.locked_until) > new Date());
+      const locked = lockHolds(lock);
       const matches = await internals.verifyPassword(body.password, found ? found.password_hash : await dummyHash());
       // The place is for the hash, not for the floor: given back the moment it is done.
       leave();
@@ -678,10 +728,23 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
 
   // The doors behind an emailed link (src/accountDoors.js): sign-in's floor,
   // its hash line, its address and its sessions, so there is one of each.
-  mountAccountDoors(router, {
+  const links = mountAccountDoors(router, {
     settings, email, line, answer: refuse,
     signIn: { addressLimiter, callerAddress, endsAt, internals, setCookie, NOBODY, NOT_CONFIGURED, ORIGIN_REFUSED },
   });
+
+  // A trusted server's door, on a deployment that names one and has sign-in on
+  // (src/personDoor.js). Sign-in's limit and hash line, not copies of them, so
+  // an address gets no more tries for going in by the other door. Off, there is
+  // no such route: it answers what any path under /auth that is not one answers.
+  if (settings.trustedServerKey !== null && settings.adminOrigin !== null) {
+    mountPersonDoor(router, {
+      settings, line, limiter, links, answer: refuse,
+      signIn: {
+        countedAddress, internals, lockHolds, logFailure, statements, BUSY, NOBODY, RATE_LIMITED, REFUSED, UNREADABLE,
+      },
+    });
+  }
 
   /**
    * A refused change of the owner's language is a line in the change log
@@ -863,7 +926,7 @@ export function createAuthRouter(settings, email = readEmailSettings()) {
         // The session found its admin a moment ago; gone since, it is nobody's password.
         user = (await internals.adminOf(req.session)) ?? { ...NOBODY, password_hash: null };
         const held = await internals.lockOf(user, address);
-        locked = Boolean(held?.locked_until && new Date(held.locked_until) > new Date());
+        locked = lockHolds(held);
         matches = await internals.verifyPassword(b.password, user.password_hash ?? await dummyHash());
       } finally {
         leave();

@@ -58,6 +58,7 @@
     "reset-admin-password": "node scripts/reset-admin-password.js",
     "measure-scrypt": "node scripts/measure-scrypt.js",
     "owner-sign-in-fail-control": "node scripts/owner-sign-in-fail-control.js",
+    "person-door-fail-control": "node scripts/person-door-fail-control.js",
     "garage-reads-fail-control": "node scripts/garage-reads-fail-control.js",
     "past-stays-fail-control": "node scripts/past-stays-fail-control.js",
     "fill-rule-fail-control": "node scripts/fill-rule-fail-control.js",

@@ -51,6 +51,7 @@ if (auth.adminOrigin === null) {
 }
 if (auth.passkeys === null) console.log('[platform] passkeys are off: PASSKEY_RP_ID is not set');
 if (!accountsDoorConfigured()) console.log('[platform] only the admin signs in: ACCOUNTS_DOOR is not set');
+if (auth.trustedServerKey === null) console.log('[platform] no trusted server may ask about the admin: TRUSTED_SERVER_KEY_SHA256 is not set');
 
 // Email (0032) the same way: a setting that is not one of its forms refuses to
 // start, and so does a key file that is named and cannot be read -- found now,
