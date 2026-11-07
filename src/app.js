@@ -3041,7 +3041,7 @@ export function createApp() {
     const updated = await recordIntent(tenantId, garageId, row.id, intent);
     const status = updated.payment?.status;
     if (status === 'succeeded') return { row: updated, outcome: 'paid' };
-    if (intent.status === 'succeeded') {
+    if (intent.status === 'succeeded' && status !== 'canceled') {
       throw conflict('payment_amount_mismatch', "Stripe took an amount other than this case's fee: a person decides");
     }
     if (status !== 'canceled') {

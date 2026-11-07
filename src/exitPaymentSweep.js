@@ -22,13 +22,17 @@
  *                           car let out unpaid stays let out unpaid. Written
  *                           down once, and on the case's exception if it has one.
  *   let out, case open      recorded paid, and on the case's exception.
- *   refunded first          not paid. Left open, written down once.
+ *   refunded whole first    no money was kept: final as canceled, and the car
+ *                           owes as normal. Written down once, by whichever
+ *                           read finds it, so nothing is ever held up by it.
+ *   refunded in part first  paid, for what it kept: the stay is credited that
+ *                           and no more. Written down once.
  *   another amount          not paid (as the lane reads it). Left open, written
  *                           down once.
  *   waiting for a card      nothing changes but what Stripe last said.
  *
  * Written down is one `exit_payment_unplaced` event, and a line on the error
- * output of the run. Nothing is refunded.
+ * output. Nothing is refunded here.
  *
  * WHAT IT ASKS ABOUT: open payments at least MIN_AGE_MS old, which a lane has
  * had its turn at, not read in the last READ_QUIET_MS -- those older than
@@ -68,6 +72,39 @@ const paidEvent = (client, tenantId, row, payment) => repo.appendEvents(client, 
   },
 }]);
 
+/** Refunded whole first: what a cancel writes, by the same id, so it is one event however it was found. */
+const canceledEvent = (client, tenantId, row, payment) => repo.appendEvents(client, tenantId, [{
+  garageId: row.garage_id,
+  laneId: row.lane_id,
+  eventId: `${exitPayments.PAYMENT_CANCELED_EVENT_KIND}:${payment.id}`,
+  kind: exitPayments.PAYMENT_CANCELED_EVENT_KIND,
+  occurredAt: new Date(),
+  detail: { actor: 'platform:exit', exit_id: row.id, payment_intent_id: payment.payment_intent_id, why: exitPayments.REFUNDED_FIRST },
+}]);
+
+/** One event per payment, whatever runs find it again. Answers whether this was the one. */
+async function writeDown(client, tenantId, row, payment, why) {
+  const { accepted } = await repo.appendEvents(client, tenantId, [{
+    garageId: row.garage_id,
+    laneId: row.lane_id,
+    eventId: `${exitPayments.UNPLACED_EVENT_KIND}:${payment.id}`,
+    kind: exitPayments.UNPLACED_EVENT_KIND,
+    occurredAt: new Date(),
+    detail: {
+      actor: 'platform:exit',
+      why,
+      exit_id: row.id,
+      stay_id: row.session_id,
+      payment_id: payment.id,
+      payment_intent_id: payment.payment_intent_id,
+      amount_minor: payment.amount_minor,
+      currency: payment.currency,
+    },
+  }]);
+  if (accepted === 1) console.error(`[exit-payments] a charge is written down for a person: payment ${payment.id}, ${why}`);
+  return accepted === 1;
+}
+
 /**
  * What Stripe says of the case's intent, written down, under the case's lock;
  * the case as it now stands. `after` runs in the same transaction, given the
@@ -79,6 +116,8 @@ export const recordCaseIntent = (tenantId, garageId, exitId, intent, readerId = 
   if (readerId) payment = await exitPayments.recordReader(client, tenantId, payment, readerId);
   const written = await exitPayments.recordIntent(client, tenantId, payment, intent);
   if (written.paidNow) await paidEvent(client, tenantId, row, written.row);
+  if (written.refunded === exitPayments.REFUNDED_FIRST) await canceledEvent(client, tenantId, row, written.row);
+  written.wroteDown = Boolean(written.refunded) && await writeDown(client, tenantId, row, written.row, written.refunded);
   await after?.(client, row, written);
   return exits.caseById(client, tenantId, garageId, exitId);
 });
@@ -103,28 +142,6 @@ async function duePayments(client, tenantId, now, limit) {
 const backOfTheLine = (tenantId, paymentId) => withTenant(tenantId, (client) => client.query(
   `UPDATE exit_payments SET read_at = now() WHERE tenant_id = $1 AND id = $2 AND status = 'open'`, [tenantId, paymentId]));
 
-/** One event per payment, whatever runs find it again. Answers whether this was the one. */
-async function writeDown(client, tenantId, row, payment, why) {
-  const { accepted } = await repo.appendEvents(client, tenantId, [{
-    garageId: row.garage_id,
-    laneId: row.lane_id,
-    eventId: `${exitPayments.UNPLACED_EVENT_KIND}:${payment.id}`,
-    kind: exitPayments.UNPLACED_EVENT_KIND,
-    occurredAt: new Date(),
-    detail: {
-      actor: 'platform:exit_payment_sweep',
-      why,
-      exit_id: row.id,
-      stay_id: row.session_id,
-      payment_id: payment.id,
-      payment_intent_id: payment.payment_intent_id,
-      amount_minor: payment.amount_minor,
-      currency: payment.currency,
-    },
-  }]);
-  return accepted === 1;
-}
-
 async function stayIsOver(client, tenantId, sessionId) {
   if (!sessionId) return false;
   const { rows } = await client.query('SELECT exit_at FROM sessions WHERE tenant_id = $1 AND id = $2', [tenantId, sessionId]);
@@ -136,13 +153,13 @@ async function place(client, tenantId, row, written, intent) {
   const payment = written.row;
   if (payment.status === 'open') {
     const unplaced = intent.status === 'succeeded' && await writeDown(client, tenantId, row, payment, payment.last_failure);
-    return { paid: false, unplaced, why: payment.last_failure };
+    return { paid: false, unplaced };
   }
-  if (!written.paidNow) return { paid: false, unplaced: false };
+  if (!written.paidNow) return { paid: false, unplaced: written.wroteDown };
   const exception = await exceptions.ofCase(client, tenantId, row.id);
   if (exception) await exceptions.recordPaymentAfter(client, tenantId, exception, payment);
   const why = row.closed_at ? 'case_closed' : (await stayIsOver(client, tenantId, row.session_id)) ? 'stay_ended' : null;
-  return { paid: true, unplaced: Boolean(why) && await writeDown(client, tenantId, row, payment, why), why };
+  return { paid: true, unplaced: written.wroteDown || (Boolean(why) && await writeDown(client, tenantId, row, payment, why)) };
 }
 
 /**
@@ -163,10 +180,7 @@ export async function sweepOpenPayments(tenantId, { now = new Date(), limit = SW
         found = await place(client, tenantId, row, written, intent);
       });
       if (found.paid) summary.paid += 1;
-      if (found.unplaced) {
-        summary.unplaced += 1;
-        console.error(`[exit-payments] a charge is written down for a person: payment ${p.id}, ${found.why}`);
-      }
+      if (found.unplaced) summary.unplaced += 1;
     } catch (err) {
       summary.failed += 1;
       console.error(`[exit-payments] payment ${p.id} left for the next run: ${err.code ?? err.message ?? err}`);

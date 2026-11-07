@@ -41,7 +41,9 @@
  *   found_not_on_exception      a charge found after a let-out is not on its exception
  *   written_down_twice          a charge is written down at every read
  *   refund_taken_as_paid        a charge refunded first is taken as paid
- *   refund_forgotten            the next read marks a refunded charge paid
+ *   refund_holds_the_car        a charge refunded whole is left open, in the car's way
+ *   refund_seen_as_mismatch     a cancel that finds it refunded whole answers 409
+ *   part_refund_credited_whole  a part refund is credited as if whole
  *   mismatch_not_written_down   another amount is written nowhere
  *   let_out_before_read         a car that paid is written as let out unpaid
  *   let_out_held_by_stripe      a silent Stripe holds a let-out up
@@ -271,8 +273,8 @@ const SOURCE_BREAKS = [
     name: 'sweep_closes_the_case',
     why: 'the sweep closes what it found paid',
     file: SWEEP,
-    from: '  if (!written.paidNow) return { paid: false, unplaced: false };\n',
-    to: "  if (!written.paidNow) return { paid: false, unplaced: false };\n  await exits.endCase(client, tenantId, row.id, { why: 'stay_ended', by: 'sweep' });\n",
+    from: '  if (!written.paidNow) return { paid: false, unplaced: written.wroteDown };\n',
+    to: "  if (!written.paidNow) return { paid: false, unplaced: written.wroteDown };\n  await exits.endCase(client, tenantId, row.id, { why: 'stay_ended', by: 'sweep' });\n",
   },
   {
     name: 'closed_not_written_down',
@@ -299,15 +301,29 @@ const SOURCE_BREAKS = [
     name: 'refund_taken_as_paid',
     why: 'a charge refunded first is taken as paid',
     file: 'src/exitPayments.js',
-    from: '((intent.latest_charge?.amount_refunded ?? 0) !== 0 || row.last_failure === REFUNDED_FIRST)',
-    to: 'row.last_failure === REFUNDED_FIRST',
+    from: "const taken = row.status === 'open' && intent.status === 'succeeded' ? refundOn(intent) : 0;",
+    to: 'const taken = 0;',
   },
   {
-    name: 'refund_forgotten',
-    why: 'the next read marks a refunded charge paid',
+    name: 'refund_holds_the_car',
+    why: "a charge refunded whole is left open, in the car's way",
     file: 'src/exitPayments.js',
-    from: '((intent.latest_charge?.amount_refunded ?? 0) !== 0 || row.last_failure === REFUNDED_FIRST)',
-    to: '(intent.latest_charge?.amount_refunded ?? 0) !== 0',
+    from: "    state = 'canceled';\n    failure = REFUNDED_FIRST;",
+    to: "    state = 'open';\n    failure = REFUNDED_FIRST;",
+  },
+  {
+    name: 'refund_seen_as_mismatch',
+    why: 'a cancel that finds it refunded whole answers 409',
+    file: 'src/app.js',
+    from: "    if (intent.status === 'succeeded' && status !== 'canceled') {",
+    to: "    if (intent.status === 'succeeded') {",
+  },
+  {
+    name: 'part_refund_credited_whole',
+    why: 'a part refund is credited as if whole',
+    file: 'src/exitPayments.js',
+    from: '    refunded = PART_REFUNDED_FIRST;\n    refundedMinor = taken;',
+    to: '    refunded = PART_REFUNDED_FIRST;',
   },
   {
     name: 'mismatch_not_written_down',

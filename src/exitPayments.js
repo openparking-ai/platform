@@ -24,7 +24,8 @@
  * CANCELED ONLY ON STRIPE'S WORD. A cancel reads the intent first: one that
  * succeeded is paid, and is never refunded or voided here; one a card is
  * being authorised on is left to finish and asked about again. The record
- * says canceled only when Stripe answered with a canceled intent.
+ * says canceled only when Stripe answered with a canceled intent, or with a
+ * charge it refunded whole: either way no money was kept.
  *
  * PULL, NOT PUSH, as the account's state is (0020): nothing listens for
  * Stripe's webhooks. The lane polls the case while the driver pays; each
@@ -36,9 +37,10 @@
  * (`readIntentWithCharge`): a payment found late lands on the day the card was
  * taken. A lane's own poll is there as it happens, and keeps the clock.
  *
- * A CHARGE REFUNDED BEFORE IT WAS RECORDED IS NOT PAID: a read that carries the
- * charge and finds a refund leaves the payment open, and says so
- * (`REFUNDED_FIRST`), which holds at every later read.
+ * A CHARGE REFUNDED BEFORE IT WAS RECORDED: read with its charge, one refunded
+ * whole kept no money, so the payment is final as canceled (`REFUNDED_FIRST`)
+ * and the car owes as if it had never paid: a refund never holds a car. One
+ * refunded in part is paid, for what it kept (`refunded_minor`, 0048).
  *
  * Offline: the lane's reader is driven from here (Stripe's server-driven
  * integration), which takes no card while the reader or Stripe is offline.
@@ -54,8 +56,10 @@ export const PAID_EVENT_KIND = 'exit_paid';
 export const PAYMENT_CANCELED_EVENT_KIND = 'exit_payment_canceled';
 /** Stripe took a card and no record can say paid, or the case was over when it was found: written down once. */
 export const UNPLACED_EVENT_KIND = 'exit_payment_unplaced';
-/** `last_failure` of a payment Stripe took and refunded before anything recorded it. */
+/** `last_failure` of a payment Stripe took and refunded whole before anything recorded it. */
 export const REFUNDED_FIRST = 'refunded_before_recorded';
+/** Why a payment refunded in part before anything recorded it was written down. */
+export const PART_REFUNDED_FIRST = 'part_refunded_before_recorded';
 
 /**
  * How long a refund read waits for Stripe (0048): a car is at the barrier, so
@@ -109,6 +113,13 @@ export function stateOf(intent) {
   if (intent.status === 'succeeded') return 'succeeded';
   if (intent.status === 'canceled') return 'canceled';
   return 'open';
+}
+
+/** What was refunded of an intent, on a read that carries the charge; 0 on one that does not. */
+export function refundOn(intent) {
+  const refunded = Number(intent?.latest_charge?.amount_refunded ?? 0);
+  if (!Number.isInteger(refunded) || refunded < 0) throw new StripeUnreachable('Stripe answered a refunded amount this platform cannot read');
+  return refunded;
 }
 
 /** When Stripe took the card, on a read that carries the charge; null on one that does not. */
@@ -180,9 +191,11 @@ export async function insertPayment(client, tenantId, p) {
 /**
  * What Stripe says of the intent, written down. Paid only when Stripe's
  * amount and currency are the ones recorded: an intent whose amount moved is
- * never taken as payment for this fee, and a charge refunded first is never
- * taken as payment at all. Answers the row and whether this read is the one
- * that found it paid.
+ * never taken as payment for this fee. A read that carries the charge and finds
+ * it refunded first: refunded whole is canceled, whatever its amount, since no
+ * money was kept; in part is paid, keeping what was refunded. Answers the row,
+ * whether this read is the one that found it paid, and `refunded`, the reason,
+ * when this read is the one that found a refund.
  */
 export async function recordIntent(client, tenantId, row, intent) {
   if (intent.id !== row.payment_intent_id) throw new Error('recordIntent: a different intent');
@@ -192,22 +205,31 @@ export async function recordIntent(client, tenantId, row, intent) {
     state = 'open';
     failure = 'amount_mismatch';
   }
-  if (row.status === 'open' && state === 'succeeded'
-    && ((intent.latest_charge?.amount_refunded ?? 0) !== 0 || row.last_failure === REFUNDED_FIRST)) {
-    state = 'open';
+  let refunded = null;
+  let refundedMinor = null;
+  const taken = row.status === 'open' && intent.status === 'succeeded' ? refundOn(intent) : 0;
+  if (taken > 0 && taken >= intent.amount) {
+    state = 'canceled';
     failure = REFUNDED_FIRST;
+    refunded = REFUNDED_FIRST;
+    refundedMinor = taken;
+  } else if (taken > 0 && state === 'succeeded') {
+    refunded = PART_REFUNDED_FIRST;
+    refundedMinor = taken;
   }
   if (row.status !== 'open') state = row.status;
   const { rows } = await client.query(
     `UPDATE exit_payments
         SET status = $3, stripe_status = $4, last_failure = $5, read_at = now(),
             succeeded_at = CASE WHEN $3 = 'succeeded' THEN COALESCE(succeeded_at, $6::timestamptz, now()) END,
-            canceled_at  = CASE WHEN $3 = 'canceled'  THEN COALESCE(canceled_at, now())  END
+            canceled_at  = CASE WHEN $3 = 'canceled'  THEN COALESCE(canceled_at, now())  END,
+            refunded_minor  = CASE WHEN $7::int IS NULL THEN refunded_minor ELSE LEAST($7::int, amount_minor) END,
+            refunds_read_at = CASE WHEN $7::int IS NULL THEN refunds_read_at ELSE now() END
       WHERE tenant_id = $1 AND id = $2
       RETURNING *`,
-    [tenantId, row.id, state, String(intent.status).slice(0, 40), failure, chargedAt(intent)],
+    [tenantId, row.id, state, String(intent.status).slice(0, 40), failure, chargedAt(intent), refundedMinor],
   );
-  return { row: rows[0], paidNow: row.status === 'open' && state === 'succeeded' };
+  return { row: rows[0], paidNow: row.status === 'open' && state === 'succeeded', refunded };
 }
 
 export async function recordReader(client, tenantId, row, readerId) {
@@ -254,10 +276,7 @@ export function readIntentWithCharge(config, accountId, intentId, { timeoutMs = 
  * platform hears of nowhere else. One read per payment.
  */
 export async function refundedOf(config, accountId, intentId) {
-  const intent = await readIntentWithCharge(config, accountId, intentId, { timeoutMs: REFUND_READ_TIMEOUT_MS });
-  const refunded = Number(intent?.latest_charge?.amount_refunded ?? 0);
-  if (!Number.isInteger(refunded) || refunded < 0) throw new StripeUnreachable('Stripe answered a refunded amount this platform cannot read');
-  return refunded;
+  return refundOn(await readIntentWithCharge(config, accountId, intentId, { timeoutMs: REFUND_READ_TIMEOUT_MS }));
 }
 
 /** What Stripe said was refunded of a paid payment, kept: never more than it took. */

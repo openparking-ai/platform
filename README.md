@@ -2022,10 +2022,13 @@ sweeps, or a sweep and a lane, record once. Then:
   `exit_payment_unplaced` event (`why`: `case_closed` or `stay_ended`).
 - on a case a person let out: recorded paid, and appended to its exception
   (`payment_after_let_out`).
-- refunded before it was recorded, in whole or in part: **not paid**, left open,
-  `last_failure: "refunded_before_recorded"`, which holds at every later read;
-  one `exit_payment_unplaced` event. Another amount than the one recorded: not
-  paid, as the lane reads it, and one event. Nothing is ever refunded here.
+- refunded whole before it was recorded: no money was kept, so it is final as
+  `canceled` with `last_failure: "refunded_before_recorded"`, and the car owes as
+  normal: its close, its stay's end and its next entry all go through. Refunded
+  in part: paid, keeping `refunded_minor`, so the stay is credited what was kept.
+  Either way one `exit_payment_unplaced` event, whichever read found it. Another
+  amount than the one recorded: not paid, left open as the lane reads it, and
+  one event. Nothing is ever refunded here.
 
 Up to 200 payments per account per run (`SWEEP_LIMIT`), the longest unread
 first, and a read that failed goes to the back of the line, so every payment

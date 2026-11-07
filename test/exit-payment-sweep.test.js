@@ -13,8 +13,10 @@
  *   * two sweeps at once, and a sweep and a lane at once, record once;
  *   * a payment on a closed case is kept and credited, the case and the stay as
  *     they were, written down once; a car let out unpaid stays let out unpaid;
- *   * a charge refunded first is not paid, at any later read; another amount is
- *     not paid; each written down once;
+ *   * a charge refunded whole first is final as canceled and never stops a car:
+ *     its close, its stay's end and its next entry all go through; refunded in
+ *     part it is paid for what it kept; another amount is not paid; each
+ *     written down once;
  *   * a car that paid and is let out is not written as let out unpaid;
  *   * the paid date is Stripe's when the read carries it, the clock otherwise;
  *   * every row gets its turn, and Stripe's errors stop nothing.
@@ -232,36 +234,123 @@ test('A CAR LET OUT UNPAID WITH STRIPE SILENT stays let out unpaid: the charge f
   assert.equal(whole.payment_after_let_out.status, 'succeeded', 'the latest is the one read back');
 });
 
-test('REFUNDED FIRST: not paid, at any later read, written down once; the case still owes', async () => {
-  const g = await cardGarage(h, 'sweep-refunded');
-  const { exit, intentId } = await started(g);
-  h.stub.presentCard(intentId);
-  h.stub.refund(intentId, exit.fee.fee_minor);
+/** A car whose charge Stripe took and refunded whole, recorded by nothing yet. */
+async function refundedWhole(g) {
+  const car = await paidAtTheReader(g);
+  h.stub.refund(car.intentId, car.exit.fee.fee_minor);
+  return car;
+}
 
+test('REFUNDED WHOLE FIRST: no money was kept. Final as canceled, written down once, nothing at Stripe; the case owes as normal', async () => {
+  const g = await cardGarage(h, 'sweep-refunded');
+  const { exit, intentId } = await refundedWhole(g);
+  const from = h.stub.requests.length;
   assert.deepEqual(await sweep(g), { due: 1, paid: 0, unplaced: 1, failed: 0 });
+  assert.deepEqual(stripeWrites(from), []);
   const p = await paymentOf(g, exit.id);
-  assert.deepEqual([p.status, p.last_failure, p.succeeded_at], ['open', 'refunded_before_recorded', null]);
+  assert.deepEqual([p.status, p.last_failure, p.succeeded_at, p.refunded_minor], ['canceled', 'refunded_before_recorded', null, exit.fee.fee_minor]);
   assert.deepEqual(await eventsOf(g, 'exit_paid', exit.id), []);
   const noted = await eventsOf(g, 'exit_payment_unplaced', exit.id);
   assert.deepEqual([noted.length, noted[0].detail.why], [1, 'refunded_before_recorded']);
+  assert.equal((await eventsOf(g, 'exit_payment_canceled', exit.id)).length, 1);
 
-  assert.deepEqual(await sweep(g), { due: 1, paid: 0, unplaced: 0, failed: 0 }, 'asked again, written once');
-  assert.equal((await eventsOf(g, 'exit_payment_unplaced', exit.id)).length, 1);
-
-  // The lane's poll reads no charge: what the sweep learned holds.
+  assert.deepEqual(await sweep(g), { due: 0, paid: 0, unplaced: 0, failed: 0 }, 'final: not asked about again');
   const polled = await caseOf(h, g, exit.id);
-  assert.deepEqual([polled.settled, polled.needs, polled.payment.status], [false, 'payment', 'open']);
-  assert.deepEqual(await eventsOf(g, 'exit_paid', exit.id), []);
+  assert.deepEqual([polled.settled, polled.needs, polled.payment.status], [false, 'payment', 'canceled']);
   assert.equal(h.stub.cancels.includes(intentId), false);
 });
 
-test('PART REFUNDED FIRST is not paid either: a person decides', async () => {
+for (const [how, first] of [['the sweep found it', true], ['nothing had read it', false]]) {
+  test(`A FULL REFUND NEVER STOPS A CAR, ${how}: the close goes through, the car owing as normal`, async () => {
+    const g = await cardGarage(h, `refund-close-${first}`);
+    const { exit } = await refundedWhole(g);
+    if (first) await sweep(g);
+    const res = await close(h, g, exit.id);
+    assert.equal(res.status, 200, await res.clone().text());
+    const stay = await stayOf(g, exit.session_id);
+    assert.deepEqual([stay.let_out?.paid, stay.let_out?.owed_minor], [false, exit.fee.fee_minor], 'it left owing');
+    assert.equal((await paymentOf(g, exit.id)).status, 'canceled');
+    assert.equal((await eventsOf(g, 'exit_payment_unplaced', exit.id)).length, 1, 'written down once, whoever found it');
+    assert.equal((await eventsOf(g, 'exit_payment_canceled', exit.id)).length, 1);
+  });
+
+  test(`A FULL REFUND NEVER STOPS A CAR, ${how}: a person ends the stay`, async () => {
+    const g = await cardGarage(h, `refund-end-${first}`);
+    const { exit } = await refundedWhole(g);
+    if (first) await sweep(g);
+    const res = await h.call(g.op, 'POST', `/garages/${g.world.garage}/stays/${exit.session_id}/end`, { outcome: 'ended', reason: 'seen leaving' });
+    assert.equal(res.status, 200, await res.clone().text());
+    const stay = await stayOf(g, exit.session_id);
+    assert.equal(stay.ended.reason, 'ended');
+    assert.equal(stay.ended.paid, undefined, 'nothing paid');
+    assert.equal((await paymentOf(g, exit.id)).status, 'canceled');
+    assert.equal((await eventsOf(g, 'exit_payment_unplaced', exit.id)).length, 1);
+  });
+
+  test(`A FULL REFUND NEVER STOPS A CAR, ${how}: the car comes in again`, async () => {
+    const g = await cardGarage(h, `refund-entry-${first}`);
+    const { plate, exit } = await refundedWhole(g);
+    if (first) await sweep(g);
+    await enter(h, g, { plate, inMin: 0.1 });
+    const stay = await stayOf(g, exit.session_id);
+    assert.equal(stay.ended.reason, 'superseded');
+    assert.equal((await paymentOf(g, exit.id)).status, 'canceled');
+    assert.equal((await eventsOf(g, 'exit_payment_unplaced', exit.id)).length, 1);
+  });
+
+  test(`A FULL REFUND NEVER STOPS A CAR, ${how}: its next case asks the whole fee and can be paid`, async () => {
+    const g = await cardGarage(h, `refund-next-${first}`);
+    const { plate } = await refundedWhole(g);
+    if (first) await sweep(g);
+    const next = await caseAt(h, g, plate, { exitMin: 0.2 });
+    assert.deepEqual([next.settled, next.needs, next.fee.credit_minor], [false, 'payment', 0]);
+    const again = await pay(h, g, next.id);
+    h.stub.presentCard(again.payment.payment_intent_id);
+    assert.equal((await caseOf(h, g, next.id)).why, 'paid');
+  });
+}
+
+test('Control: an unrefunded car closes paid, with nothing written down', async () => {
+  const g = await cardGarage(h, 'refund-control');
+  const { exit } = await paidAtTheReader(g);
+  await sweep(g);
+  assert.equal((await close(h, g, exit.id)).status, 200);
+  assert.equal((await stayOf(g, exit.session_id)).let_out, null);
+  assert.deepEqual(await eventsOf(g, 'exit_payment_unplaced', exit.id), []);
+});
+
+test('A FULL REFUND AT A LET-OUT: the car is written as it is, owing, and the let-out goes through', async () => {
+  const g = await cardGarage(h, 'refund-let-out');
+  const { exit } = await refundedWhole(g);
+  const res = await h.call(g.op, 'POST', `/garages/${g.world.garage}/exits/${exit.id}/let-out`, { reason: 'gate jammed' });
+  assert.equal(res.status, 200, await res.clone().text());
+  const [x] = await rows(g, 'SELECT * FROM exceptions WHERE exit_id = $1', [exit.id]);
+  assert.deepEqual([x.kind, x.owed_minor, x.paid_minor], ['let_out_unpaid', exit.fee.fee_minor, 0]);
+  assert.equal((await close(h, g, exit.id)).status, 200);
+});
+
+test('REFUNDED IN PART FIRST: paid for what it kept, written down once; the stay is credited that and no more', async () => {
   const g = await cardGarage(h, 'sweep-part');
+  const { plate, exit, intentId } = await paidAtTheReader(g);
+  h.stub.refund(intentId, 100);
+  assert.deepEqual(await sweep(g), { due: 1, paid: 1, unplaced: 1, failed: 0 });
+  const p = await paymentOf(g, exit.id);
+  assert.deepEqual([p.status, p.refunded_minor, p.last_failure], ['succeeded', 100, null]);
+  assert.equal((await eventsOf(g, 'exit_paid', exit.id)).length, 1);
+  assert.equal((await eventsOf(g, 'exit_payment_unplaced', exit.id))[0].detail.why, 'part_refunded_before_recorded');
+  const next = await caseAt(h, g, plate, { exitMin: 0.2 });
+  assert.equal(next.fee.credit_minor, exit.fee.fee_minor - 100, 'credited only what was kept');
+  assert.equal(next.fee.fee_minor, 100, 'and asked the rest');
+});
+
+test('ANOTHER AMOUNT REFUNDED WHOLE kept no money either: canceled, not left in the way', async () => {
+  const g = await cardGarage(h, 'refund-amount');
   const { exit, intentId } = await started(g);
+  h.stub.intents.get(intentId).amount += 100;
   h.stub.presentCard(intentId);
-  h.stub.refund(intentId, 1);
-  assert.deepEqual(await sweep(g), { due: 1, paid: 0, unplaced: 1, failed: 0 });
-  assert.equal((await paymentOf(g, exit.id)).status, 'open');
+  h.stub.refund(intentId, h.stub.intents.get(intentId).amount);
+  assert.equal((await sweep(g)).unplaced, 1);
+  assert.equal((await paymentOf(g, exit.id)).status, 'canceled');
 });
 
 test('REFUNDED AFTER IT WAS RECORDED is paid, as it was: the credit reads the refund as before', async () => {
