@@ -196,6 +196,17 @@ const WRITES = [
     state: (s) => one(a.tenant, 'SELECT charges_enabled, card_payments FROM garage_stripe_accounts WHERE garage_id = $1', [s.g.id]),
   },
   {
+    action: 'payment_account.test_confirm',
+    setup: async () => {
+      const s = await paidGarage();
+      assert.equal((await call(base, 'POST', `/garages/${s.g.id}/stripe-account/refresh`, { as: a })).status, 200);
+      return s;
+    },
+    run: (s) => call(base, 'POST', `/garages/${s.g.id}/stripe-account/test-confirmed`, { as: a }),
+    line: (l) => assert.deepEqual([l.before, l.after], [{ test_confirmed: false }, { test_confirmed: true }]),
+    state: (s) => one(a.tenant, 'SELECT test_confirmed_at IS NOT NULL AS ticked FROM garage_stripe_accounts WHERE garage_id = $1', [s.g.id]),
+  },
+  {
     action: 'payment_account.reader_place',
     setup: paidGarage,
     run: (s) => call(base, 'POST', `/garages/${s.g.id}/stripe-account/location`, { as: a, body: { display_name: 'Paid Garage', address: ADDRESS } }),
@@ -603,7 +614,7 @@ function routeTable(expressApp) {
   return out;
 }
 
-test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 38 -- and every one has a recipe here, or is always refused', () => {
+test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 39 -- and every one has a recipe here, or is always refused', () => {
   const reads = READ_POSTS.map(([m, p]) => `${m} ${p}`);
   const writes = routeTable(expressApp).filter((r) => r.mount === '/api/v1' && r.method !== 'GET').map((r) => `${r.method} ${r.path}`);
   assert.deepEqual(writes.filter((w) => !reads.includes(w)).sort(), WRITE_ROUTES.map(([m, p]) => `${m} ${p}`).sort());
@@ -616,13 +627,14 @@ test('THE LIST: the operator router\'s write routes are exactly WRITE_ROUTES -- 
   // And U7f's one: a banned car taken off the list; and 0037's: a car at an
   // exit let out by a person; 0038's: a payment started at a phone reader;
   // and 0039's: a stay nothing closed, ended by a person; and 0040's four:
-  // a walk started, a car seen on it, a candidate picked, the walk finished.
-  assert.equal(WRITE_ROUTES.length, 38);
+  // a walk started, a car seen on it, a candidate picked, the walk finished;
+  // and 0052's: the owner's tick that they tested the payment account.
+  assert.equal(WRITE_ROUTES.length, 39);
   const covered = new Set([...WRITES.map((w) => w.action), ...ALWAYS_REFUSED]);
   assert.deepEqual(WRITE_ROUTES.map(([, , action]) => action).filter((x) => !covered.has(x)), [], 'a write route with no recipe here');
   // The owner's one write outside the operator router: the language.
   assert.deepEqual(routeTable(expressApp).filter((r) => r.mount === '/api/v1/auth' && r.method === 'PUT').map((r) => r.path), ['/language']);
-  assert.equal(WRITES.length, 38, '37 operator writes that can succeed, and the language: 39 writes with the retired rates route');
+  assert.equal(WRITES.length, 39, '38 operator writes that can succeed, and the language: 40 writes with the retired rates route');
 });
 
 test('EVERY WRITE: one change, exactly one line -- who, what, before and after -- by the session, and by the key the same way', async () => {

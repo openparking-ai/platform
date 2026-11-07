@@ -1408,6 +1408,15 @@ export function createApp() {
     res.json({ stripe_account: stripeAccount.presentAccount(row) });
   }));
 
+  /** The owner's tick that they tested the account. The first one stands; a second changes nothing. */
+  operator.post('/garages/:garageId/stripe-account/test-confirmed', may('payments:change'), connectRoute(async (req, res) => {
+    const row = await stripeAccount.confirmTested(req.tenantId, req.params.garageId, {
+      actor: `${req.actor.kind}:${req.actor.id}`,
+      record: recorder(req),
+    });
+    res.json({ stripe_account: stripeAccount.presentAccount(row) });
+  }));
+
   /**
    * The garage's Location, on its own account: where its readers are grouped.
    * Refused while the account cannot take a card.
@@ -5404,6 +5413,7 @@ export const WRITE_ROUTES = Object.freeze([
   ['POST', '/garages/:garageId/stripe-account', 'payment_account.create'],
   ['POST', '/garages/:garageId/stripe-account/onboarding-link', 'payment_account.setup_link'],
   ['POST', '/garages/:garageId/stripe-account/refresh', 'payment_account.read'],
+  ['POST', '/garages/:garageId/stripe-account/test-confirmed', 'payment_account.test_confirm'],
   ['POST', '/garages/:garageId/stripe-account/location', 'payment_account.reader_place'],
   ['POST', '/lanes/:laneId/reader', 'lane.card_reader_connect'],
   ['POST', '/lanes/:laneId/reader/unbind', 'lane.card_reader_disconnect'],

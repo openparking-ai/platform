@@ -174,6 +174,19 @@ test('A PERSON SEES ONLY THEIR GARAGES: the list is cut, and another garage of t
   assert.equal((await call(`/api/v1/garages/${a.one.garage}/lanes`, { cookie: p.token })).status, 200);
 });
 
+test('THE TICK OF A TESTED PAYMENT ACCOUNT: reading payments is not enough, and another garage answers as if it were not there', async () => {
+  const a = await account('tick');
+  const reader = await linked(a, { garages: 'all', permissions: ['payments:read'] });
+  const path = (garage) => `/api/v1/garages/${garage}/stripe-account/test-confirmed`;
+  const refused = await call(path(a.one.garage), { method: 'POST', cookie: reader.token });
+  assert.equal(refused.status, 403);
+  assert.equal(refused.json.code, 'permission_refused');
+  const oneGarage = await linked(a, { garages: [a.one.garage], permissions: ['payments:change'] });
+  const elsewhere = await call(path(a.two.garage), { method: 'POST', cookie: oneGarage.token });
+  assert.equal(elsewhere.status, 404);
+  assert.equal(elsewhere.json.code, 'garage_not_found');
+});
+
 test('A PERMISSION NOT HELD is 403 permission_refused, changes nothing, and is a refused attempt naming the person', async () => {
   const a = await account('pm-refuse');
   const p = await linked(a, { garages: 'all', permissions: ['garages:read'] });

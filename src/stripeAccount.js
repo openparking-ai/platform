@@ -98,6 +98,7 @@ export function presentAccount(row) {
     account_id: row.account_id,
     create_requested_at: row.create_requested_at,
     account_recorded_at: row.account_recorded_at,
+    test_confirmed_at: row.test_confirmed_at,
     card_payments: row.card_payments,
     card_payments_read_at: row.card_payments_read_at,
     charges_enabled: row.charges_enabled,
@@ -428,6 +429,48 @@ export async function refreshAccount(tenantId, garageId, { actor, record = null 
       before: shown(row), after: shown(rows[0]),
     });
     return rows[0];
+  });
+}
+
+/**
+ * The owner's tick (0052): "I did test charges and it is working fine." Kept
+ * with who and when, and the first tick wins: asked again, the account answers
+ * as it stands and nothing changes, so a double click is not a second tick.
+ *
+ * Refused for a garage with no account, and for an account that, as last read,
+ * cannot take a card: there is nothing yet to have tested. Nothing asks Stripe,
+ * and nothing reads this tick: not opening a garage, not any card path.
+ */
+export async function confirmTested(tenantId, garageId, { actor, record = null }) {
+  requireConnect();
+  const line = (before, after) => ({
+    garageId, action: 'payment_account.test_confirm',
+    subject: { kind: 'payment_account', id: null, name: null },
+    before: { test_confirmed: before }, after: { test_confirmed: after },
+  });
+  return withTenant(tenantId, async (client) => {
+    await garageOr404(client, tenantId, garageId);
+    const row = await readRow(client, tenantId, garageId);
+    if (!row?.account_id) {
+      throw new ConnectRefusal(409, 'no_stripe_account', 'this garage has no Stripe account yet; create it first');
+    }
+    if (!row.test_confirmed_at && (row.card_payments !== 'active' || row.charges_enabled !== true)) {
+      throw new ConnectRefusal(
+        409,
+        'card_payments_not_active',
+        "this garage's Stripe account cannot take a card yet, as last read: finish onboarding, ask again with refresh, then confirm.",
+      );
+    }
+    const { rows } = await client.query(
+      `UPDATE garage_stripe_accounts
+          SET test_confirmed_at = now(), test_confirmed_by = $3
+        WHERE tenant_id = $1 AND garage_id = $2 AND test_confirmed_at IS NULL
+        RETURNING *`,
+      [tenantId, garageId, actor],
+    );
+    // Already ticked, by an earlier request or one that got here first.
+    await record?.(client, rows[0] ? line(false, true) : line(true, true));
+    return rows[0] ?? readRow(client, tenantId, garageId);
   });
 }
 

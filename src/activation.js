@@ -26,7 +26,9 @@
  * module holds none of it and names no processor (the test still sweeps it).
  * What the owner also asked for -- money collection TESTED -- is not a
  * condition yet, because nothing in the system tests a payment yet; a gate
- * never reports satisfied what it cannot observe.
+ * never reports satisfied what it cannot observe. The owner's own tick that
+ * they tested it (0052) is not a condition either: a garage must be open
+ * before a car can pay, so opening cannot wait for it.
  *
  * `readout()` says which conditions hold and why not, for an operator, and
  * is the ONE place the conditions are written in this module. `activate()`

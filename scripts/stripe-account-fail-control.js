@@ -222,6 +222,20 @@ const SOURCE_BREAKS = [
     to: "      [tenantId, garageId, 'inactive', false, false],",
   },
   {
+    name: 'tick_any_account',
+    why: 'an account that cannot take a card can be confirmed as tested',
+    file: 'src/stripeAccount.js',
+    from: "    if (!row.test_confirmed_at && (row.card_payments !== 'active' || row.charges_enabled !== true)) {",
+    to: '    if (false) {',
+  },
+  {
+    name: 'tick_second_line',
+    why: 'a second tick writes a second line in the change log',
+    file: 'src/stripeAccount.js',
+    from: '    await record?.(client, rows[0] ? line(false, true) : line(true, true));',
+    to: '    await record?.(client, line(false, true));',
+  },
+  {
     name: 'form_arrays_unindexed',
     why: 'the form encoder drops an array\'s index',
     file: 'src/form.js',
@@ -231,6 +245,19 @@ const SOURCE_BREAKS = [
 ];
 
 const SCHEMA_BREAKS = [
+  {
+    name: 'tick_not_frozen',
+    why: 'a test confirmation can be changed or taken back at the table',
+    edits: [
+      {
+        file: '0052_payment_account_test_confirmed.sql',
+        from: `CREATE TRIGGER garage_stripe_accounts_test_confirmed_guard
+  BEFORE UPDATE ON garage_stripe_accounts
+  FOR EACH ROW EXECUTE FUNCTION garage_stripe_accounts_test_confirmed_guard();`,
+        to: '',
+      },
+    ],
+  },
   {
     name: 'rearm_unguarded',
     why: 'the trigger lets any reservation be rewritten',

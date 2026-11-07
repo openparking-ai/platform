@@ -497,6 +497,131 @@ test('Stripe unreachable is said by name', async () => {
   assert.equal((await res.json()).code, 'stripe_unreachable');
 });
 
+// --- the owner's tick that they tested the account (0052) ---------------------------------------
+
+/** A garage whose account, as last read, can take a card. */
+async function garageThatTakesCards() {
+  configure();
+  const garage = await newGarage();
+  const { stripe_account: account } = await (await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' })).json();
+  stub.setState(account.account_id, { card_payments: 'active', charges_enabled: true, details_submitted: true });
+  assert.equal((await op('POST', `/garages/${garage}/stripe-account/refresh`)).status, 200);
+  return garage;
+}
+const tick = (garage, token) => op('POST', `/garages/${garage}/stripe-account/test-confirmed`, undefined, token);
+
+test('the tick is kept with who and when, the read answers when, and the key that ticked is named by id', async () => {
+  const garage = await garageThatTakesCards();
+  const before = (await (await op('GET', `/garages/${garage}/stripe-account`)).json()).stripe_account;
+  assert.equal(before.test_confirmed_at, null, 'no tick until one is given');
+
+  const n = stub.requests.length;
+  const res = await tick(garage);
+  assert.equal(res.status, 200);
+  const { stripe_account: ticked } = await res.json();
+  assert.ok(ticked.test_confirmed_at);
+  assert.equal('test_confirmed_by' in ticked, false, 'who ticked is the record\'s, not the read\'s');
+  assert.equal(stub.requests.length, n, 'a tick asks Stripe nothing');
+
+  const row = await rowOf(garage);
+  assert.equal(row.test_confirmed_at.toISOString(), new Date(ticked.test_confirmed_at).toISOString());
+  assert.match(row.test_confirmed_by, /^key:[0-9a-f-]{36}$/);
+  const read = (await (await op('GET', `/garages/${garage}/stripe-account`)).json()).stripe_account;
+  assert.equal(read.test_confirmed_at, ticked.test_confirmed_at);
+});
+
+test('the first tick wins: another changes nothing and writes no second line', async () => {
+  const garage = await garageThatTakesCards();
+  const second = await issueOperatorToken(tenant);
+  const first = (await (await tick(garage)).json()).stripe_account;
+  const held = await rowOf(garage);
+
+  const again = await tick(garage, second);
+  assert.equal(again.status, 200);
+  assert.equal((await again.json()).stripe_account.test_confirmed_at, first.test_confirmed_at);
+  const row = await rowOf(garage);
+  assert.equal(row.test_confirmed_by, held.test_confirmed_by, 'the second key is not recorded');
+
+  const lines = await withTenant(tenant, async (c) => (await c.query(
+    "SELECT id FROM garage_changes WHERE garage_id = $1 AND action = 'payment_account.test_confirm' AND outcome = 'done'", [garage],
+  )).rows);
+  assert.equal(lines.length, 1);
+});
+
+test('two ticks at once keep one', async () => {
+  const garage = await garageThatTakesCards();
+  const answers = await Promise.all([tick(garage), tick(garage)]);
+  assert.deepEqual(answers.map((r) => r.status), [200, 200]);
+  const lines = await withTenant(tenant, async (c) => (await c.query(
+    "SELECT id FROM garage_changes WHERE garage_id = $1 AND action = 'payment_account.test_confirm' AND outcome = 'done'", [garage],
+  )).rows);
+  assert.equal(lines.length, 1);
+});
+
+test('a tick is refused with no account, and with an account that cannot take a card yet', async () => {
+  configure();
+  const none = await newGarage();
+  let res = await tick(none);
+  assert.equal(res.status, 409);
+  assert.equal((await res.json()).code, 'no_stripe_account');
+
+  const garage = await newGarage();
+  await op('POST', `/garages/${garage}/stripe-account`, { country: 'US' });
+  res = await tick(garage);
+  assert.equal(res.status, 409, 'never read: nothing says it can take a card');
+  assert.equal((await res.json()).code, 'card_payments_not_active');
+  assert.equal((await op('POST', `/garages/${garage}/stripe-account/refresh`)).status, 200);
+  res = await tick(garage);
+  assert.equal(res.status, 409, 'read, and it cannot');
+  assert.equal((await res.json()).code, 'card_payments_not_active');
+  assert.equal((await rowOf(garage)).test_confirmed_at, null);
+});
+
+test('with no Connect configured, a tick says so and keeps nothing', async () => {
+  const garage = await garageThatTakesCards();
+  unconfigure();
+  const res = await tick(garage);
+  assert.equal(res.status, 409);
+  assert.equal((await res.json()).code, 'connect_not_configured');
+  assert.equal((await rowOf(garage)).test_confirmed_at, null);
+});
+
+test('no sign-in, no tick; and another tenant cannot tick this garage', async () => {
+  const garage = await garageThatTakesCards();
+  const anonymous = await fetch(`${base}/api/v1/garages/${garage}/stripe-account/test-confirmed`, { method: 'POST' });
+  assert.equal(anonymous.status, 401);
+  const res = await tick(garage, otherToken);
+  assert.equal(res.status, 404);
+  assert.equal((await rowOf(garage)).test_confirmed_at, null);
+});
+
+test('a tick, once given, stands at the table: never changed, never taken back; and it holds no name', async () => {
+  const garage = await garageThatTakesCards();
+  const write = (sql) => withTenant(tenant, (c) => c.query(sql, [garage]));
+  await assert.rejects(
+    write("UPDATE garage_stripe_accounts SET test_confirmed_at = now(), test_confirmed_by = 'key:someone@example.com' WHERE garage_id = $1"),
+    /garage_stripe_accounts_test_confirmed_by_shape/,
+  );
+  await assert.rejects(write('UPDATE garage_stripe_accounts SET test_confirmed_at = now() WHERE garage_id = $1'), /garage_stripe_accounts_test_confirmed_together/);
+  assert.equal((await tick(garage)).status, 200);
+  await assert.rejects(write('UPDATE garage_stripe_accounts SET test_confirmed_at = NULL, test_confirmed_by = NULL WHERE garage_id = $1'), /once given, never changes/);
+  await assert.rejects(write("UPDATE garage_stripe_accounts SET test_confirmed_at = now() + interval '1 day' WHERE garage_id = $1"), /once given, never changes/);
+  await assert.rejects(write(`UPDATE garage_stripe_accounts SET test_confirmed_by = 'key:00000000-0000-4000-8000-000000000000' WHERE garage_id = $1`), /once given, never changes/);
+  // Everything Stripe's reads write goes on as before.
+  assert.equal((await op('POST', `/garages/${garage}/stripe-account/refresh`)).status, 200);
+});
+
+test('a reservation cannot carry a tick: what was tested is an account', async () => {
+  configure();
+  const garage = await newGarage();
+  await assert.rejects(
+    withTenant(tenant, (c) => c.query(
+      `INSERT INTO garage_stripe_accounts (tenant_id, garage_id, create_idempotency_key, create_requested_by, test_confirmed_at, test_confirmed_by)
+       VALUES ($1, $2, 'row-tick', 'test', now(), 'key:00000000-0000-4000-8000-000000000000')`, [tenant, garage])),
+    /garage_stripe_accounts_test_confirmed_needs_an_account/,
+  );
+});
+
 // --- the table holds its own rules ----------------------------------------------------------------
 
 test('a recorded account never changes, and a fact never lands without its read time', async () => {

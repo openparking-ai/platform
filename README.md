@@ -1805,6 +1805,12 @@ garage's details itself.
   it was read**. There is no webhook: the platform pulls.
 - `GET /api/v1/garages/<id>/stripe-account` answers what was last read,
   without asking Stripe.
+- `POST /api/v1/garages/<id>/stripe-account/test-confirmed` keeps the owner's
+  tick that they tested the account and saw the money arrive (migration 0052):
+  who and when, and `test_confirmed_at` in the account's answers. The first
+  tick stands, and a later one changes nothing. It is refused with no account,
+  and with one that, as last read, cannot take a card. Nothing reads it:
+  opening a garage does not wait for it, and neither does a payment.
 
 The account is created with Stripe's Accounts API and its controller
 properties: `stripe_dashboard.type: none`, `fees.payer: account`,
