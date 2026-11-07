@@ -978,8 +978,9 @@ test('A BODY THE OPERATOR SURFACE CANNOT READ: malformed, not JSON, oversized or
   const changing = routeTable(main.app).filter((r) => r.base === '/api/v1' && r.method !== 'GET');
   // U4's 22, U4b's four people-to-tell writes and U4c's four board writes,
   // U7f's one, U7g's try: a POST that changes nothing but reads a body, and
-  // 0037's exit let out by a person; 0040's four inventory walk writes.
-  const CHANGING_ROUTES = 39;
+  // 0037's exit let out by a person; 0040's four inventory walk writes;
+  // 0052's tick that the owner tested the payment account.
+  const CHANGING_ROUTES = 40;
   assert.equal(changing.length, CHANGING_ROUTES, `the walk found ${changing.length} non-GET operator routes`);
   // A walk's sighting carries a phone's picture: its body may be 5 MB, so
   // "oversized" is more than that there.
