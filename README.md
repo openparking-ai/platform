@@ -2012,7 +2012,9 @@ older than an hour, every 15 minutes; there is no age past which it stops). It
 **only reads Stripe**: it creates, confirms, captures and cancels nothing, so an
 intent waiting for a card is left to the lane. What it finds is written the way
 a lane's answer is -- the case locked, the same `exit_paid` event -- so two
-sweeps, or a sweep and a lane, record once. Then:
+sweeps, or a sweep and a lane, record once. Whichever read finds a payment
+first -- the sweep, a lane's poll, a close, a let-out, the next case -- it goes
+the same way:
 
 - paid, with the case open: recorded paid. The stay stays as it is; closing it
   is the existing rules'.
@@ -2020,21 +2022,28 @@ sweeps, or a sweep and a lane, record once. Then:
   open credits it at its next case. Nothing the case, the stay or a let-out
   wrote is changed, so a car let out unpaid stays let out unpaid. One
   `exit_payment_unplaced` event (`why`: `case_closed` or `stay_ended`).
-- on a case a person let out: recorded paid, and appended to its exception
-  (`payment_after_let_out`).
+- on a case a person let out: the payment as it now stands is appended to its
+  exception (`payment_after_let_out`).
 - refunded whole before it was recorded: no money was kept, so it is final as
   `canceled` with `last_failure: "refunded_before_recorded"`, and the car owes as
   normal: its close, its stay's end and its next entry all go through. Refunded
-  in part: paid, keeping `refunded_minor`, so the stay is credited what was kept.
-  Either way one `exit_payment_unplaced` event, whichever read found it. Another
-  amount than the one recorded: not paid, left open as the lane reads it, and
-  one event. Nothing is ever refunded here.
+  in part: paid, keeping `refunded_minor`, so the stay is credited what was kept
+  and an exception shows that. Either way one `exit_payment_unplaced` event.
+  Another amount than the one recorded: not paid, left open, and one event.
+  Nothing is ever refunded here. A lane's own poll reads no charge, so it does
+  not see a refund.
+
+A final payment keeps what it says: reads are taken outside the case's lock, so
+one that lands late changes nothing on it.
 
 Up to 200 payments per account per run (`SWEEP_LIMIT`), the longest unread
 first, and a read that failed goes to the back of the line, so every payment
-gets its turn; Stripe's errors are logged and asked again next run. It prints
-counts, a line on the error output for each charge written down, and exits 1
-when there was one or a read failed. No Stripe key: nothing to ask.
+gets its turn; Stripe's errors are logged and asked again next run. One run at a
+time: a run that finds another at work stops, and a run stops reading after 5
+minutes. It prints counts and a line on the error output for each charge it wrote
+down, and exits 1 when a read failed or a charge was written down in the last 2
+minutes, by it or by any other read, so each is seen by about two runs. No Stripe
+key: nothing to ask.
 
 **When it was paid is Stripe's word** wherever the read carries the charge
 (`latest_charge.created`): the sweep, a let-out, the case that found it. A
@@ -2051,7 +2060,7 @@ decides). The reader's own refusals are named: `503 reader_offline`,
 `409 reader_busy`.
 
 **A person who lets the car out** while a payment is open: Stripe is read
-first (3 seconds at most; the let-out never waits on it), so a car that paid is
+first (3 seconds at most for the charge, once), so a car that paid is
 not written down as let out unpaid. Then the intent is canceled, so no card is
 taken for a settled exit; if Stripe says it had already succeeded, that is
 recorded instead — paid and let out.

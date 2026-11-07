@@ -3,8 +3,8 @@
  * The control for paying at the exit (0038).
  *
  * Every property the payment's safety rests on is broken below, one at a
- * time, and `test/exit-payments.test.js` or `test/exit-payment-sweep.test.js`
- * is REQUIRED to go red -- with at least one test still green, so a break that stops the file running is not
+ * time, and `test/exit-payments.test.js`, `test/exit-payment-sweep.test.js` or
+ * `test/exit-payment-timing.test.js` is REQUIRED to go red -- with at least one test still green, so a break that stops the file running is not
  * mistaken for one the tests caught. A pass is the failure.
  *
  * SOURCE breaks are applied to a COPY of the tree in a temporary directory; no
@@ -53,6 +53,14 @@
  *   failed_read_keeps_its_place a read that failed spends the run's places again
  *   error_stops_the_run         one read refused ends the run
  *   old_rows_forgotten          an old open payment is not asked about again
+ *   final_row_overwritten       a read taken outside the lock overwrites a final row
+ *   stale_copy_appended         a let-out's older copy is appended over a later one
+ *   paid_minor_whole            an exception counts a part refund as paid
+ *   alarm_misses_others         a charge written down elsewhere is not counted
+ *   runs_stack                  a run does not stop for one already working
+ *   deadline_ignored            a run reads on past its deadline
+ *   charge_read_long            a close waits 30 seconds for a charge read
+ *   let_out_reads_charge_twice  a let-out waits for the charge twice
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with one
  * statement of 0038 edited, so the property genuinely never existed there.
@@ -80,6 +88,8 @@ const ROOT = resolve(import.meta.dirname, '..');
 const SCRATCH = process.env.EXIT_PAYMENTS_SCRATCH_DB || 'openparking_exit_payments_control';
 
 const SWEEP = 'src/exitPaymentSweep.js';
+// Its tests wait out a timeout: only the breaks that need them run them.
+const TIMING = ['--test', 'test/exit-payment-timing.test.js'];
 const CASE_LOCK = {
   from: 'const row = await exits.caseById(client, tenantId, garageId, exitId, { lock: true });',
   to: 'const row = await exits.caseById(client, tenantId, garageId, exitId);',
@@ -181,7 +191,7 @@ const SOURCE_BREAKS = [
     name: 'person_leaves_intent_open',
     why: "a person's letting out leaves the intent open",
     file: 'src/app.js',
-    from: '      const settled = await cancelForPerson(req.tenantId, row.garage_id, row);',
+    from: '      const settled = await cancelForPerson(req.tenantId, row.garage_id, row, { readCharge });',
     to: '      const settled = row;',
   },
   {
@@ -273,15 +283,15 @@ const SOURCE_BREAKS = [
     name: 'sweep_closes_the_case',
     why: 'the sweep closes what it found paid',
     file: SWEEP,
-    from: '  if (!written.paidNow) return { paid: false, unplaced: written.wroteDown };\n',
-    to: "  if (!written.paidNow) return { paid: false, unplaced: written.wroteDown };\n  await exits.endCase(client, tenantId, row.id, { why: 'stay_ended', by: 'sweep' });\n",
+    from: '  const exception = await exceptions.ofCase(client, tenantId, row.id);\n',
+    to: "  if (written.paidNow) await exits.endCase(client, tenantId, row.id, { why: 'stay_ended', by: 'sweep' });\n  const exception = await exceptions.ofCase(client, tenantId, row.id);\n",
   },
   {
     name: 'closed_not_written_down',
     why: 'a charge on a closed case is written nowhere',
     file: SWEEP,
-    from: "  const why = row.closed_at ? 'case_closed' : (await stayIsOver(client, tenantId, row.session_id)) ? 'stay_ended' : null;",
-    to: '  const why = null;',
+    from: "  if (written.paidNow) over = row.closed_at ? 'case_closed' : (await stayIsOver(client, tenantId, row.session_id)) ? 'stay_ended' : null;\n",
+    to: '',
   },
   {
     name: 'found_not_on_exception',
@@ -336,15 +346,15 @@ const SOURCE_BREAKS = [
     name: 'let_out_before_read',
     why: 'a car that paid is written as let out unpaid',
     file: 'src/app.js',
-    from: '      await readBeforeLetOut(req.tenantId, req.params.garageId, req.params.exitId);\n',
-    to: '',
+    from: '      const readCharge = await readBeforeLetOut(req.tenantId, req.params.garageId, req.params.exitId);\n',
+    to: '      const readCharge = true;\n',
   },
   {
     name: 'let_out_held_by_stripe',
     why: 'a silent Stripe holds a let-out up',
     file: 'src/app.js',
-    from: '      await recordIntent(tenantId, garageId, exitId, intent);\n    } catch (err) {\n      if (!(err instanceof StripeUnreachable || err instanceof StripeError)) throw err;',
-    to: '      await recordIntent(tenantId, garageId, exitId, intent);\n    } catch (err) {\n      throw err;',
+    from: '      return true;\n    } catch (err) {\n      if (!(err instanceof StripeUnreachable || err instanceof StripeError)) throw err;\n      return false;',
+    to: '      return true;\n    } catch (err) {\n      throw err;',
   },
   {
     name: 'paid_date_is_read_time',
@@ -364,8 +374,8 @@ const SOURCE_BREAKS = [
     name: 'found_date_is_read_time',
     why: 'a payment found at a later case keeps the read time',
     file: 'src/app.js',
-    from: "    if (intent.status === 'succeeded') {\n      intent = await exitPayments.readIntentWithCharge(",
-    to: '    if (false) {\n      intent = await exitPayments.readIntentWithCharge(',
+    from: "    if (intent.status === 'succeeded' && readCharge) {\n",
+    to: '    if (false) {\n',
   },
   {
     name: 'failed_read_keeps_its_place',
@@ -387,6 +397,65 @@ const SOURCE_BREAKS = [
     file: SWEEP,
     from: 'export const OLD_EVERY_MS = 15 * 60_000;',
     to: 'export const OLD_EVERY_MS = 1000 * 86_400_000;',
+  },
+  {
+    name: 'final_row_overwritten',
+    why: 'a read taken outside the lock overwrites what a final row says',
+    file: 'src/exitPayments.js',
+    from: '    failure = row.last_failure;\n    stripeStatus = row.stripe_status;\n',
+    to: '',
+  },
+  {
+    name: 'stale_copy_appended',
+    why: "a let-out's older copy of the payment is appended over a later one",
+    edits: [
+      { file: 'src/exceptions.js', from: '  if (last?.records[0]?.status === current.status) return null;\n', to: '' },
+      { file: 'src/exceptions.js', from: 'records: [presentPayment(current)], complete: true,', to: 'records: [presentPayment(payment)], complete: true,' },
+    ],
+  },
+  {
+    name: 'paid_minor_whole',
+    why: 'an exception counts a part refund as paid',
+    file: 'src/exceptions.js',
+    from: 'sum + p.amount_minor - p.refunded_minor, 0);',
+    to: 'sum + p.amount_minor, 0);',
+  },
+  {
+    name: 'alarm_misses_others',
+    why: 'a charge written down by a close, a let-out or a lane is not counted',
+    file: SWEEP,
+    from: "'SELECT count(*)::int AS n FROM events WHERE tenant_id = $1 AND kind = $2 AND occurred_at >= $3',",
+    to: "'SELECT 0 AS n FROM events WHERE tenant_id = $1 AND kind = $2 AND occurred_at >= $3 LIMIT 1',",
+  },
+  {
+    name: 'runs_stack',
+    why: 'a run does not stop for one already working',
+    file: SWEEP,
+    from: "    if (!rows[0].got) return { ran: false };\n",
+    to: '',
+  },
+  {
+    name: 'deadline_ignored',
+    why: 'a run reads on past its deadline',
+    file: SWEEP,
+    from: '    if (Date.now() >= deadline) break;\n',
+    to: '',
+  },
+  {
+    name: 'charge_read_long',
+    why: 'a close waits 30 seconds for a charge read',
+    file: 'src/app.js',
+    from: "p.payment_intent_id, { timeoutMs: exitPayments.REFUND_READ_TIMEOUT_MS }).catch((err) => {",
+    to: 'p.payment_intent_id).catch((err) => {',
+    suite: TIMING,
+  },
+  {
+    name: 'let_out_reads_charge_twice',
+    why: 'a let-out waits for the charge twice',
+    file: 'src/app.js',
+    from: '      const settled = await cancelForPerson(req.tenantId, row.garage_id, row, { readCharge });',
+    to: '      const settled = await cancelForPerson(req.tenantId, row.garage_id, row);',
+    suite: TIMING,
   },
 ];
 
@@ -428,8 +497,8 @@ function stage() {
   return dir;
 }
 
-function run(dir, extraEnv = {}) {
-  return spawnSync(process.execPath, SUITE, {
+function run(dir, extraEnv = {}, suite = SUITE) {
+  return spawnSync(process.execPath, suite, {
     cwd: dir,
     env: { ...process.env, ...extraEnv },
     stdio: 'pipe',
@@ -571,7 +640,7 @@ for (const brk of SOURCE_BREAKS) {
       }
       writeFileSync(path, source.replace(edit.from, edit.to));
     }
-    if (anchored && !judge(brk.name, brk.why, run(dir))) failures += 1;
+    if (anchored && !judge(brk.name, brk.why, run(dir, {}, brk.suite))) failures += 1;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

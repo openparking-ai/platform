@@ -25,7 +25,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { pool, withTenant } from './helpers.js';
 import {
-  sweepOpenPayments, MIN_AGE_MS, OLD_EVERY_MS, RECENT_MS,
+  sweepOpenPayments, recordCaseIntent, whileHoldingSweepLock, writtenDownSince, MIN_AGE_MS, OLD_EVERY_MS, RECENT_MS,
 } from '../src/exitPaymentSweep.js';
 import {
   startHarness, cardGarage, enter, caseAt, pay, caseOf, close, rows, plateNo, unconfigure, configure,
@@ -504,3 +504,146 @@ test('ONE ACCOUNT AT A TIME: a sweep of one tenant never reads another tenant\'s
   assert.equal((await sweep(a)).paid, 1);
   assert.equal((await paymentOf(b, inB.exit.id)).status, 'open');
 });
+
+/** A car let out while Stripe was silent, its card then taken: its record is yet to hear. */
+async function letOutThenPaid(g) {
+  const c = await started(g);
+  const res = await silentStripe(() => h.call(g.op, 'POST', `/garages/${g.world.garage}/exits/${c.exit.id}/let-out`, { reason: 'reader frozen' }));
+  assert.equal(res.status, 200);
+  h.stub.presentCard(c.intentId);
+  const [x] = await rows(g, 'SELECT * FROM exceptions WHERE exit_id = $1', [c.exit.id]);
+  return { ...c, x };
+}
+const afterLetOut = async (g, x) => (await (await h.call(g.op, 'GET', `/garages/${g.world.garage}/exceptions/${x.id}`)).json()).exception.payment_after_let_out?.status;
+
+test('THE LANE FINDS IT FIRST: the charge found after a let-out is on the exception all the same', async () => {
+  const g = await cardGarage(h, 'found-lane');
+  const c = await letOutThenPaid(g);
+  await caseOf(h, g, c.exit.id);
+  assert.equal(await afterLetOut(g, c.x), 'succeeded');
+});
+
+test('THE CLOSE FINDS IT FIRST: the same', async () => {
+  const g = await cardGarage(h, 'found-close');
+  const c = await letOutThenPaid(g);
+  const res = await close(h, g, c.exit.id);
+  assert.equal(res.status, 200, await res.clone().text());
+  assert.equal(await afterLetOut(g, c.x), 'succeeded');
+});
+
+test('A LANE POLL REACHES A CLOSED CASE FIRST: written down once all the same, and counted for the alarm', async () => {
+  const g = await cardGarage(h, 'found-closed');
+  const since = new Date();
+  assert.equal(await writtenDownSince(g.tenant, since), 0, 'control: nothing yet');
+  const c = await paidAtTheReader(g);
+  await withTenant(g.tenant, (cl) => cl.query(`UPDATE exits SET closed_at = now(), ended = $2 WHERE id = $1`,
+    [c.exit.id, { why: 'stay_ended', by: 'user:someone', at: new Date().toISOString() }]));
+  await caseOf(h, g, c.exit.id);
+  assert.equal((await eventsOf(g, 'exit_payment_unplaced', c.exit.id)).length, 1);
+  assert.equal(await writtenDownSince(g.tenant, since), 1);
+  assert.equal(await writtenDownSince(g.tenant, new Date(Date.now() + 60_000)), 0, 'control: only since then');
+});
+
+test("THE SWEEP LANDS WHILE A LET-OUT'S CANCEL HANGS: the let-out's older copy does not cover what it found", async () => {
+  const g = await cardGarage(h, 'found-overlap');
+  const c = await started(g);
+  const real = globalThis.fetch;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let reached;
+  const atReader = new Promise((r) => { reached = r; });
+  let silent = true;
+  globalThis.fetch = (url, opts) => {
+    const u = String(url);
+    if (!silent || !u.startsWith(h.stub.base)) return real(url, opts);
+    if (u.includes('/terminal/readers/') && (opts?.method ?? 'GET') === 'GET') {
+      reached();
+      silent = false;
+      return gate.then(() => Promise.reject(new TypeError('fetch failed')));
+    }
+    return Promise.reject(new TypeError('fetch failed'));
+  };
+  try {
+    const letOut = h.call(g.op, 'POST', `/garages/${g.world.garage}/exits/${c.exit.id}/let-out`, { reason: 'reader frozen' });
+    await Promise.race([atReader, letOut]);
+    h.stub.presentCard(c.intentId);
+    assert.equal((await sweep(g)).paid, 1);
+    release();
+    assert.equal((await letOut).status, 200);
+  } finally {
+    release();
+    globalThis.fetch = real;
+  }
+  const [x] = await rows(g, 'SELECT * FROM exceptions WHERE exit_id = $1', [c.exit.id]);
+  assert.equal(await afterLetOut(g, x), 'succeeded');
+});
+
+test('A FINAL ROW KEEPS WHAT IT SAYS: a read in hand from before does not wipe the mark', async () => {
+  const g = await cardGarage(h, 'final-kept');
+  const c = await started(g);
+  const intent = {
+    id: c.intentId, status: 'succeeded', amount: c.exit.fee.fee_minor, currency: 'usd', last_payment_error: null,
+    latest_charge: { id: 'ch_x', created: 1700000000, amount_refunded: c.exit.fee.fee_minor },
+  };
+  await recordCaseIntent(g.tenant, g.world.garage, c.exit.id, intent);
+  await recordCaseIntent(g.tenant, g.world.garage, c.exit.id, { ...intent, status: 'requires_payment_method', latest_charge: null });
+  const p = await paymentOf(g, c.exit.id);
+  assert.deepEqual([p.status, p.last_failure, p.stripe_status], ['canceled', 'refunded_before_recorded', 'succeeded']);
+});
+
+test('THREE SWEEPS AT ONCE over refunded charges keep every mark', async () => {
+  const g = await cardGarage(h, 'final-race');
+  const cars = [];
+  for (let i = 0; i < 8; i += 1) cars.push(await refundedWhole(g));
+  await Promise.all([sweep(g), sweep(g), sweep(g)]);
+  for (const c of cars) assert.equal((await paymentOf(g, c.exit.id)).last_failure, 'refunded_before_recorded');
+});
+
+test('REFUNDED IN PART, FOUND AT A LET-OUT: the exception shows what was kept', async () => {
+  const g = await cardGarage(h, 'part-let-out');
+  const c = await paidAtTheReader(g);
+  h.stub.refund(c.intentId, 100);
+  assert.equal((await h.call(g.op, 'POST', `/garages/${g.world.garage}/exits/${c.exit.id}/let-out`, { reason: 'gate jammed' })).status, 200);
+  const [x] = await rows(g, 'SELECT * FROM exceptions WHERE exit_id = $1', [c.exit.id]);
+  assert.deepEqual([x.owed_minor, x.paid_minor], [0, c.exit.fee.fee_minor - 100]);
+});
+
+test('A PART REFUND ON A CLOSED CASE is written down once, naming both', async () => {
+  const g = await cardGarage(h, 'part-closed');
+  const c = await paidAtTheReader(g);
+  h.stub.refund(c.intentId, 100);
+  await withTenant(g.tenant, (cl) => cl.query(`UPDATE exits SET closed_at = now(), ended = $2 WHERE id = $1`,
+    [c.exit.id, { why: 'stay_ended', by: 'user:someone', at: new Date().toISOString() }]));
+  assert.equal((await sweep(g)).unplaced, 1);
+  const [e] = await eventsOf(g, 'exit_payment_unplaced', c.exit.id);
+  assert.deepEqual([e.detail.why, e.detail.also], ['part_refunded_before_recorded', 'case_closed']);
+});
+
+test('ONE RUN AT A TIME: a run finding another at work stops, and the lock is free after', async () => {
+  let release;
+  const held = new Promise((r) => { release = r; });
+  let inside;
+  const entered = new Promise((r) => { inside = r; });
+  const first = whileHoldingSweepLock(async () => { inside(); await held; return 'first'; });
+  await entered;
+  let second;
+  try {
+    second = await whileHoldingSweepLock(async () => 'second');
+  } finally {
+    release();
+  }
+  assert.deepEqual(second, { ran: false });
+  assert.deepEqual(await first, { ran: true, value: 'first' });
+  assert.deepEqual(await whileHoldingSweepLock(async () => 'third'), { ran: true, value: 'third' }, 'control: free again');
+});
+
+test('A RUN PAST ITS DEADLINE reads no more; the next reads them', async () => {
+  const g = await cardGarage(h, 'sweep-deadline');
+  const c = await paidAtTheReader(g);
+  const from = h.stub.requests.length;
+  assert.equal((await sweep(g, { deadline: Date.now() - 1 })).paid, 0);
+  assert.deepEqual(stripeReads(from), []);
+  assert.equal((await sweep(g)).paid, 1, 'control: the next run');
+  assert.equal((await paymentOf(g, c.exit.id)).status, 'succeeded');
+});
+

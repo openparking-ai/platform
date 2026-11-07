@@ -2996,7 +2996,7 @@ export function createApp() {
    * said, so asking again is safe. The reader is cleared only while it shows
    * this intent: a later car's payment on the same reader is never touched.
    */
-  async function cancelPayment(tenantId, garageId, row, { why }) {
+  async function cancelPayment(tenantId, garageId, row, { why, readCharge = true }) {
     const p = row.payment;
     if (!p) return { row, outcome: 'none' };
     if (p.status === 'succeeded') return { row, outcome: 'paid' };
@@ -3031,9 +3031,10 @@ export function createApp() {
       }
     }
     // Found paid here, perhaps long after the card: Stripe's own time, and
-    // what it has refunded since. Out of reach, the read above stands.
-    if (intent.status === 'succeeded') {
-      intent = await exitPayments.readIntentWithCharge(config, p.account_id, p.payment_intent_id).catch((err) => {
+    // what it has refunded since. A car may be at the barrier, so the read is
+    // short; out of reach, the read above stands.
+    if (intent.status === 'succeeded' && readCharge) {
+      intent = await exitPayments.readIntentWithCharge(config, p.account_id, p.payment_intent_id, { timeoutMs: exitPayments.REFUND_READ_TIMEOUT_MS }).catch((err) => {
         if (err instanceof StripeUnreachable || err instanceof StripeError) return intent;
         throw err;
       });
@@ -3358,19 +3359,22 @@ export function createApp() {
    * BEFORE A PERSON'S LET-OUT IS WRITTEN: an open payment is read from Stripe
    * and recorded, so a car that paid is never written down as let out unpaid.
    * A read, never a cancel. A car is at the barrier: Stripe silent past
-   * REFUND_READ_TIMEOUT_MS, or refusing, the let-out goes on as last recorded.
+   * REFUND_READ_TIMEOUT_MS, or refusing, the let-out goes on as last recorded,
+   * and the answer says not to ask for the charge a second time.
    */
   async function readBeforeLetOut(tenantId, garageId, exitId) {
     const row = await withTenant(tenantId, (client) => exits.caseById(client, tenantId, garageId, exitId));
     const p = row?.payment;
-    if (p?.status !== 'open' || row.closed_at || row.person) return;
+    if (p?.status !== 'open' || row.closed_at || row.person) return true;
     const config = connectConfig();
-    if (!config.key) return;
+    if (!config.key) return true;
     try {
       const intent = await exitPayments.readIntentWithCharge(config, p.account_id, p.payment_intent_id, { timeoutMs: exitPayments.REFUND_READ_TIMEOUT_MS });
       await recordIntent(tenantId, garageId, exitId, intent);
+      return true;
     } catch (err) {
       if (!(err instanceof StripeUnreachable || err instanceof StripeError)) throw err;
+      return false;
     }
   }
 
@@ -3381,9 +3385,9 @@ export function createApp() {
    * After the person's decision is written, never in its way: a payment left
    * open here is settled by the case's close, which cancels before it writes.
    */
-  async function cancelForPerson(tenantId, garageId, row) {
+  async function cancelForPerson(tenantId, garageId, row, { readCharge = true } = {}) {
     try {
-      return (await cancelPayment(tenantId, garageId, row, { why: 'let_out_by_person' })).row;
+      return (await cancelPayment(tenantId, garageId, row, { why: 'let_out_by_person', readCharge })).row;
     } catch (err) {
       if (err instanceof StripeUnreachable || err instanceof StripeError || err instanceof stripeAccount.ConnectRefusal
         || err.code === 'payment_in_progress' || err.code === 'payment_amount_mismatch') return row;
@@ -4260,7 +4264,7 @@ export function createApp() {
       if (typeof reason !== 'string' || reason.trim().length === 0 || reason.length > 500) {
         throw bad('reason is required: why the car is let out, at most 500 characters');
       }
-      await readBeforeLetOut(req.tenantId, req.params.garageId, req.params.exitId);
+      const readCharge = await readBeforeLetOut(req.tenantId, req.params.garageId, req.params.exitId);
       const row = await changeTx(req, async (client) => {
         exception = null;
         const garage = await ownGarage(client, req);
@@ -4294,7 +4298,7 @@ export function createApp() {
         });
         return updated;
       });
-      const settled = await cancelForPerson(req.tenantId, row.garage_id, row);
+      const settled = await cancelForPerson(req.tenantId, row.garage_id, row, { readCharge });
       // What is learned after the decision, appended to its exception: the
       // payment as the let-out left it, and the gate agent's records so far.
       // Neither ever holds the let-out up.

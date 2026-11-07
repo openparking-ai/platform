@@ -165,11 +165,12 @@ jobs:
           echo "$line"
           echo "$line" | grep -Eqx 'exceptions: [0-9]+ tenant\(s\); [0-9]+ written from the record, [0-9]+ finished, 0 tenant\(s\) left for the next run\.'
 
-      - name: The exit payments' sweep runs clean on a fresh database
+      - name: The exit payments' sweep runs clean after the suite
         run: |
-          line="$(npm run -s sweep-exit-payments)"
+          # After the suite: its own charges written down may be in the window, and exit 1.
+          line="$(npm run -s sweep-exit-payments || true)"
           echo "$line"
-          echo "$line" | grep -Eqx 'exit payments: [0-9]+ tenant\(s\); 0 read, 0 recorded paid, 0 written down, 0 left for the next run\.'
+          echo "$line" | grep -Eqx 'exit payments: [0-9]+ tenant\(s\); 0 read, 0 recorded paid, [0-9]+ written down lately, 0 left for the next run\.'
 
       - name: RLS fail-control
         # Proves the isolation suite actually measures isolation, by requiring
@@ -255,8 +256,8 @@ jobs:
         # sweep reading only, recording once, keeping what is closed as it
         # was, a refund not paid; a let-out reading Stripe first; the paid
         # date Stripe's -- and three of 0038's guards, and requires
-        # test/exit-payments.test.js or test/exit-payment-sweep.test.js to go
-        # red.
+        # test/exit-payments.test.js, test/exit-payment-sweep.test.js or
+        # test/exit-payment-timing.test.js to go red.
         run: npm run exit-payments-fail-control
 
       - name: Exit-let-out fail-control

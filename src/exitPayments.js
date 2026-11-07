@@ -193,9 +193,11 @@ export async function insertPayment(client, tenantId, p) {
  * amount and currency are the ones recorded: an intent whose amount moved is
  * never taken as payment for this fee. A read that carries the charge and finds
  * it refunded first: refunded whole is canceled, whatever its amount, since no
- * money was kept; in part is paid, keeping what was refunded. Answers the row,
- * whether this read is the one that found it paid, and `refunded`, the reason,
- * when this read is the one that found a refund.
+ * money was kept; in part is paid, keeping what was refunded. A final row keeps
+ * what it says: reads are taken outside the case's lock, so one that lands after
+ * the row went final has nothing to add. Answers the row, whether this read is
+ * the one that made it final (`finalNow`) or found it paid (`paidNow`), and
+ * `refunded`, the reason, when this read is the one that found a refund.
  */
 export async function recordIntent(client, tenantId, row, intent) {
   if (intent.id !== row.payment_intent_id) throw new Error('recordIntent: a different intent');
@@ -217,7 +219,12 @@ export async function recordIntent(client, tenantId, row, intent) {
     refunded = PART_REFUNDED_FIRST;
     refundedMinor = taken;
   }
-  if (row.status !== 'open') state = row.status;
+  let stripeStatus = String(intent.status).slice(0, 40);
+  if (row.status !== 'open') {
+    state = row.status;
+    failure = row.last_failure;
+    stripeStatus = row.stripe_status;
+  }
   const { rows } = await client.query(
     `UPDATE exit_payments
         SET status = $3, stripe_status = $4, last_failure = $5, read_at = now(),
@@ -227,9 +234,9 @@ export async function recordIntent(client, tenantId, row, intent) {
             refunds_read_at = CASE WHEN $7::int IS NULL THEN refunds_read_at ELSE now() END
       WHERE tenant_id = $1 AND id = $2
       RETURNING *`,
-    [tenantId, row.id, state, String(intent.status).slice(0, 40), failure, chargedAt(intent), refundedMinor],
+    [tenantId, row.id, state, stripeStatus, failure, chargedAt(intent), refundedMinor],
   );
-  return { row: rows[0], paidNow: row.status === 'open' && state === 'succeeded', refunded };
+  return { row: rows[0], finalNow: row.status === 'open' && state !== 'open', paidNow: row.status === 'open' && state === 'succeeded', refunded };
 }
 
 export async function recordReader(client, tenantId, row, readerId) {
