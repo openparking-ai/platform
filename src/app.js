@@ -33,6 +33,7 @@ import * as exits from './exits.js';
 import * as exitMatch from './exitMatch.js';
 import * as exitPicker from './exitPicker.js';
 import * as exitPayments from './exitPayments.js';
+import * as exitPaymentSweep from './exitPaymentSweep.js';
 import * as textReceipt from './textReceipt.js';
 import * as stuck from './stuckStays.js';
 import * as walks from './walks.js';
@@ -2786,31 +2787,8 @@ export function createApp() {
   // says the intent succeeded for that amount.
   // -------------------------------------------------------------------------
 
-  const paidEvent = (client, tenantId, row, payment) => repo.appendEvents(client, tenantId, [{
-    garageId: row.garage_id,
-    laneId: row.lane_id,
-    eventId: `${exitPayments.PAID_EVENT_KIND}:${payment.id}`,
-    kind: exitPayments.PAID_EVENT_KIND,
-    occurredAt: new Date(),
-    detail: {
-      actor: 'platform:exit',
-      exit_id: row.id,
-      amount_minor: payment.amount_minor,
-      currency: payment.currency,
-      payment_intent_id: payment.payment_intent_id,
-      channel: payment.channel,
-    },
-  }]);
-
   /** What Stripe says of the case's intent, written down; the case as it now stands. */
-  const recordIntent = (tenantId, garageId, exitId, intent, readerId = null) => withTenant(tenantId, async (client) => {
-    const row = await exits.caseById(client, tenantId, garageId, exitId, { lock: true });
-    let payment = await exitPayments.paymentOf(client, tenantId, exitId);
-    if (readerId) payment = await exitPayments.recordReader(client, tenantId, payment, readerId);
-    const written = await exitPayments.recordIntent(client, tenantId, payment, intent);
-    if (written.paidNow) await paidEvent(client, tenantId, row, written.row);
-    return exits.caseById(client, tenantId, garageId, exitId);
-  });
+  const recordIntent = exitPaymentSweep.recordCaseIntent;
 
   /**
    * Start the payment of a case's fee, or carry on with the one it has.
@@ -3051,6 +3029,14 @@ export function createApp() {
         if (!(err instanceof StripeError)) throw err;
         intent = await exitPayments.readIntent(config, p.account_id, p.payment_intent_id);
       }
+    }
+    // Found paid here, perhaps long after the card: Stripe's own time, and
+    // what it has refunded since. Out of reach, the read above stands.
+    if (intent.status === 'succeeded') {
+      intent = await exitPayments.readIntentWithCharge(config, p.account_id, p.payment_intent_id).catch((err) => {
+        if (err instanceof StripeUnreachable || err instanceof StripeError) return intent;
+        throw err;
+      });
     }
     const updated = await recordIntent(tenantId, garageId, row.id, intent);
     const status = updated.payment?.status;
@@ -3366,6 +3352,26 @@ export function createApp() {
         payment: (exitCase.payment ?? exits.paidFor(exitCase))?.status ?? null,
       },
     });
+  }
+
+  /**
+   * BEFORE A PERSON'S LET-OUT IS WRITTEN: an open payment is read from Stripe
+   * and recorded, so a car that paid is never written down as let out unpaid.
+   * A read, never a cancel. A car is at the barrier: Stripe silent past
+   * REFUND_READ_TIMEOUT_MS, or refusing, the let-out goes on as last recorded.
+   */
+  async function readBeforeLetOut(tenantId, garageId, exitId) {
+    const row = await withTenant(tenantId, (client) => exits.caseById(client, tenantId, garageId, exitId));
+    const p = row?.payment;
+    if (p?.status !== 'open' || row.closed_at || row.person) return;
+    const config = connectConfig();
+    if (!config.key) return;
+    try {
+      const intent = await exitPayments.readIntentWithCharge(config, p.account_id, p.payment_intent_id, { timeoutMs: exitPayments.REFUND_READ_TIMEOUT_MS });
+      await recordIntent(tenantId, garageId, exitId, intent);
+    } catch (err) {
+      if (!(err instanceof StripeUnreachable || err instanceof StripeError)) throw err;
+    }
   }
 
   /**
@@ -4254,6 +4260,7 @@ export function createApp() {
       if (typeof reason !== 'string' || reason.trim().length === 0 || reason.length > 500) {
         throw bad('reason is required: why the car is let out, at most 500 characters');
       }
+      await readBeforeLetOut(req.tenantId, req.params.garageId, req.params.exitId);
       const row = await changeTx(req, async (client) => {
         exception = null;
         const garage = await ownGarage(client, req);

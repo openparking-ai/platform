@@ -2005,6 +2005,40 @@ recorded. A decline is kept as `last_failure` and the case still needs
 payment. Stripe out of reach is not a failed poll: the case answers as last
 recorded.
 
+**A card Stripe took is recorded whether or not a lane is still asking.**
+`npm run sweep-exit-payments`, on a schedule, every minute, reads each open
+payment at least 2 minutes old that was not read in the last 30 seconds (one
+older than an hour, every 15 minutes; there is no age past which it stops). It
+**only reads Stripe**: it creates, confirms, captures and cancels nothing, so an
+intent waiting for a card is left to the lane. What it finds is written the way
+a lane's answer is -- the case locked, the same `exit_paid` event -- so two
+sweeps, or a sweep and a lane, record once. Then:
+
+- paid, with the case open: recorded paid. The stay stays as it is; closing it
+  is the existing rules'.
+- paid, with the case closed or the stay over: recorded paid, and a stay still
+  open credits it at its next case. Nothing the case, the stay or a let-out
+  wrote is changed, so a car let out unpaid stays let out unpaid. One
+  `exit_payment_unplaced` event (`why`: `case_closed` or `stay_ended`).
+- on a case a person let out: recorded paid, and appended to its exception
+  (`payment_after_let_out`).
+- refunded before it was recorded, in whole or in part: **not paid**, left open,
+  `last_failure: "refunded_before_recorded"`, which holds at every later read;
+  one `exit_payment_unplaced` event. Another amount than the one recorded: not
+  paid, as the lane reads it, and one event. Nothing is ever refunded here.
+
+Up to 200 payments per account per run (`SWEEP_LIMIT`), the longest unread
+first, and a read that failed goes to the back of the line, so every payment
+gets its turn; Stripe's errors are logged and asked again next run. It prints
+counts, a line on the error output for each charge written down, and exits 1
+when there was one or a read failed. No Stripe key: nothing to ask.
+
+**When it was paid is Stripe's word** wherever the read carries the charge
+(`latest_charge.created`): the sweep, a let-out, the case that found it. A
+lane's own poll is there as it happens and keeps the clock. `succeeded_at` and
+the `exit_paid` event carry the same time, so a late find lands on the day the
+card was taken.
+
 Refused before any card: a closed or settled case (`exit_closed`,
 `exit_settled`), one that needs the driver's word or a person first
 (`nothing_to_pay_yet`), another lane's case, a lane with no reader
@@ -2013,9 +2047,11 @@ account, a fee below the card minimum (`fee_below_card_minimum`: a person
 decides). The reader's own refusals are named: `503 reader_offline`,
 `409 reader_busy`.
 
-**A person who lets the car out** while a payment is open cancels the
-intent, so no card is taken for a settled exit; if Stripe says it had
-already succeeded, that is recorded instead — paid and let out.
+**A person who lets the car out** while a payment is open: Stripe is read
+first (3 seconds at most; the let-out never waits on it), so a car that paid is
+not written down as let out unpaid. Then the intent is canceled, so no card is
+taken for a settled exit; if Stripe says it had already succeeded, that is
+recorded instead — paid and let out.
 
 **Checked against Stripe itself.** The suite runs against a stand-in
 (`test/stripe-stub.js`); `node scripts/stripe-test-mode-check.js` runs the
@@ -2023,7 +2059,7 @@ platform's own payment calls against Stripe's **test mode** with a simulated
 reader: an intent made once per case, handed to the reader, a second one
 refused while the reader is busy, the reader cleared and an intent canceled
 with its key, a declined card, a good card on the same intent, and a cancel
-of the paid intent refused. It takes only a test key (`sk_test_` or
+of the paid intent refused, and the paid intent read with its charge. It takes only a test key (`sk_test_` or
 `rk_test_`, from the file `STRIPE_TEST_KEY_FILE` names, or `STRIPE_API_KEY`)
 and refuses any other before anything is sent; it never prints the key.
 `STRIPE_TEST_ACCOUNT` (an `acct_` id) is the test connected account it acts

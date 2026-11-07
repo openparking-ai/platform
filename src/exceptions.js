@@ -56,7 +56,7 @@ const LANE_DETAIL_KEYS = Object.freeze([
 /** The events this platform writes about an exit, whose detail it wrote itself and names no car. */
 const PLATFORM_KINDS = new Set([
   'exit_unmatched', 'exit_driver_word', 'exit_let_out_by_person', 'exit_superseded', 'exit_stay_reentered',
-  'exit_payment_started', 'exit_paid', 'exit_payment_canceled', 'exit_covered', 'close_unpriced', 'exit_reader_refused',
+  'exit_payment_started', 'exit_paid', 'exit_payment_canceled', 'exit_payment_unplaced', 'exit_covered', 'close_unpriced', 'exit_reader_refused',
   // A QR shown at the lane (#80): its detail is a closed set with no token
   // and no plate, held so where the platform writes it and where a lane does.
   'qr_presented',
@@ -260,6 +260,12 @@ export async function appendRecord(client, tenantId, exceptionId, r) {
       r.detail ?? null, JSON.stringify(r.records ?? [])],
   );
   return rows[0];
+}
+
+/** The exception of an exit case, or null. */
+export async function ofCase(client, tenantId, exitId) {
+  const { rows } = await client.query('SELECT * FROM exceptions WHERE tenant_id = $1 AND exit_id = $2', [tenantId, exitId]);
+  return rows[0] ?? null;
 }
 
 /** The payment of the case as it stood once the let-out canceled it, or found it paid. */
@@ -603,7 +609,8 @@ export function presentWhole(x) {
     case_opened_at: x.case_opened_at,
     window: { from: x.window_from, to: x.window_to },
     story: x.story,
-    payment_after_let_out: x.records.filter((r) => r.source === 'payment_after_let_out').map((r) => r.records[0] ?? null)[0] ?? null,
+    // The latest: the sweep appends what it found after the let-out's own.
+    payment_after_let_out: x.records.filter((r) => r.source === 'payment_after_let_out').at(-1)?.records[0] ?? null,
     lane_events_after: gate('lane_events_after')[0]?.records ?? null,
     // Ids and times; each image at
     // GET /garages/:garageId/exceptions/:exceptionId/pictures/:pictureId.

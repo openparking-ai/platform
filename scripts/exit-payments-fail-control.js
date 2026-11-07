@@ -3,8 +3,8 @@
  * The control for paying at the exit (0038).
  *
  * Every property the payment's safety rests on is broken below, one at a
- * time, and `test/exit-payments.test.js` is REQUIRED to go red -- with at
- * least one test still green, so a break that stops the file running is not
+ * time, and `test/exit-payments.test.js` or `test/exit-payment-sweep.test.js`
+ * is REQUIRED to go red -- with at least one test still green, so a break that stops the file running is not
  * mistaken for one the tests caught. A pass is the failure.
  *
  * SOURCE breaks are applied to a COPY of the tree in a temporary directory; no
@@ -31,6 +31,26 @@
  *   number_kept                 the receipt's number is kept whole
  *   caribbean_texted            a number of another plan member is texted
  *   toll_free_texted            a toll-free number is texted
+ *   sweep_reads_nothing         a payment no lane finished is never asked about
+ *   sweep_young_rows            the sweep reads a payment a lane is still at
+ *   sweep_writes_stripe         the sweep cancels an intent at Stripe
+ *   sweep_no_lock               two sweeps at once both record a payment
+ *   sweep_and_lane_twice        a sweep and a lane at once tell it twice
+ *   sweep_closes_the_case       the sweep closes what it found paid
+ *   closed_not_written_down     a charge on a closed case is written nowhere
+ *   found_not_on_exception      a charge found after a let-out is not on its exception
+ *   written_down_twice          a charge is written down at every read
+ *   refund_taken_as_paid        a charge refunded first is taken as paid
+ *   refund_forgotten            the next read marks a refunded charge paid
+ *   mismatch_not_written_down   another amount is written nowhere
+ *   let_out_before_read         a car that paid is written as let out unpaid
+ *   let_out_held_by_stripe      a silent Stripe holds a let-out up
+ *   paid_date_is_read_time      the paid date is when it was read
+ *   event_date_is_read_time     the event's date is when it was read
+ *   found_date_is_read_time     a payment found at a later case keeps the read time
+ *   failed_read_keeps_its_place a read that failed spends the run's places again
+ *   error_stops_the_run         one read refused ends the run
+ *   old_rows_forgotten          an old open payment is not asked about again
  *
  * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with one
  * statement of 0038 edited, so the property genuinely never existed there.
@@ -56,6 +76,12 @@ import pg from 'pg';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const SCRATCH = process.env.EXIT_PAYMENTS_SCRATCH_DB || 'openparking_exit_payments_control';
+
+const SWEEP = 'src/exitPaymentSweep.js';
+const CASE_LOCK = {
+  from: 'const row = await exits.caseById(client, tenantId, garageId, exitId, { lock: true });',
+  to: 'const row = await exits.caseById(client, tenantId, garageId, exitId);',
+};
 
 const SOURCE_BREAKS = [
   {
@@ -166,8 +192,8 @@ const SOURCE_BREAKS = [
   {
     name: 'paid_untold',
     why: 'a payment found paid leaves no event',
-    file: 'src/app.js',
-    from: '    if (written.paidNow) await paidEvent(client, tenantId, row, written.row);',
+    file: 'src/exitPaymentSweep.js',
+    from: '  if (written.paidNow) await paidEvent(client, tenantId, row, written.row);',
     to: '',
   },
   {
@@ -205,6 +231,147 @@ const SOURCE_BREAKS = [
     from: " || npa[1] === npa[2]) return null;",
     to: ') return null;',
   },
+  {
+    name: 'sweep_reads_nothing',
+    why: 'a payment no lane finished is never asked about',
+    file: SWEEP,
+    from: '  const due = await withTenant(tenantId, (client) => duePayments(client, tenantId, now, limit));',
+    to: '  const due = [];',
+  },
+  {
+    name: 'sweep_young_rows',
+    why: 'the sweep reads a payment a lane is still at',
+    file: SWEEP,
+    from: 'export const MIN_AGE_MS = 2 * 60_000;',
+    to: 'export const MIN_AGE_MS = 0;',
+  },
+  {
+    name: 'sweep_writes_stripe',
+    why: 'the sweep cancels an intent at Stripe',
+    file: SWEEP,
+    from: '      let found = null;',
+    to: '      await exitPayments.cancelIntent(config, p.account_id, p.payment_intent_id).catch(() => {});\n      let found = null;',
+  },
+  {
+    name: 'sweep_no_lock',
+    why: 'two sweeps at once both record a payment',
+    file: SWEEP,
+    from: CASE_LOCK.from,
+    to: CASE_LOCK.to,
+  },
+  {
+    name: 'sweep_and_lane_twice',
+    why: 'a sweep and a lane at once tell it twice',
+    edits: [
+      { file: SWEEP, ...CASE_LOCK },
+      { file: SWEEP, from: 'eventId: `${exitPayments.PAID_EVENT_KIND}:${payment.id}`,', to: 'eventId: `${exitPayments.PAID_EVENT_KIND}:${payment.id}:${Math.random()}`,' },
+    ],
+  },
+  {
+    name: 'sweep_closes_the_case',
+    why: 'the sweep closes what it found paid',
+    file: SWEEP,
+    from: '  if (!written.paidNow) return { paid: false, unplaced: false };\n',
+    to: "  if (!written.paidNow) return { paid: false, unplaced: false };\n  await exits.endCase(client, tenantId, row.id, { why: 'stay_ended', by: 'sweep' });\n",
+  },
+  {
+    name: 'closed_not_written_down',
+    why: 'a charge on a closed case is written nowhere',
+    file: SWEEP,
+    from: "  const why = row.closed_at ? 'case_closed' : (await stayIsOver(client, tenantId, row.session_id)) ? 'stay_ended' : null;",
+    to: '  const why = null;',
+  },
+  {
+    name: 'found_not_on_exception',
+    why: 'a charge found after a let-out is not on its exception',
+    file: SWEEP,
+    from: '  if (exception) await exceptions.recordPaymentAfter(client, tenantId, exception, payment);\n',
+    to: '',
+  },
+  {
+    name: 'written_down_twice',
+    why: 'a charge is written down at every read',
+    file: SWEEP,
+    from: 'eventId: `${exitPayments.UNPLACED_EVENT_KIND}:${payment.id}`,',
+    to: 'eventId: `${exitPayments.UNPLACED_EVENT_KIND}:${payment.id}:${Math.random()}`,',
+  },
+  {
+    name: 'refund_taken_as_paid',
+    why: 'a charge refunded first is taken as paid',
+    file: 'src/exitPayments.js',
+    from: '((intent.latest_charge?.amount_refunded ?? 0) !== 0 || row.last_failure === REFUNDED_FIRST)',
+    to: 'row.last_failure === REFUNDED_FIRST',
+  },
+  {
+    name: 'refund_forgotten',
+    why: 'the next read marks a refunded charge paid',
+    file: 'src/exitPayments.js',
+    from: '((intent.latest_charge?.amount_refunded ?? 0) !== 0 || row.last_failure === REFUNDED_FIRST)',
+    to: '(intent.latest_charge?.amount_refunded ?? 0) !== 0',
+  },
+  {
+    name: 'mismatch_not_written_down',
+    why: 'another amount is written nowhere',
+    file: SWEEP,
+    from: "    const unplaced = intent.status === 'succeeded' && await writeDown(client, tenantId, row, payment, payment.last_failure);",
+    to: '    const unplaced = false;',
+  },
+  {
+    name: 'let_out_before_read',
+    why: 'a car that paid is written as let out unpaid',
+    file: 'src/app.js',
+    from: '      await readBeforeLetOut(req.tenantId, req.params.garageId, req.params.exitId);\n',
+    to: '',
+  },
+  {
+    name: 'let_out_held_by_stripe',
+    why: 'a silent Stripe holds a let-out up',
+    file: 'src/app.js',
+    from: '      await recordIntent(tenantId, garageId, exitId, intent);\n    } catch (err) {\n      if (!(err instanceof StripeUnreachable || err instanceof StripeError)) throw err;',
+    to: '      await recordIntent(tenantId, garageId, exitId, intent);\n    } catch (err) {\n      throw err;',
+  },
+  {
+    name: 'paid_date_is_read_time',
+    why: 'the paid date is when it was read',
+    file: 'src/exitPayments.js',
+    from: 'COALESCE(succeeded_at, $6::timestamptz, now())',
+    to: 'COALESCE(succeeded_at, now(), $6::timestamptz)',
+  },
+  {
+    name: 'event_date_is_read_time',
+    why: "the event's date is when it was read",
+    file: SWEEP,
+    from: '  occurredAt: new Date(payment.succeeded_at),',
+    to: '  occurredAt: new Date(),',
+  },
+  {
+    name: 'found_date_is_read_time',
+    why: 'a payment found at a later case keeps the read time',
+    file: 'src/app.js',
+    from: "    if (intent.status === 'succeeded') {\n      intent = await exitPayments.readIntentWithCharge(",
+    to: '    if (false) {\n      intent = await exitPayments.readIntentWithCharge(',
+  },
+  {
+    name: 'failed_read_keeps_its_place',
+    why: "a read that failed spends the run's places again",
+    file: SWEEP,
+    from: '      await backOfTheLine(tenantId, p.id).catch(() => {});\n',
+    to: '',
+  },
+  {
+    name: 'error_stops_the_run',
+    why: 'one read refused ends the run',
+    file: SWEEP,
+    from: '      summary.failed += 1;\n',
+    to: '      throw err;\n',
+  },
+  {
+    name: 'old_rows_forgotten',
+    why: 'an old open payment is not asked about again',
+    file: SWEEP,
+    from: 'export const OLD_EVERY_MS = 15 * 60_000;',
+    to: 'export const OLD_EVERY_MS = 1000 * 86_400_000;',
+  },
 ];
 
 const ADDED_0038 = '0038_exit_payments.sql';
@@ -234,7 +401,7 @@ const SCHEMA_BREAKS = [
   },
 ];
 
-const SUITE = ['--test', 'test/exit-payments.test.js'];
+const SUITE = ['--test', 'test/exit-payments.test.js', 'test/exit-payment-sweep.test.js'];
 
 function stage() {
   const dir = mkdtempSync(join(tmpdir(), 'openparking-exit-payments-control-'));
@@ -376,15 +543,19 @@ console.log('\n== control B: each SOURCE break must make it FAIL ==');
 for (const brk of SOURCE_BREAKS) {
   const dir = stage();
   try {
-    const path = join(dir, brk.file);
-    const source = readFileSync(path, 'utf8');
-    if (!source.includes(brk.from)) {
-      console.error(`  ${brk.name.padEnd(36)} *** ANCHOR NOT FOUND in ${brk.file} ***`);
-      failures += 1;
-      continue;
+    let anchored = true;
+    for (const edit of brk.edits ?? [brk]) {
+      const path = join(dir, edit.file);
+      const source = readFileSync(path, 'utf8');
+      if (!source.includes(edit.from)) {
+        console.error(`  ${brk.name.padEnd(36)} *** ANCHOR NOT FOUND in ${edit.file} ***`);
+        failures += 1;
+        anchored = false;
+        break;
+      }
+      writeFileSync(path, source.replace(edit.from, edit.to));
     }
-    writeFileSync(path, source.replace(brk.from, brk.to));
-    if (!judge(brk.name, brk.why, run(dir))) failures += 1;
+    if (anchored && !judge(brk.name, brk.why, run(dir))) failures += 1;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
