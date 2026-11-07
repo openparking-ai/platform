@@ -153,8 +153,8 @@ const SOURCE_BREAKS = [
     why: 'the tenth wrong password does not lock',
     suite: SIGN_IN,
     file: 'src/signIn.js',
-    from: '        [user.tenant_id, user.user_id, address, MAX_FAILED, LOCK_MINUTES, counted],',
-    to: '        [user.tenant_id, user.user_id, address, MAX_FAILED + 1, LOCK_MINUTES, counted],',
+    from: '      [user.tenant_id, user.user_id, address, MAX_FAILED, LOCK_MINUTES, counted],',
+    to: '      [user.tenant_id, user.user_id, address, MAX_FAILED + 1, LOCK_MINUTES, counted],',
   },
   {
     name: 'lock_whole_account',
@@ -169,8 +169,8 @@ const SOURCE_BREAKS = [
     why: 'the caller address is read from X-Forwarded-For with no trusted proxy',
     suite: SIGN_IN,
     file: 'src/signIn.js',
-    from: "  let address = (settings.trustProxy === null ? req.socket.remoteAddress : req.ip) ?? 'unknown';",
-    to: "  let address = (req.get?.('x-forwarded-for') ?? (settings.trustProxy === null ? req.socket.remoteAddress : req.ip)) ?? 'unknown';",
+    from: "  const address = (settings.trustProxy === null ? req.socket.remoteAddress : req.ip) ?? 'unknown';",
+    to: "  const address = (req.get?.('x-forwarded-for') ?? (settings.trustProxy === null ? req.socket.remoteAddress : req.ip)) ?? 'unknown';",
   },
   {
     name: 'idle_unchecked',

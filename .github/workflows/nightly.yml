@@ -175,6 +175,10 @@ jobs:
         run: npm run validations-fail-control
       - name: Validations-door fail-control
         run: npm run validations-door-fail-control
+      - name: Person-door fail-control
+        run: npm run person-door-fail-control
+      - name: Linked-accounts fail-control
+        run: npm run linked-accounts-fail-control
       - name: Stripe-account fail-control
         run: npm run stripe-account-fail-control
       - name: Taxes fail-control

@@ -80,7 +80,7 @@ export const UNREADABLE = Object.freeze({
 const LANGUAGES = ['en', 'es'];
 
 /** The body, when it has exactly these keys, each a string; or null. */
-function exactly(body, keys) {
+export function exactly(body, keys) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
   const has = Object.keys(body);
   if (has.length !== keys.length || !keys.every((k) => has.includes(k) && typeof body[k] === 'string')) return null;
@@ -222,14 +222,18 @@ export function mountAccountDoors(router, { settings, email, line, answer, signI
     }
   });
 
+  /** The reset email: after the answer, so the send is not on the wire; and only for an admin. */
+  const sendReset = (made) => {
+    if (made && email.configured) {
+      sendLater(email, { to: made.email, ...resetEmail(made.language, { link: resetLink(settings.adminOrigin, made.token) }) }, 'reset email');
+    }
+  };
+
   router.post('/forgot', ...admit('forgot'), async (req, res) => {
     try {
       const made = await requestReset(req.door.email, signIn.NOBODY);
       await answer(req, res, 200, FORGOT_SENT);
-      // After the answer, so the send is not on the wire; and only for an admin.
-      if (made && email.configured) {
-        sendLater(email, { to: made.email, ...resetEmail(made.language, { link: resetLink(settings.adminOrigin, made.token) }) }, 'reset email');
-      }
+      sendReset(made);
       return undefined;
     } catch (err) {
       return failed(req, res, 'forgot', err);
@@ -256,4 +260,7 @@ export function mountAccountDoors(router, { settings, email, line, answer, signI
       return failed(req, res, 'reset', err);
     }
   });
+
+  // What the trusted server's door shares with forgot (src/personDoor.js): its count, and its email.
+  return { forgotLimiter: limiters.forgot, sendReset };
 }

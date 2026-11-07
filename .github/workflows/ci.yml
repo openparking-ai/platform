@@ -560,6 +560,14 @@ jobs:
         # test/validations-door.test.js to go red.
         run: npm run validations-door-fail-control
 
+      - name: Person-door fail-control
+        # The trusted server's door. Each break removes one property -- the key
+        # checked, the caller's address counted, one refusal, a place given
+        # back, a bound on every wait, the door's connections its own -- and
+        # its test must go red; six more break the public sign-in and forgot,
+        # which share its statements and are held to the byte.
+        run: npm run person-door-fail-control
+
       - name: Stripe-account fail-control
         # A garage's own Stripe account (0020): created only on the operator's
         # request, as the garage's -- no Stripe dashboard, its own Stripe
